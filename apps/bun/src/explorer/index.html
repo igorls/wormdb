@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WormDB Explorer</title>
+    <meta
+      name="description"
+      content="Real-time key-value explorer powered by WormDB custom procedures"
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <!-- Header -->
+      <header class="top-bar">
+        <div class="brand">
+          <div class="brand-icon">
+            <svg
+              width="22"
+              height="22"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <path
+                d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"
+              />
+              <polyline points="3.27 6.96 12 12.01 20.73 6.96" />
+              <line x1="12" y1="22.08" x2="12" y2="12" />
+            </svg>
+          </div>
+          <h1>KV Explorer</h1>
+          <span class="tag">PROCEDURES</span>
+        </div>
+        <div class="stats-bar" id="stats-bar">
+          <div class="stat-chip reads">
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+            >
+              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+              <circle cx="12" cy="12" r="3" />
+            </svg>
+            <span>Reads</span>
+            <strong id="stat-reads">0</strong>
+          </div>
+          <div class="stat-chip writes">
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+            >
+              <path d="M12 20h9" />
+              <path
+                d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"
+              />
+            </svg>
+            <span>Writes</span>
+            <strong id="stat-writes">0</strong>
+          </div>
+          <div class="stat-chip keys">
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+            >
+              <rect x="3" y="3" width="7" height="7" />
+              <rect x="14" y="3" width="7" height="7" />
+              <rect x="14" y="14" width="7" height="7" />
+              <rect x="3" y="14" width="7" height="7" />
+            </svg>
+            <span>Keys</span>
+            <strong id="stat-keys">0</strong>
+          </div>
+        </div>
+      </header>
+
+      <!-- Main Layout -->
+      <div class="main-layout">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+          <div class="sidebar-toolbar">
+            <div class="search-box">
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+              >
+                <circle cx="11" cy="11" r="8" />
+                <line x1="21" y1="21" x2="16.65" y2="16.65" />
+              </svg>
+              <input
+                type="text"
+                id="search-input"
+                placeholder="Filter keys..."
+              />
+            </div>
+            <button id="btn-add-key" class="btn-icon add" title="Add Key">
+              <svg
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+              >
+                <line x1="12" y1="5" x2="12" y2="19" />
+                <line x1="5" y1="12" x2="19" y2="12" />
+              </svg>
+            </button>
+          </div>
+          <div class="key-list-container">
+            <ul id="key-list" class="key-list">
+              <!-- Keys populated via JS -->
+            </ul>
+          </div>
+        </aside>
+
+        <!-- Detail Pane -->
+        <main class="detail-pane" id="detail-pane">
+          <div class="empty-state" id="empty-state">
+            <div class="empty-icon">
+              <svg
+                width="48"
+                height="48"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path
+                  d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"
+                />
+                <polyline points="3.27 6.96 12 12.01 20.73 6.96" />
+                <line x1="12" y1="22.08" x2="12" y2="12" />
+              </svg>
+            </div>
+            <h2>No Key Selected</h2>
+            <p>
+              Select a key from the sidebar or create a new one to start
+              exploring.
+            </p>
+            <p class="empty-hint">
+              All mutations go through <code>EXEC kv_put</code> and
+              <code>EXEC kv_get</code> procedures.
+            </p>
+          </div>
+
+          <div class="key-detail hidden" id="key-detail">
+            <div class="detail-header">
+              <div class="detail-key-name">
+                <code id="detail-key">—</code>
+                <span id="lock-badge" class="lock-badge hidden">
+                  <svg
+                    width="12"
+                    height="12"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                  >
+                    <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+                    <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                  </svg>
+                  WORM
+                </span>
+              </div>
+              <div class="detail-actions">
+                <button
+                  id="btn-worm"
+                  class="btn-action warning"
+                  title="WORM Lock"
+                >
+                  <svg
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                  >
+                    <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+                    <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                  </svg>
+                  Lock
+                </button>
+                <button
+                  id="btn-delete"
+                  class="btn-action danger"
+                  title="Delete Key"
+                >
+                  <svg
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                  >
+                    <polyline points="3 6 5 6 21 6" />
+                    <path
+                      d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"
+                    />
+                  </svg>
+                  Delete
+                </button>
+              </div>
+            </div>
+
+            <!-- Value Editor -->
+            <div class="value-section">
+              <label class="section-label">Value</label>
+              <div class="editor-wrap">
+                <textarea
+                  id="value-editor"
+                  placeholder="Enter value..."
+                  spellcheck="false"
+                ></textarea>
+                <div id="save-indicator" class="save-indicator">
+                  <span class="dot"></span> <span class="text">Saved</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Metadata Panel -->
+            <div class="meta-section" id="meta-section">
+              <label class="section-label"
+                >Metadata
+                <span class="meta-hint">(tracked by procedures)</span></label
+              >
+              <div class="meta-grid">
+                <div class="meta-card">
+                  <span class="meta-label">Created</span>
+                  <span class="meta-value" id="meta-created">—</span>
+                </div>
+                <div class="meta-card">
+                  <span class="meta-label">Updated</span>
+                  <span class="meta-value" id="meta-updated">—</span>
+                </div>
+                <div class="meta-card">
+                  <span class="meta-label">Writes</span>
+                  <span class="meta-value mono" id="meta-writes">0</span>
+                </div>
+                <div class="meta-card">
+                  <span class="meta-label">Reads</span>
+                  <span class="meta-value mono" id="meta-reads">0</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Procedure Log -->
+            <div class="proc-section">
+              <label class="section-label">Procedure Call Log</label>
+              <div class="proc-log" id="proc-log">
+                <div class="proc-empty">
+                  Procedure calls will appear here as you interact.
+                </div>
+              </div>
+            </div>
+          </div>
+        </main>
+      </div>
+
+      <!-- Status Footer -->
+      <footer class="status-bar">
+        <div class="status-item connection">
+          <div id="conn-indicator" class="status-dot"></div>
+          <span id="conn-text">Connecting...</span>
+        </div>
+        <div class="status-item">
+          <span>Server Uptime:</span>
+          <strong id="stat-uptime">—</strong>
+        </div>
+        <div class="status-item">
+          <span>WAL Size:</span>
+          <strong id="stat-wal">0 B</strong>
+        </div>
+      </footer>
+    </div>
+
+    <!-- Toast Container -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <!-- Confirmation Dialog -->
+    <div id="dialog-overlay" class="dialog-overlay">
+      <div class="dialog">
+        <h3 id="dialog-title">Confirm</h3>
+        <p id="dialog-message">Are you sure?</p>
+        <div class="dialog-actions">
+          <button id="btn-dialog-cancel" class="btn secondary">Cancel</button>
+          <button id="btn-dialog-confirm" class="btn primary">Confirm</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Add Key Dialog -->
+    <div id="add-dialog-overlay" class="dialog-overlay">
+      <div class="dialog add-dialog">
+        <h3>Add Key</h3>
+        <div class="form-group">
+          <label for="new-key-input">Key</label>
+          <input
+            type="text"
+            id="new-key-input"
+            placeholder="e.g. user:profile:1"
+            spellcheck="false"
+          />
+        </div>
+        <div class="form-group">
+          <label for="new-value-input">Value</label>
+          <textarea
+            id="new-value-input"
+            placeholder="Enter value..."
+            rows="4"
+            spellcheck="false"
+          ></textarea>
+        </div>
+        <div class="dialog-actions">
+          <button id="btn-add-cancel" class="btn secondary">Cancel</button>
+          <button id="btn-add-confirm" class="btn primary">
+            Create via EXEC kv_put
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

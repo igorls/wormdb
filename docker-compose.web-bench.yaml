@@ -1,0 +1,128 @@
+# WormDB Browser Benchmark — Self-Contained Stack
+#
+# Compares database access architectures from the browser:
+#   Lane 1: Classic DB + REST API + Client (fetch → Bun → WormDB TCP)
+#   Lane 2: WormDB browser-direct with SCT auth (WebSocket → Gateway)
+#   Lane 3: WormDB browser-direct without auth (WebSocket → Gateway)
+#   Lane 4: HTTP/3 QUIC (placeholder — not yet implemented)
+#
+# Prerequisites:
+#   1. Build WormDB:  zig build
+#   2. Generate keys:  bun run apps/browser/demo/keygen.ts --save
+#   3. Build browser client:  cd apps/browser && bun run build && cd ../..
+#
+# Usage:
+#   docker compose -f docker-compose.web-bench.yaml up -d --build
+#   open http://localhost:8080/demo/benchmark.html
+#   docker compose -f docker-compose.web-bench.yaml down -v
+
+services:
+  # ── WormDB Instance 1: Auth-enabled gateway on port 6390 ────────────
+  wormdb-auth:
+    build: .
+    image: wormdb:latest
+    container_name: bench-wormdb-auth
+    hostname: wormdb-auth
+    ports:
+      - "6390:6390"     # WebSocket gateway (auth)
+    volumes:
+      - wormdb-auth-data:/data
+      - ./bench/wormdb-auth.json:/etc/wormdb/config.json:ro
+      - ./.wormdb-keys.json:/etc/wormdb/keys.json:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        PK=$$(cat /etc/wormdb/keys.json | sed -n 's/.*"publicKey": "\([^"]*\)".*/\1/p')
+        sed "s|BENCH_PUBLIC_KEY_PLACEHOLDER|$$PK|g" /etc/wormdb/config.json > /tmp/config.json
+        exec /usr/bin/wormdb --config /tmp/config.json
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "6389"]
+      interval: 2s
+      timeout: 2s
+      start_period: 3s
+      retries: 5
+    networks: [bench]
+
+  # ── WormDB Instance 2: No-auth gateway on port 6392 ────────────────
+  wormdb-noauth:
+    image: wormdb:latest
+    container_name: bench-wormdb-noauth
+    hostname: wormdb-noauth
+    ports:
+      - "6392:6392"     # WebSocket gateway (no auth)
+    volumes:
+      - wormdb-noauth-data:/data
+      - ./bench/wormdb-noauth.json:/etc/wormdb/config.json:ro
+    command: ["--config", "/etc/wormdb/config.json"]
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "6391"]
+      interval: 2s
+      timeout: 2s
+      start_period: 3s
+      retries: 5
+    networks: [bench]
+
+  # ── Auth Provider: mints SCT tokens ─────────────────────────────────
+  auth-provider:
+    image: oven/bun:1-slim
+    container_name: bench-auth-provider
+    hostname: auth-provider
+    ports:
+      - "8081:8081"
+    working_dir: /app
+    volumes:
+      - ./apps/browser/demo/auth-provider.ts:/app/auth-provider.ts:ro
+      - ./.wormdb-keys.json:/app/.wormdb-keys.json:ro
+    command: ["bun", "run", "auth-provider.ts"]
+    depends_on:
+      wormdb-auth:
+        condition: service_healthy
+    networks: [bench]
+
+  # ── REST API Backend: proxy for Classic lane ────────────────────────
+  # Mount the full apps/ tree so the relative import ../../bun/src/lib/client resolves.
+  api-backend:
+    image: oven/bun:1-slim
+    container_name: bench-api-backend
+    hostname: api-backend
+    ports:
+      - "8082:8082"
+    working_dir: /app
+    volumes:
+      - ./apps:/app/apps:ro
+    environment:
+      WORMDB_HOST: wormdb-noauth
+      WORMDB_PORT: "6391"
+      API_PORT: "8082"
+    command: ["bun", "run", "apps/browser/demo/api-backend.ts"]
+    depends_on:
+      wormdb-noauth:
+        condition: service_healthy
+    networks: [bench]
+
+  # ── Web Server: serves benchmark.html and wormdb-web client ─────────
+  # Mount apps/browser so serve.ts path resolution (./apps/browser${path}) works.
+  web-server:
+    image: oven/bun:1-slim
+    container_name: bench-web-server
+    hostname: web-server
+    ports:
+      - "8080:8080"
+    working_dir: /app
+    volumes:
+      - ./apps/browser:/app/apps/browser:ro
+    command: ["bun", "run", "apps/browser/demo/serve.ts"]
+    depends_on:
+      - wormdb-auth
+      - wormdb-noauth
+      - auth-provider
+      - api-backend
+    networks: [bench]
+
+networks:
+  bench:
+    driver: bridge
+
+volumes:
+  wormdb-auth-data:
+  wormdb-noauth-data:

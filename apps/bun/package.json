@@ -1,0 +1,22 @@
+{
+  "name": "wormdb-bun-tools",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "client": "bun run src/bin/client.ts",
+    "bench": "bun run src/bin/bench.ts",
+    "bench:quick": "bun run src/bin/bench.ts --tests exec-transfer,spacetime-transfer --ops 2000 --warmup-ops 200 --concurrency 64 --pool-size 64 --keyspace 3000 --bank-initial-balance 100000 --bank-min-amount 1 --bank-max-amount 100",
+    "bench:quick:exec": "bun run src/bin/bench.ts --test exec-transfer --ops 2000 --warmup-ops 200 --concurrency 64 --pool-size 64 --keyspace 3000 --bank-initial-balance 100000 --bank-min-amount 1 --bank-max-amount 100",
+    "bench:frontier": "bun run src/bin/bench.ts --test exec-transfer --ops 200000 --warmup-ops 5000 --concurrency 96 --pool-size 96 --inflight 64 --keyspace 100000 --bank-initial-balance 10000000 --bank-min-amount 1 --bank-max-amount 1",
+    "ui": "bun run src/bin/ui.ts",
+    "notepad": "bun run src/bin/notepad.ts",
+    "explorer": "bun run src/bin/explorer.ts",
+    "test": "bun test",
+    "test:coverage": "bun test --coverage"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.9",
+    "@types/node": "^25.3.3"
+  }
+}

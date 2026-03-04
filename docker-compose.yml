@@ -1,0 +1,97 @@
+# WormDB 6-Node Cluster with Embedded MeshGuard
+#
+# SWIM gossip auto-discovers membership transitively — each node seeds
+# from a different peer, forming a discovery chain:
+#   node1 (no seed) ← node2 ← node4
+#                    ← node3 ← node5
+#                              ← node6
+#
+# Usage:
+#   docker compose up -d          # Start 6-node cluster
+#   docker compose logs -f        # Follow logs
+#   docker compose down -v        # Stop and clean data
+
+services:
+  node1:
+    build: .
+    image: wormdb:latest
+    container_name: wormdb-node1
+    hostname: node1
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    ports: ["26389:6389"]
+    volumes: [node1-data:/data]
+    command: ["--port", "6389", "--data", "/data", "--cluster", "wormdb-cluster"]
+    networks: [mesh]
+
+  node2:
+    image: wormdb:latest
+    container_name: wormdb-node2
+    hostname: node2
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    ports: ["26390:6389"]
+    volumes: [node2-data:/data]
+    command: ["--port", "6389", "--data", "/data", "--cluster", "wormdb-cluster", "--seed", "node1:51821"]
+    depends_on: [node1]
+    networks: [mesh]
+
+  node3:
+    image: wormdb:latest
+    container_name: wormdb-node3
+    hostname: node3
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    ports: ["26391:6389"]
+    volumes: [node3-data:/data]
+    command: ["--port", "6389", "--data", "/data", "--cluster", "wormdb-cluster", "--seed", "node2:51821"]
+    depends_on: [node2]
+    networks: [mesh]
+
+  node4:
+    image: wormdb:latest
+    container_name: wormdb-node4
+    hostname: node4
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    ports: ["26392:6389"]
+    volumes: [node4-data:/data]
+    command: ["--port", "6389", "--data", "/data", "--cluster", "wormdb-cluster", "--seed", "node1:51821"]
+    depends_on: [node1]
+    networks: [mesh]
+
+  node5:
+    image: wormdb:latest
+    container_name: wormdb-node5
+    hostname: node5
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    ports: ["26393:6389"]
+    volumes: [node5-data:/data]
+    command: ["--port", "6389", "--data", "/data", "--cluster", "wormdb-cluster", "--seed", "node3:51821"]
+    depends_on: [node3]
+    networks: [mesh]
+
+  node6:
+    image: wormdb:latest
+    container_name: wormdb-node6
+    hostname: node6
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    ports: ["26394:6389"]
+    volumes: [node6-data:/data]
+    command: ["--port", "6389", "--data", "/data", "--cluster", "wormdb-cluster", "--seed", "node5:51821"]
+    depends_on: [node5]
+    networks: [mesh]
+
+networks:
+  mesh:
+    driver: bridge
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:
+  node5-data:
+  node6-data:

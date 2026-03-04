@@ -1,0 +1,11 @@
+{
+  "data": "/data",
+  "server": { "port": 6389 },
+  "gateway": { "enabled": true, "port": 6390 },
+  "store": { "persistence": "none" },
+  "auth": {
+    "require_auth": true,
+    "public_keys": ["BENCH_PUBLIC_KEY_PLACEHOLDER"],
+    "token_max_age_s": 86400
+  }
+}

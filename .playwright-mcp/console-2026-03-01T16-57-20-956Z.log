@@ -1,0 +1,271 @@
+[   90049ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[   90049ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[   93048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[   93048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[   96048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[   96048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[   99048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[   99048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  102048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  102048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  105048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  105048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  108048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  108049ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  111048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  111048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  114048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  114049ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  117048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  117048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  120048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  120048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  123049ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  123049ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  126048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  126048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  129048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  129048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  132049ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  132049ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  135048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  135048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  138048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  138048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  141048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  141048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  144048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  144048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  147048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  147048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  150048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  150048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  153048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  153048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  156048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  156048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  159048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  159048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  162048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  162048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  165048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  165048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  168048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  168048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  171048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  171048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  174048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  174048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  177048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  177048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  180048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  180048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  183048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  183048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  186048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  186048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  189048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  189048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  192048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  192048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  195048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  195048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  198048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  198048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  201048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  201048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  204048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  204048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  207048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  207048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[  210048ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/status:0
+[  210048ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8080/assets/app.js:101:23) @ http://localhost:8080/assets/app.js:113
+[ 1406491ms] [ERROR] Failed to load resource: the server responded with a status of 503 (Service Unavailable) @ http://localhost:8080/api/status:0
+[ 1406491ms] [ERROR] Status refresh failed: Error: Server error
+    at refreshStatus (http://localhost:8080/assets/app.js:142:13) @ http://localhost:8080/assets/app.js:152
+[ 1409487ms] [ERROR] Failed to load resource: the server responded with a status of 503 (Service Unavailable) @ http://localhost:8080/api/status:0
+[ 1409487ms] [ERROR] Status refresh failed: Error: Server error
+    at refreshStatus (http://localhost:8080/assets/app.js:142:13) @ http://localhost:8080/assets/app.js:152
+[ 1412487ms] [ERROR] Failed to load resource: the server responded with a status of 503 (Service Unavailable) @ http://localhost:8080/api/status:0
+[ 1412487ms] [ERROR] Status refresh failed: Error: Server error
+    at refreshStatus (http://localhost:8080/assets/app.js:142:13) @ http://localhost:8080/assets/app.js:152
+[ 1415487ms] [ERROR] Failed to load resource: the server responded with a status of 503 (Service Unavailable) @ http://localhost:8080/api/status:0
+[ 1415488ms] [ERROR] Status refresh failed: Error: Server error
+    at refreshStatus (http://localhost:8080/assets/app.js:142:13) @ http://localhost:8080/assets/app.js:152
+[ 1458772ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1458772ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1461771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1461771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1462214ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1464771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1464772ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1467215ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1467771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1467772ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1470771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1470772ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1472216ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1473771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1473771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1476772ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1476772ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1477217ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1479771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1479771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1482218ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1482771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1482771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1485771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1485772ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1487219ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1488771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1488771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1491771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1491771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1492220ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1494771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1494771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1497221ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1497771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1497771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1500771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1500771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1502222ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1503771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1503771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1506771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1506771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1507223ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1509771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1509771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1512224ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1512771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1512772ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1515771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1515771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1517225ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1518771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1518771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1521771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1521771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1522226ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1524771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1524772ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1527227ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1527771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1527771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1530771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1530772ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1532228ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1533771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1533771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1536771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1536771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1537229ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1539771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1539772ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1542230ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1542771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1542771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1545771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1545771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1547231ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1548771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1548771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1551771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1551771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1552232ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1554772ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1554772ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1557233ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1557771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1557771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1560771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1560771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1562234ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1563771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1563771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1566772ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1566772ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164
+[ 1567235ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/events:0
+[ 1569771ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8888/api/status:0
+[ 1569771ms] [ERROR] Status refresh failed: TypeError: Failed to fetch
+    at refreshStatus (http://localhost:8888/assets/app.js:148:23) @ http://localhost:8888/assets/app.js:164

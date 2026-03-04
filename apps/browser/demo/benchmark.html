@@ -1,0 +1,1211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WormDB — Browser Benchmark</title>
+  <meta name="description" content="Compare database access architectures: Classic REST API vs WormDB browser-direct with and without auth.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <style>
+    :root {
+      --bg-root: #09090b;
+      --bg-card: #141417;
+      --bg-card-alt: #0e0e11;
+      --bg-input: #09090b;
+      --bg-hover: #1f1f22;
+      --border: #27272a;
+      --border-active: #52525b;
+      --text: #fafafa;
+      --text-secondary: #a1a1aa;
+      --text-dim: #71717a;
+      --accent: #ededef;
+      --danger: #ef4444;
+      --blue: #3b82f6;
+      --purple: #8b5cf6;
+      --amber: #f59e0b;
+      --font: 'Inter', -apple-system, sans-serif;
+      --mono: 'JetBrains Mono', monospace;
+      --radius: 8px;
+      --ease: 200ms cubic-bezier(0.4, 0, 0.2, 1);
+      --lane-classic: #3b82f6;
+      --lane-auth: #8b5cf6;
+      --lane-noauth: #10b981;
+      --lane-quic: #71717a;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: var(--font);
+      background: var(--bg-root);
+      color: var(--text);
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+
+    /* ── Layout ─────────────────────────────────────────────────── */
+    .container {
+      max-width: 1000px;
+      margin: 0 auto;
+      padding: 3rem 1.5rem 5rem;
+    }
+
+    /* ── Header ─────────────────────────────────────────────────── */
+    .header {
+      text-align: center;
+      margin-bottom: 3.5rem;
+      position: relative;
+    }
+
+    .logo-row {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+
+    .logo {
+      width: 44px; height: 44px;
+      border-radius: 8px;
+      background: var(--text);
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 800; font-size: 20px; color: var(--bg-root);
+    }
+
+    .header h1 {
+      font-size: 2.2rem;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+    }
+
+    .header h1 span { 
+      color: var(--text-dim); 
+    }
+
+    .header .subtitle {
+      color: var(--text-secondary);
+      font-size: 1rem;
+      margin-top: 0.5rem;
+      max-width: 600px;
+      margin-left: auto;
+      margin-right: auto;
+      line-height: 1.5;
+    }
+
+    /* ── Cards ──────────────────────────────────────────────────── */
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.75rem;
+      margin-bottom: 1.5rem;
+      transition: border-color var(--ease);
+    }
+
+    .card:hover {
+      border-color: #3f3f46;
+    }
+
+    .card-title {
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-secondary);
+      margin-bottom: 1.25rem;
+      display: flex;
+      align-items: center;
+    }
+    
+    .card-title::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+      margin-left: 1rem;
+    }
+
+    /* ── Config Grid ───────────────────────────────────────────── */
+    .config-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.25rem;
+    }
+
+    @media (max-width: 700px) {
+      .config-grid { grid-template-columns: 1fr; }
+    }
+
+    /* ── Endpoints Card ────────────────────────────────────────── */
+    .endpoint-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 0.8rem;
+    }
+
+    .endpoint-item {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      padding: 0.6rem 0.75rem;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg-input);
+      font-size: 0.82rem;
+      transition: all var(--ease);
+    }
+
+    .endpoint-item:hover {
+      border-color: var(--border-active);
+    }
+
+    .endpoint-item .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--border-active);
+      flex-shrink: 0;
+      transition: all var(--ease);
+    }
+
+    .endpoint-item .dot.ok { background: var(--lane-noauth); }
+    .endpoint-item .dot.err { background: var(--danger); }
+
+    .endpoint-item .label {
+      color: var(--text);
+      font-weight: 500;
+      flex: 1;
+    }
+
+    .endpoint-item .url {
+      font-family: var(--mono);
+      font-size: 0.75rem;
+      color: var(--text-dim);
+    }
+
+    /* ── Test Type Tabs ────────────────────────────────────────── */
+    .test-tabs {
+      display: inline-flex;
+      background: var(--bg-input);
+      border-radius: 8px;
+      padding: 0.25rem;
+      gap: 0.25rem;
+      border: 1px solid var(--border);
+    }
+
+    .test-tab {
+      padding: 0.5rem 1rem;
+      border-radius: 6px;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--text-secondary);
+      font-family: var(--font);
+      font-size: 0.85rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all var(--ease);
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+
+    .test-tab:hover:not(.active) {
+      background: var(--bg-hover);
+      color: var(--text);
+    }
+
+    .test-tab.active {
+      background: var(--bg-hover);
+      color: var(--text);
+      border-color: var(--border-active);
+    }
+
+    .test-tab .lucide {
+      width: 1rem;
+      height: 1rem;
+    }
+
+    .test-tab.disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+      pointer-events: none;
+    }
+
+    /* ── Params ─────────────────────────────────────────────────── */
+    .param-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1.5rem;
+      margin-top: 1.5rem;
+    }
+
+    .param-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+    }
+
+    .param-group label {
+      font-size: 0.75rem;
+      color: var(--text-dim);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .param-group select, .param-group input {
+      font-family: var(--mono);
+      font-size: 0.85rem;
+      background: var(--bg-input);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.5rem 0.75rem;
+      outline: none;
+      transition: all var(--ease);
+      min-width: 120px;
+    }
+
+    .param-group select:hover, .param-group input:hover {
+      border-color: var(--border-active);
+    }
+
+    .param-group select:focus, .param-group input:focus {
+      border-color: var(--text);
+    }
+
+    /* ── Run Button ─────────────────────────────────────────────── */
+    .run-bar {
+      display: flex;
+      align-items: center;
+      gap: 1.5rem;
+      margin-top: 2rem;
+      margin-bottom: 2rem;
+    }
+
+    .run-btn {
+      font-family: var(--font);
+      font-size: 0.95rem;
+      font-weight: 600;
+      padding: 0.75rem 2rem;
+      background: var(--text);
+      color: var(--bg-root);
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all var(--ease);
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .run-btn .lucide {
+      width: 1rem;
+      height: 1rem;
+    }
+
+    .run-btn:hover:not(:disabled) {
+      background: #e4e4e7;
+      transform: translateY(-1px);
+    }
+
+    .run-btn:disabled {
+      background: var(--bg-hover);
+      color: var(--text-dim);
+      cursor: not-allowed;
+    }
+
+    .run-btn:active:not(:disabled) { transform: translateY(0); }
+
+    .run-status {
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+      font-weight: 500;
+      font-family: var(--mono);
+    }
+
+    /* ── Progress Bars ─────────────────────────────────────────── */
+    .progress-section {
+      display: none;
+    }
+
+    .progress-section.visible { display: block; animation: fadeIn 0.4s ease; }
+
+    .lane-progress {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+
+    .lane-label {
+      font-size: 0.8rem;
+      font-weight: 500;
+      min-width: 180px;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      color: var(--text-secondary);
+    }
+
+    .lane-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .progress-track {
+      flex: 1;
+      height: 6px;
+      background: var(--bg-hover);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+
+    .progress-fill {
+      height: 100%;
+      border-radius: 3px;
+      transition: width 150ms cubic-bezier(0.4, 0, 0.2, 1);
+      width: 0%;
+    }
+
+    .lane-ops {
+      font-family: var(--mono);
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      min-width: 90px;
+      text-align: right;
+    }
+
+    /* ── Results Table ──────────────────────────────────────────── */
+    .results-section { display: none; margin-top: 2rem; }
+    .results-section.visible { display: block; }
+
+    .results-table {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      font-size: 0.82rem;
+    }
+
+    .results-table th {
+      text-align: right;
+      padding: 0.8rem 1rem;
+      font-weight: 600;
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-dim);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .results-table th:first-child { text-align: left; }
+
+    .results-table td {
+      text-align: right;
+      padding: 0.85rem 1rem;
+      font-family: var(--mono);
+      font-size: 0.85rem;
+      border-bottom: 1px solid var(--bg-hover);
+      color: var(--text-secondary);
+      transition: background var(--ease);
+    }
+
+    .results-table td:first-child {
+      text-align: left;
+      font-family: var(--font);
+      font-weight: 500;
+      color: var(--text);
+    }
+
+    .results-table td.winner {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .results-table tr:hover td {
+      background: var(--bg-hover);
+    }
+
+    .lane-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .lane-badge .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    /* ── Histogram Canvas ──────────────────────────────────────── */
+    .chart-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+      margin-bottom: 1.5rem;
+    }
+
+    @media (max-width: 800px) {
+      .chart-grid { grid-template-columns: 1fr; }
+    }
+
+    .chart-box {
+      background: var(--bg-card-alt);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.25rem;
+    }
+
+    .chart-box .chart-title {
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--text-secondary);
+      margin-bottom: 0.75rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .chart-box .chart-title .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+    }
+
+    .chart-box canvas {
+      width: 100%;
+      height: 150px;
+      border-radius: 6px;
+    }
+
+    /* ── Export ─────────────────────────────────────────────────── */
+    .export-bar {
+      display: flex;
+      gap: 0.8rem;
+      margin-top: 1.5rem;
+      justify-content: flex-end;
+    }
+
+    .export-btn {
+      font-family: var(--font);
+      font-size: 0.82rem;
+      font-weight: 500;
+      padding: 0.6rem 1rem;
+      background: transparent;
+      color: var(--text-secondary);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all var(--ease);
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .export-btn .lucide {
+      width: 0.9rem;
+      height: 0.9rem;
+    }
+
+    .export-btn:hover {
+      color: var(--text);
+      border-color: var(--border-active);
+      background: var(--bg-hover);
+    }
+
+    /* ── Coming Soon Badge ─────────────────────────────────────── */
+    .coming-soon {
+      font-size: 0.65rem;
+      background: var(--bg-hover);
+      color: var(--text-dim);
+      padding: 0.2rem 0.5rem;
+      border-radius: 4px;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      border: 1px solid var(--border);
+      text-transform: uppercase;
+    }
+
+    /* ── Scrollbar ──────────────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border-active); border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+
+    /* ── Animations ─────────────────────────────────────────────── */
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+    .fade-in { animation: fadeIn 0.4s cubic-bezier(0.2, 0.8, 0.2, 1) forwards; }
+
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+    .pulsing { animation: pulse 2s ease-in-out infinite; }
+  </style>
+</head>
+<body>
+
+<div class="container">
+
+  <!-- Header -->
+  <header class="header">
+    <div class="logo-row">
+      <div class="logo">W</div>
+      <h1>Worm<span>DB</span> Benchmark</h1>
+    </div>
+    <p class="subtitle">Browser-level latency comparison across database access architectures</p>
+  </header>
+
+  <!-- Endpoints Status -->
+  <div class="card" id="endpointsCard">
+    <div class="card-title">Service Endpoints</div>
+    <div class="endpoint-grid" id="endpointGrid">
+      <div class="endpoint-item" id="ep-api">
+        <div class="dot" id="dot-api"></div>
+        <span class="label">REST API</span>
+        <span class="url" id="url-api">localhost:8082</span>
+      </div>
+      <div class="endpoint-item" id="ep-ws-auth">
+        <div class="dot" id="dot-ws-auth"></div>
+        <span class="label">WormDB + Auth</span>
+        <span class="url" id="url-ws-auth">localhost:6390</span>
+      </div>
+      <div class="endpoint-item" id="ep-ws-noauth">
+        <div class="dot" id="dot-ws-noauth"></div>
+        <span class="label">WormDB No Auth</span>
+        <span class="url" id="url-ws-noauth">localhost:6392</span>
+      </div>
+      <div class="endpoint-item" id="ep-auth-provider">
+        <div class="dot" id="dot-auth-provider"></div>
+        <span class="label">Auth Provider</span>
+        <span class="url" id="url-auth-provider">localhost:8081</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Configuration -->
+  <div class="config-grid">
+    <!-- Test Types -->
+    <div class="card">
+      <div class="card-title">Test Type</div>
+      <div class="test-tabs" id="testTabs">
+        <button class="test-tab active" data-test="write"><i data-lucide="pen-line"></i> Write</button>
+        <button class="test-tab" data-test="read"><i data-lucide="book-open"></i> Read</button>
+        <button class="test-tab" data-test="mixed"><i data-lucide="shuffle"></i> Mixed 80/20</button>
+        <button class="test-tab" data-test="burst"><i data-lucide="zap"></i> Burst</button>
+      </div>
+      <div class="param-row">
+        <div class="param-group">
+          <label>Iterations</label>
+          <select id="iterations">
+            <option value="50">50</option>
+            <option value="100" selected>100</option>
+            <option value="500">500</option>
+            <option value="1000">1000</option>
+          </select>
+        </div>
+        <div class="param-group">
+          <label>Payload Size</label>
+          <select id="payloadSize">
+            <option value="64">64 B</option>
+            <option value="256" selected>256 B</option>
+            <option value="1024">1 KB</option>
+            <option value="4096">4 KB</option>
+          </select>
+        </div>
+        <div class="param-group">
+          <label>Warmup</label>
+          <select id="warmup">
+            <option value="0">0</option>
+            <option value="3">3</option>
+            <option value="5" selected>5</option>
+            <option value="10">10</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <!-- Endpoint Overrides -->
+    <div class="card">
+      <div class="card-title">Endpoint Configuration</div>
+      <div class="param-row" style="flex-direction: column;">
+        <div class="param-group">
+          <label>REST API URL</label>
+          <input type="text" id="cfgApiUrl" value="http://localhost:8082" spellcheck="false">
+        </div>
+        <div class="param-group">
+          <label>WormDB Gateway (Auth)</label>
+          <input type="text" id="cfgWsAuth" value="ws://localhost:6390" spellcheck="false">
+        </div>
+        <div class="param-group">
+          <label>WormDB Gateway (No Auth)</label>
+          <input type="text" id="cfgWsNoAuth" value="ws://localhost:6392" spellcheck="false">
+        </div>
+        <div class="param-group">
+          <label>Auth Provider</label>
+          <input type="text" id="cfgAuthProvider" value="http://localhost:8081" spellcheck="false">
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Run Bar -->
+  <div class="run-bar">
+    <button class="run-btn" id="runBtn"><i data-lucide="play"></i> Run Benchmark</button>
+    <span class="run-status" id="runStatus"></span>
+  </div>
+
+  <!-- Progress -->
+  <div class="card progress-section" id="progressSection">
+    <div class="card-title">Progress</div>
+    <div class="lane-progress">
+      <div class="lane-label"><div class="lane-dot" style="background: var(--lane-classic)"></div> Classic REST API</div>
+      <div class="progress-track"><div class="progress-fill" id="prog-classic" style="background: var(--lane-classic)"></div></div>
+      <div class="lane-ops" id="ops-classic">—</div>
+    </div>
+    <div class="lane-progress">
+      <div class="lane-label"><div class="lane-dot" style="background: var(--lane-auth)"></div> WormDB + Auth</div>
+      <div class="progress-track"><div class="progress-fill" id="prog-auth" style="background: var(--lane-auth)"></div></div>
+      <div class="lane-ops" id="ops-auth">—</div>
+    </div>
+    <div class="lane-progress">
+      <div class="lane-label"><div class="lane-dot" style="background: var(--lane-noauth)"></div> WormDB Direct</div>
+      <div class="progress-track"><div class="progress-fill" id="prog-noauth" style="background: var(--lane-noauth)"></div></div>
+      <div class="lane-ops" id="ops-noauth">—</div>
+    </div>
+    <div class="lane-progress" style="opacity: 0.3;">
+      <div class="lane-label"><div class="lane-dot" style="background: var(--lane-quic)"></div> HTTP/3 QUIC <span class="coming-soon">COMING SOON</span></div>
+      <div class="progress-track"><div class="progress-fill" style="background: var(--lane-quic); width: 0%"></div></div>
+      <div class="lane-ops">—</div>
+    </div>
+  </div>
+
+  <!-- Results -->
+  <div class="results-section" id="resultsSection">
+
+    <!-- Histograms -->
+    <div class="card fade-in">
+      <div class="card-title">Latency Distribution</div>
+      <div class="chart-grid" id="chartGrid">
+        <div class="chart-box">
+          <div class="chart-title"><div class="dot" style="background: var(--lane-classic)"></div> Classic REST API</div>
+          <canvas id="hist-classic" height="150"></canvas>
+        </div>
+        <div class="chart-box">
+          <div class="chart-title"><div class="dot" style="background: var(--lane-auth)"></div> WormDB + Auth</div>
+          <canvas id="hist-auth" height="150"></canvas>
+        </div>
+        <div class="chart-box">
+          <div class="chart-title"><div class="dot" style="background: var(--lane-noauth)"></div> WormDB Direct</div>
+          <canvas id="hist-noauth" height="150"></canvas>
+        </div>
+        <div class="chart-box" style="opacity: 0.3;">
+          <div class="chart-title"><div class="dot" style="background: var(--lane-quic)"></div> HTTP/3 QUIC <span class="coming-soon" style="margin-left: 0.5rem;">COMING SOON</span></div>
+          <canvas id="hist-quic" height="150"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <!-- Comparison Table -->
+    <div class="card fade-in">
+      <div class="card-title">Comparison</div>
+      <table class="results-table" id="resultsTable">
+        <thead>
+          <tr>
+            <th>Lane</th>
+            <th>Min</th>
+            <th>Median</th>
+            <th>Mean</th>
+            <th>P95</th>
+            <th>P99</th>
+            <th>Max</th>
+            <th>Std Dev</th>
+            <th>Ops/sec</th>
+          </tr>
+        </thead>
+        <tbody id="resultsBody"></tbody>
+      </table>
+    </div>
+
+    <!-- Export -->
+    <div class="export-bar">
+      <button class="export-btn" id="exportJson"><i data-lucide="download"></i> Export JSON</button>
+      <button class="export-btn" id="exportCsv"><i data-lucide="download"></i> Export CSV</button>
+    </div>
+  </div>
+
+</div>
+
+<script type="module">
+  import { WormDB } from '../dist/index.js';
+
+  // ── State ──────────────────────────────────────────────────────
+  let currentTest = 'write';
+  let isRunning = false;
+  let benchResults = {};
+
+  // ── DOM ────────────────────────────────────────────────────────
+  const $ = id => document.getElementById(id);
+  const runBtn = $('runBtn');
+  const runStatus = $('runStatus');
+  const progressSection = $('progressSection');
+  const resultsSection = $('resultsSection');
+
+  // ── Test Tab Selection ─────────────────────────────────────────
+  const testTabs = document.querySelectorAll('.test-tab');
+  testTabs.forEach(tab => {
+    tab.addEventListener('click', () => {
+      if (isRunning || tab.classList.contains('disabled')) return;
+      testTabs.forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      currentTest = tab.dataset.test;
+    });
+  });
+
+  // ── Endpoint Health Check ──────────────────────────────────────
+  async function checkEndpoints() {
+    const checks = [
+      { id: 'api', test: async () => { await fetch($('cfgApiUrl').value + '/api/status'); } },
+      { id: 'auth-provider', test: async () => { await fetch($('cfgAuthProvider').value + '/auth/keys'); } },
+      { id: 'ws-auth', test: async () => { await probeWs($('cfgWsAuth').value); } },
+      { id: 'ws-noauth', test: async () => { await probeWs($('cfgWsNoAuth').value); } },
+    ];
+
+    for (const c of checks) {
+      try {
+        await c.test();
+        $('dot-' + c.id).className = 'dot ok';
+      } catch {
+        $('dot-' + c.id).className = 'dot err';
+      }
+    }
+  }
+
+  function probeWs(url) {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(url);
+      const timer = setTimeout(() => { ws.close(); reject(new Error('timeout')); }, 2000);
+      ws.onopen = () => { clearTimeout(timer); ws.close(); resolve(); };
+      ws.onerror = () => { clearTimeout(timer); reject(new Error('ws error')); };
+    });
+  }
+
+  checkEndpoints();
+  setInterval(checkEndpoints, 10000);
+
+  // ── Payload Generator ──────────────────────────────────────────
+  function generatePayload(size) {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    let result = '';
+    for (let i = 0; i < size; i++) {
+      result += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return result;
+  }
+
+  // ── Formatting ─────────────────────────────────────────────────
+  function fmtMs(v) {
+    if (v < 0.001) return '0µs';
+    if (v < 1) return `${(v * 1000).toFixed(0)}µs`;
+    return `${v.toFixed(3)}ms`;
+  }
+
+  // ── Statistics ─────────────────────────────────────────────────
+  function calcStats(latencies) {
+    if (!latencies.length) return null;
+    const sorted = [...latencies].sort((a, b) => a - b);
+    const n = sorted.length;
+    const sum = sorted.reduce((a, b) => a + b, 0);
+    const mean = sum / n;
+    const variance = sorted.reduce((s, v) => s + (v - mean) ** 2, 0) / n;
+    const pct = p => sorted[Math.min(Math.floor(n * p), n - 1)];
+
+    return {
+      min: sorted[0],
+      max: sorted[n - 1],
+      mean,
+      median: pct(0.5),
+      p95: pct(0.95),
+      p99: pct(0.99),
+      stddev: Math.sqrt(variance),
+      opsPerSec: Math.round(1000 / mean),
+      count: n,
+      raw: sorted,
+    };
+  }
+
+  // ── Classic REST Lane ──────────────────────────────────────────
+  async function runClassicLane(test, iterations, payloadSize, warmup, onProgress) {
+    const apiUrl = $('cfgApiUrl').value;
+    const payload = generatePayload(payloadSize);
+    const latencies = [];
+
+    // Warmup: seed keys for read tests
+    for (let i = 0; i < Math.max(warmup, iterations); i++) {
+      await fetch(`${apiUrl}/api/kv/bench:classic:${i}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value: payload }),
+      });
+      if (i < warmup) continue;
+    }
+
+    // Actual run
+    for (let i = 0; i < iterations; i++) {
+      const key = `bench:classic:${i}`;
+      const t0 = performance.now();
+
+      if (test === 'write') {
+        await fetch(`${apiUrl}/api/kv/${key}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value: payload }),
+        });
+      } else if (test === 'read') {
+        await fetch(`${apiUrl}/api/kv/${key}`);
+      } else if (test === 'mixed') {
+        if (Math.random() < 0.8) {
+          await fetch(`${apiUrl}/api/kv/${key}`);
+        } else {
+          await fetch(`${apiUrl}/api/kv/${key}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ value: payload }),
+          });
+        }
+      } else if (test === 'burst') {
+        // Fire without waiting — still measure from start to response
+        await fetch(`${apiUrl}/api/kv/${key}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value: payload }),
+        });
+      }
+
+      latencies.push(performance.now() - t0);
+      onProgress(i + 1, iterations);
+    }
+
+    return latencies;
+  }
+
+  // ── WormDB Direct Lane ─────────────────────────────────────────
+  async function runWormDBLane(wsUrl, authProviderUrl, test, iterations, payloadSize, warmup, onProgress) {
+    const payload = generatePayload(payloadSize);
+    const opts = { url: wsUrl, autoReconnect: false, timeoutMs: 10000 };
+
+    // If auth provider URL is set, get a token
+    if (authProviderUrl) {
+      try {
+        const resp = await fetch(`${authProviderUrl}/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'benchmark', scope: 'benchmark' }),
+        });
+        const data = await resp.json();
+        if (data.token) {
+          const tokenBytes = new Uint8Array(data.token.match(/.{2}/g).map(b => parseInt(b, 16)));
+          opts.tokenProvider = () => tokenBytes;
+        }
+      } catch (err) {
+        console.warn('[bench] Auth provider unavailable:', err.message);
+      }
+    }
+
+    const db = new WormDB(opts);
+    await db.connect();
+
+    // Warmup + seed keys
+    for (let i = 0; i < Math.max(warmup, iterations); i++) {
+      await db.set(`bench:worm:${i}`, payload);
+    }
+
+    const latencies = [];
+
+    for (let i = 0; i < iterations; i++) {
+      const key = `bench:worm:${i}`;
+      const t0 = performance.now();
+
+      if (test === 'write') {
+        await db.set(key, payload);
+      } else if (test === 'read') {
+        await db.get(key);
+      } else if (test === 'mixed') {
+        if (Math.random() < 0.8) {
+          await db.get(key);
+        } else {
+          await db.set(key, payload);
+        }
+      } else if (test === 'burst') {
+        await db.set(key, payload);
+      }
+
+      latencies.push(performance.now() - t0);
+      onProgress(i + 1, iterations);
+    }
+
+    await db.close();
+    return latencies;
+  }
+
+  // ── Draw Histogram ─────────────────────────────────────────────
+  function drawHistogram(canvasId, latencies, color) {
+    const canvas = $(canvasId);
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+
+    canvas.width = canvas.offsetWidth * dpr;
+    canvas.height = 150 * dpr;
+    ctx.scale(dpr, dpr);
+
+    const w = canvas.offsetWidth;
+    const h = 150;
+
+    ctx.clearRect(0, 0, w, h);
+
+    if (!latencies || !latencies.length) {
+      ctx.fillStyle = '#454d65';
+      ctx.font = '12px Inter';
+      ctx.textAlign = 'center';
+      ctx.fillText('No data', w / 2, h / 2);
+      return;
+    }
+
+    const sorted = [...latencies].sort((a, b) => a - b);
+    const min = sorted[0];
+    const max = sorted[sorted.length - 1];
+    const bins = 40;
+    const binWidth = (max - min) / bins || 1;
+    const counts = new Array(bins).fill(0);
+
+    for (const v of sorted) {
+      const idx = Math.min(Math.floor((v - min) / binWidth), bins - 1);
+      counts[idx]++;
+    }
+
+    const maxCount = Math.max(...counts);
+    const barW = (w - 40) / bins;
+    const margin = 20;
+
+    // Bars
+    for (let i = 0; i < bins; i++) {
+      const barH = maxCount > 0 ? (counts[i] / maxCount) * (h - 35) : 0;
+      const x = margin + i * barW;
+      const y = h - 20 - barH;
+
+      ctx.fillStyle = color + '88';
+      ctx.beginPath();
+      const r = Math.min(2, barW / 2);
+      ctx.roundRect(x, y, barW - 1, barH, [r, r, 0, 0]);
+      ctx.fill();
+    }
+
+    // Axis labels
+    ctx.fillStyle = '#545c76';
+    ctx.font = '10px JetBrains Mono';
+    ctx.textAlign = 'left';
+    ctx.fillText(fmtMs(min), margin, h - 4);
+    ctx.textAlign = 'right';
+    ctx.fillText(fmtMs(max), w - margin, h - 4);
+    ctx.textAlign = 'center';
+
+    const median = sorted[Math.floor(sorted.length * 0.5)];
+    ctx.fillText(`p50: ${fmtMs(median)}`, w / 2, h - 4);
+  }
+
+  // ── Render Results Table ───────────────────────────────────────
+  function renderResults(results) {
+    const body = $('resultsBody');
+    body.innerHTML = '';
+
+    const lanes = [
+      { key: 'classic', name: 'Classic REST API', color: 'var(--lane-classic)' },
+      { key: 'auth', name: 'WormDB + Auth', color: 'var(--lane-auth)' },
+      { key: 'noauth', name: 'WormDB Direct', color: 'var(--lane-noauth)' },
+    ];
+
+    // Find winners for each metric (lower is better except ops/sec)
+    const metrics = ['min', 'median', 'mean', 'p95', 'p99', 'max', 'stddev'];
+    const winners = {};
+    for (const m of metrics) {
+      let best = Infinity, bestKey = '';
+      for (const l of lanes) {
+        if (results[l.key] && results[l.key][m] < best) {
+          best = results[l.key][m];
+          bestKey = l.key;
+        }
+      }
+      winners[m] = bestKey;
+    }
+    // ops/sec: higher is better
+    let bestOps = 0, bestOpsKey = '';
+    for (const l of lanes) {
+      if (results[l.key] && results[l.key].opsPerSec > bestOps) {
+        bestOps = results[l.key].opsPerSec;
+        bestOpsKey = l.key;
+      }
+    }
+    winners['opsPerSec'] = bestOpsKey;
+
+    for (const lane of lanes) {
+      const s = results[lane.key];
+      if (!s) continue;
+
+      const tr = document.createElement('tr');
+      const fmt = (v, metric) => {
+        const isWinner = winners[metric] === lane.key;
+        return `<td class="${isWinner ? 'winner' : ''}">${fmtMs(v)}</td>`;
+      };
+
+      tr.innerHTML = `
+        <td><span class="lane-badge"><span class="dot" style="background: ${lane.color}"></span> ${lane.name}</span></td>
+        ${fmt(s.min, 'min')}
+        ${fmt(s.median, 'median')}
+        ${fmt(s.mean, 'mean')}
+        ${fmt(s.p95, 'p95')}
+        ${fmt(s.p99, 'p99')}
+        ${fmt(s.max, 'max')}
+        ${fmt(s.stddev, 'stddev')}
+        <td class="${winners['opsPerSec'] === lane.key ? 'winner' : ''}">${s.opsPerSec.toLocaleString()}</td>
+      `;
+      body.appendChild(tr);
+    }
+
+    // QUIC placeholder row
+    const quicTr = document.createElement('tr');
+    quicTr.style.opacity = '0.3';
+    quicTr.innerHTML = `
+      <td><span class="lane-badge"><span class="dot" style="background: var(--lane-quic)"></span> HTTP/3 QUIC <span class="coming-soon" style="margin-left: 0.4rem;">COMING SOON</span></span></td>
+      <td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+    `;
+    body.appendChild(quicTr);
+  }
+
+  // ── Run Benchmark ──────────────────────────────────────────────
+  async function runBenchmark() {
+    if (isRunning) return;
+    isRunning = true;
+    runBtn.disabled = true;
+    runBtn.textContent = '⏳ Running…';
+
+    const test = currentTest;
+    const iterations = parseInt($('iterations').value);
+    const payloadSize = parseInt($('payloadSize').value);
+    const warmup = parseInt($('warmup').value);
+
+    progressSection.classList.add('visible');
+    resultsSection.classList.remove('visible');
+
+    // Reset progress
+    for (const id of ['classic', 'auth', 'noauth']) {
+      $(`prog-${id}`).style.width = '0%';
+      $(`ops-${id}`).textContent = '—';
+    }
+
+    const results = {};
+
+    const makeProgress = (id) => (done, total) => {
+      const pct = Math.round((done / total) * 100);
+      $(`prog-${id}`).style.width = pct + '%';
+      $(`ops-${id}`).textContent = `${done}/${total}`;
+    };
+
+    try {
+      // Lane 1: Classic REST API
+      runStatus.textContent = 'Running Classic REST API…';
+      runStatus.classList.add('pulsing');
+      const classicLatencies = await runClassicLane(test, iterations, payloadSize, warmup, makeProgress('classic'));
+      results.classic = calcStats(classicLatencies);
+
+      // Lane 2: WormDB + Auth
+      runStatus.textContent = 'Running WormDB + Auth…';
+      const authLatencies = await runWormDBLane(
+        $('cfgWsAuth').value, $('cfgAuthProvider').value,
+        test, iterations, payloadSize, warmup, makeProgress('auth')
+      );
+      results.auth = calcStats(authLatencies);
+
+      // Lane 3: WormDB Direct (no auth)
+      runStatus.textContent = 'Running WormDB Direct…';
+      const noauthLatencies = await runWormDBLane(
+        $('cfgWsNoAuth').value, null,
+        test, iterations, payloadSize, warmup, makeProgress('noauth')
+      );
+      results.noauth = calcStats(noauthLatencies);
+
+      // Done
+      runStatus.classList.remove('pulsing');
+      runStatus.textContent = `✓ Complete — ${test} test, ${iterations} iterations, ${payloadSize}B payload`;
+
+      benchResults = {
+        test, iterations, payloadSize, warmup,
+        timestamp: new Date().toISOString(),
+        lanes: results,
+      };
+
+      // Show results
+      resultsSection.classList.add('visible');
+      renderResults(results);
+      drawHistogram('hist-classic', results.classic?.raw, '#3b9cff');
+      drawHistogram('hist-auth', results.auth?.raw, '#b380ff');
+      drawHistogram('hist-noauth', results.noauth?.raw, '#00e5b5');
+      drawHistogram('hist-quic', [], '#545c76');
+
+    } catch (err) {
+      runStatus.classList.remove('pulsing');
+      runStatus.textContent = `✗ Error: ${err.message}`;
+      console.error('[bench]', err);
+    } finally {
+      isRunning = false;
+      runBtn.disabled = false;
+      runBtn.textContent = '▶ Run Benchmark';
+    }
+  }
+
+  runBtn.addEventListener('click', runBenchmark);
+
+  // ── Export ──────────────────────────────────────────────────────
+  $('exportJson').addEventListener('click', () => {
+    if (!benchResults.lanes) return;
+    // Strip raw arrays for concise export, keep stats
+    const exportData = JSON.parse(JSON.stringify(benchResults));
+    for (const key of Object.keys(exportData.lanes)) {
+      delete exportData.lanes[key].raw;
+    }
+    const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `wormdb-bench-${benchResults.test}-${Date.now()}.json`;
+    a.click();
+  });
+
+  $('exportCsv').addEventListener('click', () => {
+    if (!benchResults.lanes) return;
+    const lanes = benchResults.lanes;
+    let csv = 'Lane,Min,Median,Mean,P95,P99,Max,StdDev,OpsPerSec\n';
+    const names = { classic: 'Classic REST API', auth: 'WormDB + Auth', noauth: 'WormDB Direct' };
+    for (const [key, stats] of Object.entries(lanes)) {
+      if (!stats) continue;
+      csv += `"${names[key]}",${stats.min.toFixed(4)},${stats.median.toFixed(4)},${stats.mean.toFixed(4)},${stats.p95.toFixed(4)},${stats.p99.toFixed(4)},${stats.max.toFixed(4)},${stats.stddev.toFixed(4)},${stats.opsPerSec}\n`;
+    }
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `wormdb-bench-${benchResults.test}-${Date.now()}.csv`;
+    a.click();
+  });
+
+  // ── Keyboard shortcut ──────────────────────────────────────────
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && e.ctrlKey && !isRunning) {
+      runBenchmark();
+    }
+  });
+
+  // Initialize Icons
+  lucide.createIcons();
+</script>
+
+</body>
+</html>

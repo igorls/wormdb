@@ -1,0 +1,46 @@
+# WormDB Benchmark Tools
+# Run against existing cluster:
+#   docker compose up -d  (start cluster first)
+#   docker compose -f docker-compose.bench.yml run --rm benchmark
+
+services:
+  benchmark:
+    image: alpine:3.19
+    container_name: wormdb-benchmark
+    command: >
+      sh -c "
+        apk add --no-cache bash bc netcat-openbsd &&
+        echo '=== WormDB Benchmark ===' &&
+        echo '' &&
+        echo 'Waiting for node1...' &&
+        until nc -z node1 6389; do sleep 0.5; done &&
+        echo '' &&
+        echo 'SET benchmark (1000 writes):' &&
+        time for i in $$(seq 1 1000); do echo \"SET key$$i value$$i\" | nc -w1 node1 6389 > /dev/null; done &&
+        echo '' &&
+        echo 'GET benchmark (1000 reads):' &&
+        time for i in $$(seq 1 1000); do echo \"GET key$$i\" | nc -w1 node1 6389 > /dev/null; done &&
+        echo '' &&
+        echo 'Mixed benchmark (500 read, 500 write):' &&
+        time for i in $$(seq 1 1000); do
+          if [ $$((i % 2)) -eq 0 ]; then
+            echo \"GET key$$i\" | nc -w1 node1 6389 > /dev/null
+          else
+            echo \"SET key$$i newvalue$$i\" | nc -w1 node1 6389 > /dev/null
+          fi
+        done &&
+        echo '' &&
+        echo 'WORM benchmark (100 WORM writes):' &&
+        time for i in $$(seq 1 100); do echo \"SET wormkey$$i wormval$$i WORM\" | nc -w1 node1 6389 > /dev/null; done &&
+        echo '' &&
+        echo 'WORM violation test (should fail):' &&
+        echo 'SET wormkey1 newvalue' | nc -w1 node1 6389 &&
+        echo '' &&
+        echo '=== Benchmark Complete ==='
+      "
+    networks:
+      - wormdb-net
+
+networks:
+  wormdb-net:
+    external: true

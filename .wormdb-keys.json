@@ -1,0 +1,7 @@
+{
+  "publicKey": "dhpfrtD6zTdC7VnrCoXBomB+6hbuMTdOwx4Gi07ETSI=",
+  "secretKey": "RtguxqsiUwyA/cpBaRRx3gILiOvYEvkDGtUioU8eM2p2Gl+u0PrNN0LtWesKhcGiYH7qFu4xN07DHgaLTsRNIg==",
+  "publicKeyHex": "761a5faed0facd3742ed59eb0a85c1a2607eea16ee31374ec31e068b4ec44d22",
+  "generatedAt": "2026-03-04T06:15:33.904Z",
+  "_warning": "Keep secretKey private. Only share publicKey with WormDB nodes."
+}

@@ -1,0 +1,33 @@
+{
+  "data": "./data",
+
+  "server": {
+    "port": 6389,
+    "backend": "threadpool"
+  },
+
+  "store": {
+    "persistence": "full",
+    "sync_writes": true
+  },
+
+  "cluster": {
+    "name": "myapp",
+    "seed": "10.0.0.1:51821",
+    "replication_factor": 0,
+    "gossip_port": 51821,
+    "wg_port": 51830
+  },
+
+  "gateway": {
+    "enabled": true,
+    "port": 6390,
+    "public_endpoint": "wss://us-east.myapp.com"
+  },
+
+  "auth": {
+    "public_keys": [],
+    "require_auth": true,
+    "token_max_age_s": 3600
+  }
+}

@@ -1,0 +1,57 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Runtime data (WAL files)
+data/
+data-*/
+test_data/
+test_cluster/
+
+# Binary test outputs
+test_hash
+test_io
+
+# Vendored tools
+.tools/
+
+# Profiling data (large, regenerable)
+profiles/
+
+# Generated context packs
+context_*.md
+
+# Dependencies (bun install)
+node_modules
+
+# Output
+out
+dist
+*.tgz
+
+# Code coverage
+coverage
+*.lcov
+
+# Logs
+logs
+_.log
+report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
+
+# Dotenv
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+
+# Caches
+.eslintcache
+.cache
+*.tsbuildinfo
+
+# IntelliJ based IDEs
+.idea
+
+# Finder (MacOS) folder config
+.DS_Store

@@ -1,0 +1,6 @@
+{
+  "data": "/data",
+  "server": { "port": 6391 },
+  "gateway": { "enabled": true, "port": 6392 },
+  "store": { "persistence": "none" }
+}

@@ -1,0 +1,84 @@
+# WormDB Notepad Cluster Demo
+#
+# 2-node WormDB cluster + 2 Bun notepad servers for real-time replication demo.
+#
+# Usage:
+#   docker compose -f docker-compose.demo.yml up -d --build
+#   Open http://localhost:3001 (Tab A) and http://localhost:3002 (Tab B)
+#   docker compose -f docker-compose.demo.yml down -v
+
+services:
+  node-a:
+    build: .
+    image: wormdb:latest
+    container_name: wormdb-demo-a
+    hostname: node-a
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    ports: ["26389:6389"]
+    volumes: [node-a-data:/data]
+    command: ["--port", "6389", "--data", "/data", "--cluster", "notepad-demo", "--seed", "node-b:51821", "--persistence", "snapshot"]
+    networks: [demo]
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "6389"]
+      interval: 2s
+      timeout: 2s
+      start_period: 3s
+      retries: 5
+
+  node-b:
+    image: wormdb:latest
+    container_name: wormdb-demo-b
+    hostname: node-b
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    ports: ["26390:6389"]
+    volumes: [node-b-data:/data]
+    command: ["--port", "6389", "--data", "/data", "--cluster", "notepad-demo", "--seed", "node-a:51821", "--persistence", "snapshot"]
+    depends_on:
+      node-a:
+        condition: service_healthy
+    networks: [demo]
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "6389"]
+      interval: 2s
+      timeout: 2s
+      start_period: 3s
+      retries: 5
+
+  notepad-a:
+    build:
+      context: .
+      dockerfile: apps/bun/Dockerfile
+    image: wormdb-notepad:latest
+    container_name: wormdb-notepad-a
+    ports: ["3001:8081"]
+    environment:
+      WORMDB_HOST: node-a
+      WORMDB_PORT: "6389"
+      NOTEPAD_PORT: "8081"
+    depends_on:
+      node-a:
+        condition: service_healthy
+    networks: [demo]
+
+  notepad-b:
+    image: wormdb-notepad:latest
+    container_name: wormdb-notepad-b
+    ports: ["3002:8081"]
+    environment:
+      WORMDB_HOST: node-b
+      WORMDB_PORT: "6389"
+      NOTEPAD_PORT: "8081"
+    depends_on:
+      node-b:
+        condition: service_healthy
+    networks: [demo]
+
+networks:
+  demo:
+    driver: bridge
+
+volumes:
+  node-a-data:
+  node-b-data:

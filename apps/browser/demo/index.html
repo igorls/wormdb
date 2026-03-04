@@ -1,0 +1,945 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WormDB — Browser-Direct Demo</title>
+  <meta name="description" content="Interactive demo of WormDB browser-direct access over WebSocket. No backend required.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    /* ── Design Tokens ─────────────────────────────────────────────── */
+    :root {
+      --bg-root: #07080d;
+      --bg-surface: rgba(14, 17, 28, 0.85);
+      --bg-card: rgba(20, 24, 40, 0.7);
+      --bg-input: rgba(10, 12, 22, 0.9);
+      --border: rgba(60, 72, 110, 0.25);
+      --border-focus: rgba(0, 212, 170, 0.5);
+      --text-primary: #e8ecf4;
+      --text-secondary: #8892a8;
+      --text-dim: #505870;
+      --accent: #00d4aa;
+      --accent-glow: rgba(0, 212, 170, 0.15);
+      --accent-hover: #00f0c0;
+      --danger: #ff4466;
+      --danger-glow: rgba(255, 68, 102, 0.15);
+      --warning: #ffaa22;
+      --warning-glow: rgba(255, 170, 34, 0.15);
+      --purple: #9966ff;
+      --purple-glow: rgba(153, 102, 255, 0.12);
+      --blue: #44aaff;
+      --blue-glow: rgba(68, 170, 255, 0.12);
+      --radius: 12px;
+      --radius-sm: 8px;
+      --font-body: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      --font-mono: 'JetBrains Mono', 'SF Mono', 'Cascadia Code', monospace;
+      --transition: 200ms cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    /* ── Reset & Base ──────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: var(--font-body);
+      background: var(--bg-root);
+      color: var(--text-primary);
+      min-height: 100vh;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background:
+        radial-gradient(ellipse 80% 50% at 50% -20%, rgba(0,212,170,0.06) 0%, transparent 60%),
+        radial-gradient(ellipse 60% 40% at 80% 100%, rgba(153,102,255,0.04) 0%, transparent 50%);
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* ── Layout ────────────────────────────────────────────────────── */
+    .shell {
+      position: relative;
+      z-index: 1;
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 2rem 1.5rem 4rem;
+    }
+
+    /* ── Header ────────────────────────────────────────────────────── */
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 2rem;
+      padding-bottom: 1.5rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .brand-icon {
+      width: 36px;
+      height: 36px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, var(--accent), #0088aa);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      font-weight: 700;
+      color: #fff;
+      box-shadow: 0 0 20px rgba(0,212,170,0.2);
+    }
+
+    .brand h1 {
+      font-size: 1.25rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    .brand h1 span { color: var(--accent); }
+
+    .brand-sub {
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      margin-top: 1px;
+    }
+
+    /* ── Connection Bar ────────────────────────────────────────────── */
+    .conn-bar {
+      display: flex;
+      gap: 0.75rem;
+      align-items: center;
+      margin-bottom: 2rem;
+      padding: 1rem 1.25rem;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      backdrop-filter: blur(16px);
+    }
+
+    .conn-bar input {
+      flex: 1;
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+      background: var(--bg-input);
+      color: var(--text-primary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 0.55rem 0.85rem;
+      outline: none;
+      transition: border-color var(--transition);
+    }
+
+    .conn-bar input:focus {
+      border-color: var(--border-focus);
+      box-shadow: 0 0 0 3px var(--accent-glow);
+    }
+
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--text-dim);
+      transition: all var(--transition);
+      flex-shrink: 0;
+    }
+
+    .status-dot.connected {
+      background: var(--accent);
+      box-shadow: 0 0 8px var(--accent);
+    }
+
+    .status-dot.connecting {
+      background: var(--warning);
+      box-shadow: 0 0 8px var(--warning);
+      animation: pulse 1.2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    .status-text {
+      font-size: 0.78rem;
+      color: var(--text-secondary);
+      min-width: 90px;
+    }
+
+    .latency-badge {
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      color: var(--accent);
+      background: var(--accent-glow);
+      padding: 0.2rem 0.5rem;
+      border-radius: 4px;
+      display: none;
+    }
+
+    .latency-badge.visible { display: inline-block; }
+
+    /* ── Buttons ───────────────────────────────────────────────────── */
+    .btn {
+      font-family: var(--font-body);
+      font-size: 0.82rem;
+      font-weight: 600;
+      padding: 0.55rem 1.2rem;
+      border: 1px solid transparent;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: all var(--transition);
+      white-space: nowrap;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #060a0d;
+      border-color: var(--accent);
+    }
+
+    .btn-primary:hover {
+      background: var(--accent-hover);
+      box-shadow: 0 0 16px var(--accent-glow);
+      transform: translateY(-1px);
+    }
+
+    .btn-danger {
+      background: transparent;
+      color: var(--danger);
+      border-color: rgba(255,68,102,0.3);
+    }
+
+    .btn-danger:hover {
+      background: var(--danger-glow);
+      border-color: var(--danger);
+    }
+
+    .btn-ghost {
+      background: transparent;
+      color: var(--text-secondary);
+      border-color: var(--border);
+    }
+
+    .btn-ghost:hover {
+      color: var(--text-primary);
+      border-color: var(--text-dim);
+      background: rgba(255,255,255,0.03);
+    }
+
+    .btn-sm {
+      font-size: 0.75rem;
+      padding: 0.4rem 0.8rem;
+    }
+
+    .btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+      transform: none !important;
+    }
+
+    /* ── Panels Grid ───────────────────────────────────────────────── */
+    .panels {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.25rem;
+    }
+
+    .panel {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      backdrop-filter: blur(16px);
+      overflow: hidden;
+      transition: border-color var(--transition);
+    }
+
+    .panel:hover { border-color: rgba(60,72,110,0.4); }
+
+    .panel-full { grid-column: 1 / -1; }
+
+    .panel-head {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.9rem 1.15rem;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.82rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+
+    .panel-head .icon {
+      font-size: 1rem;
+      opacity: 0.7;
+    }
+
+    .panel-head .accent-kv { color: var(--accent); }
+    .panel-head .accent-exec { color: var(--purple); }
+    .panel-head .accent-pubsub { color: var(--blue); }
+    .panel-head .accent-auth { color: var(--warning); }
+
+    .panel-body {
+      padding: 1.15rem;
+    }
+
+    /* ── Form Rows ─────────────────────────────────────────────────── */
+    .form-row {
+      display: flex;
+      gap: 0.6rem;
+      margin-bottom: 0.75rem;
+      align-items: center;
+    }
+
+    .form-row:last-child { margin-bottom: 0; }
+
+    .form-row label {
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      min-width: 52px;
+      text-align: right;
+      font-weight: 500;
+    }
+
+    .form-row input, .form-row select {
+      flex: 1;
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      background: var(--bg-input);
+      color: var(--text-primary);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.45rem 0.7rem;
+      outline: none;
+      transition: border-color var(--transition);
+    }
+
+    .form-row input:focus, .form-row select:focus {
+      border-color: var(--border-focus);
+      box-shadow: 0 0 0 2px var(--accent-glow);
+    }
+
+    .form-row .toggle {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      cursor: pointer;
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      user-select: none;
+    }
+
+    .form-row .toggle input[type="checkbox"] {
+      flex: none;
+      width: 14px;
+      height: 14px;
+      accent-color: var(--accent);
+    }
+
+    /* ── Result Output ─────────────────────────────────────────────── */
+    .result {
+      margin-top: 0.75rem;
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.65rem 0.85rem;
+      min-height: 36px;
+      color: var(--text-secondary);
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 120px;
+      overflow-y: auto;
+      transition: all 0.3s ease;
+    }
+
+    .result.ok { color: var(--accent); border-color: rgba(0,212,170,0.2); }
+    .result.err { color: var(--danger); border-color: rgba(255,68,102,0.2); }
+    .result.val { color: var(--text-primary); }
+
+    /* ── Event Log ─────────────────────────────────────────────────── */
+    .event-log {
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.65rem 0.85rem;
+      height: 200px;
+      overflow-y: auto;
+      color: var(--text-secondary);
+      scroll-behavior: smooth;
+    }
+
+    .event-entry {
+      padding: 0.25rem 0;
+      border-bottom: 1px solid rgba(60,72,110,0.1);
+      animation: fadeIn 0.3s ease;
+    }
+
+    .event-entry:last-child { border-bottom: none; }
+
+    .event-time { color: var(--text-dim); }
+    .event-channel { color: var(--blue); font-weight: 500; }
+    .event-message { color: var(--text-primary); }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(-4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* ── Sub Tags ──────────────────────────────────────────────────── */
+    .sub-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      margin-top: 0.6rem;
+      min-height: 26px;
+    }
+
+    .sub-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      background: var(--blue-glow);
+      color: var(--blue);
+      border: 1px solid rgba(68,170,255,0.2);
+      border-radius: 4px;
+      padding: 0.2rem 0.5rem;
+      animation: fadeIn 0.2s ease;
+    }
+
+    .sub-tag .x {
+      cursor: pointer;
+      opacity: 0.6;
+      transition: opacity var(--transition);
+    }
+
+    .sub-tag .x:hover { opacity: 1; }
+
+    /* ── Status Panel ──────────────────────────────────────────────── */
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 0.6rem;
+    }
+
+    .stat {
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.6rem 0.8rem;
+      text-align: center;
+    }
+
+    .stat-value {
+      font-family: var(--font-mono);
+      font-size: 1.15rem;
+      font-weight: 600;
+      color: var(--accent);
+    }
+
+    .stat-label {
+      font-size: 0.68rem;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-top: 2px;
+    }
+
+    /* ── Toast ─────────────────────────────────────────────────────── */
+    .toast-container {
+      position: fixed;
+      top: 1rem;
+      right: 1rem;
+      z-index: 1000;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+
+    .toast {
+      font-family: var(--font-body);
+      font-size: 0.8rem;
+      padding: 0.65rem 1rem;
+      border-radius: var(--radius-sm);
+      backdrop-filter: blur(12px);
+      animation: toastIn 0.3s ease;
+      max-width: 340px;
+    }
+
+    .toast.ok {
+      background: var(--accent-glow);
+      border: 1px solid rgba(0,212,170,0.3);
+      color: var(--accent);
+    }
+
+    .toast.err {
+      background: var(--danger-glow);
+      border: 1px solid rgba(255,68,102,0.3);
+      color: var(--danger);
+    }
+
+    @keyframes toastIn {
+      from { opacity: 0; transform: translateX(20px); }
+      to { opacity: 1; transform: translateX(0); }
+    }
+
+    /* ── Footer ────────────────────────────────────────────────────── */
+    .footer {
+      text-align: center;
+      margin-top: 2.5rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid var(--border);
+      font-size: 0.72rem;
+      color: var(--text-dim);
+    }
+
+    .footer a { color: var(--accent); text-decoration: none; }
+    .footer a:hover { text-decoration: underline; }
+
+    /* ── Responsive ────────────────────────────────────────────────── */
+    @media (max-width: 768px) {
+      .panels { grid-template-columns: 1fr; }
+      .conn-bar { flex-wrap: wrap; }
+      .header { flex-direction: column; gap: 0.75rem; text-align: center; }
+      .status-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+
+    /* ── Scrollbar ──────────────────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--text-dim); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--text-secondary); }
+  </style>
+</head>
+<body>
+  <div class="shell">
+
+    <!-- Header -->
+    <header class="header">
+      <div class="brand">
+        <div class="brand-icon">W</div>
+        <div>
+          <h1>Worm<span>DB</span></h1>
+          <div class="brand-sub">Browser-Direct Demo</div>
+        </div>
+      </div>
+      <div class="status-grid" id="statusGrid" style="max-width: 320px; display: none;">
+        <div class="stat">
+          <div class="stat-value" id="statKeys">—</div>
+          <div class="stat-label">Keys</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value" id="statWal">—</div>
+          <div class="stat-label">WAL Size</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value" id="statLatency">—</div>
+          <div class="stat-label">Latency</div>
+        </div>
+      </div>
+    </header>
+
+    <!-- Connection Bar -->
+    <div class="conn-bar">
+      <div class="status-dot" id="connDot"></div>
+      <span class="status-text" id="connText">Disconnected</span>
+      <input type="text" id="connUrl" value="ws://localhost:6390" placeholder="ws://host:port" spellcheck="false">
+      <span class="latency-badge" id="connLatency"></span>
+      <button class="btn btn-primary" id="connBtn">Connect</button>
+    </div>
+
+    <!-- Panels -->
+    <div class="panels">
+
+      <!-- KV Explorer -->
+      <div class="panel">
+        <div class="panel-head">
+          <span class="icon accent-kv">◆</span> Key-Value Explorer
+        </div>
+        <div class="panel-body">
+          <div class="form-row">
+            <label>Key</label>
+            <input type="text" id="kvKey" placeholder="user:alice:name" spellcheck="false">
+          </div>
+          <div class="form-row">
+            <label>Value</label>
+            <input type="text" id="kvValue" placeholder="Alice Wonderland" spellcheck="false">
+          </div>
+          <div class="form-row">
+            <label></label>
+            <label class="toggle"><input type="checkbox" id="kvWorm"> WORM (immutable)</label>
+            <button class="btn btn-primary btn-sm" id="kvSetBtn" disabled>SET</button>
+            <button class="btn btn-ghost btn-sm" id="kvGetBtn" disabled>GET</button>
+            <button class="btn btn-danger btn-sm" id="kvDelBtn" disabled>DEL</button>
+          </div>
+          <div class="result" id="kvResult">Connect to start</div>
+        </div>
+      </div>
+
+      <!-- EXEC Console -->
+      <div class="panel">
+        <div class="panel-head">
+          <span class="icon accent-exec">▶</span> Procedure Console
+        </div>
+        <div class="panel-body">
+          <div class="form-row">
+            <label>Proc</label>
+            <input type="text" id="execProc" placeholder="increment" spellcheck="false">
+          </div>
+          <div class="form-row">
+            <label>Args</label>
+            <input type="text" id="execArgs" placeholder="counter 1  (space-separated)" spellcheck="false">
+          </div>
+          <div class="form-row">
+            <label></label>
+            <button class="btn btn-primary btn-sm" id="execBtn" disabled style="background: var(--purple); border-color: var(--purple);">Execute</button>
+          </div>
+          <div class="result" id="execResult">Connect to start</div>
+        </div>
+      </div>
+
+      <!-- PubSub -->
+      <div class="panel panel-full">
+        <div class="panel-head">
+          <span class="icon accent-pubsub">◉</span> PubSub — Live Event Stream
+          <div style="margin-left: auto; display: flex; gap: 0.5rem; align-items: center;">
+            <input type="text" id="subChannel" placeholder="channel" spellcheck="false"
+              style="font-family: var(--font-mono); font-size: 0.78rem; width: 140px; background: var(--bg-input); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; padding: 0.35rem 0.6rem; outline: none;">
+            <button class="btn btn-ghost btn-sm" id="subBtn" disabled>Subscribe</button>
+            <span style="color: var(--text-dim); font-size: 0.72rem;">|</span>
+            <input type="text" id="pubChannel" placeholder="channel" spellcheck="false"
+              style="font-family: var(--font-mono); font-size: 0.78rem; width: 110px; background: var(--bg-input); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; padding: 0.35rem 0.6rem; outline: none;">
+            <input type="text" id="pubMessage" placeholder="message" spellcheck="false"
+              style="font-family: var(--font-mono); font-size: 0.78rem; width: 150px; background: var(--bg-input); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; padding: 0.35rem 0.6rem; outline: none;">
+            <button class="btn btn-ghost btn-sm" id="pubBtn" disabled>Publish</button>
+          </div>
+        </div>
+        <div class="panel-body" style="padding-top: 0.5rem;">
+          <div class="sub-tags" id="subTags"></div>
+          <div class="event-log" id="eventLog" style="margin-top: 0.6rem;">
+            <div style="color: var(--text-dim); font-style: italic;">Subscribe to a channel to see live events...</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <footer class="footer">
+      <strong>WormDB</strong> Browser-Direct Demo — No backend. No API layer. Just the browser and the database.
+      <br>Protocol: WormWire binary over WebSocket · <a href="https://github.com/igorls/wormdb" target="_blank">GitHub</a>
+    </footer>
+
+  </div>
+
+  <div class="toast-container" id="toasts"></div>
+
+  <!-- ── Application Logic ──────────────────────────────────────────── -->
+  <script type="module">
+    import { WormDB } from '../dist/index.js';
+
+    // ── State ────────────────────────────────────────────────────────
+    let db = null;
+    let statusInterval = null;
+    const subscriptions = new Map(); // channel → handler
+
+    // ── DOM ──────────────────────────────────────────────────────────
+    const $ = id => document.getElementById(id);
+
+    const connDot     = $('connDot');
+    const connText    = $('connText');
+    const connUrl     = $('connUrl');
+    const connLatency = $('connLatency');
+    const connBtn     = $('connBtn');
+    const statusGrid  = $('statusGrid');
+    const statKeys    = $('statKeys');
+    const statWal     = $('statWal');
+    const statLatency = $('statLatency');
+
+    const kvKey       = $('kvKey');
+    const kvValue     = $('kvValue');
+    const kvWorm      = $('kvWorm');
+    const kvSetBtn    = $('kvSetBtn');
+    const kvGetBtn    = $('kvGetBtn');
+    const kvDelBtn    = $('kvDelBtn');
+    const kvResult    = $('kvResult');
+
+    const execProc    = $('execProc');
+    const execArgs    = $('execArgs');
+    const execBtn     = $('execBtn');
+    const execResult  = $('execResult');
+
+    const subChannel  = $('subChannel');
+    const subBtn      = $('subBtn');
+    const pubChannel  = $('pubChannel');
+    const pubMessage  = $('pubMessage');
+    const pubBtn      = $('pubBtn');
+    const subTags     = $('subTags');
+    const eventLog    = $('eventLog');
+
+    // ── Actions ──────────────────────────────────────────────────────
+    const allBtns = [kvSetBtn, kvGetBtn, kvDelBtn, execBtn, subBtn, pubBtn];
+    const setConnected = (on) => {
+      allBtns.forEach(b => b.disabled = !on);
+    };
+
+    function updateUI(state) {
+      connDot.className = 'status-dot' + (state === 'connected' ? ' connected' : state === 'connecting' ? ' connecting' : '');
+      connText.textContent = state === 'connected' ? 'Connected' : state === 'connecting' ? 'Connecting…' : 'Disconnected';
+      connBtn.textContent = state === 'connected' ? 'Disconnect' : 'Connect';
+      connBtn.className = state === 'connected' ? 'btn btn-danger' : 'btn btn-primary';
+      setConnected(state === 'connected');
+      statusGrid.style.display = state === 'connected' ? 'grid' : 'none';
+    }
+
+    async function connect() {
+      const url = connUrl.value.trim();
+      if (!url) return;
+
+      updateUI('connecting');
+      const start = performance.now();
+
+      db = new WormDB({ url, autoReconnect: false });
+
+      try {
+        await db.connect();
+        const latency = Math.round(performance.now() - start);
+        connLatency.textContent = `${latency}ms`;
+        connLatency.classList.add('visible');
+        updateUI('connected');
+        toast(`Connected to ${url}`, 'ok');
+
+        // Global event listener
+        db.onEvent((channel, message) => {
+          addEvent(channel, message);
+        });
+
+        // Start status polling
+        pollStatus();
+        statusInterval = setInterval(pollStatus, 3000);
+
+        // Set default result texts
+        kvResult.textContent = 'Ready';
+        kvResult.className = 'result';
+        execResult.textContent = 'Ready';
+        execResult.className = 'result';
+      } catch (err) {
+        updateUI('disconnected');
+        toast(`Connection failed: ${err.message}`, 'err');
+      }
+    }
+
+    async function disconnect() {
+      if (statusInterval) { clearInterval(statusInterval); statusInterval = null; }
+      if (db) { await db.close(); db = null; }
+      connLatency.classList.remove('visible');
+      updateUI('disconnected');
+      subscriptions.clear();
+      subTags.innerHTML = '';
+      eventLog.innerHTML = '<div style="color: var(--text-dim); font-style: italic;">Disconnected</div>';
+      kvResult.textContent = 'Connect to start';
+      kvResult.className = 'result';
+      execResult.textContent = 'Connect to start';
+      execResult.className = 'result';
+    }
+
+    async function pollStatus() {
+      if (!db || db.state !== 'connected') return;
+      try {
+        const start = performance.now();
+        const raw = await db.status();
+        const latency = Math.round(performance.now() - start);
+        statLatency.textContent = `${latency}ms`;
+
+        const pairs = Object.fromEntries(
+          raw.trim().split('\n').map(l => l.split('='))
+        );
+        statKeys.textContent = pairs.keys ?? '—';
+        const wal = parseInt(pairs.wal_size ?? '0');
+        statWal.textContent = wal > 1024 ? `${(wal / 1024).toFixed(1)}K` : `${wal}B`;
+      } catch { /* ignore */ }
+    }
+
+    // ── KV ────────────────────────────────────────────────────────────
+    kvSetBtn.addEventListener('click', async () => {
+      const key = kvKey.value.trim();
+      const val = kvValue.value;
+      if (!key) return;
+      try {
+        await db.set(key, val, kvWorm.checked);
+        kvResult.textContent = `✓ SET ${key}` + (kvWorm.checked ? ' (WORM)' : '');
+        kvResult.className = 'result ok';
+      } catch (err) {
+        kvResult.textContent = `✗ ${err.message}`;
+        kvResult.className = 'result err';
+      }
+    });
+
+    kvGetBtn.addEventListener('click', async () => {
+      const key = kvKey.value.trim();
+      if (!key) return;
+      try {
+        const val = await db.get(key);
+        if (val === null) {
+          kvResult.textContent = `(null) — key not found`;
+          kvResult.className = 'result';
+        } else {
+          kvResult.textContent = val;
+          kvResult.className = 'result val';
+          kvValue.value = val;
+        }
+      } catch (err) {
+        kvResult.textContent = `✗ ${err.message}`;
+        kvResult.className = 'result err';
+      }
+    });
+
+    kvDelBtn.addEventListener('click', async () => {
+      const key = kvKey.value.trim();
+      if (!key) return;
+      try {
+        await db.del(key);
+        kvResult.textContent = `✓ DEL ${key}`;
+        kvResult.className = 'result ok';
+        kvValue.value = '';
+      } catch (err) {
+        kvResult.textContent = `✗ ${err.message}`;
+        kvResult.className = 'result err';
+      }
+    });
+
+    // Enter key triggers GET on key field, SET on value field
+    kvKey.addEventListener('keydown', e => { if (e.key === 'Enter') kvGetBtn.click(); });
+    kvValue.addEventListener('keydown', e => { if (e.key === 'Enter') kvSetBtn.click(); });
+
+    // ── EXEC ──────────────────────────────────────────────────────────
+    execBtn.addEventListener('click', async () => {
+      const proc = execProc.value.trim();
+      if (!proc) return;
+      const args = execArgs.value.trim() ? execArgs.value.trim().split(/\s+/) : [];
+      try {
+        const resp = await db.exec(proc, ...args);
+        if (resp.type === 'ok') {
+          execResult.textContent = '✓ OK';
+          execResult.className = 'result ok';
+        } else if (resp.type === 'value') {
+          execResult.textContent = resp.data;
+          execResult.className = 'result val';
+        } else if (resp.type === 'null') {
+          execResult.textContent = '(null)';
+          execResult.className = 'result';
+        } else if (resp.type === 'error') {
+          execResult.textContent = `✗ ${resp.message}`;
+          execResult.className = 'result err';
+        }
+      } catch (err) {
+        execResult.textContent = `✗ ${err.message}`;
+        execResult.className = 'result err';
+      }
+    });
+
+    execProc.addEventListener('keydown', e => { if (e.key === 'Enter') execBtn.click(); });
+    execArgs.addEventListener('keydown', e => { if (e.key === 'Enter') execBtn.click(); });
+
+    // ── PubSub ────────────────────────────────────────────────────────
+    subBtn.addEventListener('click', async () => {
+      const ch = subChannel.value.trim();
+      if (!ch || subscriptions.has(ch)) return;
+
+      const handler = (channel, message) => addEvent(channel, message);
+      try {
+        await db.subscribe(ch, handler);
+        subscriptions.set(ch, handler);
+        addSubTag(ch);
+        subChannel.value = '';
+        toast(`Subscribed to ${ch}`, 'ok');
+      } catch (err) {
+        toast(`Subscribe failed: ${err.message}`, 'err');
+      }
+    });
+
+    pubBtn.addEventListener('click', async () => {
+      const ch = pubChannel.value.trim();
+      const msg = pubMessage.value.trim();
+      if (!ch || !msg) return;
+      try {
+        await db.publish(ch, msg);
+        toast(`Published to ${ch}`, 'ok');
+      } catch (err) {
+        toast(`Publish failed: ${err.message}`, 'err');
+      }
+    });
+
+    subChannel.addEventListener('keydown', e => { if (e.key === 'Enter') subBtn.click(); });
+    pubMessage.addEventListener('keydown', e => { if (e.key === 'Enter') pubBtn.click(); });
+
+    function addSubTag(ch) {
+      const tag = document.createElement('span');
+      tag.className = 'sub-tag';
+      tag.innerHTML = `#${ch} <span class="x" title="Unsubscribe">✕</span>`;
+      tag.querySelector('.x').addEventListener('click', async () => {
+        const handler = subscriptions.get(ch);
+        if (handler && db) {
+          await db.unsubscribe(ch, handler);
+          subscriptions.delete(ch);
+        }
+        tag.remove();
+      });
+      subTags.appendChild(tag);
+    }
+
+    function addEvent(channel, message) {
+      // Remove placeholder
+      const placeholder = eventLog.querySelector('[style*="font-style"]');
+      if (placeholder) placeholder.remove();
+
+      const entry = document.createElement('div');
+      entry.className = 'event-entry';
+      const time = new Date().toLocaleTimeString();
+      entry.innerHTML = `<span class="event-time">${time}</span> <span class="event-channel">#${channel}</span> <span class="event-message">${escapeHtml(message)}</span>`;
+      eventLog.appendChild(entry);
+      eventLog.scrollTop = eventLog.scrollHeight;
+
+      // Keep max 200 entries
+      while (eventLog.children.length > 200) eventLog.firstChild.remove();
+    }
+
+    // ── Connect Button ────────────────────────────────────────────────
+    connBtn.addEventListener('click', () => {
+      if (db && db.state === 'connected') {
+        disconnect();
+      } else {
+        connect();
+      }
+    });
+
+    connUrl.addEventListener('keydown', e => { if (e.key === 'Enter') connBtn.click(); });
+
+    // ── Toasts ────────────────────────────────────────────────────────
+    function toast(msg, type = 'ok') {
+      const el = document.createElement('div');
+      el.className = `toast ${type}`;
+      el.textContent = msg;
+      $('toasts').appendChild(el);
+      setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity 0.3s'; }, 2800);
+      setTimeout(() => el.remove(), 3200);
+    }
+
+    function escapeHtml(s) {
+      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+  </script>
+</body>
+</html>

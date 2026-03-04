@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WormDB Notepad</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
+</head>
+<body>
+  <div class="app-container">
+    <aside class="sidebar">
+      <header class="sidebar-header">
+        <div class="brand">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="brand-icon"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+          <h1>WormNotes</h1>
+        </div>
+        <div class="author-area">
+          <span id="author-name" class="author-name">Guest</span>
+          <button id="btn-edit-author" class="icon-btn" title="Change Author">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+          </button>
+        </div>
+        <div class="sidebar-meta">
+          <span id="note-count" class="count-pill">0 notes</span>
+        </div>
+      </header>
+      
+      <div class="sidebar-actions">
+        <button id="btn-new-note" class="btn primary full-width">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+          New Note
+        </button>
+      </div>
+
+      <div class="note-list-container">
+        <ul id="note-list" class="note-list">
+          <!-- Notes populated via JS -->
+        </ul>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <header class="editor-header">
+        <div class="title-wrapper">
+          <input type="text" id="note-title" placeholder="Untitled Note" disabled />
+          <div id="save-indicator" class="save-indicator">
+            <span class="dot"></span> <span class="text">Saved</span>
+          </div>
+        </div>
+        
+        <div class="editor-actions">
+          <button id="btn-save-snapshot" class="btn secondary" title="Force manual WAL save to disk">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg>
+            Snapshot
+          </button>
+          <button id="btn-worm-lock" class="btn warning" disabled>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+            WORM Lock
+          </button>
+          <button id="btn-delete-note" class="btn danger" disabled title="Delete Note">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+          </button>
+        </div>
+      </header>
+
+      <div id="mobile-view-toggle" class="mobile-view-toggle" aria-label="Editor view selector">
+        <button id="btn-view-editor" class="view-tab active" type="button">Editor</button>
+        <button id="btn-view-preview" class="view-tab" type="button">Preview</button>
+      </div>
+
+      <div class="editor-workspace" id="editor-workspace">
+        <div class="editor-pane">
+          <textarea id="note-editor" placeholder="Select or create a note to begin editing..." disabled></textarea>
+        </div>
+        <div class="preview-pane">
+          <div id="markdown-preview" class="markdown-body"></div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <footer class="status-bar">
+    <div class="status-item connection">
+      <div id="conn-indicator" class="status-dot"></div>
+      <span id="conn-text">Connecting...</span>
+    </div>
+    <div class="status-item">
+      <span>Keys:</span>
+      <strong id="stat-keys">0</strong>
+    </div>
+    <div class="status-item">
+      <span>WAL Size:</span>
+      <strong id="stat-wal">0 B</strong>
+    </div>
+    <div class="status-item">
+      <span>Uptime:</span>
+      <strong id="stat-uptime">-</strong>
+    </div>
+  </footer>
+
+  <div id="toast-container" class="toast-container"></div>
+
+  <!-- Confirmation Dialog -->
+  <div id="dialog-overlay" class="dialog-overlay">
+    <div class="dialog">
+      <h3 id="dialog-title">Confirm</h3>
+      <p id="dialog-message">Are you sure?</p>
+      <div class="dialog-actions">
+        <button id="btn-dialog-cancel" class="btn secondary">Cancel</button>
+        <button id="btn-dialog-confirm" class="btn primary">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

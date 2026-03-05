@@ -1,1211 +1,1333 @@
 <!DOCTYPE html>
-<html lang="en">
+<html class="dark" lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WormDB — Browser Benchmark</title>
-  <meta name="description" content="Compare database access architectures: Classic REST API vs WormDB browser-direct with and without auth.">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-  <script src="https://unpkg.com/lucide@latest"></script>
-  <style>
-    :root {
-      --bg-root: #09090b;
-      --bg-card: #141417;
-      --bg-card-alt: #0e0e11;
-      --bg-input: #09090b;
-      --bg-hover: #1f1f22;
-      --border: #27272a;
-      --border-active: #52525b;
-      --text: #fafafa;
-      --text-secondary: #a1a1aa;
-      --text-dim: #71717a;
-      --accent: #ededef;
-      --danger: #ef4444;
-      --blue: #3b82f6;
-      --purple: #8b5cf6;
-      --amber: #f59e0b;
-      --font: 'Inter', -apple-system, sans-serif;
-      --mono: 'JetBrains Mono', monospace;
-      --radius: 8px;
-      --ease: 200ms cubic-bezier(0.4, 0, 0.2, 1);
-      --lane-classic: #3b82f6;
-      --lane-auth: #8b5cf6;
-      --lane-noauth: #10b981;
-      --lane-quic: #71717a;
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>WormDB Benchmark Dashboard</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<script id="tailwind-config">
+    tailwind.config = {
+        darkMode: "class",
+        theme: {
+            extend: {
+                colors: {
+                    "primary": "#3b82f6",
+                    "primary-dark": "#1d4ed8",
+                    "primary-light": "#93c5fd",
+                    "background-light": "#f6f6f8",
+                    "background-dark": "#09090b",
+                    "surface-dark": "#18181b",
+                    "surface-darker": "#121214",
+                    "accent-purple": "#8b5cf6",
+                    "accent-green": "#10b981",
+                    "border-dark": "#27272a"
+                },
+                fontFamily: {
+                    "display": ["Inter", "sans-serif"],
+                    "mono": ["JetBrains Mono", "monospace"]
+                },
+                borderRadius: {"DEFAULT": "0.25rem", "lg": "0.75rem", "xl": "1rem", "full": "9999px"},
+            },
+        },
+    }
+</script>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet"/>
+<style>
+    .glass-card {
+        background: rgba(24, 24, 27, 0.6);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        border: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .mesh-bg {
+        background-color: #09090b;
+        background-image: 
+            radial-gradient(at 0% 0%, rgba(59, 130, 246, 0.15) 0px, transparent 50%),
+            radial-gradient(at 100% 0%, rgba(139, 92, 246, 0.15) 0px, transparent 50%);
+    }
+    .glow-btn {
+        background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
+        box-shadow: 0 0 20px rgba(59, 130, 246, 0.4);
+        transition: all 0.3s ease;
+    }
+    .glow-btn:hover:not(:disabled) {
+        box-shadow: 0 0 30px rgba(139, 92, 246, 0.6);
+        transform: translateY(-1px);
+    }
+    .glow-btn:disabled {
+        opacity: 0.7;
+        cursor: not-allowed;
+        background: #27272a;
+        box-shadow: none;
+    }
+    .running-btn {
+        animation: runningPulse 2s infinite;
+        background: linear-gradient(135deg, #2563eb 0%, #7c3aed 100%) !important;
+        box-shadow: 0 0 25px rgba(139, 92, 246, 0.6) !important;
+    }
+    @keyframes runningPulse {
+        0% { box-shadow: 0 0 15px rgba(59, 130, 246, 0.6); }
+        50% { box-shadow: 0 0 35px rgba(139, 92, 246, 0.9); }
+        100% { box-shadow: 0 0 15px rgba(59, 130, 246, 0.6); }
+    }
+    .pulse-dot {
+        animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+        0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+        70% { box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+    }
+    .glow-text {
+        color: #10b981;
+        text-shadow: 0 0 10px rgba(16, 185, 129, 0.5);
+    }
+    .winner {
+        color: #10b981 !important;
+        font-weight: bold;
+        text-shadow: 0 0 10px rgba(16, 185, 129, 0.5);
+    }
+    .bar-col {
+        transition: height 0.3s ease;
+    }
+
+    /* Progressive reveal transitions */
+    .section-reveal {
+        max-height: 0;
+        opacity: 0;
+        overflow: hidden;
+        transition: max-height 0.6s cubic-bezier(0.4, 0, 0.2, 1),
+                    opacity 0.4s ease 0.1s,
+                    margin-top 0.4s ease;
+        margin-top: 0;
+    }
+    .section-reveal.visible {
+        max-height: 2000px;
+        opacity: 1;
+        margin-top: 2rem;
     }
-
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-    body {
-      font-family: var(--font);
-      background: var(--bg-root);
-      color: var(--text);
-      min-height: 100vh;
-      -webkit-font-smoothing: antialiased;
-      overflow-x: hidden;
-    }
-
-    /* ── Layout ─────────────────────────────────────────────────── */
-    .container {
-      max-width: 1000px;
-      margin: 0 auto;
-      padding: 3rem 1.5rem 5rem;
-    }
-
-    /* ── Header ─────────────────────────────────────────────────── */
-    .header {
-      text-align: center;
-      margin-bottom: 3.5rem;
-      position: relative;
-    }
-
-    .logo-row {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 1rem;
-      margin-bottom: 1rem;
-    }
-
-    .logo {
-      width: 44px; height: 44px;
-      border-radius: 8px;
-      background: var(--text);
-      display: flex; align-items: center; justify-content: center;
-      font-weight: 800; font-size: 20px; color: var(--bg-root);
-    }
-
-    .header h1 {
-      font-size: 2.2rem;
-      font-weight: 700;
-      letter-spacing: -0.03em;
-    }
-
-    .header h1 span { 
-      color: var(--text-dim); 
-    }
-
-    .header .subtitle {
-      color: var(--text-secondary);
-      font-size: 1rem;
-      margin-top: 0.5rem;
-      max-width: 600px;
-      margin-left: auto;
-      margin-right: auto;
-      line-height: 1.5;
-    }
-
-    /* ── Cards ──────────────────────────────────────────────────── */
-    .card {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 1.75rem;
-      margin-bottom: 1.5rem;
-      transition: border-color var(--ease);
-    }
-
-    .card:hover {
-      border-color: #3f3f46;
-    }
-
-    .card-title {
-      font-size: 0.75rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--text-secondary);
-      margin-bottom: 1.25rem;
-      display: flex;
-      align-items: center;
-    }
-    
-    .card-title::after {
-      content: '';
-      flex: 1;
-      height: 1px;
-      background: var(--border);
-      margin-left: 1rem;
-    }
-
-    /* ── Config Grid ───────────────────────────────────────────── */
-    .config-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 1.25rem;
-    }
-
-    @media (max-width: 700px) {
-      .config-grid { grid-template-columns: 1fr; }
-    }
-
-    /* ── Endpoints Card ────────────────────────────────────────── */
-    .endpoint-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-      gap: 0.8rem;
-    }
-
-    .endpoint-item {
-      display: flex;
-      align-items: center;
-      gap: 0.6rem;
-      padding: 0.6rem 0.75rem;
-      border-radius: 6px;
-      border: 1px solid var(--border);
-      background: var(--bg-input);
-      font-size: 0.82rem;
-      transition: all var(--ease);
-    }
-
-    .endpoint-item:hover {
-      border-color: var(--border-active);
-    }
-
-    .endpoint-item .dot {
-      width: 8px; height: 8px;
-      border-radius: 50%;
-      background: var(--border-active);
-      flex-shrink: 0;
-      transition: all var(--ease);
-    }
-
-    .endpoint-item .dot.ok { background: var(--lane-noauth); }
-    .endpoint-item .dot.err { background: var(--danger); }
-
-    .endpoint-item .label {
-      color: var(--text);
-      font-weight: 500;
-      flex: 1;
-    }
-
-    .endpoint-item .url {
-      font-family: var(--mono);
-      font-size: 0.75rem;
-      color: var(--text-dim);
-    }
-
-    /* ── Test Type Tabs ────────────────────────────────────────── */
-    .test-tabs {
-      display: inline-flex;
-      background: var(--bg-input);
-      border-radius: 8px;
-      padding: 0.25rem;
-      gap: 0.25rem;
-      border: 1px solid var(--border);
-    }
-
-    .test-tab {
-      padding: 0.5rem 1rem;
-      border-radius: 6px;
-      border: 1px solid transparent;
-      background: transparent;
-      color: var(--text-secondary);
-      font-family: var(--font);
-      font-size: 0.85rem;
-      font-weight: 500;
-      cursor: pointer;
-      transition: all var(--ease);
-      display: flex;
-      align-items: center;
-      gap: 0.4rem;
-    }
-
-    .test-tab:hover:not(.active) {
-      background: var(--bg-hover);
-      color: var(--text);
-    }
-
-    .test-tab.active {
-      background: var(--bg-hover);
-      color: var(--text);
-      border-color: var(--border-active);
-    }
-
-    .test-tab .lucide {
-      width: 1rem;
-      height: 1rem;
-    }
-
-    .test-tab.disabled {
-      opacity: 0.4;
-      cursor: not-allowed;
-      pointer-events: none;
-    }
-
-    /* ── Params ─────────────────────────────────────────────────── */
-    .param-row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 1.5rem;
-      margin-top: 1.5rem;
-    }
-
-    .param-group {
-      display: flex;
-      flex-direction: column;
-      gap: 0.4rem;
-    }
-
-    .param-group label {
-      font-size: 0.75rem;
-      color: var(--text-dim);
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-    }
-
-    .param-group select, .param-group input {
-      font-family: var(--mono);
-      font-size: 0.85rem;
-      background: var(--bg-input);
-      color: var(--text);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 0.5rem 0.75rem;
-      outline: none;
-      transition: all var(--ease);
-      min-width: 120px;
-    }
-
-    .param-group select:hover, .param-group input:hover {
-      border-color: var(--border-active);
-    }
-
-    .param-group select:focus, .param-group input:focus {
-      border-color: var(--text);
-    }
-
-    /* ── Run Button ─────────────────────────────────────────────── */
-    .run-bar {
-      display: flex;
-      align-items: center;
-      gap: 1.5rem;
-      margin-top: 2rem;
-      margin-bottom: 2rem;
-    }
-
-    .run-btn {
-      font-family: var(--font);
-      font-size: 0.95rem;
-      font-weight: 600;
-      padding: 0.75rem 2rem;
-      background: var(--text);
-      color: var(--bg-root);
-      border: none;
-      border-radius: 6px;
-      cursor: pointer;
-      transition: all var(--ease);
-      display: inline-flex;
-      align-items: center;
-      gap: 0.5rem;
-    }
-
-    .run-btn .lucide {
-      width: 1rem;
-      height: 1rem;
-    }
-
-    .run-btn:hover:not(:disabled) {
-      background: #e4e4e7;
-      transform: translateY(-1px);
-    }
-
-    .run-btn:disabled {
-      background: var(--bg-hover);
-      color: var(--text-dim);
-      cursor: not-allowed;
-    }
-
-    .run-btn:active:not(:disabled) { transform: translateY(0); }
-
-    .run-status {
-      font-size: 0.85rem;
-      color: var(--text-secondary);
-      font-weight: 500;
-      font-family: var(--mono);
-    }
-
-    /* ── Progress Bars ─────────────────────────────────────────── */
-    .progress-section {
-      display: none;
-    }
-
-    .progress-section.visible { display: block; animation: fadeIn 0.4s ease; }
-
-    .lane-progress {
-      display: flex;
-      align-items: center;
-      gap: 1rem;
-      margin-bottom: 1rem;
-    }
-
-    .lane-label {
-      font-size: 0.8rem;
-      font-weight: 500;
-      min-width: 180px;
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      color: var(--text-secondary);
-    }
-
-    .lane-dot {
-      width: 8px; height: 8px;
-      border-radius: 50%;
-      flex-shrink: 0;
-    }
-
-    .progress-track {
-      flex: 1;
-      height: 6px;
-      background: var(--bg-hover);
-      border-radius: 3px;
-      overflow: hidden;
-    }
-
-    .progress-fill {
-      height: 100%;
-      border-radius: 3px;
-      transition: width 150ms cubic-bezier(0.4, 0, 0.2, 1);
-      width: 0%;
-    }
-
-    .lane-ops {
-      font-family: var(--mono);
-      font-size: 0.75rem;
-      color: var(--text-secondary);
-      min-width: 90px;
-      text-align: right;
-    }
-
-    /* ── Results Table ──────────────────────────────────────────── */
-    .results-section { display: none; margin-top: 2rem; }
-    .results-section.visible { display: block; }
-
-    .results-table {
-      width: 100%;
-      border-collapse: separate;
-      border-spacing: 0;
-      font-size: 0.82rem;
-    }
-
-    .results-table th {
-      text-align: right;
-      padding: 0.8rem 1rem;
-      font-weight: 600;
-      font-size: 0.7rem;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--text-dim);
-      border-bottom: 1px solid var(--border);
-    }
-
-    .results-table th:first-child { text-align: left; }
-
-    .results-table td {
-      text-align: right;
-      padding: 0.85rem 1rem;
-      font-family: var(--mono);
-      font-size: 0.85rem;
-      border-bottom: 1px solid var(--bg-hover);
-      color: var(--text-secondary);
-      transition: background var(--ease);
-    }
-
-    .results-table td:first-child {
-      text-align: left;
-      font-family: var(--font);
-      font-weight: 500;
-      color: var(--text);
-    }
-
-    .results-table td.winner {
-      color: var(--text);
-      font-weight: 600;
-    }
-
-    .results-table tr:hover td {
-      background: var(--bg-hover);
-    }
-
-    .lane-badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.5rem;
-    }
-
-    .lane-badge .dot {
-      width: 8px; height: 8px;
-      border-radius: 50%;
-      flex-shrink: 0;
-    }
-
-    /* ── Histogram Canvas ──────────────────────────────────────── */
-    .chart-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 1.5rem;
-      margin-bottom: 1.5rem;
-    }
-
-    @media (max-width: 800px) {
-      .chart-grid { grid-template-columns: 1fr; }
+    .section-reveal.results-reveal {
+        transition: max-height 0.8s cubic-bezier(0.4, 0, 0.2, 1),
+                    opacity 0.5s ease 0.2s,
+                    margin-top 0.4s ease;
     }
-
-    .chart-box {
-      background: var(--bg-card-alt);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 1.25rem;
-    }
-
-    .chart-box .chart-title {
-      font-size: 0.75rem;
-      font-weight: 600;
-      color: var(--text-secondary);
-      margin-bottom: 0.75rem;
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-    }
-
-    .chart-box .chart-title .dot {
-      width: 8px; height: 8px;
-      border-radius: 50%;
-    }
-
-    .chart-box canvas {
-      width: 100%;
-      height: 150px;
-      border-radius: 6px;
-    }
-
-    /* ── Export ─────────────────────────────────────────────────── */
-    .export-bar {
-      display: flex;
-      gap: 0.8rem;
-      margin-top: 1.5rem;
-      justify-content: flex-end;
-    }
-
-    .export-btn {
-      font-family: var(--font);
-      font-size: 0.82rem;
-      font-weight: 500;
-      padding: 0.6rem 1rem;
-      background: transparent;
-      color: var(--text-secondary);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      cursor: pointer;
-      transition: all var(--ease);
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-    }
-
-    .export-btn .lucide {
-      width: 0.9rem;
-      height: 0.9rem;
-    }
-
-    .export-btn:hover {
-      color: var(--text);
-      border-color: var(--border-active);
-      background: var(--bg-hover);
-    }
-
-    /* ── Coming Soon Badge ─────────────────────────────────────── */
-    .coming-soon {
-      font-size: 0.65rem;
-      background: var(--bg-hover);
-      color: var(--text-dim);
-      padding: 0.2rem 0.5rem;
-      border-radius: 4px;
-      font-weight: 600;
-      letter-spacing: 0.05em;
-      border: 1px solid var(--border);
-      text-transform: uppercase;
+    .section-reveal.results-reveal.visible {
+        max-height: 4000px;
     }
 
-    /* ── Scrollbar ──────────────────────────────────────────────── */
     ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: var(--border-active); border-radius: 4px; }
-    ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
-
-    /* ── Animations ─────────────────────────────────────────────── */
-    @keyframes fadeIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
-    .fade-in { animation: fadeIn 0.4s cubic-bezier(0.2, 0.8, 0.2, 1) forwards; }
-
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
-    .pulsing { animation: pulse 2s ease-in-out infinite; }
-  </style>
+    ::-webkit-scrollbar-thumb { background: #52525b; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #71717a; }
+</style>
 </head>
-<body>
-
-<div class="container">
-
-  <!-- Header -->
-  <header class="header">
-    <div class="logo-row">
-      <div class="logo">W</div>
-      <h1>Worm<span>DB</span> Benchmark</h1>
+<body class="bg-background-light dark:bg-background-dark text-slate-900 dark:text-slate-100 font-display min-h-screen mesh-bg">
+<div class="relative flex h-auto min-h-screen w-full flex-col group/design-root overflow-x-hidden">
+<div class="layout-container flex h-full grow flex-col">
+<!-- Header -->
+<header class="flex items-center justify-between whitespace-nowrap border-b border-solid border-border-dark px-10 py-4 glass-card sticky top-0 z-50">
+    <div class="flex items-center gap-4">
+        <div class="size-8 rounded-lg bg-gradient-to-br from-primary to-accent-purple flex items-center justify-center shadow-lg shadow-primary/20">
+            <span class="text-white font-black text-xl leading-none">W</span>
+        </div>
+        <div>
+            <h2 class="text-slate-100 text-xl font-bold leading-tight tracking-tight">WormDB Benchmark</h2>
+            <p class="text-slate-400 text-xs mt-0.5 hidden md:block">Browser-level latency comparison across database access architectures</p>
+        </div>
     </div>
-    <p class="subtitle">Browser-level latency comparison across database access architectures</p>
-  </header>
-
-  <!-- Endpoints Status -->
-  <div class="card" id="endpointsCard">
-    <div class="card-title">Service Endpoints</div>
-    <div class="endpoint-grid" id="endpointGrid">
-      <div class="endpoint-item" id="ep-api">
-        <div class="dot" id="dot-api"></div>
-        <span class="label">REST API</span>
-        <span class="url" id="url-api">localhost:8082</span>
-      </div>
-      <div class="endpoint-item" id="ep-ws-auth">
-        <div class="dot" id="dot-ws-auth"></div>
-        <span class="label">WormDB + Auth</span>
-        <span class="url" id="url-ws-auth">localhost:6390</span>
-      </div>
-      <div class="endpoint-item" id="ep-ws-noauth">
-        <div class="dot" id="dot-ws-noauth"></div>
-        <span class="label">WormDB No Auth</span>
-        <span class="url" id="url-ws-noauth">localhost:6392</span>
-      </div>
-      <div class="endpoint-item" id="ep-auth-provider">
-        <div class="dot" id="dot-auth-provider"></div>
-        <span class="label">Auth Provider</span>
-        <span class="url" id="url-auth-provider">localhost:8081</span>
-      </div>
+    <div class="flex flex-1 justify-end gap-4">
+        <a href="https://github.com/wormdb" target="_blank" class="flex cursor-pointer items-center justify-center overflow-hidden rounded-lg h-10 px-4 bg-surface-dark border border-border-dark text-slate-200 text-sm font-medium hover:bg-surface-darker transition-colors">
+            <span class="material-symbols-outlined mr-2 text-[20px]">code</span>
+            <span>GitHub</span>
+        </a>
     </div>
-  </div>
-
-  <!-- Configuration -->
-  <div class="config-grid">
-    <!-- Test Types -->
-    <div class="card">
-      <div class="card-title">Test Type</div>
-      <div class="test-tabs" id="testTabs">
-        <button class="test-tab active" data-test="write"><i data-lucide="pen-line"></i> Write</button>
-        <button class="test-tab" data-test="read"><i data-lucide="book-open"></i> Read</button>
-        <button class="test-tab" data-test="mixed"><i data-lucide="shuffle"></i> Mixed 80/20</button>
-        <button class="test-tab" data-test="burst"><i data-lucide="zap"></i> Burst</button>
-      </div>
-      <div class="param-row">
-        <div class="param-group">
-          <label>Iterations</label>
-          <select id="iterations">
-            <option value="50">50</option>
-            <option value="100" selected>100</option>
-            <option value="500">500</option>
-            <option value="1000">1000</option>
-          </select>
-        </div>
-        <div class="param-group">
-          <label>Payload Size</label>
-          <select id="payloadSize">
-            <option value="64">64 B</option>
-            <option value="256" selected>256 B</option>
-            <option value="1024">1 KB</option>
-            <option value="4096">4 KB</option>
-          </select>
-        </div>
-        <div class="param-group">
-          <label>Warmup</label>
-          <select id="warmup">
-            <option value="0">0</option>
-            <option value="3">3</option>
-            <option value="5" selected>5</option>
-            <option value="10">10</option>
-          </select>
-        </div>
-      </div>
+</header>
+<main class="flex-1 w-full max-w-[1600px] mx-auto p-6 md:px-10 md:py-8 flex flex-col gap-8">
+    <!-- Hero Section -->
+    <div class="flex flex-col gap-2 mb-2">
+        <h1 class="text-4xl md:text-5xl font-black tracking-tight text-transparent bg-clip-text bg-gradient-to-r from-white to-slate-400">Database Latency Benchmark</h1>
+        <p class="text-slate-400 text-lg max-w-2xl">Compare the real-world performance of different database access patterns directly from your browser to the edge.</p>
     </div>
 
-    <!-- Endpoint Overrides -->
-    <div class="card">
-      <div class="card-title">Endpoint Configuration</div>
-      <div class="param-row" style="flex-direction: column;">
-        <div class="param-group">
-          <label>REST API URL</label>
-          <input type="text" id="cfgApiUrl" value="http://localhost:8082" spellcheck="false">
+    <!-- Service Endpoints -->
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div class="glass-card flex flex-col gap-3 rounded-xl p-5 hover:border-primary/30 transition-colors">
+            <div class="flex justify-between items-start">
+                <p class="text-slate-300 text-sm font-medium uppercase tracking-wider">REST API</p>
+                <div class="flex items-center gap-1.5" id="dot-wrap-api">
+                    <div class="w-2 h-2 rounded-full pulse-dot bg-accent-green border border-border-dark" id="dot-api"></div>
+                </div>
+            </div>
+            <p class="text-slate-100 font-mono text-sm font-semibold truncate" id="url-api">localhost:8082</p>
+            <div class="flex items-center gap-2 text-slate-400 text-xs mt-auto">
+                <span class="material-symbols-outlined text-[14px]">public</span><span>Classic</span>
+            </div>
         </div>
-        <div class="param-group">
-          <label>WormDB Gateway (Auth)</label>
-          <input type="text" id="cfgWsAuth" value="ws://localhost:6390" spellcheck="false">
+        <div class="glass-card flex flex-col gap-3 rounded-xl p-5 hover:border-primary/30 transition-colors relative overflow-hidden">
+            <div class="absolute inset-0 bg-gradient-to-br from-primary/5 to-transparent pointer-events-none"></div>
+            <div class="flex justify-between items-start">
+                <div class="flex items-center gap-2">
+                    <span class="material-symbols-outlined text-primary text-[18px]">security</span>
+                    <p class="text-primary-light text-sm font-bold uppercase tracking-wider">WormDB + Auth</p>
+                </div>
+                <div class="flex items-center gap-1.5" id="dot-wrap-ws-auth">
+                    <div class="w-2 h-2 rounded-full pulse-dot bg-accent-green border border-border-dark" id="dot-ws-auth"></div>
+                </div>
+            </div>
+            <p class="text-slate-100 font-mono text-sm font-semibold truncate" id="url-ws-auth">localhost:6390</p>
+            <div class="flex items-center gap-2 text-slate-400 text-xs mt-auto">
+                <span class="material-symbols-outlined text-[14px]">public</span><span>Gateway Edge</span>
+            </div>
         </div>
-        <div class="param-group">
-          <label>WormDB Gateway (No Auth)</label>
-          <input type="text" id="cfgWsNoAuth" value="ws://localhost:6392" spellcheck="false">
+        <div class="glass-card flex flex-col gap-3 rounded-xl p-5 hover:border-accent-purple/30 transition-colors">
+            <div class="flex justify-between items-start">
+                <div class="flex items-center gap-2">
+                    <span class="material-symbols-outlined text-accent-purple text-[18px]">bolt</span>
+                    <p class="text-purple-300 text-sm font-bold uppercase tracking-wider">WormDB No Auth</p>
+                </div>
+                <div class="flex items-center gap-1.5" id="dot-wrap-ws-noauth">
+                    <div class="w-2 h-2 rounded-full pulse-dot bg-accent-green border border-border-dark" id="dot-ws-noauth"></div>
+                </div>
+            </div>
+            <p class="text-slate-100 font-mono text-sm font-semibold truncate" id="url-ws-noauth">localhost:6392</p>
+            <div class="flex items-center gap-2 text-slate-400 text-xs mt-auto">
+                <span class="material-symbols-outlined text-[14px]">public</span><span>Direct Stream</span>
+            </div>
         </div>
-        <div class="param-group">
-          <label>Auth Provider</label>
-          <input type="text" id="cfgAuthProvider" value="http://localhost:8081" spellcheck="false">
+        <div class="glass-card flex flex-col gap-3 rounded-xl p-5 hover:border-accent-green/30 transition-colors relative overflow-hidden">
+            <div class="absolute inset-0 bg-gradient-to-br from-accent-green/5 to-transparent pointer-events-none"></div>
+            <div class="flex justify-between items-start">
+                <div class="flex items-center gap-2">
+                    <span class="material-symbols-outlined text-accent-green text-[18px]">speed</span>
+                    <p class="text-green-300 text-sm font-bold uppercase tracking-wider">QUIC</p>
+                </div>
+                <div class="flex items-center gap-1.5" id="dot-wrap-quic">
+                    <div class="w-2 h-2 rounded-full pulse-dot bg-accent-green border border-border-dark" id="dot-quic"></div>
+                </div>
+            </div>
+            <p class="text-slate-100 font-mono text-sm font-semibold truncate" id="url-quic">localhost:6394</p>
+            <div class="flex items-center gap-2 text-slate-400 text-xs mt-auto">
+                <span class="material-symbols-outlined text-[14px]">public</span><span>WebTransport</span>
+            </div>
         </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Run Bar -->
-  <div class="run-bar">
-    <button class="run-btn" id="runBtn"><i data-lucide="play"></i> Run Benchmark</button>
-    <span class="run-status" id="runStatus"></span>
-  </div>
-
-  <!-- Progress -->
-  <div class="card progress-section" id="progressSection">
-    <div class="card-title">Progress</div>
-    <div class="lane-progress">
-      <div class="lane-label"><div class="lane-dot" style="background: var(--lane-classic)"></div> Classic REST API</div>
-      <div class="progress-track"><div class="progress-fill" id="prog-classic" style="background: var(--lane-classic)"></div></div>
-      <div class="lane-ops" id="ops-classic">—</div>
-    </div>
-    <div class="lane-progress">
-      <div class="lane-label"><div class="lane-dot" style="background: var(--lane-auth)"></div> WormDB + Auth</div>
-      <div class="progress-track"><div class="progress-fill" id="prog-auth" style="background: var(--lane-auth)"></div></div>
-      <div class="lane-ops" id="ops-auth">—</div>
-    </div>
-    <div class="lane-progress">
-      <div class="lane-label"><div class="lane-dot" style="background: var(--lane-noauth)"></div> WormDB Direct</div>
-      <div class="progress-track"><div class="progress-fill" id="prog-noauth" style="background: var(--lane-noauth)"></div></div>
-      <div class="lane-ops" id="ops-noauth">—</div>
-    </div>
-    <div class="lane-progress" style="opacity: 0.3;">
-      <div class="lane-label"><div class="lane-dot" style="background: var(--lane-quic)"></div> HTTP/3 QUIC <span class="coming-soon">COMING SOON</span></div>
-      <div class="progress-track"><div class="progress-fill" style="background: var(--lane-quic); width: 0%"></div></div>
-      <div class="lane-ops">—</div>
-    </div>
-  </div>
-
-  <!-- Results -->
-  <div class="results-section" id="resultsSection">
-
-    <!-- Histograms -->
-    <div class="card fade-in">
-      <div class="card-title">Latency Distribution</div>
-      <div class="chart-grid" id="chartGrid">
-        <div class="chart-box">
-          <div class="chart-title"><div class="dot" style="background: var(--lane-classic)"></div> Classic REST API</div>
-          <canvas id="hist-classic" height="150"></canvas>
-        </div>
-        <div class="chart-box">
-          <div class="chart-title"><div class="dot" style="background: var(--lane-auth)"></div> WormDB + Auth</div>
-          <canvas id="hist-auth" height="150"></canvas>
-        </div>
-        <div class="chart-box">
-          <div class="chart-title"><div class="dot" style="background: var(--lane-noauth)"></div> WormDB Direct</div>
-          <canvas id="hist-noauth" height="150"></canvas>
-        </div>
-        <div class="chart-box" style="opacity: 0.3;">
-          <div class="chart-title"><div class="dot" style="background: var(--lane-quic)"></div> HTTP/3 QUIC <span class="coming-soon" style="margin-left: 0.5rem;">COMING SOON</span></div>
-          <canvas id="hist-quic" height="150"></canvas>
-        </div>
-      </div>
     </div>
 
-    <!-- Comparison Table -->
-    <div class="card fade-in">
-      <div class="card-title">Comparison</div>
-      <table class="results-table" id="resultsTable">
-        <thead>
-          <tr>
-            <th>Lane</th>
-            <th>Min</th>
-            <th>Median</th>
-            <th>Mean</th>
-            <th>P95</th>
-            <th>P99</th>
-            <th>Max</th>
-            <th>Std Dev</th>
-            <th>Ops/sec</th>
-          </tr>
-        </thead>
-        <tbody id="resultsBody"></tbody>
-      </table>
+    <!-- Configuration Area -->
+    <div class="glass-card rounded-xl p-6 flex flex-col gap-6">
+        <div class="flex flex-col xl:flex-row gap-6 items-end">
+            <!-- Test Type Segmented Control -->
+            <div class="flex-1 w-full">
+                <h3 class="text-slate-200 text-sm font-semibold mb-3">Test Workload</h3>
+                <div class="flex p-1 rounded-lg bg-surface-darker border border-border-dark h-12">
+                    <label class="flex-1 cursor-pointer">
+                        <input class="peer sr-only test-radio" name="test-type" type="radio" value="write" checked/>
+                        <div class="h-full rounded-md flex items-center justify-center text-sm font-medium text-slate-400 peer-checked:bg-surface-dark peer-checked:text-white peer-checked:shadow-sm transition-all shadow-primary">Write</div>
+                    </label>
+                    <label class="flex-1 cursor-pointer">
+                        <input class="peer sr-only test-radio" name="test-type" type="radio" value="read"/>
+                        <div class="h-full rounded-md flex items-center justify-center text-sm font-medium text-slate-400 peer-checked:bg-surface-dark peer-checked:text-white peer-checked:shadow-sm transition-all shadow-primary">Read</div>
+                    </label>
+                    <label class="flex-1 cursor-pointer">
+                        <input class="peer sr-only test-radio" name="test-type" type="radio" value="mixed"/>
+                        <div class="h-full rounded-md flex items-center justify-center text-sm font-medium text-slate-400 peer-checked:bg-surface-dark peer-checked:text-white peer-checked:shadow-sm transition-all shadow-primary">Mixed 80/20</div>
+                    </label>
+                    <label class="flex-1 cursor-pointer">
+                        <input class="peer sr-only test-radio" name="test-type" type="radio" value="burst"/>
+                        <div class="h-full rounded-md flex items-center justify-center text-sm font-medium text-slate-400 peer-checked:bg-surface-dark peer-checked:text-white peer-checked:shadow-sm transition-all shadow-primary">Burst</div>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Dropdowns -->
+            <div class="flex gap-4 w-full xl:w-auto">
+                <div class="flex flex-col gap-3 flex-1 xl:w-28">
+                    <label class="text-slate-200 text-sm font-semibold">Iterations</label>
+                    <select id="iterations" class="h-12 w-full rounded-lg bg-surface-darker border border-border-dark text-white px-3 focus:border-primary focus:ring-1 focus:ring-primary outline-none appearance-none cursor-pointer">
+                        <option value="50">50</option>
+                        <option value="100" selected>100</option>
+                        <option value="500">500</option>
+                        <option value="1000">1,000</option>
+                        <option value="5000">5,000</option>
+                    </select>
+                </div>
+                <div class="flex flex-col gap-3 flex-1 xl:w-28">
+                    <label class="text-slate-200 text-sm font-semibold">Payload</label>
+                    <select id="payloadSize" class="h-12 w-full rounded-lg bg-surface-darker border border-border-dark text-white px-3 focus:border-primary focus:ring-1 focus:ring-primary outline-none appearance-none cursor-pointer">
+                        <option value="64">64 B</option>
+                        <option value="256" selected>256 B</option>
+                        <option value="1024">1 KB</option>
+                        <option value="4096">4 KB</option>
+                        <option value="16384">16 KB</option>
+                    </select>
+                </div>
+                <div class="flex flex-col gap-3 flex-1 xl:w-24">
+                    <label class="text-slate-200 text-sm font-semibold">Warmup</label>
+                    <select id="warmup" class="h-12 w-full rounded-lg bg-surface-darker border border-border-dark text-white px-3 focus:border-primary focus:ring-1 focus:ring-primary outline-none appearance-none cursor-pointer">
+                        <option value="0">0</option>
+                        <option value="3">3</option>
+                        <option value="5" selected>5</option>
+                        <option value="10">10</option>
+                    </select>
+                </div>
+                <div class="flex flex-col gap-3 flex-1 xl:w-28">
+                    <label class="text-slate-200 text-sm font-semibold">Pipeline</label>
+                    <select id="pipelineDepth" class="h-12 w-full rounded-lg bg-surface-darker border border-border-dark text-white px-3 focus:border-primary focus:ring-1 focus:ring-primary outline-none appearance-none cursor-pointer">
+                        <option value="1">1 (seq)</option>
+                        <option value="4">4</option>
+                        <option value="8">8</option>
+                        <option value="16">16</option>
+                        <option value="32" selected>32</option>
+                        <option value="64">64</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- CTA -->
+            <div class="w-full xl:w-auto mt-4 xl:mt-0">
+                <button id="runBtn" class="w-full xl:w-56 h-12 rounded-lg glow-btn text-white font-bold text-base flex items-center justify-center gap-2">
+                    <span class="material-symbols-outlined text-[20px] run-icon">play_arrow</span>
+                    <span class="run-text">Run Benchmark</span>
+                </button>
+            </div>
+        </div>
+        <div id="runStatus" class="text-xs font-mono text-primary-light h-5 transition-opacity"></div>
+
+        <details class="group">
+            <summary class="text-sm text-slate-400 cursor-pointer hover:text-slate-200 transition-colors flex items-center gap-1 select-none">
+                <span class="material-symbols-outlined text-[18px] group-open:rotate-90 transition-transform">chevron_right</span>
+                Advanced Endpoint Configuration
+            </summary>
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mt-4 p-4 border border-border-dark bg-surface-darker rounded-lg">
+                <div class="flex flex-col gap-2">
+                    <label class="text-xs text-slate-400 font-semibold uppercase tracking-wider">REST API URL</label>
+                    <input type="text" id="cfgApiUrl" value="http://localhost:8082" class="font-mono text-sm bg-surface-dark border border-border-dark rounded p-2 text-slate-200 focus:border-primary outline-none focus:ring-1 focus:ring-primary">
+                </div>
+                <div class="flex flex-col gap-2">
+                    <label class="text-xs text-slate-400 font-semibold uppercase tracking-wider">Gateway (Auth)</label>
+                    <input type="text" id="cfgWsAuth" value="ws://localhost:6390" class="font-mono text-sm bg-surface-dark border border-border-dark rounded p-2 text-slate-200 focus:border-primary outline-none focus:ring-1 focus:ring-primary">
+                </div>
+                <div class="flex flex-col gap-2">
+                    <label class="text-xs text-slate-400 font-semibold uppercase tracking-wider">Gateway (No Auth)</label>
+                    <input type="text" id="cfgWsNoAuth" value="ws://localhost:6392" class="font-mono text-sm bg-surface-dark border border-border-dark rounded p-2 text-slate-200 focus:border-primary outline-none focus:ring-1 focus:ring-primary">
+                </div>
+                <div class="flex flex-col gap-2">
+                    <label class="text-xs text-slate-400 font-semibold uppercase tracking-wider">Auth Provider</label>
+                    <input type="text" id="cfgAuthProvider" value="http://localhost:8081" class="font-mono text-sm bg-surface-dark border border-border-dark rounded p-2 text-slate-200 focus:border-primary outline-none focus:ring-1 focus:ring-primary">
+                </div>
+                <div class="flex flex-col gap-2">
+                    <label class="text-xs text-slate-400 font-semibold uppercase tracking-wider">QUIC Gateway</label>
+                    <input type="text" id="cfgQuicUrl" value="https://localhost:6394" class="font-mono text-sm bg-surface-dark border border-border-dark rounded p-2 text-slate-200 focus:border-primary outline-none focus:ring-1 focus:ring-primary">
+                </div>
+            </div>
+        </details>
     </div>
 
-    <!-- Export -->
-    <div class="export-bar">
-      <button class="export-btn" id="exportJson"><i data-lucide="download"></i> Export JSON</button>
-      <button class="export-btn" id="exportCsv"><i data-lucide="download"></i> Export CSV</button>
+    <!-- ═══════ REAL-TIME THROUGHPUT CHART (hidden until benchmark starts) ═══════ -->
+    <div id="throughputSection" class="section-reveal">
+        <div class="glass-card rounded-xl p-6 flex flex-col gap-4 w-full relative overflow-hidden">
+            <div class="flex justify-between items-start mb-2 relative z-10 flex-wrap gap-4">
+                <div>
+                    <h3 class="text-slate-100 text-lg font-bold flex items-center gap-2">
+                        Real-time Throughput
+                        <span class="flex h-2 w-2 relative ml-1" id="liveIndicator">
+                            <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-accent-green opacity-75"></span>
+                            <span class="relative inline-flex rounded-full h-2 w-2 bg-accent-green"></span>
+                        </span>
+                    </h3>
+                    <p class="text-slate-400 text-sm">Operations per second over time</p>
+                </div>
+                <div class="flex items-center gap-6 flex-wrap">
+                    <div class="flex flex-col items-end" id="counter-classic-wrap" style="display:none">
+                        <span class="text-[10px] text-slate-500 font-bold uppercase tracking-wider mb-1">REST API</span>
+                        <span class="text-lg font-semibold text-slate-300 font-mono leading-none"><span id="counter-classic">—</span> <span class="text-[10px] font-normal text-slate-500">Ops/sec</span></span>
+                    </div>
+                    <div class="flex flex-col items-end" id="counter-auth-wrap" style="display:none">
+                        <span class="text-[10px] text-primary-light font-bold uppercase tracking-wider mb-1">WormDB + Auth</span>
+                        <span class="text-2xl font-bold text-primary font-mono leading-none"><span id="counter-auth">—</span> <span class="text-xs font-medium text-primary-light/70">Ops/sec</span></span>
+                    </div>
+                    <div class="flex flex-col items-end" id="counter-noauth-wrap" style="display:none">
+                        <span class="text-[10px] text-purple-300 font-bold uppercase tracking-wider mb-1">WormDB No Auth</span>
+                        <span class="text-4xl font-black text-transparent bg-clip-text bg-gradient-to-r from-accent-purple to-purple-300 font-mono leading-none"><span id="counter-noauth">—</span> <span class="text-sm font-bold text-accent-purple">Ops/sec</span></span>
+                    </div>
+                    <div class="flex flex-col items-end" id="counter-quic-wrap" style="display:none">
+                        <span class="text-[10px] text-green-300 font-bold uppercase tracking-wider mb-1">QUIC</span>
+                        <span class="text-4xl font-black text-transparent bg-clip-text bg-gradient-to-r from-accent-green to-green-300 font-mono leading-none"><span id="counter-quic">—</span> <span class="text-sm font-bold text-accent-green">Ops/sec</span></span>
+                    </div>
+                </div>
+            </div>
+            <div class="w-full h-[340px] relative mt-2">
+                <canvas id="throughputCanvas" class="w-full h-full"></canvas>
+            </div>
+        </div>
     </div>
-  </div>
 
+    <!-- ═══════ RESULTS AREA (hidden until benchmark completes) ═══════ -->
+    <div id="resultsSection" class="section-reveal results-reveal">
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <!-- Latency Distribution & Progress -->
+            <div class="lg:col-span-1 glass-card rounded-xl p-6 flex flex-col gap-6" id="latencySection">
+                <h3 class="text-slate-100 text-lg font-bold">Latency Distribution</h3>
+                <div class="flex flex-col gap-5 mt-2 flex-1 justify-between">
+                    
+                    <!-- Chart 1 (Classic REST) -->
+                    <div class="flex flex-col gap-2">
+                        <div class="flex justify-between text-xs mb-1">
+                            <span class="text-slate-300 font-medium tracking-wide border-b border-slate-700/50 pb-1">REST API</span>
+                            <span class="text-slate-400 font-mono" id="avg-classic">— avg</span>
+                        </div>
+                        <div class="h-16 flex items-end gap-[2px] w-full" id="hist-classic"></div>
+                        <div class="w-full bg-surface-darker h-1.5 rounded-full overflow-hidden mt-1 relative">
+                            <div class="bg-slate-500 h-full w-[0%] transition-all duration-200" id="prog-classic"></div>
+                        </div>
+                    </div>
+
+                    <!-- Chart 2 (WormDB + Auth) -->
+                    <div class="flex flex-col gap-2">
+                        <div class="flex justify-between text-xs mb-1">
+                            <span class="text-primary-light font-medium tracking-wide flex items-center gap-1.5 border-b border-primary/20 pb-1"><div class="w-2 h-2 rounded-full bg-primary-light"></div> WormDB + Auth</span>
+                            <span class="text-primary-light font-mono" id="avg-auth">— avg</span>
+                        </div>
+                        <div class="h-16 flex items-end gap-[2px] w-full" id="hist-auth"></div>
+                        <div class="w-full bg-surface-darker h-1.5 rounded-full overflow-hidden mt-1 relative">
+                            <div class="bg-primary h-full w-[0%] transition-all duration-200" id="prog-auth"></div>
+                        </div>
+                    </div>
+
+                    <!-- Chart 3 (WormDB No Auth) -->
+                    <div class="flex flex-col gap-2">
+                        <div class="flex justify-between text-xs mb-1">
+                            <span class="text-purple-300 font-medium tracking-wide flex items-center gap-1.5 border-b border-accent-purple/20 pb-1"><div class="w-2 h-2 rounded-full bg-accent-purple"></div> WormDB No Auth</span>
+                            <span class="text-purple-300 font-mono" id="avg-noauth">— avg</span>
+                        </div>
+                        <div class="h-16 flex items-end gap-[2px] w-full" id="hist-noauth"></div>
+                        <div class="w-full bg-surface-darker h-1.5 rounded-full overflow-hidden mt-1 relative">
+                            <div class="bg-accent-purple h-full w-[0%] transition-all duration-200" id="prog-noauth"></div>
+                        </div>
+                    </div>
+
+                    <!-- Chart 4 (QUIC WebTransport) -->
+                    <div class="flex flex-col gap-2">
+                        <div class="flex justify-between text-xs mb-1">
+                            <span class="text-green-300 font-medium tracking-wide flex items-center gap-1.5 border-b border-accent-green/20 pb-1"><div class="w-2 h-2 rounded-full bg-accent-green"></div> QUIC WebTransport</span>
+                            <span class="text-green-300 font-mono" id="avg-quic">— avg</span>
+                        </div>
+                        <div class="h-16 flex items-end gap-[2px] w-full" id="hist-quic"></div>
+                        <div class="w-full bg-surface-darker h-1.5 rounded-full overflow-hidden mt-1 relative">
+                            <div class="bg-accent-green h-full w-[0%] transition-all duration-200" id="prog-quic"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Comparison Table -->
+            <div class="lg:col-span-2 glass-card rounded-xl p-6 overflow-hidden flex flex-col">
+                <h3 class="text-slate-100 text-lg font-bold mb-4">Detailed Performance Metrics</h3>
+                <div class="overflow-x-auto w-full flex-1">
+                    <table class="w-full text-left border-collapse whitespace-nowrap">
+                        <thead>
+                            <tr class="border-b border-border-dark text-slate-400 text-xs uppercase tracking-wider">
+                                <th class="py-3 px-4 font-semibold">Architecture</th>
+                                <th class="py-3 px-2 font-semibold text-right">Min</th>
+                                <th class="py-3 px-2 font-semibold text-right">Median</th>
+                                <th class="py-3 px-2 font-semibold text-right">Mean</th>
+                                <th class="py-3 px-2 font-semibold text-right">P95</th>
+                                <th class="py-3 px-2 font-semibold text-right">P99</th>
+                                <th class="py-3 px-2 font-semibold text-right">Max</th>
+                                <th class="py-3 px-2 font-semibold text-right">Std Dev</th>
+                                <th class="py-3 px-2 font-semibold text-right">Ops/sec</th>
+                            </tr>
+                        </thead>
+                        <tbody class="text-sm divide-y divide-border-dark/50" id="resultsBody">
+                        </tbody>
+                    </table>
+                </div>
+                
+                <!-- Footer Actions -->
+                <div class="mt-auto pt-6 flex justify-end gap-3 border-t border-border-dark/50">
+                    <button id="exportJson" class="flex items-center gap-2 px-4 py-2 rounded-lg bg-surface-darker hover:bg-surface-dark border border-border-dark text-slate-300 text-sm font-medium transition-colors">
+                        <span class="material-symbols-outlined text-[18px]">data_object</span>
+                        Export JSON
+                    </button>
+                    <button id="exportCsv" class="flex items-center gap-2 px-4 py-2 rounded-lg bg-surface-darker hover:bg-surface-dark border border-border-dark text-slate-300 text-sm font-medium transition-colors">
+                        <span class="material-symbols-outlined text-[18px]">table_chart</span>
+                        Export CSV
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</main>
+</div>
 </div>
 
 <script type="module">
-  import { WormDB } from '../dist/index.js';
+    import { WormDB } from '../dist/index.js';
 
-  // ── State ──────────────────────────────────────────────────────
-  let currentTest = 'write';
-  let isRunning = false;
-  let benchResults = {};
+    // ── State ──────────────────────────────────────────────────────
+    let currentTest = 'write';
+    let isRunning = false;
+    let benchResults = {};
 
-  // ── DOM ────────────────────────────────────────────────────────
-  const $ = id => document.getElementById(id);
-  const runBtn = $('runBtn');
-  const runStatus = $('runStatus');
-  const progressSection = $('progressSection');
-  const resultsSection = $('resultsSection');
+    // ── DOM Utilities ──────────────────────────────────────────────
+    const $ = id => document.getElementById(id);
+    const runBtn = $('runBtn');
+    const runStatus = $('runStatus');
+    const throughputSection = $('throughputSection');
+    const resultsSection = $('resultsSection');
 
-  // ── Test Tab Selection ─────────────────────────────────────────
-  const testTabs = document.querySelectorAll('.test-tab');
-  testTabs.forEach(tab => {
-    tab.addEventListener('click', () => {
-      if (isRunning || tab.classList.contains('disabled')) return;
-      testTabs.forEach(t => t.classList.remove('active'));
-      tab.classList.add('active');
-      currentTest = tab.dataset.test;
+    // ── Test Tab Selection ─────────────────────────────────────────
+    const radios = document.querySelectorAll('.test-radio');
+    radios.forEach(radio => {
+        radio.addEventListener('change', (e) => {
+            if (isRunning) { e.preventDefault(); return; }
+            currentTest = e.target.value;
+        });
     });
-  });
 
-  // ── Endpoint Health Check ──────────────────────────────────────
-  async function checkEndpoints() {
-    const checks = [
-      { id: 'api', test: async () => { await fetch($('cfgApiUrl').value + '/api/status'); } },
-      { id: 'auth-provider', test: async () => { await fetch($('cfgAuthProvider').value + '/auth/keys'); } },
-      { id: 'ws-auth', test: async () => { await probeWs($('cfgWsAuth').value); } },
-      { id: 'ws-noauth', test: async () => { await probeWs($('cfgWsNoAuth').value); } },
-    ];
+    // ── Endpoint Health Check ──────────────────────────────────────
+    async function checkEndpoints() {
+        const checks = [
+            { id: 'api', test: async () => { await fetch($('cfgApiUrl').value + '/api/status'); } },
+            { id: 'auth-provider', test: async () => { await fetch($('cfgAuthProvider').value + '/auth/keys'); } },
+            { id: 'ws-auth', test: async () => { await probeWs($('cfgWsAuth').value); } },
+            { id: 'ws-noauth', test: async () => { await probeWs($('cfgWsNoAuth').value); } },
+        ];
 
-    for (const c of checks) {
-      try {
-        await c.test();
-        $('dot-' + c.id).className = 'dot ok';
-      } catch {
-        $('dot-' + c.id).className = 'dot err';
-      }
+        for (const c of checks) {
+            c.test().then(() => {
+                const dot = $('dot-' + c.id);
+                if(dot) dot.className = 'w-2 h-2 rounded-full pulse-dot bg-accent-green transition-colors';
+                const url = $('url-' + c.id);
+                const inputId = 'cfg' + c.id.replace('api', 'ApiUrl').replace('auth-provider', 'AuthProvider').replace('ws-auth', 'WsAuth').replace('ws-noauth', 'WsNoAuth');
+                const inputUrl = $(inputId);
+                if(url && inputUrl) url.textContent = inputUrl.value.replace('http://','').replace('https://','').replace('ws://','').replace('wss://','');
+            }).catch(() => {
+                const dot = $('dot-' + c.id);
+                if(dot) dot.className = 'w-2 h-2 rounded-full bg-red-500 transition-colors';
+            });
+        }
     }
-  }
 
-  function probeWs(url) {
-    return new Promise((resolve, reject) => {
-      const ws = new WebSocket(url);
-      const timer = setTimeout(() => { ws.close(); reject(new Error('timeout')); }, 2000);
-      ws.onopen = () => { clearTimeout(timer); ws.close(); resolve(); };
-      ws.onerror = () => { clearTimeout(timer); reject(new Error('ws error')); };
+    function probeWs(url) {
+        return new Promise((resolve, reject) => {
+            const ws = new WebSocket(url);
+            const timer = setTimeout(() => { ws.close(); reject(new Error('timeout')); }, 2000);
+            ws.onopen = () => { clearTimeout(timer); ws.close(); resolve(); };
+            ws.onerror = () => { clearTimeout(timer); reject(new Error('ws error')); };
+        });
+    }
+
+    checkEndpoints();
+    setInterval(checkEndpoints, 10000);
+
+    // ── Payload Generator ──────────────────────────────────────────
+    function generatePayload(size) {
+        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+        let result = '';
+        for (let i = 0; i < size; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
+        }
+        return result;
+    }
+
+    // ── Formatting ─────────────────────────────────────────────────
+    function fmtMs(v) {
+        if (v < 0.001) return '0µs';
+        if (v < 1) return `${(v * 1000).toFixed(0)}µs`;
+        return `${v.toFixed(3)}ms`;
+    }
+
+    // ── Statistics ─────────────────────────────────────────────────
+    function calcStats(latencies, elapsedMs) {
+        if (!latencies || !latencies.length) return null;
+        const sorted = [...latencies].sort((a, b) => a - b);
+        const n = sorted.length;
+        const sum = sorted.reduce((a, b) => a + b, 0);
+        const mean = sum / n;
+        const variance = sorted.reduce((s, v) => s + (v - mean) ** 2, 0) / n;
+        const pct = p => sorted[Math.min(Math.floor(n * p), n - 1)];
+
+        // If wall-clock elapsed time is provided (e.g. for pipelined benchmarks),
+        // use it for ops/sec; otherwise fall back to 1000/mean.
+        const opsPerSec = elapsedMs ? Math.round((n / elapsedMs) * 1000) : Math.round(1000 / mean);
+
+        return {
+            min: sorted[0],
+            max: sorted[n - 1],
+            mean,
+            median: pct(0.5),
+            p95: pct(0.95),
+            p99: pct(0.99),
+            stddev: Math.sqrt(variance),
+            opsPerSec,
+            count: n,
+            raw: sorted,
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // ── Real-Time Throughput Chart Engine (Canvas 2D) ──────────────
+    // ═══════════════════════════════════════════════════════════════
+    const CHART_COLORS = {
+        classic: { line: '#94a3b8', fill: 'rgba(148, 163, 184, 0.15)', glow: 'rgba(148, 163, 184, 0.4)' },
+        auth:    { line: '#3b82f6', fill: 'rgba(59, 130, 246, 0.2)',  glow: 'rgba(59, 130, 246, 0.5)' },
+        noauth:  { line: '#8b5cf6', fill: 'rgba(139, 92, 246, 0.25)', glow: 'rgba(139, 92, 246, 0.6)' },
+        quic:    { line: '#10b981', fill: 'rgba(16, 185, 129, 0.25)', glow: 'rgba(16, 185, 129, 0.6)' },
+    };
+    const GRID_COLOR = '#27272a';
+    const MAX_POINTS = 200;
+
+    // Per-lane time series
+    let chartData = { classic: [], auth: [], noauth: [], quic: [] };
+    let chartPeaks = { classic: 0, auth: 0, noauth: 0, quic: 0 };
+    let chartAnimFrame = null;
+
+    function resetChart() {
+        chartData = { classic: [], auth: [], noauth: [], quic: [] };
+        chartPeaks = { classic: 0, auth: 0, noauth: 0, quic: 0 };
+        for (const id of ['classic', 'auth', 'noauth', 'quic']) {
+            $(`counter-${id}`).textContent = '—';
+            $(`counter-${id}-wrap`).style.display = 'none';
+        }
+    }
+
+    function pushChartSample(lane, opsPerSec) {
+        const series = chartData[lane];
+        series.push({ t: performance.now(), ops: opsPerSec });
+        if (series.length > MAX_POINTS) series.shift();
+        if (opsPerSec > chartPeaks[lane]) chartPeaks[lane] = opsPerSec;
+
+        // Update live counter
+        const counterEl = $(`counter-${lane}`);
+        if (counterEl) counterEl.textContent = Math.round(opsPerSec).toLocaleString();
+    }
+
+    function drawChart() {
+        const canvas = $('throughputCanvas');
+        if (!canvas) return;
+        const dpr = window.devicePixelRatio || 1;
+        const rect = canvas.getBoundingClientRect();
+        canvas.width = rect.width * dpr;
+        canvas.height = rect.height * dpr;
+        const ctx = canvas.getContext('2d');
+        ctx.scale(dpr, dpr);
+        const W = rect.width;
+        const H = rect.height;
+
+        // Clear
+        ctx.clearRect(0, 0, W, H);
+
+        // Find global max ops for Y-axis
+        let globalMax = 100;
+        for (const lane of ['classic', 'auth', 'noauth', 'quic']) {
+            if (chartPeaks[lane] > globalMax) globalMax = chartPeaks[lane];
+        }
+        globalMax = Math.ceil(globalMax * 1.15); // 15% headroom
+
+        // Grid lines
+        ctx.strokeStyle = GRID_COLOR;
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 4]);
+        const gridRows = 4;
+        for (let i = 1; i <= gridRows; i++) {
+            const y = H - (H * i / (gridRows + 1));
+            ctx.beginPath();
+            ctx.moveTo(0, y);
+            ctx.lineTo(W, y);
+            ctx.stroke();
+
+            // Y-axis labels
+            const val = Math.round(globalMax * i / (gridRows + 1));
+            ctx.fillStyle = '#52525b';
+            ctx.font = '10px Inter, sans-serif';
+            ctx.textAlign = 'left';
+            ctx.fillText(val.toLocaleString(), 4, y - 4);
+        }
+        ctx.setLineDash([]);
+
+        // Draw each lane (back-to-front: classic, auth, noauth)
+        // Each lane independently spans the full canvas width (normalized by its own sample count)
+        const drawOrder = ['classic', 'auth', 'noauth', 'quic'];
+        for (const lane of drawOrder) {
+            const series = chartData[lane];
+            if (series.length < 2) continue;
+
+            const colors = CHART_COLORS[lane];
+            const xStep = W / (series.length - 1);
+
+            // Build path — each lane fills full width independently
+            ctx.beginPath();
+            for (let i = 0; i < series.length; i++) {
+                const x = i * xStep;
+                const y = H - (series[i].ops / globalMax) * H;
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            }
+
+            // Line stroke with glow
+            ctx.strokeStyle = colors.line;
+            ctx.lineWidth = lane === 'noauth' ? 3 : 2;
+            ctx.shadowColor = colors.glow;
+            ctx.shadowBlur = lane === 'noauth' ? 8 : 4;
+            ctx.stroke();
+            ctx.shadowBlur = 0;
+
+            // Fill area
+            const lastX = (series.length - 1) * xStep;
+            ctx.lineTo(lastX, H);
+            ctx.lineTo(0, H);
+            ctx.closePath();
+            ctx.fillStyle = colors.fill;
+            ctx.fill();
+
+            // Peak dot on the latest point
+            const lastPt = series[series.length - 1];
+            const py = H - (lastPt.ops / globalMax) * H;
+            ctx.beginPath();
+            ctx.arc(lastX, py, 4, 0, Math.PI * 2);
+            ctx.fillStyle = '#09090b';
+            ctx.fill();
+            ctx.strokeStyle = colors.line;
+            ctx.lineWidth = 2.5;
+            ctx.stroke();
+        }
+    }
+
+    function startChartAnimation() {
+        function loop() {
+            drawChart();
+            chartAnimFrame = requestAnimationFrame(loop);
+        }
+        loop();
+    }
+
+    function stopChartAnimation() {
+        if (chartAnimFrame) {
+            cancelAnimationFrame(chartAnimFrame);
+            chartAnimFrame = null;
+        }
+        // Final render
+        drawChart();
+        // Stop live indicator
+        const indicator = $('liveIndicator');
+        if (indicator) indicator.style.display = 'none';
+    }
+
+    // ── Section Visibility ────────────────────────────────────────
+    function showThroughputSection() {
+        throughputSection.classList.add('visible');
+        const indicator = $('liveIndicator');
+        if (indicator) indicator.style.display = '';
+    }
+
+    function hideThroughputSection() {
+        throughputSection.classList.remove('visible');
+    }
+
+    function showResultsSection() {
+        resultsSection.classList.add('visible');
+    }
+
+    function hideResultsSection() {
+        resultsSection.classList.remove('visible');
+    }
+
+    // ── Runners ────────────────────────────────────────────────────
+    async function runClassicLane(test, iterations, payloadSize, warmup, pipelineDepth, onProgress, onSeedProgress) {
+        const apiUrl = $('cfgApiUrl').value;
+        const payload = generatePayload(payloadSize);
+
+        // Build a fetch command for a given key and test type
+        function makeRequest(key) {
+            if (test === 'write' || test === 'burst') {
+                return () => fetch(`${apiUrl}/api/kv/${key}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ value: payload }) });
+            } else if (test === 'read') {
+                return () => fetch(`${apiUrl}/api/kv/${key}`);
+            } else if (test === 'mixed') {
+                if (Math.random() < 0.8) return () => fetch(`${apiUrl}/api/kv/${key}`);
+                return () => fetch(`${apiUrl}/api/kv/${key}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ value: payload }) });
+            }
+        }
+
+        // Pipelined executor
+        async function runPipelinedFetch(cmds, onEach) {
+            const total = cmds.length;
+            let writeIdx = 0, readIdx = 0;
+            const timestamps = new Float64Array(total);
+            const inflight = [];
+
+            const initialBatch = Math.min(pipelineDepth, total);
+            for (let i = 0; i < initialBatch; i++) {
+                timestamps[writeIdx] = performance.now();
+                inflight.push(cmds[writeIdx]());
+                writeIdx++;
+            }
+
+            while (readIdx < total) {
+                await inflight[readIdx];
+                const lat = performance.now() - timestamps[readIdx];
+                readIdx++;
+                if (onEach) onEach(readIdx, total, lat);
+                if (writeIdx < total) {
+                    timestamps[writeIdx] = performance.now();
+                    inflight.push(cmds[writeIdx]());
+                    writeIdx++;
+                }
+            }
+        }
+
+        // Seed phase
+        const seedTotal = Math.max(warmup, iterations);
+        const seedCmds = [];
+        for (let i = 0; i < seedTotal; i++) {
+            seedCmds.push(() => fetch(`${apiUrl}/api/kv/bench:classic:${i}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ value: payload }) }));
+        }
+        await runPipelinedFetch(seedCmds, (done) => { if (onSeedProgress) onSeedProgress(done, seedTotal); });
+
+        // Benchmark phase
+        const benchCmds = [];
+        for (let i = 0; i < iterations; i++) {
+            benchCmds.push(makeRequest(`bench:classic:${i}`));
+        }
+        const latencies = [];
+        const t0 = performance.now();
+        await runPipelinedFetch(benchCmds, (done, total, lat) => {
+            latencies.push(lat);
+            onProgress(done, total, latencies);
+        });
+        const elapsedMs = performance.now() - t0;
+        return { latencies, elapsedMs };
+    }
+
+    async function runWormDBLane(wsUrl, authProviderUrl, test, iterations, payloadSize, warmup, pipelineDepth, onProgress, onSeedProgress) {
+        const payload = generatePayload(payloadSize);
+        const opts = { url: wsUrl, autoReconnect: false, timeoutMs: 10000 };
+        if (authProviderUrl) {
+            try {
+                const resp = await fetch(`${authProviderUrl}/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'benchmark', scope: 'benchmark' }) });
+                const data = await resp.json();
+                if (data.token) opts.tokenProvider = () => new Uint8Array(data.token.match(/.{2}/g).map(b => parseInt(b, 16)));
+            } catch (err) { console.warn('[bench] Auth provider unavailable:', err.message); }
+        }
+        const db = new WormDB(opts);
+        await db.connect();
+
+        function makeCmd(key) {
+            if (test === 'write' || test === 'burst') return () => db.set(key, payload);
+            else if (test === 'read') return () => db.get(key);
+            else if (test === 'mixed') {
+                return Math.random() < 0.8 ? () => db.get(key) : () => db.set(key, payload);
+            }
+        }
+
+        // Pipelined executor for WormDB
+        async function runPipelinedWS(cmds, onEach) {
+            const total = cmds.length;
+            let writeIdx = 0, readIdx = 0;
+            const timestamps = new Float64Array(total);
+            const promises = [];
+
+            const initialBatch = Math.min(pipelineDepth, total);
+            for (let i = 0; i < initialBatch; i++) {
+                timestamps[writeIdx] = performance.now();
+                promises.push(cmds[writeIdx]());
+                writeIdx++;
+            }
+
+            while (readIdx < total) {
+                await promises[readIdx];
+                const lat = performance.now() - timestamps[readIdx];
+                readIdx++;
+                if (onEach) onEach(readIdx, total, lat);
+                if (writeIdx < total) {
+                    timestamps[writeIdx] = performance.now();
+                    promises.push(cmds[writeIdx]());
+                    writeIdx++;
+                }
+            }
+        }
+
+        // Seed phase
+        const seedTotal = Math.max(warmup, iterations);
+        const seedCmds = [];
+        for (let i = 0; i < seedTotal; i++) {
+            seedCmds.push(() => db.set(`bench:worm:${i}`, payload));
+        }
+        await runPipelinedWS(seedCmds, (done) => { if (onSeedProgress) onSeedProgress(done, seedTotal); });
+
+        // Benchmark phase
+        const benchCmds = [];
+        for (let i = 0; i < iterations; i++) {
+            benchCmds.push(makeCmd(`bench:worm:${i}`));
+        }
+        const latencies = [];
+        const t0 = performance.now();
+        await runPipelinedWS(benchCmds, (done, total, lat) => {
+            latencies.push(lat);
+            onProgress(done, total, latencies);
+        });
+        const elapsedMs = performance.now() - t0;
+        await db.close();
+        return { latencies, elapsedMs };
+    }
+
+    // ── WormWire Binary Protocol Helpers ──────────────────────────
+    const textEncoder = new TextEncoder();
+    const textDecoder = new TextDecoder();
+
+    function wormWireSet(key, value) {
+        const keyBytes = textEncoder.encode(key);
+        const valBytes = textEncoder.encode(value);
+        // SET: [1B cmd=0x02][4B payload_len][1B flags=0x00][4B key_len][key][4B val_len][val]
+        const payloadLen = 1 + 4 + keyBytes.length + 4 + valBytes.length;
+        const buf = new ArrayBuffer(5 + payloadLen);
+        const dv = new DataView(buf);
+        dv.setUint8(0, 0x02);                      // cmd: set
+        dv.setUint32(1, payloadLen, false);          // BE payload length
+        dv.setUint8(5, 0x00);                       // flags
+        dv.setUint32(6, keyBytes.length, false);     // BE key length
+        new Uint8Array(buf, 10, keyBytes.length).set(keyBytes);
+        dv.setUint32(10 + keyBytes.length, valBytes.length, false);
+        new Uint8Array(buf, 14 + keyBytes.length, valBytes.length).set(valBytes);
+        return new Uint8Array(buf);
+    }
+
+    function wormWireGet(key) {
+        const keyBytes = textEncoder.encode(key);
+        // GET: [1B cmd=0x01][4B payload_len][4B key_len][key]
+        const payloadLen = 4 + keyBytes.length;
+        const buf = new ArrayBuffer(5 + payloadLen);
+        const dv = new DataView(buf);
+        dv.setUint8(0, 0x01);                       // cmd: get
+        dv.setUint32(1, payloadLen, false);           // BE payload length
+        dv.setUint32(5, keyBytes.length, false);      // BE key length
+        new Uint8Array(buf, 9, keyBytes.length).set(keyBytes);
+        return new Uint8Array(buf);
+    }
+
+    async function readWormWireResponse(reader) {
+        // Read header: [1B status][4B payload_len]
+        let headerBuf = new Uint8Array(5);
+        let offset = 0;
+        while (offset < 5) {
+            const { value, done } = await reader.read();
+            if (done) throw new Error('Stream closed before response header');
+            const chunk = new Uint8Array(value.buffer || value);
+            const need = Math.min(chunk.length, 5 - offset);
+            headerBuf.set(chunk.subarray(0, need), offset);
+            offset += need;
+        }
+        const status = headerBuf[0];
+        const payloadLen = new DataView(headerBuf.buffer).getUint32(1, false);
+        // Read payload (if any) — we don't need the body for benchmarking
+        let remaining = payloadLen;
+        while (remaining > 0) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            remaining -= (value.byteLength || value.length);
+        }
+        return status; // 0x00 = ok, 0x01 = value, 0x03 = err
+    }
+
+    // ── QUIC/WebTransport Runner ────────────────────────────────
+    async function runQuicLane(quicUrl, test, iterations, payloadSize, warmup, pipelineDepth, onProgress, onSeedProgress) {
+        if (typeof WebTransport === 'undefined') {
+            throw new Error('WebTransport not supported in this browser');
+        }
+
+        const PIPELINE_DEPTH = pipelineDepth;
+
+        // Fetch certificate fingerprint for self-signed cert
+        let transportOpts = {};
+        try {
+            const fpResp = await fetch('/demo/fingerprint.txt');
+            if (fpResp.ok) {
+                const fpB64 = (await fpResp.text()).trim();
+                const fpBytes = Uint8Array.from(atob(fpB64), c => c.charCodeAt(0));
+                transportOpts.serverCertificateHashes = [{
+                    algorithm: 'sha-256',
+                    value: fpBytes.buffer
+                }];
+            }
+        } catch (e) {
+            console.warn('[bench] Could not fetch cert fingerprint:', e.message);
+        }
+
+        const transport = new WebTransport(quicUrl, transportOpts);
+        await transport.ready;
+
+        const payload = generatePayload(payloadSize);
+
+        // Open a single persistent bidi-stream
+        const stream = await transport.createBidirectionalStream();
+        const writer = stream.writable.getWriter();
+        const reader = stream.readable.getReader();
+        let readBuf = new Uint8Array(0);
+
+        // Append incoming data to readBuf
+        async function fillBuffer() {
+            const { value, done } = await reader.read();
+            if (done) throw new Error('Stream closed unexpectedly');
+            const chunk = new Uint8Array(value.buffer || value);
+            if (readBuf.length === 0) {
+                readBuf = chunk;
+            } else {
+                const combined = new Uint8Array(readBuf.length + chunk.length);
+                combined.set(readBuf);
+                combined.set(chunk, readBuf.length);
+                readBuf = combined;
+            }
+        }
+
+        // Read one WormWire response [1B status][4B payload_len][payload]
+        async function readOneResponse() {
+            while (readBuf.length < 5) await fillBuffer();
+            const payloadLen = new DataView(readBuf.buffer, readBuf.byteOffset).getUint32(1, false);
+            const totalLen = 5 + payloadLen;
+            while (readBuf.length < totalLen) await fillBuffer();
+            const status = readBuf[0];
+            readBuf = readBuf.subarray(totalLen);
+            return status;
+        }
+
+        // ── Pipelined bulk execution ──────────────────────────────
+        // Fires writes without waiting and reads responses asynchronously
+        async function runPipelined(cmds, onEach) {
+            const total = cmds.length;
+            let writeIdx = 0;
+            let readIdx = 0;
+            const timestamps = new Float64Array(total);
+
+            // Kick off initial batch of writes
+            const initialBatch = Math.min(PIPELINE_DEPTH, total);
+            for (let i = 0; i < initialBatch; i++) {
+                timestamps[writeIdx] = performance.now();
+                writer.write(cmds[writeIdx]); // fire-and-forget (no await)
+                writeIdx++;
+            }
+
+            // Read responses and refill the pipeline
+            while (readIdx < total) {
+                await readOneResponse();
+                const lat = performance.now() - timestamps[readIdx];
+                readIdx++;
+                if (onEach) onEach(readIdx, total, lat);
+
+                // Send next command to keep pipeline full
+                if (writeIdx < total) {
+                    timestamps[writeIdx] = performance.now();
+                    writer.write(cmds[writeIdx]); // fire-and-forget
+                    writeIdx++;
+                }
+            }
+
+            return timestamps;
+        }
+
+        // ── Seed phase (pipelined) ───────────────────────────────
+        const seedTotal = Math.max(warmup, iterations);
+        const seedCmds = [];
+        for (let i = 0; i < seedTotal; i++) {
+            seedCmds.push(wormWireSet(`bench:quic:${i}`, payload));
+        }
+        let seedDone = 0;
+        await runPipelined(seedCmds, (done) => {
+            seedDone = done;
+            if (onSeedProgress) onSeedProgress(done, seedTotal);
+        });
+
+        // ── Benchmark phase (pipelined) ──────────────────────────
+        const benchCmds = [];
+        for (let i = 0; i < iterations; i++) {
+            const key = `bench:quic:${i}`;
+            if (test === 'write') benchCmds.push(wormWireSet(key, payload));
+            else if (test === 'read') benchCmds.push(wormWireGet(key));
+            else if (test === 'mixed') {
+                benchCmds.push(Math.random() < 0.8 ? wormWireGet(key) : wormWireSet(key, payload));
+            }
+            else if (test === 'burst') benchCmds.push(wormWireSet(key, payload));
+        }
+
+        const latencies = [];
+        const t0Bench = performance.now();
+        await runPipelined(benchCmds, (done, total, lat) => {
+            latencies.push(lat);
+            onProgress(done, total, latencies);
+        });
+        const benchElapsed = performance.now() - t0Bench;
+
+        // Cleanup
+        await writer.close();
+        reader.releaseLock();
+        transport.close();
+        return { latencies, elapsedMs: benchElapsed };
+    }
+
+    // ── CSS DOM Histogram Builder ────────────────────────────────
+    function drawCSSHistogram(containerId, latencies, colorClass, altColorClass) {
+        const container = $(containerId);
+        container.innerHTML = '';
+        if (!latencies || !latencies.length) {
+            container.innerHTML = '<div class="w-full h-full flex items-center justify-center text-xs text-slate-500 font-mono">No data</div>';
+            return;
+        }
+
+        const sorted = [...latencies].sort((a, b) => a - b);
+        const min = sorted[0];
+        const max = sorted[sorted.length - 1];
+        const bins = 40;
+        const binWidth = (max - min) / bins || 1;
+        const counts = new Array(bins).fill(0);
+
+        for (const v of sorted) {
+            const idx = Math.min(Math.floor((v - min) / binWidth), bins - 1);
+            counts[idx]++;
+        }
+
+        const maxCount = Math.max(...counts, 1);
+        
+        for (let i = 0; i < bins; i++) {
+            let pct = (counts[i] / maxCount) * 100;
+            if (counts[i] > 0 && pct < 5) pct = 5;
+            
+            const col = document.createElement('div');
+            col.className = `w-full ${colorClass} rounded-t-[1px] bar-col`;
+            col.style.height = `${pct}%`;
+            
+            if (i > bins * 0.8 && counts[i] > 0 && altColorClass) {
+                col.className = `w-full ${altColorClass} rounded-t-[1px] bar-col`;
+            }
+            
+            container.appendChild(col);
+        }
+    }
+
+    // ── Render Results ─────────────────────────────────────────────
+    function renderResults(results) {
+        const body = $('resultsBody');
+        body.innerHTML = '';
+
+        const lanes = [
+            { key: 'classic', name: 'REST API', class: 'text-slate-200' },
+            { key: 'auth', name: 'WormDB + Auth', class: 'text-primary-light' },
+            { key: 'noauth', name: 'WormDB No Auth', class: 'text-purple-300' },
+            { key: 'quic', name: 'QUIC WebTransport', class: 'text-green-300' }
+        ];
+
+        const metrics = ['min', 'median', 'mean', 'p95', 'p99', 'max', 'stddev', 'opsPerSec'];
+        const winners = {};
+        for (const m of metrics) {
+            let best = m === 'opsPerSec' ? 0 : Infinity;
+            let bestKey = '';
+            for (const l of lanes) {
+                if (results[l.key]) {
+                    const v = results[l.key][m];
+                    if ((m === 'opsPerSec' && v > best) || (m !== 'opsPerSec' && v < best)) {
+                        best = v;
+                        bestKey = l.key;
+                    }
+                }
+            }
+            winners[m] = bestKey;
+        }
+
+        for (const lane of lanes) {
+            const s = results[lane.key];
+            if (!s) continue;
+
+            const tr = document.createElement('tr');
+            const isWinner = winners.opsPerSec === lane.key;
+            tr.className = `hover:bg-surface-dark/50 transition-colors ${isWinner ? 'bg-accent-green/5' : ''}`;
+            
+            const fmt = (v, metric) => {
+                const metricWinner = winners[metric] === lane.key;
+                return `<td class="py-4 px-2 text-right font-mono ${metricWinner ? 'glow-text font-bold' : 'text-slate-300'}">${fmtMs(v)}</td>`;
+            };
+
+            tr.innerHTML = `
+                <td class="py-4 px-4 font-medium ${lane.class} flex items-center gap-2">
+                    ${lane.name} ${isWinner ? '<span class="material-symbols-outlined text-[14px] text-accent-green">emoji_events</span>' : ''}
+                </td>
+                ${fmt(s.min, 'min')}
+                ${fmt(s.median, 'median')}
+                ${fmt(s.mean, 'mean')}
+                ${fmt(s.p95, 'p95')}
+                ${fmt(s.p99, 'p99')}
+                ${fmt(s.max, 'max')}
+                ${fmt(s.stddev, 'stddev')}
+                <td class="py-4 px-2 text-right font-mono ${isWinner ? 'glow-text font-bold' : 'text-slate-300'}">${s.opsPerSec.toLocaleString()}</td>
+            `;
+            body.appendChild(tr);
+        }
+    }
+
+    // ── Throughput Sampler ─────────────────────────────────────────
+    // Batches latency samples and computes rolling ops/sec
+    function createThroughputSampler(lane, sampleIntervalMs = 20) {
+        let lastSampleTime = performance.now();
+        let lastSampleCount = 0;
+
+        return function onProgress(done, total, latencies) {
+            const now = performance.now();
+            const elapsed = now - lastSampleTime;
+            if (elapsed >= sampleIntervalMs || done === total) {
+                const newOps = done - lastSampleCount;
+                if (newOps > 0 && elapsed > 0) {
+                    const opsPerSec = (newOps / elapsed) * 1000;
+                    pushChartSample(lane, opsPerSec);
+                }
+                lastSampleTime = now;
+                lastSampleCount = done;
+            }
+
+            // Also update progress bar
+            const pct = Math.round((done / total) * 100);
+            $(`prog-${lane === 'classic' ? 'classic' : lane}`).style.width = pct + '%';
+        };
+    }
+
+    // ── Core Flow ──────────────────────────────────────────────────
+    async function runBenchmark() {
+        if (isRunning) return;
+        isRunning = true;
+        runBtn.disabled = true;
+        runBtn.classList.add('running-btn');
+        runBtn.querySelector('.run-icon').classList.add('animate-spin');
+        runBtn.querySelector('.run-icon').textContent = 'sync';
+        runBtn.querySelector('.run-text').textContent = 'Running…';
+        runStatus.textContent = '';
+
+        const test = currentTest;
+        const iterations = parseInt($('iterations').value);
+        const payloadSize = parseInt($('payloadSize').value);
+        const warmup = parseInt($('warmup').value);
+        const pipelineDepth = parseInt($('pipelineDepth').value);
+
+        // Reset state  
+        resetChart();
+        for (const id of ['classic', 'auth', 'noauth', 'quic']) $(`prog-${id}`).style.width = '0%';
+        for (const id of ['avg-classic', 'avg-auth', 'avg-noauth', 'avg-quic']) $(id).textContent = '— avg';
+        hideResultsSection();
+
+        // Show throughput chart with animation
+        showThroughputSection();
+        startChartAnimation();
+
+        const results = {};
+
+        const seedStatus = (label) => (done, total) => {
+            runStatus.textContent = `Seeding ${label}… ${done}/${total} keys`;
+        };
+
+        try {
+            // Lane 1: Classic REST
+            runStatus.textContent = 'Seeding REST API keys…';
+            $('counter-classic-wrap').style.display = '';
+            const classicSampler = createThroughputSampler('classic');
+            const classicResult = await runClassicLane(test, iterations, payloadSize, warmup, pipelineDepth, classicSampler, seedStatus('REST API'));
+            runStatus.textContent = 'Measuring REST API…';
+            results.classic = calcStats(classicResult.latencies, classicResult.elapsedMs);
+            $('avg-classic').textContent = fmtMs(results.classic.mean) + ' avg';
+            drawCSSHistogram('hist-classic', classicResult.latencies, 'bg-slate-500', 'bg-slate-700');
+
+            // Lane 2: WormDB + Auth
+            runStatus.textContent = 'Seeding WormDB + Auth keys…';
+            $('counter-auth-wrap').style.display = '';
+            const authSampler = createThroughputSampler('auth');
+            const authResult = await runWormDBLane($('cfgWsAuth').value, $('cfgAuthProvider').value, test, iterations, payloadSize, warmup, pipelineDepth, authSampler, seedStatus('WormDB + Auth'));
+            runStatus.textContent = 'Measuring WormDB + Auth…';
+            results.auth = calcStats(authResult.latencies, authResult.elapsedMs);
+            $('avg-auth').textContent = fmtMs(results.auth.mean) + ' avg';
+            drawCSSHistogram('hist-auth', authResult.latencies, 'bg-primary', 'bg-primary/40');
+
+            // Lane 3: WormDB Direct
+            runStatus.textContent = 'Seeding WormDB Direct keys…';
+            $('counter-noauth-wrap').style.display = '';
+            const noauthSampler = createThroughputSampler('noauth');
+            const noauthResult = await runWormDBLane($('cfgWsNoAuth').value, null, test, iterations, payloadSize, warmup, pipelineDepth, noauthSampler, seedStatus('WormDB Direct'));
+            runStatus.textContent = 'Measuring WormDB Direct…';
+            results.noauth = calcStats(noauthResult.latencies, noauthResult.elapsedMs);
+            $('avg-noauth').textContent = fmtMs(results.noauth.mean) + ' avg';
+            drawCSSHistogram('hist-noauth', noauthResult.latencies, 'bg-accent-purple', 'bg-accent-purple/40');
+
+            // Lane 4: QUIC WebTransport
+            runStatus.textContent = 'Connecting QUIC WebTransport…';
+            $('counter-quic-wrap').style.display = '';
+            const quicSampler = createThroughputSampler('quic');
+            try {
+                const quicResult = await runQuicLane($('cfgQuicUrl').value, test, iterations, payloadSize, warmup, pipelineDepth, quicSampler, seedStatus('QUIC'));
+                results.quic = calcStats(quicResult.latencies, quicResult.elapsedMs);
+                $('avg-quic').textContent = fmtMs(results.quic.mean) + ' avg';
+                drawCSSHistogram('hist-quic', quicResult.latencies, 'bg-accent-green', 'bg-accent-green/40');
+            } catch (quicErr) {
+                console.warn('[bench] QUIC lane skipped:', quicErr.message);
+                runStatus.textContent = `QUIC skipped: ${quicErr.message}`;
+                $('avg-quic').textContent = 'N/A';
+            }
+
+            // Done — stop chart animation, reveal results
+            stopChartAnimation();
+            runStatus.textContent = `✓ Complete — ${test} test, ${iterations} iters`;
+            benchResults = { test, iterations, payloadSize, warmup, timestamp: new Date().toISOString(), lanes: results };
+            renderResults(results);
+            showResultsSection();
+
+            // Scroll-down hint
+            setTimeout(() => {
+                const hint = document.createElement('div');
+                hint.id = 'scrollHint';
+                hint.className = 'flex flex-col items-center gap-2 mt-6 animate-bounce cursor-pointer';
+                hint.innerHTML = `
+                    <span class="text-sm text-slate-400 font-medium">Scroll down for detailed results</span>
+                    <span class="material-symbols-outlined text-primary text-[28px]">keyboard_double_arrow_down</span>
+                `;
+                hint.addEventListener('click', () => {
+                    resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    hint.remove();
+                });
+                // Insert after the throughput section
+                throughputSection.querySelector('.glass-card').appendChild(hint);
+                // Auto-remove after 6 seconds
+                setTimeout(() => hint.remove(), 6000);
+            }, 400);
+
+        } catch (err) {
+            stopChartAnimation();
+            runStatus.textContent = `✗ Error: ${err.message}`;
+            console.error('[bench]', err);
+        } finally {
+            isRunning = false;
+            runBtn.disabled = false;
+            runBtn.classList.remove('running-btn');
+            runBtn.querySelector('.run-icon').classList.remove('animate-spin');
+            runBtn.querySelector('.run-icon').textContent = 'play_arrow';
+            runBtn.querySelector('.run-text').textContent = 'Run Benchmark';
+        }
+    }
+
+    runBtn.addEventListener('click', runBenchmark);
+
+    // ── Export ──────────────────────────────────────────────────────
+    $('exportJson').addEventListener('click', () => {
+        if (!benchResults.lanes) return;
+        const exportData = JSON.parse(JSON.stringify(benchResults));
+        for (const key of Object.keys(exportData.lanes)) delete exportData.lanes[key].raw;
+        const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `wormdb-bench-${benchResults.test}-${Date.now()}.json`; a.click();
     });
-  }
 
-  checkEndpoints();
-  setInterval(checkEndpoints, 10000);
-
-  // ── Payload Generator ──────────────────────────────────────────
-  function generatePayload(size) {
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    let result = '';
-    for (let i = 0; i < size; i++) {
-      result += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return result;
-  }
-
-  // ── Formatting ─────────────────────────────────────────────────
-  function fmtMs(v) {
-    if (v < 0.001) return '0µs';
-    if (v < 1) return `${(v * 1000).toFixed(0)}µs`;
-    return `${v.toFixed(3)}ms`;
-  }
-
-  // ── Statistics ─────────────────────────────────────────────────
-  function calcStats(latencies) {
-    if (!latencies.length) return null;
-    const sorted = [...latencies].sort((a, b) => a - b);
-    const n = sorted.length;
-    const sum = sorted.reduce((a, b) => a + b, 0);
-    const mean = sum / n;
-    const variance = sorted.reduce((s, v) => s + (v - mean) ** 2, 0) / n;
-    const pct = p => sorted[Math.min(Math.floor(n * p), n - 1)];
-
-    return {
-      min: sorted[0],
-      max: sorted[n - 1],
-      mean,
-      median: pct(0.5),
-      p95: pct(0.95),
-      p99: pct(0.99),
-      stddev: Math.sqrt(variance),
-      opsPerSec: Math.round(1000 / mean),
-      count: n,
-      raw: sorted,
-    };
-  }
-
-  // ── Classic REST Lane ──────────────────────────────────────────
-  async function runClassicLane(test, iterations, payloadSize, warmup, onProgress) {
-    const apiUrl = $('cfgApiUrl').value;
-    const payload = generatePayload(payloadSize);
-    const latencies = [];
-
-    // Warmup: seed keys for read tests
-    for (let i = 0; i < Math.max(warmup, iterations); i++) {
-      await fetch(`${apiUrl}/api/kv/bench:classic:${i}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ value: payload }),
-      });
-      if (i < warmup) continue;
-    }
-
-    // Actual run
-    for (let i = 0; i < iterations; i++) {
-      const key = `bench:classic:${i}`;
-      const t0 = performance.now();
-
-      if (test === 'write') {
-        await fetch(`${apiUrl}/api/kv/${key}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ value: payload }),
-        });
-      } else if (test === 'read') {
-        await fetch(`${apiUrl}/api/kv/${key}`);
-      } else if (test === 'mixed') {
-        if (Math.random() < 0.8) {
-          await fetch(`${apiUrl}/api/kv/${key}`);
-        } else {
-          await fetch(`${apiUrl}/api/kv/${key}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ value: payload }),
-          });
+    $('exportCsv').addEventListener('click', () => {
+        if (!benchResults.lanes) return;
+        let csv = 'Lane,Min,Median,Mean,P95,P99,Max,StdDev,OpsPerSec\n';
+        const names = { classic: 'Classic REST API', auth: 'WormDB + Auth', noauth: 'WormDB Direct', quic: 'QUIC WebTransport' };
+        for (const [k, s] of Object.entries(benchResults.lanes)) {
+            if (s) csv += `"${names[k]}",${s.min.toFixed(4)},${s.median.toFixed(4)},${s.mean.toFixed(4)},${s.p95.toFixed(4)},${s.p99.toFixed(4)},${s.max.toFixed(4)},${s.stddev.toFixed(4)},${s.opsPerSec}\n`;
         }
-      } else if (test === 'burst') {
-        // Fire without waiting — still measure from start to response
-        await fetch(`${apiUrl}/api/kv/${key}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ value: payload }),
-        });
-      }
+        const blob = new Blob([csv], { type: 'text/csv' });
+        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `wormdb-bench-${benchResults.test}-${Date.now()}.csv`; a.click();
+    });
 
-      latencies.push(performance.now() - t0);
-      onProgress(i + 1, iterations);
-    }
-
-    return latencies;
-  }
-
-  // ── WormDB Direct Lane ─────────────────────────────────────────
-  async function runWormDBLane(wsUrl, authProviderUrl, test, iterations, payloadSize, warmup, onProgress) {
-    const payload = generatePayload(payloadSize);
-    const opts = { url: wsUrl, autoReconnect: false, timeoutMs: 10000 };
-
-    // If auth provider URL is set, get a token
-    if (authProviderUrl) {
-      try {
-        const resp = await fetch(`${authProviderUrl}/auth/login`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: 'benchmark', scope: 'benchmark' }),
-        });
-        const data = await resp.json();
-        if (data.token) {
-          const tokenBytes = new Uint8Array(data.token.match(/.{2}/g).map(b => parseInt(b, 16)));
-          opts.tokenProvider = () => tokenBytes;
-        }
-      } catch (err) {
-        console.warn('[bench] Auth provider unavailable:', err.message);
-      }
-    }
-
-    const db = new WormDB(opts);
-    await db.connect();
-
-    // Warmup + seed keys
-    for (let i = 0; i < Math.max(warmup, iterations); i++) {
-      await db.set(`bench:worm:${i}`, payload);
-    }
-
-    const latencies = [];
-
-    for (let i = 0; i < iterations; i++) {
-      const key = `bench:worm:${i}`;
-      const t0 = performance.now();
-
-      if (test === 'write') {
-        await db.set(key, payload);
-      } else if (test === 'read') {
-        await db.get(key);
-      } else if (test === 'mixed') {
-        if (Math.random() < 0.8) {
-          await db.get(key);
-        } else {
-          await db.set(key, payload);
-        }
-      } else if (test === 'burst') {
-        await db.set(key, payload);
-      }
-
-      latencies.push(performance.now() - t0);
-      onProgress(i + 1, iterations);
-    }
-
-    await db.close();
-    return latencies;
-  }
-
-  // ── Draw Histogram ─────────────────────────────────────────────
-  function drawHistogram(canvasId, latencies, color) {
-    const canvas = $(canvasId);
-    const ctx = canvas.getContext('2d');
-    const dpr = window.devicePixelRatio || 1;
-
-    canvas.width = canvas.offsetWidth * dpr;
-    canvas.height = 150 * dpr;
-    ctx.scale(dpr, dpr);
-
-    const w = canvas.offsetWidth;
-    const h = 150;
-
-    ctx.clearRect(0, 0, w, h);
-
-    if (!latencies || !latencies.length) {
-      ctx.fillStyle = '#454d65';
-      ctx.font = '12px Inter';
-      ctx.textAlign = 'center';
-      ctx.fillText('No data', w / 2, h / 2);
-      return;
-    }
-
-    const sorted = [...latencies].sort((a, b) => a - b);
-    const min = sorted[0];
-    const max = sorted[sorted.length - 1];
-    const bins = 40;
-    const binWidth = (max - min) / bins || 1;
-    const counts = new Array(bins).fill(0);
-
-    for (const v of sorted) {
-      const idx = Math.min(Math.floor((v - min) / binWidth), bins - 1);
-      counts[idx]++;
-    }
-
-    const maxCount = Math.max(...counts);
-    const barW = (w - 40) / bins;
-    const margin = 20;
-
-    // Bars
-    for (let i = 0; i < bins; i++) {
-      const barH = maxCount > 0 ? (counts[i] / maxCount) * (h - 35) : 0;
-      const x = margin + i * barW;
-      const y = h - 20 - barH;
-
-      ctx.fillStyle = color + '88';
-      ctx.beginPath();
-      const r = Math.min(2, barW / 2);
-      ctx.roundRect(x, y, barW - 1, barH, [r, r, 0, 0]);
-      ctx.fill();
-    }
-
-    // Axis labels
-    ctx.fillStyle = '#545c76';
-    ctx.font = '10px JetBrains Mono';
-    ctx.textAlign = 'left';
-    ctx.fillText(fmtMs(min), margin, h - 4);
-    ctx.textAlign = 'right';
-    ctx.fillText(fmtMs(max), w - margin, h - 4);
-    ctx.textAlign = 'center';
-
-    const median = sorted[Math.floor(sorted.length * 0.5)];
-    ctx.fillText(`p50: ${fmtMs(median)}`, w / 2, h - 4);
-  }
-
-  // ── Render Results Table ───────────────────────────────────────
-  function renderResults(results) {
-    const body = $('resultsBody');
-    body.innerHTML = '';
-
-    const lanes = [
-      { key: 'classic', name: 'Classic REST API', color: 'var(--lane-classic)' },
-      { key: 'auth', name: 'WormDB + Auth', color: 'var(--lane-auth)' },
-      { key: 'noauth', name: 'WormDB Direct', color: 'var(--lane-noauth)' },
-    ];
-
-    // Find winners for each metric (lower is better except ops/sec)
-    const metrics = ['min', 'median', 'mean', 'p95', 'p99', 'max', 'stddev'];
-    const winners = {};
-    for (const m of metrics) {
-      let best = Infinity, bestKey = '';
-      for (const l of lanes) {
-        if (results[l.key] && results[l.key][m] < best) {
-          best = results[l.key][m];
-          bestKey = l.key;
-        }
-      }
-      winners[m] = bestKey;
-    }
-    // ops/sec: higher is better
-    let bestOps = 0, bestOpsKey = '';
-    for (const l of lanes) {
-      if (results[l.key] && results[l.key].opsPerSec > bestOps) {
-        bestOps = results[l.key].opsPerSec;
-        bestOpsKey = l.key;
-      }
-    }
-    winners['opsPerSec'] = bestOpsKey;
-
-    for (const lane of lanes) {
-      const s = results[lane.key];
-      if (!s) continue;
-
-      const tr = document.createElement('tr');
-      const fmt = (v, metric) => {
-        const isWinner = winners[metric] === lane.key;
-        return `<td class="${isWinner ? 'winner' : ''}">${fmtMs(v)}</td>`;
-      };
-
-      tr.innerHTML = `
-        <td><span class="lane-badge"><span class="dot" style="background: ${lane.color}"></span> ${lane.name}</span></td>
-        ${fmt(s.min, 'min')}
-        ${fmt(s.median, 'median')}
-        ${fmt(s.mean, 'mean')}
-        ${fmt(s.p95, 'p95')}
-        ${fmt(s.p99, 'p99')}
-        ${fmt(s.max, 'max')}
-        ${fmt(s.stddev, 'stddev')}
-        <td class="${winners['opsPerSec'] === lane.key ? 'winner' : ''}">${s.opsPerSec.toLocaleString()}</td>
-      `;
-      body.appendChild(tr);
-    }
-
-    // QUIC placeholder row
-    const quicTr = document.createElement('tr');
-    quicTr.style.opacity = '0.3';
-    quicTr.innerHTML = `
-      <td><span class="lane-badge"><span class="dot" style="background: var(--lane-quic)"></span> HTTP/3 QUIC <span class="coming-soon" style="margin-left: 0.4rem;">COMING SOON</span></span></td>
-      <td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
-    `;
-    body.appendChild(quicTr);
-  }
-
-  // ── Run Benchmark ──────────────────────────────────────────────
-  async function runBenchmark() {
-    if (isRunning) return;
-    isRunning = true;
-    runBtn.disabled = true;
-    runBtn.textContent = '⏳ Running…';
-
-    const test = currentTest;
-    const iterations = parseInt($('iterations').value);
-    const payloadSize = parseInt($('payloadSize').value);
-    const warmup = parseInt($('warmup').value);
-
-    progressSection.classList.add('visible');
-    resultsSection.classList.remove('visible');
-
-    // Reset progress
-    for (const id of ['classic', 'auth', 'noauth']) {
-      $(`prog-${id}`).style.width = '0%';
-      $(`ops-${id}`).textContent = '—';
-    }
-
-    const results = {};
-
-    const makeProgress = (id) => (done, total) => {
-      const pct = Math.round((done / total) * 100);
-      $(`prog-${id}`).style.width = pct + '%';
-      $(`ops-${id}`).textContent = `${done}/${total}`;
-    };
-
-    try {
-      // Lane 1: Classic REST API
-      runStatus.textContent = 'Running Classic REST API…';
-      runStatus.classList.add('pulsing');
-      const classicLatencies = await runClassicLane(test, iterations, payloadSize, warmup, makeProgress('classic'));
-      results.classic = calcStats(classicLatencies);
-
-      // Lane 2: WormDB + Auth
-      runStatus.textContent = 'Running WormDB + Auth…';
-      const authLatencies = await runWormDBLane(
-        $('cfgWsAuth').value, $('cfgAuthProvider').value,
-        test, iterations, payloadSize, warmup, makeProgress('auth')
-      );
-      results.auth = calcStats(authLatencies);
-
-      // Lane 3: WormDB Direct (no auth)
-      runStatus.textContent = 'Running WormDB Direct…';
-      const noauthLatencies = await runWormDBLane(
-        $('cfgWsNoAuth').value, null,
-        test, iterations, payloadSize, warmup, makeProgress('noauth')
-      );
-      results.noauth = calcStats(noauthLatencies);
-
-      // Done
-      runStatus.classList.remove('pulsing');
-      runStatus.textContent = `✓ Complete — ${test} test, ${iterations} iterations, ${payloadSize}B payload`;
-
-      benchResults = {
-        test, iterations, payloadSize, warmup,
-        timestamp: new Date().toISOString(),
-        lanes: results,
-      };
-
-      // Show results
-      resultsSection.classList.add('visible');
-      renderResults(results);
-      drawHistogram('hist-classic', results.classic?.raw, '#3b9cff');
-      drawHistogram('hist-auth', results.auth?.raw, '#b380ff');
-      drawHistogram('hist-noauth', results.noauth?.raw, '#00e5b5');
-      drawHistogram('hist-quic', [], '#545c76');
-
-    } catch (err) {
-      runStatus.classList.remove('pulsing');
-      runStatus.textContent = `✗ Error: ${err.message}`;
-      console.error('[bench]', err);
-    } finally {
-      isRunning = false;
-      runBtn.disabled = false;
-      runBtn.textContent = '▶ Run Benchmark';
-    }
-  }
-
-  runBtn.addEventListener('click', runBenchmark);
-
-  // ── Export ──────────────────────────────────────────────────────
-  $('exportJson').addEventListener('click', () => {
-    if (!benchResults.lanes) return;
-    // Strip raw arrays for concise export, keep stats
-    const exportData = JSON.parse(JSON.stringify(benchResults));
-    for (const key of Object.keys(exportData.lanes)) {
-      delete exportData.lanes[key].raw;
-    }
-    const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `wormdb-bench-${benchResults.test}-${Date.now()}.json`;
-    a.click();
-  });
-
-  $('exportCsv').addEventListener('click', () => {
-    if (!benchResults.lanes) return;
-    const lanes = benchResults.lanes;
-    let csv = 'Lane,Min,Median,Mean,P95,P99,Max,StdDev,OpsPerSec\n';
-    const names = { classic: 'Classic REST API', auth: 'WormDB + Auth', noauth: 'WormDB Direct' };
-    for (const [key, stats] of Object.entries(lanes)) {
-      if (!stats) continue;
-      csv += `"${names[key]}",${stats.min.toFixed(4)},${stats.median.toFixed(4)},${stats.mean.toFixed(4)},${stats.p95.toFixed(4)},${stats.p99.toFixed(4)},${stats.max.toFixed(4)},${stats.stddev.toFixed(4)},${stats.opsPerSec}\n`;
-    }
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `wormdb-bench-${benchResults.test}-${Date.now()}.csv`;
-    a.click();
-  });
-
-  // ── Keyboard shortcut ──────────────────────────────────────────
-  document.addEventListener('keydown', e => {
-    if (e.key === 'Enter' && e.ctrlKey && !isRunning) {
-      runBenchmark();
-    }
-  });
-
-  // Initialize Icons
-  lucide.createIcons();
+    document.addEventListener('keydown', e => { if (e.key === 'Enter' && e.ctrlKey && !isRunning) runBenchmark(); });
 </script>
-
-</body>
-</html>
+</body></html>

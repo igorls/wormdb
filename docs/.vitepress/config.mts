@@ -49,6 +49,7 @@ export default defineConfig({
             { text: 'Server Backends', link: '/architecture/server-backends' },
             { text: 'Stored Procedures', link: '/architecture/procedures' },
             { text: 'Pub/Sub', link: '/architecture/pubsub' },
+            { text: 'Benchmarks', link: '/architecture/benchmarks' },
           ]
         }
       ],

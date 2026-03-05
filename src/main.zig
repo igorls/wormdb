@@ -15,6 +15,8 @@ const Server = wormdb.server.Server;
 const UringServer = wormdb.server.uring.UringServer;
 const EpollServer = wormdb.server.epoll.EpollServer;
 const Gateway = wormdb.server.Gateway;
+const build_options = @import("build_options");
+const QuicGateway = wormdb.server.QuicGateway;
 const auth = wormdb.server.auth;
 const Cluster = wormdb.cluster.Cluster;
 
@@ -285,6 +287,71 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
         _ = gw.start() catch |err| {
             std.log.err("Gateway start failed: {}", .{err});
         };
+    }
+
+    // Start QUIC/WebTransport gateway if enabled (compile-time gated)
+    if (comptime build_options.quic) {
+        if (cfg.gateway.quic_enabled) {
+            const cert_path_raw = cfg.gateway.tls_cert_path orelse {
+                std.log.err("QUIC Gateway: tls_cert_path is required when quic_enabled=true", .{});
+                return;
+            };
+            const key_path_raw = cfg.gateway.tls_key_path orelse {
+                std.log.err("QUIC Gateway: tls_key_path is required when quic_enabled=true", .{});
+                return;
+            };
+
+            // Sentinel-terminate paths for C interop
+            const cert_path = allocator.dupeZ(u8, cert_path_raw) catch {
+                std.log.err("QUIC Gateway: failed to allocate cert path", .{});
+                return;
+            };
+            const key_path = allocator.dupeZ(u8, key_path_raw) catch {
+                std.log.err("QUIC Gateway: failed to allocate key path", .{});
+                return;
+            };
+
+            std.log.info("QUIC Gateway: port {d}", .{cfg.gateway.quic_port});
+
+            var quic_gw = QuicGateway.init(
+                allocator,
+                &store,
+                &event_bus,
+                if (cluster) |*c| c else null,
+                cfg.gateway.quic_port,
+                cert_path,
+                key_path,
+            );
+
+            // Wire auth config (same keys as WebSocket gateway)
+            if (cfg.auth.public_keys.len > 0) {
+                var pks = allocator.alloc(auth.PublicKey, cfg.auth.public_keys.len) catch {
+                    std.log.err("QUIC Gateway: failed to allocate auth public keys", .{});
+                    return;
+                };
+                var valid_count: usize = 0;
+                for (cfg.auth.public_keys) |b64_key| {
+                    const pk = auth.decodePublicKey(b64_key) catch {
+                        std.log.err("Invalid auth public key: {s}", .{b64_key});
+                        continue;
+                    };
+                    pks[valid_count] = pk;
+                    valid_count += 1;
+                }
+                if (valid_count > 0) {
+                    quic_gw.public_keys = pks[0..valid_count];
+                    quic_gw.auth_required = cfg.auth.require_auth;
+                    quic_gw.max_token_age = cfg.auth.token_max_age_s;
+                }
+            }
+
+            // Register as global for session callbacks
+            quic_gw.setGlobal();
+
+            _ = quic_gw.start() catch |err| {
+                std.log.err("QUIC Gateway start failed: {}", .{err});
+            };
+        }
     }
 
     // Run server — selected backend

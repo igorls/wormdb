@@ -4,12 +4,13 @@
 #   Lane 1: Classic DB + REST API + Client (fetch → Bun → WormDB TCP)
 #   Lane 2: WormDB browser-direct with SCT auth (WebSocket → Gateway)
 #   Lane 3: WormDB browser-direct without auth (WebSocket → Gateway)
-#   Lane 4: HTTP/3 QUIC (placeholder — not yet implemented)
+#   Lane 4: WormDB QUIC/WebTransport direct (UDP → QUIC Gateway)
 #
 # Prerequisites:
-#   1. Build WormDB:  zig build
-#   2. Generate keys:  bun run apps/browser/demo/keygen.ts --save
-#   3. Build browser client:  cd apps/browser && bun run build && cd ../..
+#   1. Generate TLS certs:  bash bench/gen-bench-certs.sh
+#   2. Build WormDB:  zig build -Dquic=true
+#   3. Generate keys:  bun run apps/browser/demo/keygen.ts --save
+#   4. Build browser client:  cd apps/browser && bun run build && cd ../..
 #
 # Usage:
 #   docker compose -f docker-compose.web-bench.yaml up -d --build
@@ -56,6 +57,26 @@ services:
     command: ["--config", "/etc/wormdb/config.json"]
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "6391"]
+      interval: 2s
+      timeout: 2s
+      start_period: 3s
+      retries: 5
+    networks: [bench]
+
+  # ── WormDB Instance 3: QUIC/WebTransport gateway on port 6394 ───
+  wormdb-quic:
+    image: wormdb:latest
+    container_name: bench-wormdb-quic
+    hostname: wormdb-quic
+    ports:
+      - "6394:6394/udp"   # QUIC/WebTransport gateway
+    volumes:
+      - wormdb-quic-data:/data
+      - ./bench/wormdb-quic.json:/etc/wormdb/config.json:ro
+      - ./bench/certs:/etc/wormdb/certs:ro
+    command: ["--config", "/etc/wormdb/config.json"]
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "6393"]
       interval: 2s
       timeout: 2s
       start_period: 3s
@@ -115,6 +136,7 @@ services:
     depends_on:
       - wormdb-auth
       - wormdb-noauth
+      - wormdb-quic
       - auth-provider
       - api-backend
     networks: [bench]
@@ -126,3 +148,4 @@ networks:
 volumes:
   wormdb-auth-data:
   wormdb-noauth-data:
+  wormdb-quic-data:

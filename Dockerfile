@@ -1,11 +1,12 @@
 # Dockerfile for WormDB
 # Uses pre-built binary from host (meshguard embedded as library)
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsodium23 \
+    libssl3 \
     ca-certificates \
     netcat-openbsd \
     iproute2 \
@@ -21,6 +22,8 @@ RUN chmod +x /usr/bin/wormdb
 RUN mkdir -p /data
 
 EXPOSE 6389
+# QUIC/WebTransport port
+EXPOSE 6394/udp
 # Gossip port for SWIM protocol
 EXPOSE 51821/udp
 # WireGuard port

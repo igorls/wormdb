@@ -1,0 +1,12 @@
+{
+  "data": "/data",
+  "server": { "port": 6393 },
+  "gateway": {
+    "enabled": false,
+    "quic_enabled": true,
+    "quic_port": 6394,
+    "tls_cert_path": "/etc/wormdb/certs/cert.pem",
+    "tls_key_path": "/etc/wormdb/certs/key.pem"
+  },
+  "store": { "persistence": "none" }
+}

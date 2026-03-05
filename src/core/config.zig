@@ -96,6 +96,18 @@ pub const GatewayConfig = struct {
     /// Public endpoint URL advertised to browsers (e.g. "wss://us-east.myapp.com")
     /// If null, this node is hidden from browser discovery.
     public_endpoint: ?[]const u8 = null,
+
+    /// Enable the QUIC/WebTransport gateway (requires TLS cert/key)
+    quic_enabled: bool = false,
+
+    /// QUIC/WebTransport UDP port to listen on
+    quic_port: u16 = 6393,
+
+    /// Path to TLS certificate file (PEM). Required for QUIC.
+    tls_cert_path: ?[]const u8 = null,
+
+    /// Path to TLS private key file (PEM). Required for QUIC.
+    tls_key_path: ?[]const u8 = null,
 };
 
 /// Authentication configuration (Signed Capability Tokens)

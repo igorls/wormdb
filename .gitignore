@@ -55,3 +55,7 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# Generated TLS certs for benchmark QUIC gateway
+bench/certs/
+apps/browser/demo/fingerprint.txt

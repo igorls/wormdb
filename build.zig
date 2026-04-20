@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
 
     // MeshGuard library module (embedded mesh networking)
     const meshguard_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = "../GitHub/zig-meshguard/meshguard/src/lib.zig" },
+        .root_source_file = .{ .cwd_relative = "../meshguard/src/lib.zig" },
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -43,27 +43,30 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // In Zig 0.16, link* / addInclude / addCSource are on Module, not Step.Compile
+    exe_mod.addLibraryPath(b.path("deps/lib"));
+    exe_mod.linkSystemLibrary("sodium", .{});
+
     const exe = b.addExecutable(.{
         .name = "wormdb",
         .root_module = exe_mod,
     });
-    exe.linkSystemLibrary("sodium");
 
     // --- QUIC / WebTransport support (opt-in via -Dquic=true) ---
     if (enable_quic) {
         // MsQuic static library (pre-built)
-        exe.addObjectFile(.{ .cwd_relative = "deps/msquic/build/bin/Release/libmsquic.a" });
+        exe_mod.addObjectFile(.{ .cwd_relative = "deps/msquic/build/bin/Release/libmsquic.a" });
 
         // MsQuic include path
-        exe.addIncludePath(.{ .cwd_relative = "deps/msquic/src/inc" });
+        exe_mod.addIncludePath(.{ .cwd_relative = "deps/msquic/src/inc" });
 
         // libwtf include paths
-        exe.addIncludePath(.{ .cwd_relative = "deps/libwtf/include" });
-        exe.addIncludePath(.{ .cwd_relative = "deps/libwtf/src" });
-        exe.addIncludePath(.{ .cwd_relative = "deps/libwtf/deps/ls-qpack" });
-        exe.addIncludePath(.{ .cwd_relative = "deps/libwtf/deps/xxhash" });
-        exe.addIncludePath(.{ .cwd_relative = "deps/libwtf/deps/tinycthreads" });
-        exe.addIncludePath(.{ .cwd_relative = "deps/libwtf/deps/verstable" });
+        exe_mod.addIncludePath(.{ .cwd_relative = "deps/libwtf/include" });
+        exe_mod.addIncludePath(.{ .cwd_relative = "deps/libwtf/src" });
+        exe_mod.addIncludePath(.{ .cwd_relative = "deps/libwtf/deps/ls-qpack" });
+        exe_mod.addIncludePath(.{ .cwd_relative = "deps/libwtf/deps/xxhash" });
+        exe_mod.addIncludePath(.{ .cwd_relative = "deps/libwtf/deps/tinycthreads" });
+        exe_mod.addIncludePath(.{ .cwd_relative = "deps/libwtf/deps/verstable" });
 
         // libwtf C sources
         const libwtf_sources = [_][]const u8{
@@ -85,15 +88,15 @@ pub fn build(b: *std.Build) void {
             "deps/libwtf/deps/ls-qpack/lsqpack.c",
         };
         for (libwtf_sources) |src| {
-            exe.addCSourceFile(.{
+            exe_mod.addCSourceFile(.{
                 .file = .{ .cwd_relative = src },
                 .flags = &.{ "-std=gnu11", "-DWTF_EXPORTS", "-fno-sanitize=alignment" },
             });
         }
 
         // System libraries needed by MsQuic
-        exe.linkSystemLibrary("crypto");
-        exe.linkSystemLibrary("pthread");
+        exe_mod.linkSystemLibrary("crypto", .{});
+        exe_mod.linkSystemLibrary("pthread", .{});
     }
 
     b.installArtifact(exe);
@@ -109,10 +112,12 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    test_mod.addLibraryPath(b.path("deps/lib"));
+    test_mod.linkSystemLibrary("sodium", .{});
+
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
     });
-    unit_tests.linkSystemLibrary("sodium");
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");

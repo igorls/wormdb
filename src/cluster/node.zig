@@ -147,7 +147,7 @@ pub const Cluster = struct {
 
     // Active WormWire replication connections (keyed by mesh IP)
     peers: std.AutoHashMap([4]u8, PeerConnection),
-    mutex: std.Thread.Mutex,
+    mutex: core.compat.Mutex,
 
     // Discovery thread
     discovery_thread: ?std.Thread,

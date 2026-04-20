@@ -10,6 +10,7 @@ const StoreError = core.types.StoreError;
 const Config = core.config.Config;
 const PersistenceMode = core.config.PersistenceMode;
 const Wal = wal_mod.Wal;
+const compat = core.compat;
 const WalRecord = wal_mod.WalRecord;
 
 const SNAPSHOT_MAGIC = "WDBSNAP1";
@@ -24,7 +25,7 @@ pub fn shardIndex(key: []const u8) usize {
 }
 
 const Shard = struct {
-    mutex: std.Thread.Mutex,
+    mutex: core.compat.Mutex,
     data: std.StringHashMap(*Entry),
 };
 
@@ -37,17 +38,17 @@ pub const Store = struct {
     allocator: std.mem.Allocator,
     shards: [SHARD_COUNT]Shard,
     wal: ?Wal,
-    wal_enqueue_mutex: std.Thread.Mutex,
+    wal_enqueue_mutex: core.compat.Mutex,
     config: Config,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Store {
         // Only create/open WAL file when persistence == .full
         var wal: ?Wal = null;
         if (config.persistence == .full) {
-            const file = std.fs.cwd().openFile(config.wal_path, .{ .mode = .read_write }) catch blk: {
-                break :blk try std.fs.cwd().createFile(config.wal_path, .{ .read = true, .truncate = false });
+            const file = compat.Dir.openFile(core.compat.cwd(), config.wal_path, .{ .mode = .read_write }) catch blk: {
+                break :blk try compat.Dir.createFile(core.compat.cwd(), config.wal_path, .{ .read = true, .truncate = false });
             };
-            file.close();
+            compat.File.close(file);
             wal = try Wal.init(allocator, config.wal_path, config.sync_writes);
         }
         errdefer if (wal) |*w| w.deinit();
@@ -519,8 +520,8 @@ pub const Store = struct {
         const temp_snapshot_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{self.config.snapshot_path});
         defer self.allocator.free(temp_snapshot_path);
 
-        var snapshot_file = try std.fs.cwd().createFile(temp_snapshot_path, .{ .read = true, .truncate = true });
-        errdefer snapshot_file.close();
+        const snapshot_file = try compat.Dir.createFile(core.compat.cwd(), temp_snapshot_path, .{ .read = true, .truncate = true });
+        errdefer compat.File.close(snapshot_file);
 
         var data_count: usize = 0;
         for (&self.shards) |*shard| data_count += shard.data.count();
@@ -543,56 +544,56 @@ pub const Store = struct {
             }
         }.lessThan);
 
-        try snapshot_file.writeAll(SNAPSHOT_MAGIC);
+        try compat.File.writeAll(snapshot_file, SNAPSHOT_MAGIC);
 
         var version_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, version_buf[0..4], SNAPSHOT_VERSION, .little);
-        try snapshot_file.writeAll(version_buf[0..4]);
+        try compat.File.writeAll(snapshot_file, version_buf[0..4]);
 
         var count_buf: [8]u8 = undefined;
         std.mem.writeInt(u64, count_buf[0..8], @intCast(entry_index), .little);
-        try snapshot_file.writeAll(count_buf[0..8]);
+        try compat.File.writeAll(snapshot_file, count_buf[0..8]);
 
         for (entries[0..entry_index]) |entry| {
             var key_len_buf: [4]u8 = undefined;
             std.mem.writeInt(u32, key_len_buf[0..4], @intCast(entry.key.len), .little);
-            try snapshot_file.writeAll(key_len_buf[0..4]);
+            try compat.File.writeAll(snapshot_file, key_len_buf[0..4]);
 
             var value_len_buf: [4]u8 = undefined;
             std.mem.writeInt(u32, value_len_buf[0..4], @intCast(entry.value.len), .little);
-            try snapshot_file.writeAll(value_len_buf[0..4]);
+            try compat.File.writeAll(snapshot_file, value_len_buf[0..4]);
 
             const flags_byte: u8 = @bitCast(entry.flags);
-            try snapshot_file.writeAll(&[_]u8{flags_byte});
+            try compat.File.writeAll(snapshot_file, &[_]u8{flags_byte});
 
             var timestamp_buf: [8]u8 = undefined;
             std.mem.writeInt(u64, timestamp_buf[0..8], entry.timestamp, .little);
-            try snapshot_file.writeAll(timestamp_buf[0..8]);
+            try compat.File.writeAll(snapshot_file, timestamp_buf[0..8]);
 
-            try snapshot_file.writeAll(entry.key);
-            try snapshot_file.writeAll(entry.value);
+            try compat.File.writeAll(snapshot_file, entry.key);
+            try compat.File.writeAll(snapshot_file, entry.value);
         }
 
-        try snapshot_file.sync();
-        snapshot_file.close();
+        try compat.File.sync(snapshot_file);
+        compat.File.close(snapshot_file);
 
-        try std.fs.cwd().rename(temp_snapshot_path, self.config.snapshot_path);
+        try compat.Dir.rename(core.compat.cwd(), temp_snapshot_path, self.config.snapshot_path);
     }
 
     fn loadSnapshot(self: *Store) !void {
-        var snapshot_file = std.fs.cwd().openFile(self.config.snapshot_path, .{ .mode = .read_only }) catch |err| switch (err) {
+        const snapshot_file = compat.Dir.openFile(core.compat.cwd(), self.config.snapshot_path, .{ .mode = .read_only }) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
-        defer snapshot_file.close();
+        defer compat.File.close(snapshot_file);
 
-        const stat = try snapshot_file.stat();
+        const stat = try compat.File.stat(snapshot_file);
         if (stat.size == 0) {
             return;
         }
 
         var magic_buf: [SNAPSHOT_MAGIC.len]u8 = undefined;
-        if (try snapshot_file.readAll(magic_buf[0..]) != magic_buf.len) {
+        if (try compat.File.readAll(snapshot_file, magic_buf[0..]) != magic_buf.len) {
             return error.Corruption;
         }
         if (!std.mem.eql(u8, magic_buf[0..], SNAPSHOT_MAGIC)) {
@@ -600,7 +601,7 @@ pub const Store = struct {
         }
 
         var version_buf: [4]u8 = undefined;
-        if (try snapshot_file.readAll(version_buf[0..4]) != version_buf.len) {
+        if (try compat.File.readAll(snapshot_file, version_buf[0..4]) != version_buf.len) {
             return error.Corruption;
         }
         const version = std.mem.readInt(u32, version_buf[0..4], .little);
@@ -609,7 +610,7 @@ pub const Store = struct {
         }
 
         var count_buf: [8]u8 = undefined;
-        if (try snapshot_file.readAll(count_buf[0..8]) != count_buf.len) {
+        if (try compat.File.readAll(snapshot_file, count_buf[0..8]) != count_buf.len) {
             return error.Corruption;
         }
         const entry_count = std.mem.readInt(u64, count_buf[0..8], .little);
@@ -622,38 +623,38 @@ pub const Store = struct {
                 std.log.info("Snapshot load progress: {d}/{d} entries loaded...", .{ i, entry_count });
             }
             var key_len_buf: [4]u8 = undefined;
-            if (try snapshot_file.readAll(key_len_buf[0..4]) != key_len_buf.len) {
+            if (try compat.File.readAll(snapshot_file, key_len_buf[0..4]) != key_len_buf.len) {
                 return error.Corruption;
             }
             const key_len: usize = @intCast(std.mem.readInt(u32, key_len_buf[0..4], .little));
 
             var value_len_buf: [4]u8 = undefined;
-            if (try snapshot_file.readAll(value_len_buf[0..4]) != value_len_buf.len) {
+            if (try compat.File.readAll(snapshot_file, value_len_buf[0..4]) != value_len_buf.len) {
                 return error.Corruption;
             }
             const value_len: usize = @intCast(std.mem.readInt(u32, value_len_buf[0..4], .little));
 
             var flags_buf: [1]u8 = undefined;
-            if (try snapshot_file.readAll(flags_buf[0..1]) != flags_buf.len) {
+            if (try compat.File.readAll(snapshot_file, flags_buf[0..1]) != flags_buf.len) {
                 return error.Corruption;
             }
             const flags: EntryFlags = @bitCast(flags_buf[0]);
 
             var timestamp_buf: [8]u8 = undefined;
-            if (try snapshot_file.readAll(timestamp_buf[0..8]) != timestamp_buf.len) {
+            if (try compat.File.readAll(snapshot_file, timestamp_buf[0..8]) != timestamp_buf.len) {
                 return error.Corruption;
             }
             const timestamp = std.mem.readInt(u64, timestamp_buf[0..8], .little);
 
             const key = try self.allocator.alloc(u8, key_len);
             errdefer self.allocator.free(key);
-            if (try snapshot_file.readAll(key) != key.len) {
+            if (try compat.File.readAll(snapshot_file, key) != key.len) {
                 return error.Corruption;
             }
 
             const value = try self.allocator.alloc(u8, value_len);
             errdefer self.allocator.free(value);
-            if (try snapshot_file.readAll(value) != value.len) {
+            if (try compat.File.readAll(snapshot_file, value) != value.len) {
                 return error.Corruption;
             }
 

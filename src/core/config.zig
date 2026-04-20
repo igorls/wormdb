@@ -149,15 +149,16 @@ pub const WormDBConfig = struct {
 /// The file content is kept alive for the process lifetime since
 /// parsed string values reference the input buffer directly.
 pub fn loadFromFile(path: []const u8, allocator: std.mem.Allocator) !WormDBConfig {
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
-        if (err == error.FileNotFound) return WormDBConfig{};
-        return err;
-    };
-    defer file.close();
+    // Zig 0.16: use global single-threaded Io for blocking file I/O
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cwd = std.Io.Dir.cwd();
 
     // Content is intentionally NOT freed — string slices in the parsed
     // config point into this buffer for the process lifetime.
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024); // 1MB max
+    const content = cwd.readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| {
+        if (err == error.FileNotFound) return WormDBConfig{};
+        return err;
+    };
 
     return loadFromJson(content, allocator);
 }

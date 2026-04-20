@@ -25,14 +25,13 @@ const Backend = wormdb.core.config.Backend;
 const WormDBConfig = wormdb.core.config.WormDBConfig;
 const loadFromFile = wormdb.core.config.loadFromFile;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+// Zig 0.16: "Juicy Main" — accept std.process.Init for pre-initialized
+// allocator, Io, args, and environment.
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
-    // Parse command line args
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    // Get args as a slice via the arena allocator
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     // --- Step 1: Pre-scan for --help and --config ---
     var config_path: []const u8 = "wormdb.json";
@@ -40,7 +39,7 @@ pub fn main() !void {
         var i: usize = 1;
         while (i < args.len) : (i += 1) {
             if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
-                try printHelp();
+                try printHelp(init.io);
                 return;
             } else if (std.mem.eql(u8, args[i], "--config")) {
                 i += 1;
@@ -150,7 +149,7 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, args[i], "--config")) {
             i += 1; // Already handled in pre-scan, skip the value
         } else if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
-            try printHelp();
+            try printHelp(init.io);
             return;
         } else {
             std.log.err("Unknown argument: {s}", .{args[i]});
@@ -168,7 +167,9 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
     const persistence = cfg.store.persistence;
 
     // Create data directory if it doesn't exist
-    std.fs.cwd().makePath(data_dir) catch |err| {
+    // Zig 0.16: use Io.Dir.cwd() + createDirPath with blocking Io
+    const io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.Dir.cwd().createDirPath(io, data_dir) catch |err| {
         logStartupFailure(err, port, data_dir);
         return err;
     };
@@ -431,12 +432,8 @@ fn logStartupFailure(err: anyerror, port: u16, data_dir: []const u8) void {
     }
 }
 
-fn getStdOut() std.fs.File {
-    return .{ .handle = std.posix.STDOUT_FILENO };
-}
-
-fn printHelp() !void {
-    try getStdOut().writeAll(
+fn printHelp(io: std.Io) !void {
+    try std.Io.File.stdout().writeStreamingAll(io,
         \\WormDB - Distributed Key-Value Store with WORM and Event Streaming
         \\
         \\Usage:

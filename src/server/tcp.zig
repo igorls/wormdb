@@ -45,7 +45,7 @@ pub const Server = struct {
         head: usize = 0,
         tail: usize = 0,
         count: usize = 0,
-        mutex: std.Thread.Mutex = .{},
+        mutex: core.compat.Mutex = .{},
         futex: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
         fn push(self: *ConnQueue, conn: std.net.Server.Connection) bool {
@@ -79,7 +79,7 @@ pub const Server = struct {
         event_bus: *EventBus,
         stream: ?*std.net.Stream,
         write_capture: ?*std.ArrayListUnmanaged(u8),
-        write_mutex: std.Thread.Mutex,
+        write_mutex: core.compat.Mutex,
         subscriptions: std.StringHashMap(u64),
         binary_mode: bool,
 

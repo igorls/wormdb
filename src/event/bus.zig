@@ -4,6 +4,8 @@
 //! Thread-safe with atomic operations for subscriber counts.
 
 const std = @import("std");
+const core = @import("../core/mod.zig");
+const compat = core.compat;
 
 pub const Subscriber = struct {
     id: u64,
@@ -14,7 +16,7 @@ pub const Subscriber = struct {
 pub const Channel = struct {
     name: []const u8,
     subscribers: std.AutoHashMap(u64, Subscriber),
-    mutex: std.Thread.Mutex,
+    mutex: compat.Mutex,
     next_sub_id: std.atomic.Value(u64),
 
     pub fn init(allocator: std.mem.Allocator, name: []const u8) Channel {
@@ -34,7 +36,7 @@ pub const Channel = struct {
 pub const EventBus = struct {
     allocator: std.mem.Allocator,
     channels: std.StringHashMap(*Channel),
-    mutex: std.Thread.RwLock,
+    mutex: compat.RwLock,
     stats: Stats,
 
     pub const Stats = struct {

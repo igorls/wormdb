@@ -484,7 +484,7 @@ pub const Gateway = struct {
         event_bus: *EventBus,
         stream: *std.net.Stream,
         subscriptions: std.StringHashMap(u64),
-        write_mutex: std.Thread.Mutex,
+        write_mutex: core.compat.Mutex,
 
         fn init(allocator: std.mem.Allocator, event_bus: *EventBus, stream: *std.net.Stream) ConnContext {
             return .{

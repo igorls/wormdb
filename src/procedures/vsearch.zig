@@ -32,7 +32,10 @@ const Ctx = @import("context.zig").Ctx;
 const distance = @import("../vector/distance.zig");
 const topk_mod = @import("../vector/topk.zig");
 const hnsw_mod = @import("../vector/hnsw.zig");
+const metric_mod = @import("../vector/metric.zig");
 const Store = @import("../storage/store.zig").Store;
+
+pub const Metric = metric_mod.Metric;
 
 const MAX_TOP_K: usize = 100;
 const DEFAULT_NAMESPACE: []const u8 = "vec:";
@@ -43,18 +46,6 @@ const STAGE1_OVERSAMPLE: usize = 10;
 /// the stage-1→stage-2 shape stays consistent across dispatch paths.
 const HNSW_EF_SEARCH_FACTOR: usize = 1;
 const DECAY_TIME_CONSTANT_HOURS: f32 = 168.0; // ~1 week time constant
-
-const Metric = enum {
-    cosine,
-    dot,
-    l2,
-
-    fn fromStr(s: []const u8) Metric {
-        if (std.mem.eql(u8, s, "dot")) return .dot;
-        if (std.mem.eql(u8, s, "l2")) return .l2;
-        return .cosine;
-    }
-};
 
 const Mode = enum {
     auto, // BQ prefilter if available, else brute-force
@@ -330,7 +321,10 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
 
     const top_k = @min(if (top_k_raw == 0) @as(usize, 10) else top_k_raw, MAX_TOP_K);
     const namespace = ctx.arg(2) orelse DEFAULT_NAMESPACE;
-    const metric = if (ctx.arg(3)) |m| Metric.fromStr(m) else Metric.cosine;
+    const metric: Metric = if (ctx.arg(3)) |m|
+        Metric.fromStr(m) orelse Metric.cosine
+    else
+        Metric.cosine;
 
     var decay: f32 = 0.0;
     if (ctx.arg(4)) |d| {
@@ -353,29 +347,38 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
 
     const now_ms = ctx.timestamp();
 
-    // ── Stage 1A: HNSW (auto mode, namespace has registered index) ──
+    // ── Stage 1A: HNSW (auto mode, namespace has matching index) ──
     // Preferred path when available — ~5-50× faster than BQ at large N.
-    // Stage-1 ranking uses cosine distance regardless of the user's metric;
-    // stage-2 refine re-ranks with the requested metric. The oversample
-    // matches the BQ path so the refine phase sees a consistent candidate
-    // budget across dispatch strategies.
+    // The namespace's HNSW must have been built with the same metric the
+    // caller is querying with; mismatches fall through to BQ, which
+    // doesn't depend on the graph's distance choice. Stage-2 refine
+    // re-ranks with the caller's metric regardless.
     if (mode == .auto) {
         if (ctx.vector_registry) |reg| {
             if (reg.get(namespace)) |ns_idx| {
-                if (try runHnswDispatch(
-                    ctx,
-                    ns_idx,
-                    query_vec,
-                    top_k,
-                    metric,
-                    decay,
-                    now_ms,
-                    &final_heap,
-                )) {
-                    return emitJson(ctx, final_heap.sortedDesc());
+                if (ns_idx.metric == metric) {
+                    if (try runHnswDispatch(
+                        ctx,
+                        ns_idx,
+                        query_vec,
+                        top_k,
+                        metric,
+                        decay,
+                        now_ms,
+                        &final_heap,
+                    )) {
+                        return emitJson(ctx, final_heap.sortedDesc());
+                    }
+                    // runHnswDispatch returned false → index is empty; fall
+                    // through to BQ / brute-force paths.
                 }
-                // runHnswDispatch returned false → index is empty; fall
-                // through to BQ / brute-force paths.
+                // Metric mismatch: fall through, log at debug level to help
+                // operators notice un-indexed query shapes.
+                if (ns_idx.metric != metric) {
+                    std.log.debug("vsearch: metric mismatch in '{s}' (index={s}, query={s}); using BQ fallback", .{
+                        namespace, ns_idx.metric.name(), metric.name(),
+                    });
+                }
             }
         }
     }

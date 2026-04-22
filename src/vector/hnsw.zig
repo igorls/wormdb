@@ -15,6 +15,9 @@
 
 const std = @import("std");
 const distance = @import("distance.zig");
+const metric_mod = @import("metric.zig");
+
+pub const DistFn = metric_mod.DistFn;
 
 pub const HnswError = error{
     DimensionMismatch,
@@ -35,6 +38,12 @@ pub const HnswParams = struct {
     /// Deterministic RNG seed for level sampling. Change per instance in
     /// production if you want independent layer distributions.
     seed: u64 = 0xC0FFEE,
+    /// Distance function driving graph construction and search. Defaults
+    /// to cosine distance (1 − cos_sim). See `src/vector/metric.zig`.
+    /// The function pointer is called hot — one indirection costs ~1ns,
+    /// < 1% of a typical 768-dim cosine compute, so the runtime dispatch
+    /// is effectively free.
+    dist_fn: DistFn = metric_mod.cosine_dist,
 };
 
 /// Result from `search`. `id` is the internal node index; map back to the
@@ -120,17 +129,16 @@ pub const Hnsw = struct {
     // ║  Distance                                          ║
     // ╚═══════════════════════════════════════════════════╝
 
-    /// Cosine distance: 1 − cos_sim(a, b). Range [0, 2]. Smaller = closer.
-    /// Returns 1.0 for degenerate (zero-norm) inputs — safer than NaN.
-    inline fn cosineDistance(a: []align(1) const f32, b: []align(1) const f32) f32 {
-        const sim = distance.cosine(a, b);
-        return 1.0 - sim;
-    }
-
     inline fn distToNode(self: *const Hnsw, query: []align(1) const f32, node_id: u32) f32 {
         const node = &self.nodes.items[node_id];
         const v: []align(1) const f32 = @ptrCast(node.vector);
-        return cosineDistance(query, v);
+        return self.params.dist_fn(query, v);
+    }
+
+    inline fn distBetween(self: *const Hnsw, a_id: u32, b_id: u32) f32 {
+        const av: []align(1) const f32 = @ptrCast(self.nodes.items[a_id].vector);
+        const bv: []align(1) const f32 = @ptrCast(self.nodes.items[b_id].vector);
+        return self.params.dist_fn(av, bv);
     }
 
     // ╔═══════════════════════════════════════════════════╗
@@ -278,10 +286,8 @@ pub const Hnsw = struct {
             if (selected >= m_target) break;
             // Keep cand only if it is closer to the query than to any
             // already-selected neighbor.
-            const cand_vec: []align(1) const f32 = @ptrCast(self.nodes.items[cand.id].vector);
             for (out_buf[0..selected]) |sid| {
-                const s_vec: []align(1) const f32 = @ptrCast(self.nodes.items[sid].vector);
-                const d_to_selected = cosineDistance(cand_vec, s_vec);
+                const d_to_selected = self.distBetween(cand.id, sid);
                 if (d_to_selected < cand.dist) continue :outer;
             }
             out_buf[selected] = cand.id;
@@ -429,14 +435,11 @@ pub const Hnsw = struct {
         var candidates: MaxPQ = .empty;
         defer candidates.deinit(self.allocator);
 
-        const nb_vec: []align(1) const f32 = @ptrCast(nb_node.vector);
         for (nb_nbrs.items[0..nb_nbrs.count]) |id| {
-            const other_vec: []align(1) const f32 = @ptrCast(self.nodes.items[id].vector);
-            const d = cosineDistance(nb_vec, other_vec);
+            const d = self.distBetween(nb_id, id);
             try candidates.push(self.allocator, .{ .id = id, .dist = d });
         }
-        const new_vec: []align(1) const f32 = @ptrCast(self.nodes.items[new_id].vector);
-        const d_new = cosineDistance(nb_vec, new_vec);
+        const d_new = self.distBetween(nb_id, new_id);
         try candidates.push(self.allocator, .{ .id = new_id, .dist = d_new });
 
         const sel_buf = try self.allocator.alloc(u32, cap);
@@ -473,10 +476,8 @@ pub const Hnsw = struct {
         var selected: usize = 0;
         outer: for (sorted) |cand| {
             if (selected >= m_target) break;
-            const cand_vec: []align(1) const f32 = @ptrCast(self.nodes.items[cand.id].vector);
             for (out_buf[0..selected]) |sid| {
-                const s_vec: []align(1) const f32 = @ptrCast(self.nodes.items[sid].vector);
-                const d_to_selected = cosineDistance(cand_vec, s_vec);
+                const d_to_selected = self.distBetween(cand.id, sid);
                 if (d_to_selected < cand.dist) continue :outer;
             }
             out_buf[selected] = cand.id;
@@ -758,6 +759,42 @@ test "hnsw: recall vs brute-force on random data" {
     // Accept ≥ 0.85 on small random dataset; production workloads typically
     // hit 0.95+ with larger N and clustered embeddings.
     try testing.expect(recall >= 0.85);
+}
+
+test "hnsw: L2 metric yields correct ranking" {
+    var h = Hnsw.init(testing.allocator, .{ .dist_fn = metric_mod.l2_dist });
+    defer h.deinit();
+
+    // Three vectors; query is closest to v2 in L2 but not in cosine.
+    // Magnitude matters for L2, not cosine — this separates the paths.
+    _ = try h.insert(&[_]f32{ 10, 10, 0, 0 }); // id 0, far by magnitude
+    _ = try h.insert(&[_]f32{ 1.1, 1.0, 0, 0 }); // id 1, closest
+    _ = try h.insert(&[_]f32{ 5, 5, 0, 0 }); // id 2, medium
+
+    var out: [3]SearchResult = undefined;
+    const q = [_]f32{ 1, 1, 0, 0 };
+    const n = try h.search(&q, 3, 50, &out);
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqual(@as(u32, 1), out[0].id);
+    // L2-squared of [1,1] → [1.1,1] is 0.01 + 0 = 0.01
+    try testing.expectApproxEqAbs(@as(f32, 0.01), out[0].dist, 1e-4);
+}
+
+test "hnsw: dot-product metric yields correct ranking" {
+    var h = Hnsw.init(testing.allocator, .{ .dist_fn = metric_mod.dot_dist });
+    defer h.deinit();
+
+    _ = try h.insert(&[_]f32{ 0.1, 0, 0, 0 }); // id 0, small overlap
+    _ = try h.insert(&[_]f32{ 10, 0, 0, 0 }); // id 1, huge dot with query
+    _ = try h.insert(&[_]f32{ 1, 1, 0, 0 }); // id 2, medium
+
+    var out: [3]SearchResult = undefined;
+    const q = [_]f32{ 1, 0, 0, 0 };
+    const n = try h.search(&q, 3, 50, &out);
+    try testing.expectEqual(@as(usize, 3), n);
+    // Highest dot product: id 1 (10·1 = 10). Negated → dist = -10.
+    try testing.expectEqual(@as(u32, 1), out[0].id);
+    try testing.expectApproxEqAbs(@as(f32, -10), out[0].dist, 1e-4);
 }
 
 test "hnsw: k larger than index size returns all" {

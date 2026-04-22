@@ -9,6 +9,9 @@
 pub const distance = @import("distance.zig");
 pub const topk = @import("topk.zig");
 pub const TopK = topk.TopK;
+pub const metric = @import("metric.zig");
+pub const Metric = metric.Metric;
+pub const DistFn = metric.DistFn;
 pub const hnsw = @import("hnsw.zig");
 pub const Hnsw = hnsw.Hnsw;
 pub const HnswParams = hnsw.HnswParams;

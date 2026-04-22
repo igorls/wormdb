@@ -27,9 +27,20 @@
 
 const std = @import("std");
 const hnsw_mod = @import("hnsw.zig");
+const metric_mod = @import("metric.zig");
 
 pub const Hnsw = hnsw_mod.Hnsw;
 pub const HnswParams = hnsw_mod.HnswParams;
+pub const Metric = metric_mod.Metric;
+
+pub const RegistryError = error{
+    /// Returned by `getOrCreate` when the caller supplies a metric that
+    /// disagrees with the one the namespace was originally created with.
+    /// A namespace's metric is immutable — callers who want to switch
+    /// must drop the namespace (via `vreindex` with a new first insert,
+    /// or a future `vnsdrop` op) and start fresh.
+    MetricMismatch,
+};
 
 /// Local RwLock wrapper over std.Io.RwLock. Mirrors src/core/compat.zig's
 /// shape but lives inside the vector module so `zig test` can build this
@@ -73,15 +84,24 @@ pub const NamespaceIndex = struct {
     keys: std.ArrayListUnmanaged([]u8),
     /// timestamps[node_id] — from the vec Entry when inserted.
     timestamps: std.ArrayListUnmanaged(u64),
+    /// Metric chosen at namespace creation. Drives the HNSW dist_fn and
+    /// determines which query metrics can reuse this index.
+    metric: Metric,
     /// Held exclusively for inserts; shared for searches.
     lock: RwLock,
 
-    pub fn init(allocator: std.mem.Allocator, params: HnswParams) NamespaceIndex {
+    pub fn init(allocator: std.mem.Allocator, params: HnswParams, m: Metric) NamespaceIndex {
+        // Override params.dist_fn with the chosen metric so the two can't
+        // drift apart. Callers pass HnswParams for tuning (m, ef, etc);
+        // metric determines the distance fn authoritatively.
+        var p = params;
+        p.dist_fn = m.distFn();
         return .{
             .allocator = allocator,
-            .hnsw = Hnsw.init(allocator, params),
+            .hnsw = Hnsw.init(allocator, p),
             .keys = .empty,
             .timestamps = .empty,
+            .metric = m,
             .lock = .{},
         };
     }
@@ -148,11 +168,9 @@ pub const NamespaceIndex = struct {
     }
 
     /// Full reset — caller must hold write-lock. Used by vreindex before
-    /// a bulk rebuild.
+    /// a bulk rebuild. Metric is preserved (callers who want to switch
+    /// metrics must drop the namespace entirely).
     pub fn clearLocked(self: *NamespaceIndex) void {
-        // Rebuild hnsw + side tables from scratch. Freeing and re-initing
-        // the Hnsw drops all vectors + graph; the new graph starts empty
-        // with the same params.
         const params = self.hnsw.params;
         self.hnsw.deinit();
         self.hnsw = Hnsw.init(self.allocator, params);
@@ -206,11 +224,17 @@ pub const NamespaceRegistry = struct {
     /// Look up or create. Takes a write-lock briefly to insert into the
     /// registry; the returned pointer is stable across concurrent
     /// getOrCreate calls for the same namespace.
-    pub fn getOrCreate(self: *NamespaceRegistry, namespace: []const u8) !*NamespaceIndex {
+    ///
+    /// If the namespace already exists and its metric differs from `m`,
+    /// returns `error.MetricMismatch`. Namespaces are single-metric by
+    /// design — the HNSW graph is built against one distance function
+    /// and can't serve queries under another without full rebuild.
+    pub fn getOrCreate(self: *NamespaceRegistry, namespace: []const u8, m: Metric) !*NamespaceIndex {
         // Fast path: shared lock, peek the map.
         self.lock.lockShared();
         if (self.map.get(namespace)) |idx| {
             self.lock.unlockShared();
+            if (idx.metric != m) return RegistryError.MetricMismatch;
             return idx;
         }
         self.lock.unlockShared();
@@ -219,14 +243,17 @@ pub const NamespaceRegistry = struct {
         self.lock.lock();
         defer self.lock.unlock();
 
-        if (self.map.get(namespace)) |idx| return idx;
+        if (self.map.get(namespace)) |idx| {
+            if (idx.metric != m) return RegistryError.MetricMismatch;
+            return idx;
+        }
 
         const ns_copy = try self.allocator.dupe(u8, namespace);
         errdefer self.allocator.free(ns_copy);
 
         const idx = try self.allocator.create(NamespaceIndex);
         errdefer self.allocator.destroy(idx);
-        idx.* = NamespaceIndex.init(self.allocator, self.default_params);
+        idx.* = NamespaceIndex.init(self.allocator, self.default_params, m);
 
         try self.map.put(self.allocator, ns_copy, idx);
         return idx;
@@ -255,8 +282,8 @@ test "registry: getOrCreate is idempotent" {
     var reg = NamespaceRegistry.init(testing.allocator, .{});
     defer reg.deinit();
 
-    const a = try reg.getOrCreate("vec:");
-    const b = try reg.getOrCreate("vec:");
+    const a = try reg.getOrCreate("vec:", .cosine);
+    const b = try reg.getOrCreate("vec:", .cosine);
     try testing.expectEqual(a, b);
 }
 
@@ -264,8 +291,8 @@ test "registry: distinct namespaces get distinct indexes" {
     var reg = NamespaceRegistry.init(testing.allocator, .{});
     defer reg.deinit();
 
-    const a = try reg.getOrCreate("vec:articles:");
-    const b = try reg.getOrCreate("vec:products:");
+    const a = try reg.getOrCreate("vec:articles:", .cosine);
+    const b = try reg.getOrCreate("vec:products:", .cosine);
     try testing.expect(a != b);
 }
 
@@ -274,15 +301,42 @@ test "registry: get returns null before create" {
     defer reg.deinit();
 
     try testing.expect(reg.get("vec:") == null);
-    _ = try reg.getOrCreate("vec:");
+    _ = try reg.getOrCreate("vec:", .cosine);
     try testing.expect(reg.get("vec:") != null);
+}
+
+test "registry: distinct metrics on same namespace error" {
+    var reg = NamespaceRegistry.init(testing.allocator, .{});
+    defer reg.deinit();
+
+    _ = try reg.getOrCreate("vec:", .cosine);
+    // Re-request with a different metric — should reject.
+    try testing.expectError(
+        RegistryError.MetricMismatch,
+        reg.getOrCreate("vec:", .l2),
+    );
+    // Original index still accessible with the original metric.
+    const idx = try reg.getOrCreate("vec:", .cosine);
+    try testing.expectEqual(Metric.cosine, idx.metric);
+}
+
+test "registry: each metric builds independent indexes under different namespaces" {
+    var reg = NamespaceRegistry.init(testing.allocator, .{});
+    defer reg.deinit();
+
+    const a = try reg.getOrCreate("vec:cos:", .cosine);
+    const b = try reg.getOrCreate("vec:l2:", .l2);
+    const c = try reg.getOrCreate("vec:dot:", .dot);
+    try testing.expectEqual(Metric.cosine, a.metric);
+    try testing.expectEqual(Metric.l2, b.metric);
+    try testing.expectEqual(Metric.dot, c.metric);
 }
 
 test "namespace index: insert + search maps ids back to keys" {
     var reg = NamespaceRegistry.init(testing.allocator, .{ .m = 8, .ef_construction = 50 });
     defer reg.deinit();
 
-    const idx = try reg.getOrCreate("vec:");
+    const idx = try reg.getOrCreate("vec:", .cosine);
     idx.lock.lock();
     defer idx.lock.unlock();
 
@@ -312,7 +366,7 @@ test "namespace index: clearLocked resets" {
     var reg = NamespaceRegistry.init(testing.allocator, .{});
     defer reg.deinit();
 
-    const idx = try reg.getOrCreate("vec:");
+    const idx = try reg.getOrCreate("vec:", .cosine);
     idx.lock.lock();
     defer idx.lock.unlock();
 

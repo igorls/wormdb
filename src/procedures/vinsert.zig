@@ -1,12 +1,17 @@
 //! Built-in VINSERT procedure — vector insert with optional WORM
 //!
 //! Stores a vector with metadata and optional binary quantization hash.
-//! EXEC vinsert <key> <vector_bytes> [<worm>] [<namespace>]
+//! EXEC vinsert <key> <vector_bytes> [<worm>] [<namespace>] [<metric>]
 //!
 //! - key:           vector identifier (e.g., "memory-001")
 //! - vector_bytes:  raw f32 byte array (the embedding)
 //! - worm:          "1" to make immutable (default: "1" — vectors are WORM by default)
 //! - namespace:     prefix namespace (default: "vec:")
+//! - metric:        distance metric for this namespace's HNSW index.
+//!                  "cosine" (default), "dot", "l2". Captured on the first
+//!                  insert into a namespace; subsequent inserts under the
+//!                  same namespace must use the same metric or the HNSW
+//!                  update is skipped (the store+BQ writes still succeed).
 //!
 //! The procedure:
 //! 1. Validates the vector bytes (must be multiple of 4 / valid f32 array)
@@ -24,6 +29,7 @@
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
 const distance = @import("../vector/distance.zig");
+const Metric = @import("../vector/metric.zig").Metric;
 
 const DEFAULT_NAMESPACE: []const u8 = "vec:";
 
@@ -53,6 +59,12 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const namespace = ctx.arg(3) orelse DEFAULT_NAMESPACE;
     if (namespace.len > MAX_NAMESPACE_LEN)
         return ctx.err("vinsert: namespace too long (max 128 bytes)");
+
+    // Metric is per-namespace: first insert locks it in.
+    const metric: Metric = if (ctx.arg(4)) |s|
+        Metric.fromStr(s) orelse return ctx.err("vinsert: unknown metric (use cosine|dot|l2)")
+    else
+        .cosine;
 
     // ── Build keys ───────────────────────────────────────────────
     const vec_key = ctx.fmt("{s}{s}", .{ namespace, id });
@@ -109,13 +121,19 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     // because bytesToF32 already validated the length. hnsw.insert copies
     // into aligned storage internally.
     //
-    // Failure here (OOM, dim mismatch from mixed-data namespace) is logged
-    // and swallowed: the store and BQ writes have already succeeded, so
-    // future vsearch calls can still serve this vector via the BQ prefilter
-    // path. Users can rebuild via EXEC vreindex.
+    // Failure modes that are logged and swallowed (store + BQ still
+    // succeeded; future vsearch can serve via BQ prefilter; EXEC vreindex
+    // recovers):
+    //   - OOM during graph insert
+    //   - Dim mismatch vs prior inserts in the same namespace
+    //   - MetricMismatch: caller passed a different metric than the one
+    //     the namespace was created with. The store write is authoritative;
+    //     the HNSW just stays in sync with whoever created it first.
     if (ctx.vector_registry) |reg| {
-        const ns_idx = reg.getOrCreate(namespace) catch |e| blk: {
-            std.log.warn("vinsert: getOrCreate for '{s}' failed: {s}", .{ namespace, @errorName(e) });
+        const ns_idx = reg.getOrCreate(namespace, metric) catch |e| blk: {
+            std.log.warn("vinsert: getOrCreate for '{s}' (metric={s}) failed: {s}", .{
+                namespace, metric.name(), @errorName(e),
+            });
             break :blk null;
         };
         if (ns_idx) |idx| {

@@ -140,6 +140,12 @@ pub const Cluster = struct {
     store: *Store,
     event_bus: *EventBus,
     config: ClusterConfig,
+    /// Optional HNSW registry back-reference. When set, the anti-entropy
+    /// sync emits VINSERT frames for keys belonging to a registered
+    /// namespace (so the peer reconstructs both KV + HNSW in one shot);
+    /// other keys still go out as SET. Attached via attachVectorRegistry
+    /// after construction — same shape as Store.attachVectorRegistry.
+    vector_registry: ?*@import("../vector/index.zig").NamespaceRegistry = null,
 
     // meshguard components (embedded)
     identity: Keys.KeyPair,
@@ -205,6 +211,13 @@ pub const Cluster = struct {
         self.peers.deinit();
         self.membership.deinit();
         if (self.gossip_socket) |*s| s.close();
+    }
+
+    pub fn attachVectorRegistry(
+        self: *Cluster,
+        registry: *@import("../vector/index.zig").NamespaceRegistry,
+    ) void {
+        self.vector_registry = registry;
     }
 
     /// Start the mesh network: bind gossip socket, init SWIM, seed peers, start discovery thread.
@@ -358,26 +371,100 @@ pub const Cluster = struct {
                 const ip_str = WgIp.formatIp(peer.mesh_ip, &ip_buf);
                 std.log.info("cluster: anti-entropy sync starting for {s}", .{ip_str});
 
+                // Snapshot the registry's namespaces once so the per-key
+                // callback can do cheap prefix checks. The registry's own
+                // read-lock stays brief; NamespaceIndex pointers remain
+                // valid because nothing removes namespaces during this sync.
+                const RegSnap = struct {
+                    prefix: []const u8,
+                    idx: *@import("../vector/index.zig").NamespaceIndex,
+                };
+                var reg_snap: std.ArrayListUnmanaged(RegSnap) = .empty;
+                defer reg_snap.deinit(self.allocator);
+                if (self.vector_registry) |reg| {
+                    reg.lock.lockShared();
+                    defer reg.lock.unlockShared();
+                    var ri = reg.map.iterator();
+                    while (ri.next()) |e| {
+                        reg_snap.append(self.allocator, .{
+                            .prefix = e.key_ptr.*,
+                            .idx = e.value_ptr.*,
+                        }) catch break;
+                    }
+                }
+
                 const SyncCtx = struct {
                     p: *PeerConnection,
-                    synced: usize,
+                    synced_set: usize = 0,
+                    synced_vinsert: usize = 0,
+                    skipped_bq: usize = 0,
+                    reg_snap: []const RegSnap,
+                    /// Find which registered namespace (if any) owns this key.
+                    fn matchNamespace(ctx: @This(), key: []const u8) ?*RegSnap {
+                        for (ctx.reg_snap) |*r| {
+                            if (std.mem.startsWith(u8, key, r.prefix)) return @constCast(r);
+                        }
+                        return null;
+                    }
                 };
-                var sync_ctx = SyncCtx{ .p = peer, .synced = 0 };
+                var sync_ctx = SyncCtx{ .p = peer, .reg_snap = reg_snap.items };
 
                 self.store.iterateAll(@ptrCast(&sync_ctx), &struct {
                     fn cb(raw_ctx: *anyopaque, k: []const u8, v: []const u8, w: bool) void {
                         const sctx: *SyncCtx = @ptrCast(@alignCast(raw_ctx));
+
+                        // `bq:<ns><id>` companions: skip when the namespace
+                        // is registered — the peer regenerates them from
+                        // VINSERT. Otherwise, SET replicates them.
+                        const BQ_PREFIX = "bq:";
+                        if (std.mem.startsWith(u8, k, BQ_PREFIX)) {
+                            const stripped = k[BQ_PREFIX.len..];
+                            if (sctx.matchNamespace(stripped) != null) {
+                                sctx.skipped_bq += 1;
+                                return;
+                            }
+                        }
+
+                        // Registered-namespace vector keys: emit VINSERT.
+                        if (sctx.matchNamespace(k)) |r| {
+                            r.idx.lock.lockShared();
+                            defer r.idx.lock.unlockShared();
+
+                            if (r.idx.nodeIdFor(k)) |node_id| {
+                                const ts = r.idx.timestamps.items[node_id];
+                                if (sctx.p.sendCommand(.{ .vinsert = .{
+                                    .key = k,
+                                    .vector = v,
+                                    .worm = w,
+                                    .namespace = r.prefix,
+                                    .metric = r.idx.metric.name(),
+                                    .timestamp = ts,
+                                } })) {
+                                    sctx.synced_vinsert += 1;
+                                }
+                                return;
+                            }
+                            // Registered namespace but no HNSW node — this
+                            // key was SET directly. Fall through to SET.
+                        }
+
+                        // Default path: replicate as a raw SET.
                         if (sctx.p.sendCommand(.{ .set = .{
                             .key = k,
                             .value = v,
                             .worm = w,
                         } })) {
-                            sctx.synced += 1;
+                            sctx.synced_set += 1;
                         }
                     }
                 }.cb);
 
-                std.log.info("cluster: anti-entropy sync sent {d} keys to {s}", .{ sync_ctx.synced, ip_str });
+                std.log.info("cluster: sync to {s} — {d} SET, {d} VINSERT, {d} bq-skipped", .{
+                    ip_str,
+                    sync_ctx.synced_set,
+                    sync_ctx.synced_vinsert,
+                    sync_ctx.skipped_bq,
+                });
             }
         }
     }

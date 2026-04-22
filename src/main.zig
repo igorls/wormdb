@@ -179,14 +179,20 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
     const wal_path = try std.fmt.allocPrint(allocator, "{s}/wormdb.wal", .{data_dir});
     defer allocator.free(wal_path);
 
-    // Initialize store
+    // Per-namespace HNSW index registry. Constructed BEFORE the store so
+    // its init can restore graph state from a v2 snapshot trailer in the
+    // same pass as the KV load. Cold namespaces with no inserts cost nothing.
+    var vector_registry = NamespaceRegistry.init(allocator, .{});
+    defer vector_registry.deinit();
+
+    // Initialize store (restores KV + HNSW trailer if the snapshot is v2)
     std.log.info("Initializing store at {s}", .{data_dir});
     if (!cfg.store.sync_writes) std.log.warn("sync_writes disabled — data may be lost on crash", .{});
-    var store = Store.init(allocator, .{
+    var store = Store.initWithRegistry(allocator, .{
         .wal_path = wal_path,
         .sync_writes = cfg.store.sync_writes,
         .persistence = persistence,
-    }) catch |err| {
+    }, &vector_registry) catch |err| {
         logStartupFailure(err, port, data_dir);
         return err;
     };
@@ -203,11 +209,6 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
     // Initialize event bus
     var event_bus = EventBus.init(allocator);
     defer event_bus.deinit();
-
-    // Per-namespace HNSW index registry. Lazy-populated by vinsert/vreindex;
-    // cold namespaces with no vectors inserted cost nothing.
-    var vector_registry = NamespaceRegistry.init(allocator, .{});
-    defer vector_registry.deinit();
 
     // Initialize cluster if enabled
     var cluster: ?Cluster = null;
@@ -228,6 +229,7 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
             .gossip_port = cfg.cluster.gossip_port,
             .wg_port = cfg.cluster.wg_port,
         });
+        cluster.?.attachVectorRegistry(&vector_registry);
     }
     defer if (cluster != null) {
         cluster.?.deinit();

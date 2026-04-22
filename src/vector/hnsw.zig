@@ -23,7 +23,24 @@ pub const HnswError = error{
     DimensionMismatch,
     EmptyIndex,
     OutOfMemory,
+    /// A serialized graph references a node whose vector couldn't be
+    /// resolved from the surrounding KV state — snapshot is torn.
+    MissingVector,
+    /// Serialized graph data failed structural validation (unexpected
+    /// neighbor counts, etc).
+    CorruptGraph,
+    /// Reader returned fewer bytes than requested before EOF.
+    EndOfStream,
 };
+
+fn readAllExact(reader: anytype, dest: []u8) !void {
+    var pos: usize = 0;
+    while (pos < dest.len) {
+        const n = try reader.readAll(dest[pos..]);
+        if (n == 0) return error.EndOfStream;
+        pos += n;
+    }
+}
 
 pub const HnswParams = struct {
     /// Max neighbors per node at levels > 0.
@@ -123,6 +140,185 @@ pub const Hnsw = struct {
 
     pub fn len(self: *const Hnsw) usize {
         return self.nodes.items.len;
+    }
+
+    // ╔═══════════════════════════════════════════════════╗
+    // ║  Serialization                                     ║
+    // ╚═══════════════════════════════════════════════════╝
+
+    /// Binary graph-structure format — matches the plan file:
+    ///   [params: 28 bytes] m, m_max0, ef_construction (u32×3),
+    ///                      ml (f32), seed (u64), dim (u32)
+    ///   [node_count: u32]
+    ///   [has_entry: u8][entry_point: u32]    # entry_point undefined if has_entry=0
+    ///   [top_level: u8]
+    ///   For each node:
+    ///     [level: u8]
+    ///     For lc in 0..=level:
+    ///       [neighbor_count: u16]
+    ///       [neighbor_ids: u32 × count]
+    ///
+    /// Vectors are NOT written here — they live in the KV store and the
+    /// enclosing snapshot format looks them up at load time via a
+    /// resolveVector callback (see readFrom below). Saves ~dim×4 bytes
+    /// per node in the on-disk form.
+    ///
+    /// `writer` must be a reference type with a `.writeAll` method.
+    pub fn writeTo(self: *const Hnsw, writer: anytype) !void {
+        const w = writer;
+        var buf: [28]u8 = undefined;
+        std.mem.writeInt(u32, buf[0..4], self.params.m, .little);
+        std.mem.writeInt(u32, buf[4..8], self.params.m_max0, .little);
+        std.mem.writeInt(u32, buf[8..12], self.params.ef_construction, .little);
+        std.mem.writeInt(u32, buf[12..16], @bitCast(self.params.ml), .little);
+        std.mem.writeInt(u64, buf[16..24], self.params.seed, .little);
+        std.mem.writeInt(u32, buf[24..28], @intCast(self.dim), .little);
+        try w.writeAll(&buf);
+
+        var counters: [11]u8 = undefined;
+        const node_count: u32 = @intCast(self.nodes.items.len);
+        std.mem.writeInt(u32, counters[0..4], node_count, .little);
+        counters[4] = if (self.entry_point != null) 1 else 0;
+        std.mem.writeInt(u32, counters[5..9], self.entry_point orelse 0, .little);
+        counters[9] = self.top_level;
+        // byte 10 reserved for future flags (e.g. rng-state presence)
+        counters[10] = 0;
+        try w.writeAll(&counters);
+
+        for (self.nodes.items) |node| {
+            var level_buf: [1]u8 = .{node.level};
+            try w.writeAll(&level_buf);
+
+            for (node.neighbors) |nl| {
+                var nc_buf: [2]u8 = undefined;
+                std.mem.writeInt(u16, nc_buf[0..2], @intCast(nl.count), .little);
+                try w.writeAll(&nc_buf);
+
+                for (nl.items[0..nl.count]) |nb_id| {
+                    var id_buf: [4]u8 = undefined;
+                    std.mem.writeInt(u32, id_buf[0..4], nb_id, .little);
+                    try w.writeAll(&id_buf);
+                }
+            }
+        }
+    }
+
+    /// Callback type for resolving a node id back to its vector bytes during
+    /// load. The reader supplies a context + index; the callback returns the
+    /// raw vector bytes (caller-borrowed — Hnsw copies them into aligned
+    /// storage before returning). Used by the enclosing snapshot layer to
+    /// pull vectors out of the already-loaded KV store.
+    pub const ResolveVectorFn = *const fn (ctx: *anyopaque, node_id: u32) ?[]const u8;
+
+    /// Load a graph produced by `writeTo`. Reads params, node structure,
+    /// neighbor lists; then for each node invokes `resolve_vector(ctx, id)`
+    /// to fetch the vector bytes. If the callback returns null for any
+    /// node, returns `error.MissingVector` — the caller is expected to
+    /// have the full KV state loaded before calling this.
+    ///
+    /// `reader` must be a reference type with a `.readAll` method that
+    /// returns the number of bytes filled.
+    pub fn readFrom(
+        allocator: std.mem.Allocator,
+        reader: anytype,
+        resolve_vector: ResolveVectorFn,
+        resolve_ctx: *anyopaque,
+    ) !Hnsw {
+        var params_buf: [28]u8 = undefined;
+        try readAllExact(reader, &params_buf);
+
+        const params = HnswParams{
+            .m = std.mem.readInt(u32, params_buf[0..4], .little),
+            .m_max0 = std.mem.readInt(u32, params_buf[4..8], .little),
+            .ef_construction = std.mem.readInt(u32, params_buf[8..12], .little),
+            .ml = @bitCast(std.mem.readInt(u32, params_buf[12..16], .little)),
+            .seed = std.mem.readInt(u64, params_buf[16..24], .little),
+            // dist_fn defaults to cosine; NamespaceIndex.readFromLocked
+            // overrides it based on the stored metric.
+        };
+        const dim = std.mem.readInt(u32, params_buf[24..28], .little);
+
+        var counters: [11]u8 = undefined;
+        try readAllExact(reader, &counters);
+        const node_count = std.mem.readInt(u32, counters[0..4], .little);
+        const has_ep = counters[4] != 0;
+        const ep = std.mem.readInt(u32, counters[5..9], .little);
+        const top_level = counters[9];
+        // counters[10] reserved
+
+        var hnsw = Hnsw.init(allocator, params);
+        errdefer hnsw.deinit();
+        hnsw.dim = dim;
+        hnsw.top_level = top_level;
+        hnsw.entry_point = if (has_ep) ep else null;
+
+        try hnsw.nodes.ensureTotalCapacity(allocator, node_count);
+
+        var node_id: u32 = 0;
+        while (node_id < node_count) : (node_id += 1) {
+            var lvl_buf: [1]u8 = undefined;
+            try readAllExact(reader, &lvl_buf);
+            const level = lvl_buf[0];
+
+            // Resolve the vector first so we can hand aligned storage to the
+            // node. Missing → the KV state didn't contain this key; the
+            // snapshot is torn.
+            const vec_bytes = resolve_vector(resolve_ctx, node_id) orelse
+                return error.MissingVector;
+            if (vec_bytes.len != dim * @sizeOf(f32)) return error.CorruptGraph;
+
+            const vec_buf = try allocator.alignedAlloc(f32, .@"16", dim);
+            errdefer allocator.free(vec_buf);
+            const src_ptr: [*]align(1) const f32 = @ptrCast(vec_bytes.ptr);
+            @memcpy(vec_buf, src_ptr[0..dim]);
+
+            // Allocate per-level neighbor slots at their declared capacities.
+            const levels_count = @as(usize, level) + 1;
+            const neighbors = try allocator.alloc(NeighborList, levels_count);
+            errdefer allocator.free(neighbors);
+
+            var allocated_levels: usize = 0;
+            errdefer {
+                for (neighbors[0..allocated_levels]) |nl| allocator.free(nl.items);
+            }
+
+            for (neighbors, 0..) |*nl, lc| {
+                var nc_buf: [2]u8 = undefined;
+                try readAllExact(reader, &nc_buf);
+                const stored_count = std.mem.readInt(u16, nc_buf[0..2], .little);
+
+                const cap = hnsw.maxNeighborsAtLevel(@intCast(lc));
+                if (stored_count > cap) return error.CorruptGraph;
+
+                nl.* = .{
+                    .items = try allocator.alloc(u32, cap),
+                    .count = stored_count,
+                };
+                allocated_levels += 1;
+
+                var i: usize = 0;
+                while (i < stored_count) : (i += 1) {
+                    var id_buf: [4]u8 = undefined;
+                    try readAllExact(reader, &id_buf);
+                    nl.items[i] = std.mem.readInt(u32, id_buf[0..4], .little);
+                }
+            }
+
+            try hnsw.nodes.append(allocator, .{
+                .vector = vec_buf,
+                .level = level,
+                .neighbors = neighbors,
+            });
+        }
+
+        return hnsw;
+    }
+
+    /// Allow the enclosing layer to re-apply the metric's dist_fn after
+    /// load (readFrom leaves the default, because Hnsw doesn't know about
+    /// the metric enum).
+    pub fn setDistFn(self: *Hnsw, dist_fn: DistFn) void {
+        self.params.dist_fn = dist_fn;
     }
 
     // ╔═══════════════════════════════════════════════════╗
@@ -836,4 +1032,115 @@ test "hnsw: k larger than index size returns all" {
     const q = [_]f32{ 1, 0, 0, 0 };
     const n = try h.search(&q, 50, 50, &out, null);
     try testing.expectEqual(@as(usize, 5), n);
+}
+
+// ╔═══════════════════════════════════════════════════╗
+// ║  Serialization tests                               ║
+// ╚═══════════════════════════════════════════════════╝
+
+// Harness that backs a writer into an ArrayListUnmanaged and supplies a
+// reader that drains the same bytes. Exercises writeTo/readFrom without
+// bringing the full Store + snapshot format into scope.
+const SerdeHarness = struct {
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+
+    const Writer = struct {
+        h: *SerdeHarness,
+        alloc: std.mem.Allocator,
+        pub fn writeAll(self: *@This(), data: []const u8) !void {
+            try self.h.buf.appendSlice(self.alloc, data);
+        }
+    };
+
+    const Reader = struct {
+        h: *SerdeHarness,
+        pos: usize = 0,
+        pub fn readAll(self: *@This(), dest: []u8) !usize {
+            const avail = self.h.buf.items.len - self.pos;
+            const n = @min(dest.len, avail);
+            @memcpy(dest[0..n], self.h.buf.items[self.pos..][0..n]);
+            self.pos += n;
+            return n;
+        }
+    };
+};
+
+/// Vector-resolve context for the serde test — maps node_id -> original bytes
+/// (kept parallel to insertion order).
+const VecStore = struct {
+    vectors: []const []const u8,
+    fn resolve(raw_ctx: *anyopaque, node_id: u32) ?[]const u8 {
+        const self: *VecStore = @ptrCast(@alignCast(raw_ctx));
+        if (node_id >= self.vectors.len) return null;
+        return self.vectors[node_id];
+    }
+};
+
+test "hnsw: writeTo/readFrom roundtrip preserves graph shape and recall" {
+    const alloc = testing.allocator;
+    var h = Hnsw.init(alloc, .{ .m = 8, .ef_construction = 100 });
+    defer h.deinit();
+
+    // Insert 30 random 16-dim vectors; keep the raw bytes so we can
+    // resolve them back at load time.
+    var prng = std.Random.DefaultPrng.init(0xFEEDFACE);
+    const rand = prng.random();
+    const dim: usize = 16;
+    const n_vecs: usize = 30;
+
+    const raw_buf = try alloc.alloc(f32, n_vecs * dim);
+    defer alloc.free(raw_buf);
+    for (raw_buf) |*x| x.* = rand.floatNorm(f32);
+
+    var byte_slices: [n_vecs][]const u8 = undefined;
+    for (0..n_vecs) |i| {
+        const f32_slice = raw_buf[i * dim ..][0..dim];
+        const byte_ptr: [*]const u8 = @ptrCast(f32_slice.ptr);
+        byte_slices[i] = byte_ptr[0 .. dim * @sizeOf(f32)];
+        _ = try h.insert(f32_slice);
+    }
+
+    // Pre-serialization query baseline.
+    var q: [dim]f32 = undefined;
+    for (&q) |*x| x.* = rand.floatNorm(f32);
+    var baseline_out: [10]SearchResult = undefined;
+    const baseline_n = try h.search(&q, 10, 100, &baseline_out, null);
+
+    // Serialize.
+    var harness = SerdeHarness{};
+    defer harness.buf.deinit(alloc);
+    var writer = SerdeHarness.Writer{ .h = &harness, .alloc = alloc };
+    try h.writeTo(&writer);
+
+    // Deserialize into a fresh Hnsw.
+    var vec_store = VecStore{ .vectors = &byte_slices };
+    var reader = SerdeHarness.Reader{ .h = &harness };
+    var restored = try Hnsw.readFrom(alloc, &reader, VecStore.resolve, @ptrCast(&vec_store));
+    defer restored.deinit();
+
+    // Structural assertions.
+    try testing.expectEqual(h.nodes.items.len, restored.nodes.items.len);
+    try testing.expectEqual(h.dim, restored.dim);
+    try testing.expectEqual(h.top_level, restored.top_level);
+    try testing.expectEqual(h.entry_point, restored.entry_point);
+    for (h.nodes.items, 0..) |n, i| {
+        try testing.expectEqual(n.level, restored.nodes.items[i].level);
+        for (n.neighbors, 0..) |nl, lc| {
+            const rnl = restored.nodes.items[i].neighbors[lc];
+            try testing.expectEqual(nl.count, rnl.count);
+            for (nl.items[0..nl.count], 0..) |id, j| {
+                try testing.expectEqual(id, rnl.items[j]);
+            }
+        }
+    }
+
+    // Behavioral assertion: same query returns the same top-K (IDs + dists
+    // identical because vectors and graph are identical).
+    var restored_out: [10]SearchResult = undefined;
+    const restored_n = try restored.search(&q, 10, 100, &restored_out, null);
+    try testing.expectEqual(baseline_n, restored_n);
+    for (0..baseline_n) |i| {
+        try testing.expectEqual(baseline_out[i].id, restored_out[i].id);
+        try testing.expectApproxEqAbs(baseline_out[i].dist, restored_out[i].dist, 1e-6);
+    }
 }

@@ -40,6 +40,11 @@ pub const RegistryError = error{
     /// must drop the namespace (via `vreindex` with a new first insert,
     /// or a future `vnsdrop` op) and start fresh.
     MetricMismatch,
+    /// Serialized block failed structural validation (unknown metric byte,
+    /// torn counts, etc).
+    CorruptIndex,
+    /// Reader returned 0 bytes mid-record.
+    EndOfStream,
 };
 
 /// Outcome of `markTombstoneLocked`.
@@ -255,7 +260,221 @@ pub const NamespaceIndex = struct {
         self.tombstones = .{};
         self.tombstone_count = 0;
     }
+
+    // ╔═══════════════════════════════════════════════════╗
+    // ║  Serialization                                     ║
+    // ╚═══════════════════════════════════════════════════╝
+
+    /// Per-namespace block format:
+    ///   [1B metric]                                 (0=cosine, 1=dot, 2=l2)
+    ///   [4B node_count]                             (canonical; used by reader
+    ///                                               to preallocate key table
+    ///                                               BEFORE the graph block)
+    ///   For each node:
+    ///     [2B key_len][key bytes]
+    ///     [8B timestamp]
+    ///   [8B tombstone_count]
+    ///   [ceil(node_count/8) bytes: tombstone bits]  (LSB-first per byte)
+    ///   [hnsw graph block]                          (Hnsw.writeTo — repeats
+    ///                                               node_count internally for
+    ///                                               self-containment)
+    ///
+    /// Why keys first: Hnsw.readFrom resolves each node's vector by node_id
+    /// via a callback. If keys came after the graph, the callback couldn't
+    /// know which key belongs to which id at resolve time. Keys first lets
+    /// the outer reader stage a node_id → key array before the graph loads.
+    ///
+    /// Caller must hold the write-lock for the duration — writeToLocked
+    /// does not lock itself so the enclosing snapshot can batch several
+    /// namespaces under a consistent point-in-time view.
+    pub fn writeToLocked(self: *const NamespaceIndex, writer: anytype) !void {
+        const w = writer;
+
+        const metric_byte: u8 = switch (self.metric) {
+            .cosine => 0,
+            .dot => 1,
+            .l2 => 2,
+        };
+        try w.writeAll(&[_]u8{metric_byte});
+
+        const node_count = self.hnsw.len();
+        var nc_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, nc_buf[0..4], @intCast(node_count), .little);
+        try w.writeAll(&nc_buf);
+
+        for (self.keys.items, 0..) |key, i| {
+            var kl_buf: [2]u8 = undefined;
+            std.mem.writeInt(u16, kl_buf[0..2], @intCast(key.len), .little);
+            try w.writeAll(&kl_buf);
+            try w.writeAll(key);
+
+            var ts_buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, ts_buf[0..8], self.timestamps.items[i], .little);
+            try w.writeAll(&ts_buf);
+        }
+
+        var tc_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, tc_buf[0..8], self.tombstone_count, .little);
+        try w.writeAll(&tc_buf);
+
+        const tomb_bytes = (node_count + 7) / 8;
+        if (tomb_bytes > 0) {
+            const buf = try self.allocator.alloc(u8, tomb_bytes);
+            defer self.allocator.free(buf);
+            @memset(buf, 0);
+            var id: usize = 0;
+            while (id < node_count) : (id += 1) {
+                if (self.tombstones.isSet(id)) {
+                    buf[id / 8] |= @as(u8, 1) << @intCast(id % 8);
+                }
+            }
+            try w.writeAll(buf);
+        }
+
+        try self.hnsw.writeTo(w);
+    }
+
+    /// Resolver context used internally during readFromLocked — bridges
+    /// from Hnsw's node_id-based callback to the outer key-based KV
+    /// lookup. `keys` lives on the reading side's stack until the whole
+    /// index is built.
+    const LocalResolver = struct {
+        keys: []const []const u8,
+        outer_resolve: OuterResolveFn,
+        outer_ctx: *anyopaque,
+
+        pub const OuterResolveFn = *const fn (ctx: *anyopaque, key: []const u8) ?[]const u8;
+
+        fn bridge(raw_ctx: *anyopaque, node_id: u32) ?[]const u8 {
+            const self: *LocalResolver = @ptrCast(@alignCast(raw_ctx));
+            if (node_id >= self.keys.len) return null;
+            return self.outer_resolve(self.outer_ctx, self.keys[node_id]);
+        }
+    };
+
+    /// Reconstruct a NamespaceIndex from a serialized block. The caller
+    /// supplies a KEY-based resolver (`outer_resolve`) that maps a vector
+    /// key to its raw bytes; NamespaceIndex.readFromLocked builds the
+    /// node_id → key array internally from the file's keys block and
+    /// bridges the two layers.
+    ///
+    /// Caller holds no locks; the returned index owns all its storage.
+    pub fn readFromLocked(
+        allocator: std.mem.Allocator,
+        reader: anytype,
+        outer_resolve: LocalResolver.OuterResolveFn,
+        outer_ctx: *anyopaque,
+    ) !NamespaceIndex {
+        var metric_buf: [1]u8 = undefined;
+        try readAllExact(reader, &metric_buf);
+        const metric: Metric = switch (metric_buf[0]) {
+            0 => .cosine,
+            1 => .dot,
+            2 => .l2,
+            else => return error.CorruptIndex,
+        };
+
+        var nc_buf: [4]u8 = undefined;
+        try readAllExact(reader, &nc_buf);
+        const node_count = std.mem.readInt(u32, nc_buf[0..4], .little);
+
+        // ── Stage 1: read keys + timestamps ──
+        var keys: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (keys.items) |k| allocator.free(k);
+            keys.deinit(allocator);
+        }
+        try keys.ensureTotalCapacity(allocator, node_count);
+
+        var timestamps: std.ArrayListUnmanaged(u64) = .empty;
+        errdefer timestamps.deinit(allocator);
+        try timestamps.ensureTotalCapacity(allocator, node_count);
+
+        var i: usize = 0;
+        while (i < node_count) : (i += 1) {
+            var kl_buf: [2]u8 = undefined;
+            try readAllExact(reader, &kl_buf);
+            const key_len = std.mem.readInt(u16, kl_buf[0..2], .little);
+            const key_copy = try allocator.alloc(u8, key_len);
+            errdefer allocator.free(key_copy);
+            try readAllExact(reader, key_copy);
+
+            var ts_buf: [8]u8 = undefined;
+            try readAllExact(reader, &ts_buf);
+            const ts = std.mem.readInt(u64, ts_buf[0..8], .little);
+
+            try keys.append(allocator, key_copy);
+            try timestamps.append(allocator, ts);
+        }
+
+        // ── Stage 2: read tombstone header + bits ──
+        var tc_buf: [8]u8 = undefined;
+        try readAllExact(reader, &tc_buf);
+        const tombstone_count = std.mem.readInt(u64, tc_buf[0..8], .little);
+
+        var tombstones: std.DynamicBitSetUnmanaged = if (node_count == 0)
+            .{}
+        else
+            try std.DynamicBitSetUnmanaged.initEmpty(allocator, node_count);
+        errdefer tombstones.deinit(allocator);
+
+        const tomb_bytes = (node_count + 7) / 8;
+        if (tomb_bytes > 0) {
+            const buf = try allocator.alloc(u8, tomb_bytes);
+            defer allocator.free(buf);
+            try readAllExact(reader, buf);
+            var id: usize = 0;
+            while (id < node_count) : (id += 1) {
+                if ((buf[id / 8] & (@as(u8, 1) << @intCast(id % 8))) != 0) {
+                    tombstones.set(id);
+                }
+            }
+        }
+
+        // ── Stage 3: read graph, bridging node_id → key lookups ──
+        var bridge_ctx = LocalResolver{
+            .keys = keys.items,
+            .outer_resolve = outer_resolve,
+            .outer_ctx = outer_ctx,
+        };
+        var hnsw = try Hnsw.readFrom(
+            allocator,
+            reader,
+            LocalResolver.bridge,
+            @ptrCast(&bridge_ctx),
+        );
+        errdefer hnsw.deinit();
+        hnsw.setDistFn(metric.distFn());
+
+        // ── Build the reverse map (keys must already be populated) ──
+        var key_to_node: std.StringHashMapUnmanaged(u32) = .empty;
+        errdefer key_to_node.deinit(allocator);
+        for (keys.items, 0..) |k, idx| {
+            try key_to_node.put(allocator, k, @intCast(idx));
+        }
+
+        return .{
+            .allocator = allocator,
+            .hnsw = hnsw,
+            .keys = keys,
+            .timestamps = timestamps,
+            .key_to_node = key_to_node,
+            .tombstones = tombstones,
+            .tombstone_count = tombstone_count,
+            .metric = metric,
+            .lock = .{},
+        };
+    }
 };
+
+fn readAllExact(reader: anytype, dest: []u8) !void {
+    var pos: usize = 0;
+    while (pos < dest.len) {
+        const n = try reader.readAll(dest[pos..]);
+        if (n == 0) return error.EndOfStream;
+        pos += n;
+    }
+}
 
 pub const NamespaceRegistry = struct {
     allocator: std.mem.Allocator,
@@ -345,6 +564,103 @@ pub const NamespaceRegistry = struct {
             self.allocator.free(kv.key);
             kv.value.deinit();
             self.allocator.destroy(kv.value);
+        }
+    }
+
+    // ╔═══════════════════════════════════════════════════╗
+    // ║  Serialization                                     ║
+    // ╚═══════════════════════════════════════════════════╝
+
+    /// Magic + subversion marker that begins the HNSW section when
+    /// embedded in a snapshot. Distinct from the outer WDBSNAP1/2 magic
+    /// so a bare "is there HNSW data here?" check is cheap.
+    pub const HNSW_MARKER = "WDBHNSW1";
+
+    /// Serialize every namespace index into `writer`:
+    ///   [8B HNSW_MARKER]
+    ///   [4B ns_count]
+    ///   For each namespace (in iteration order):
+    ///     [2B ns_len][namespace]
+    ///     [NamespaceIndex block via writeToLocked]
+    ///
+    /// Takes the registry's write lock AND each NamespaceIndex's write
+    /// lock for the duration of its block. The enclosing snapshot
+    /// machinery holds all shard locks outside of this call, so the
+    /// combined window is a consistent point-in-time capture.
+    pub fn writeTo(self: *NamespaceRegistry, writer: anytype) !void {
+        const w = writer;
+
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        try w.writeAll(HNSW_MARKER);
+
+        var count_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, count_buf[0..4], @intCast(self.map.count()), .little);
+        try w.writeAll(&count_buf);
+
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            const ns = entry.key_ptr.*;
+            const idx = entry.value_ptr.*;
+
+            var ns_len_buf: [2]u8 = undefined;
+            std.mem.writeInt(u16, ns_len_buf[0..2], @intCast(ns.len), .little);
+            try w.writeAll(&ns_len_buf);
+            try w.writeAll(ns);
+
+            idx.lock.lock();
+            defer idx.lock.unlock();
+            try idx.writeToLocked(w);
+        }
+    }
+
+    /// Restore namespaces from a serialized block produced by `writeTo`.
+    /// The registry must be empty on entry; populates `self.map` with
+    /// newly-constructed NamespaceIndex values owning their own storage.
+    ///
+    /// `outer_resolve(key)` returns the raw vector bytes for a stored key
+    /// (typically a closure over the already-loaded KV store). It is
+    /// called during graph reconstruction; the file's key section is
+    /// read before the graph so the reader always has the right key in
+    /// hand for a given node_id when the resolver runs.
+    pub fn readFrom(
+        self: *NamespaceRegistry,
+        reader: anytype,
+        outer_resolve: NamespaceIndex.LocalResolver.OuterResolveFn,
+        outer_ctx: *anyopaque,
+    ) !void {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        var marker_buf: [HNSW_MARKER.len]u8 = undefined;
+        try readAllExact(reader, &marker_buf);
+        if (!std.mem.eql(u8, &marker_buf, HNSW_MARKER)) return error.CorruptIndex;
+
+        var count_buf: [4]u8 = undefined;
+        try readAllExact(reader, &count_buf);
+        const ns_count = std.mem.readInt(u32, count_buf[0..4], .little);
+
+        var i: u32 = 0;
+        while (i < ns_count) : (i += 1) {
+            var ns_len_buf: [2]u8 = undefined;
+            try readAllExact(reader, &ns_len_buf);
+            const ns_len = std.mem.readInt(u16, ns_len_buf[0..2], .little);
+            const ns_copy = try self.allocator.alloc(u8, ns_len);
+            errdefer self.allocator.free(ns_copy);
+            try readAllExact(reader, ns_copy);
+
+            const idx_ptr = try self.allocator.create(NamespaceIndex);
+            errdefer self.allocator.destroy(idx_ptr);
+            idx_ptr.* = try NamespaceIndex.readFromLocked(
+                self.allocator,
+                reader,
+                outer_resolve,
+                outer_ctx,
+            );
+            errdefer idx_ptr.deinit();
+
+            try self.map.put(self.allocator, ns_copy, idx_ptr);
         }
     }
 };
@@ -544,3 +860,116 @@ test "namespace index: search excludes tombstoned nodes" {
     try testing.expectEqual(@as(usize, 2), idx.liveCount());
     try testing.expectEqual(@as(usize, 3), idx.len());
 }
+
+
+// ╔═══════════════════════════════════════════════════╗
+// ║  Registry serialization tests                      ║
+// ╚═══════════════════════════════════════════════════╝
+
+const RegSerdeHarness = struct {
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+
+    const Writer = struct {
+        h: *RegSerdeHarness,
+        alloc: std.mem.Allocator,
+        pub fn writeAll(self: *@This(), data: []const u8) !void {
+            try self.h.buf.appendSlice(self.alloc, data);
+        }
+    };
+
+    const Reader = struct {
+        h: *RegSerdeHarness,
+        pos: usize = 0,
+        pub fn readAll(self: *@This(), dest: []u8) !usize {
+            const avail = self.h.buf.items.len - self.pos;
+            const n = @min(dest.len, avail);
+            @memcpy(dest[0..n], self.h.buf.items[self.pos..][0..n]);
+            self.pos += n;
+            return n;
+        }
+    };
+};
+
+/// Key-based resolver for the serde test: maps a stored vec key to its
+/// original bytes. Simulates the KV-lookup path the real snapshot layer
+/// will provide.
+const KeyResolver = struct {
+    map: *std.StringHashMapUnmanaged([]const u8),
+    fn resolve(raw_ctx: *anyopaque, key: []const u8) ?[]const u8 {
+        const self: *KeyResolver = @ptrCast(@alignCast(raw_ctx));
+        return self.map.get(key);
+    }
+};
+
+test "registry: writeTo/readFrom roundtrip preserves indexes" {
+    const alloc = testing.allocator;
+
+    // Build a registry with two namespaces, different metrics.
+    var src_reg = NamespaceRegistry.init(alloc, .{ .m = 4, .ef_construction = 50 });
+    defer src_reg.deinit();
+
+    // Store the vector bytes so the reader can look them up by key.
+    var key_to_bytes: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer key_to_bytes.deinit(alloc);
+
+    const v1 = [_]f32{ 1, 0, 0, 0 };
+    const v2 = [_]f32{ 0, 1, 0, 0 };
+    const v3 = [_]f32{ 0, 0, 1, 0 };
+
+    const v1_bytes_ptr: [*]const u8 = @ptrCast(&v1);
+    const v2_bytes_ptr: [*]const u8 = @ptrCast(&v2);
+    const v3_bytes_ptr: [*]const u8 = @ptrCast(&v3);
+    const v1_bytes = v1_bytes_ptr[0 .. 4 * @sizeOf(f32)];
+    const v2_bytes = v2_bytes_ptr[0 .. 4 * @sizeOf(f32)];
+    const v3_bytes = v3_bytes_ptr[0 .. 4 * @sizeOf(f32)];
+
+    try key_to_bytes.put(alloc, "vec:a", v1_bytes);
+    try key_to_bytes.put(alloc, "vec:b", v2_bytes);
+    try key_to_bytes.put(alloc, "vec:articles:x", v3_bytes);
+
+    const v1_align: []align(1) const f32 = @ptrCast(&v1);
+    const v2_align: []align(1) const f32 = @ptrCast(&v2);
+    const v3_align: []align(1) const f32 = @ptrCast(&v3);
+
+    {
+        const idx = try src_reg.getOrCreate("vec:", .cosine);
+        idx.lock.lock();
+        defer idx.lock.unlock();
+        _ = try idx.insertLocked("vec:a", v1_align, 1000);
+        _ = try idx.insertLocked("vec:b", v2_align, 2000);
+        _ = idx.markTombstoneLocked("vec:b");
+    }
+    {
+        const idx = try src_reg.getOrCreate("vec:articles:", .l2);
+        idx.lock.lock();
+        defer idx.lock.unlock();
+        _ = try idx.insertLocked("vec:articles:x", v3_align, 3000);
+    }
+
+    // Serialize.
+    var harness = RegSerdeHarness{};
+    defer harness.buf.deinit(alloc);
+    var writer = RegSerdeHarness.Writer{ .h = &harness, .alloc = alloc };
+    try src_reg.writeTo(&writer);
+
+    // Deserialize into a fresh registry.
+    var dst_reg = NamespaceRegistry.init(alloc, .{ .m = 4, .ef_construction = 50 });
+    defer dst_reg.deinit();
+
+    var resolver = KeyResolver{ .map = &key_to_bytes };
+    var reader = RegSerdeHarness.Reader{ .h = &harness };
+    try dst_reg.readFrom(&reader, KeyResolver.resolve, @ptrCast(&resolver));
+
+    // Validate structure.
+    const vec_idx = dst_reg.get("vec:").?;
+    const articles_idx = dst_reg.get("vec:articles:").?;
+    try testing.expectEqual(Metric.cosine, vec_idx.metric);
+    try testing.expectEqual(Metric.l2, articles_idx.metric);
+    try testing.expectEqual(@as(usize, 2), vec_idx.len());
+    try testing.expectEqual(@as(usize, 1), vec_idx.tombstone_count);
+    try testing.expect(vec_idx.isTombstoned(vec_idx.nodeIdFor("vec:b").?));
+    try testing.expect(!vec_idx.isTombstoned(vec_idx.nodeIdFor("vec:a").?));
+    try testing.expectEqual(@as(u64, 1000), vec_idx.timestamps.items[vec_idx.nodeIdFor("vec:a").?]);
+    try testing.expectEqual(@as(usize, 1), articles_idx.len());
+}
+

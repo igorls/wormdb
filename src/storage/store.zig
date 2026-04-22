@@ -13,8 +13,24 @@ const Wal = wal_mod.Wal;
 const compat = core.compat;
 const WalRecord = wal_mod.WalRecord;
 
+// Snapshot format:
+//   v1 → WDBSNAP1: KV entries only (legacy, still loadable).
+//   v2 → WDBSNAP1 with version field set to 2: same KV block, followed
+//        by an optional HNSW trailer produced by NamespaceRegistry.writeTo.
+//        New writes always emit v2. Older readers on v1-only binaries
+//        simply won't see the trailer.
+//
+// The magic bytes stay "WDBSNAP1" for backward compatibility — only
+// the u32 version field after the magic distinguishes v1 from v2.
 const SNAPSHOT_MAGIC = "WDBSNAP1";
-const SNAPSHOT_VERSION: u32 = 1;
+const SNAPSHOT_VERSION: u32 = 2;
+
+/// Optional back-reference to the per-namespace HNSW registry. When set,
+/// writeSnapshot appends the HNSW trailer after the KV section; loadSnapshot
+/// restores it when it finds the WDBHNSW1 marker. Populated via
+/// `Store.attachVectorRegistry` after both are constructed (main.zig).
+const hnsw_index_mod = @import("../vector/index.zig");
+pub const NamespaceRegistry = hnsw_index_mod.NamespaceRegistry;
 
 const SHARD_COUNT: usize = 256;
 
@@ -40,8 +56,29 @@ pub const Store = struct {
     wal: ?Wal,
     wal_enqueue_mutex: core.compat.Mutex,
     config: Config,
+    /// Optional HNSW registry back-reference. Attached by main.zig after
+    /// both objects exist; snapshot write/load use it when present.
+    vector_registry: ?*NamespaceRegistry = null,
+
+    /// Attach the per-namespace HNSW registry to this store so snapshots
+    /// persist and restore graph state alongside KV data. Call after both
+    /// the store and the registry have been constructed (see main.zig).
+    pub fn attachVectorRegistry(self: *Store, registry: *NamespaceRegistry) void {
+        self.vector_registry = registry;
+    }
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Store {
+        return initWithRegistry(allocator, config, null);
+    }
+
+    /// Like `init`, but attaches a vector registry before snapshot loading
+    /// so a v2 snapshot's HNSW trailer can be restored in the same pass.
+    /// Callers that don't use vector search should use `init`.
+    pub fn initWithRegistry(
+        allocator: std.mem.Allocator,
+        config: Config,
+        registry: ?*NamespaceRegistry,
+    ) !Store {
         // Only create/open WAL file when persistence == .full
         var wal: ?Wal = null;
         if (config.persistence == .full) {
@@ -67,6 +104,7 @@ pub const Store = struct {
             .wal = wal,
             .wal_enqueue_mutex = .{},
             .config = config,
+            .vector_registry = registry,
         };
 
         // Load snapshot for full and snapshot modes, skip for none
@@ -617,11 +655,44 @@ pub const Store = struct {
             try compat.File.writeAll(snapshot_file, entry.value);
         }
 
+        // ── v2 HNSW trailer (optional) ──
+        // Only written when a registry is attached and has at least one
+        // namespace. Shards are still locked at this point (from the top
+        // of writeSnapshot's defer), so no new vinsert can race with the
+        // per-namespace write-locks we acquire inside registry.writeTo.
+        if (self.vector_registry) |reg| {
+            if (reg.map.count() > 0) {
+                var snap_writer = FileWriter{ .file = snapshot_file };
+                reg.writeTo(&snap_writer) catch |err| {
+                    std.log.warn("writeSnapshot: HNSW trailer skipped: {s}", .{@errorName(err)});
+                };
+            }
+        }
+
         try compat.File.sync(snapshot_file);
         compat.File.close(snapshot_file);
 
         try compat.Dir.rename(core.compat.cwd(), temp_snapshot_path, self.config.snapshot_path);
     }
+
+    /// Thin adapter exposing `.writeAll` over an `std.Io.File`. Needed
+    /// because the registry/HNSW serializers take `anytype` writers and
+    /// `compat.File.writeAll` is a free function, not a method.
+    const FileWriter = struct {
+        file: std.Io.File,
+        pub fn writeAll(self: *@This(), data: []const u8) !void {
+            try compat.File.writeAll(self.file, data);
+        }
+    };
+
+    /// Thin adapter exposing `.readAll` over an `std.Io.File`. Mirrors
+    /// FileWriter for the read path.
+    const FileReader = struct {
+        file: std.Io.File,
+        pub fn readAll(self: *@This(), dest: []u8) !usize {
+            return compat.File.readAll(self.file, dest);
+        }
+    };
 
     fn loadSnapshot(self: *Store) !void {
         const snapshot_file = compat.Dir.openFile(core.compat.cwd(), self.config.snapshot_path, .{ .mode = .read_only }) catch |err| switch (err) {
@@ -648,7 +719,7 @@ pub const Store = struct {
             return error.Corruption;
         }
         const version = std.mem.readInt(u32, version_buf[0..4], .little);
-        if (version != SNAPSHOT_VERSION) {
+        if (version != 1 and version != 2) {
             return error.Corruption;
         }
 
@@ -722,7 +793,44 @@ pub const Store = struct {
         }
 
         std.log.info("Snapshot load complete.", .{});
+
+        // ── v2 HNSW trailer (optional) ──
+        // v1 files have nothing after the last KV entry; readFrom would
+        // hit EOF and we'd swallow the error below. v2 files have a
+        // WDBHNSW1-marked block that restores the registry.
+        if (version >= 2 and self.vector_registry != null) {
+            var reader = FileReader{ .file = snapshot_file };
+            const resolver = KvResolver{ .store = self };
+            // Use a local const to satisfy the &-of-rvalue requirement.
+            var resolver_mut = resolver;
+            self.vector_registry.?.readFrom(
+                &reader,
+                KvResolver.resolve,
+                @ptrCast(&resolver_mut),
+            ) catch |err| switch (err) {
+                // End-of-stream is normal if the file is v2 but happened
+                // to be saved before any namespace was registered (or if
+                // the snapshot was written by an older v1 writer — though
+                // those would have version==1). Log and move on.
+                error.EndOfStream => std.log.info("Snapshot: no HNSW trailer present.", .{}),
+                else => {
+                    std.log.warn("Snapshot: HNSW trailer load failed: {s}", .{@errorName(err)});
+                },
+            };
+        }
     }
+
+    /// Key-based vector resolver for NamespaceRegistry.readFrom. Looks the
+    /// key up in the already-loaded KV shards and returns the raw value
+    /// bytes (borrowed — the caller copies into aligned storage).
+    const KvResolver = struct {
+        store: *Store,
+        fn resolve(raw_ctx: *anyopaque, key: []const u8) ?[]const u8 {
+            const self: *KvResolver = @ptrCast(@alignCast(raw_ctx));
+            const entry = self.store.getUnsafe(key) orelse return null;
+            return entry.value;
+        }
+    };
 };
 
 test "Store basic operations" {
@@ -930,5 +1038,129 @@ test "WAL truncation keeps state correct across restart" {
 
         try testing.expectEqualStrings("b", reloaded.get("stable").?.value);
         try testing.expect(reloaded.get("tmp") == null);
+    }
+}
+
+test "Snapshot v2: HNSW trailer survives round trip" {
+    const testing = std.testing;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_v2.wal", .{tmp_path});
+    defer testing.allocator.free(wal_path);
+
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_v2.snapshot", .{tmp_path});
+    defer testing.allocator.free(snapshot_path);
+
+    const wal_file = try compat.Dir.createFile(tmp_dir.dir, "test_v2.wal", .{});
+    compat.File.close(wal_file);
+
+    const config = Config{
+        .wal_path = wal_path,
+        .snapshot_path = snapshot_path,
+        .sync_writes = false,
+        .persistence = .snapshot, // writes snapshot on deinit
+    };
+
+    // Raw vector bytes (4 floats each).
+    const vec_a = [_]f32{ 1, 0, 0, 0 };
+    const vec_b = [_]f32{ 0, 1, 0, 0 };
+    const vec_a_bytes_ptr: [*]const u8 = @ptrCast(&vec_a);
+    const vec_b_bytes_ptr: [*]const u8 = @ptrCast(&vec_b);
+    const vec_a_bytes = vec_a_bytes_ptr[0 .. 4 * @sizeOf(f32)];
+    const vec_b_bytes = vec_b_bytes_ptr[0 .. 4 * @sizeOf(f32)];
+
+    // ── Write pass: store + insert into HNSW, then deinit to snapshot ──
+    {
+        var registry = NamespaceRegistry.init(testing.allocator, .{});
+        defer registry.deinit();
+
+        var store = try Store.initWithRegistry(testing.allocator, config, &registry);
+        defer store.deinit();
+
+        try store.set("vec:a", vec_a_bytes, true);
+        try store.set("vec:b", vec_b_bytes, true);
+
+        const idx = try registry.getOrCreate("vec:", .cosine);
+        idx.lock.lock();
+        defer idx.lock.unlock();
+        const vec_a_align: []align(1) const f32 = @ptrCast(&vec_a);
+        const vec_b_align: []align(1) const f32 = @ptrCast(&vec_b);
+        _ = try idx.insertLocked("vec:a", vec_a_align, 111);
+        _ = try idx.insertLocked("vec:b", vec_b_align, 222);
+        _ = idx.markTombstoneLocked("vec:b");
+    }
+
+    // ── Read pass: fresh registry/store should restore HNSW state ──
+    {
+        var registry = NamespaceRegistry.init(testing.allocator, .{});
+        defer registry.deinit();
+
+        var store = try Store.initWithRegistry(testing.allocator, config, &registry);
+        defer store.deinit();
+
+        // KV survived
+        try testing.expectEqual(@as(usize, 2), store.count());
+        try testing.expectEqualSlices(u8, vec_a_bytes, store.get("vec:a").?.value);
+
+        // HNSW survived
+        const idx = registry.get("vec:").?;
+        idx.lock.lockShared();
+        defer idx.lock.unlockShared();
+        try testing.expectEqual(@as(usize, 2), idx.len());
+        try testing.expectEqual(@as(usize, 1), idx.tombstone_count);
+        try testing.expect(idx.isTombstoned(idx.nodeIdFor("vec:b").?));
+        try testing.expectEqual(@as(u64, 111), idx.timestamps.items[idx.nodeIdFor("vec:a").?]);
+    }
+}
+
+test "Snapshot v1 loads without HNSW when registry provided" {
+    // A snapshot written with no registry attached produces a bare v2
+    // file (no HNSW trailer). Loading with a registry should succeed and
+    // leave the registry empty — this exercises the "trailer absent"
+    // branch in loadSnapshot.
+    const testing = std.testing;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_v1_compat.wal", .{tmp_path});
+    defer testing.allocator.free(wal_path);
+
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_v1_compat.snapshot", .{tmp_path});
+    defer testing.allocator.free(snapshot_path);
+
+    const wal_file = try compat.Dir.createFile(tmp_dir.dir, "test_v1_compat.wal", .{});
+    compat.File.close(wal_file);
+
+    const config = Config{
+        .wal_path = wal_path,
+        .snapshot_path = snapshot_path,
+        .sync_writes = false,
+        .persistence = .snapshot,
+    };
+
+    // Write without registry.
+    {
+        var store = try Store.init(testing.allocator, config);
+        defer store.deinit();
+        try store.set("plain", "value", false);
+    }
+
+    // Read with registry.
+    {
+        var registry = NamespaceRegistry.init(testing.allocator, .{});
+        defer registry.deinit();
+
+        var store = try Store.initWithRegistry(testing.allocator, config, &registry);
+        defer store.deinit();
+
+        try testing.expectEqualStrings("value", store.get("plain").?.value);
+        try testing.expect(registry.get("vec:") == null);
     }
 }

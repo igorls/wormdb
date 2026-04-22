@@ -9,6 +9,9 @@
 pub const distance = @import("distance.zig");
 pub const topk = @import("topk.zig");
 pub const TopK = topk.TopK;
+pub const hnsw = @import("hnsw.zig");
+pub const Hnsw = hnsw.Hnsw;
+pub const HnswParams = hnsw.HnswParams;
 
 // Re-export commonly used functions
 pub const cosine = distance.cosine;

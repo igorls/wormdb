@@ -208,6 +208,7 @@ pub const Hnsw = struct {
         ef: usize,
         lc: u8,
         visited: *std.DynamicBitSetUnmanaged,
+        skip: ?*const std.DynamicBitSetUnmanaged,
     ) !MaxPQ {
         // Reset visited (caller guarantees it's sized for current nodes.len).
         visited.unsetAll();
@@ -218,12 +219,15 @@ pub const Hnsw = struct {
         var w: MaxPQ = .empty;
         errdefer w.deinit(self.allocator);
 
-        // Seed both heaps with the entry points.
+        // Seed both heaps with the entry points. Skipped entry points still
+        // go into `candidates` (we traverse through them) but not into `w`.
         for (entry_ids) |ep| {
             if (ep >= self.nodes.items.len) continue;
             const d = self.distToNode(query, ep);
             try candidates.push(self.allocator, .{ .id = ep, .dist = d });
-            try w.push(self.allocator, .{ .id = ep, .dist = d });
+            if (!isSkipped(skip, ep)) {
+                try w.push(self.allocator, .{ .id = ep, .dist = d });
+            }
             visited.set(ep);
         }
 
@@ -243,15 +247,26 @@ pub const Hnsw = struct {
                 const d = self.distToNode(query, nb_id);
                 const worst = if (w.peek()) |f| f.dist else std.math.inf(f32);
 
+                // Always queue the neighbor for traversal so the graph
+                // stays fully connected even if this node is skipped for
+                // result purposes.
                 if (d < worst or w.count() < ef) {
                     try candidates.push(self.allocator, .{ .id = nb_id, .dist = d });
-                    try w.push(self.allocator, .{ .id = nb_id, .dist = d });
-                    if (w.count() > ef) _ = w.pop();
+                    if (!isSkipped(skip, nb_id)) {
+                        try w.push(self.allocator, .{ .id = nb_id, .dist = d });
+                        if (w.count() > ef) _ = w.pop();
+                    }
                 }
             }
         }
 
         return w;
+    }
+
+    inline fn isSkipped(skip: ?*const std.DynamicBitSetUnmanaged, id: u32) bool {
+        const s = skip orelse return false;
+        if (id >= s.bit_length) return false;
+        return s.isSet(id);
     }
 
     // ╔═══════════════════════════════════════════════════╗
@@ -351,6 +366,7 @@ pub const Hnsw = struct {
                 1,
                 @intCast(lc),
                 &visited,
+                null, // construction never filters — graph sees all nodes
             );
             defer w.deinit(self.allocator);
             // ef=1, so only one candidate — pull it out.
@@ -376,6 +392,7 @@ pub const Hnsw = struct {
                 self.params.ef_construction,
                 level,
                 &visited,
+                null,
             );
             // Re-seed eps for next level from the candidate set before we consume w.
             eps.clearRetainingCapacity();
@@ -492,16 +509,22 @@ pub const Hnsw = struct {
 
     /// k-NN search. Fills `out` with up to `k` results sorted by ascending
     /// distance. Returns the number of results written (≤ k; may be < k if
-    /// the index has fewer nodes).
+    /// the index has fewer live nodes).
     ///
     /// `ef` controls recall/speed. Typical values: 50 (fast, ~90% recall)
     /// to 200 (slower, ~98% recall). Must be ≥ k.
+    ///
+    /// `skip`, if non-null, is a bit set indexed by node id. Nodes with
+    /// their bit set are **still traversed** (their neighbors are explored)
+    /// but are never returned in `out` — this is how tombstone-style
+    /// deletion is implemented without rebuilding the graph.
     pub fn search(
         self: *Hnsw,
         query: []align(1) const f32,
         k: usize,
         ef: usize,
         out: []SearchResult,
+        skip: ?*const std.DynamicBitSetUnmanaged,
     ) !usize {
         if (self.entry_point == null) return 0;
         if (k == 0) return 0;
@@ -512,22 +535,24 @@ pub const Hnsw = struct {
         defer visited.deinit(self.allocator);
 
         // ── Greedy descend from top level with ef=1 ──
+        // Upper layers don't filter — navigation is about geometry, not
+        // eligibility. A tombstoned entry-point still guides descent; we
+        // just won't return it at the final layer.
         var current_ep: u32 = self.entry_point.?;
         var lc: i32 = self.top_level;
         while (lc > 0) : (lc -= 1) {
-            var w = try self.searchLayer(query, &.{current_ep}, 1, @intCast(lc), &visited);
+            var w = try self.searchLayer(query, &.{current_ep}, 1, @intCast(lc), &visited, null);
             defer w.deinit(self.allocator);
             if (w.peek()) |best| current_ep = best.id;
         }
 
-        // ── Final layer with full ef ──
-        var w = try self.searchLayer(query, &.{current_ep}, effective_ef, 0, &visited);
+        // ── Final layer with full ef — apply the skip filter here. ──
+        var w = try self.searchLayer(query, &.{current_ep}, effective_ef, 0, &visited, skip);
         defer w.deinit(self.allocator);
 
         // Drain into `out`, ascending by distance. MaxPQ pops furthest first,
         // so walk backwards.
         const n = @min(k, w.count());
-        // We may have more than n in w (up to ef). Discard the extras first.
         while (w.count() > n) _ = w.pop();
         var idx: usize = n;
         while (idx > 0) : (idx -= 1) {
@@ -550,7 +575,7 @@ test "hnsw: empty index returns zero results" {
 
     var out: [5]SearchResult = undefined;
     const q = [_]f32{ 1, 0, 0, 0 };
-    const n = try h.search(&q, 5, 50, &out);
+    const n = try h.search(&q, 5, 50, &out, null);
     try testing.expectEqual(@as(usize, 0), n);
 }
 
@@ -563,7 +588,7 @@ test "hnsw: single node returns itself" {
     try testing.expectEqual(@as(u32, 0), id);
 
     var out: [5]SearchResult = undefined;
-    const n = try h.search(&v, 5, 50, &out);
+    const n = try h.search(&v, 5, 50, &out, null);
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expectEqual(@as(u32, 0), out[0].id);
     try testing.expectApproxEqAbs(@as(f32, 0), out[0].dist, 1e-5);
@@ -577,7 +602,7 @@ test "hnsw: dimension mismatch" {
     try testing.expectError(error.DimensionMismatch, h.insert(&[_]f32{ 1, 0, 0, 0 }));
 
     var out: [1]SearchResult = undefined;
-    try testing.expectError(error.DimensionMismatch, h.search(&[_]f32{ 1, 0 }, 1, 50, &out));
+    try testing.expectError(error.DimensionMismatch, h.search(&[_]f32{ 1, 0 }, 1, 50, &out, null));
 }
 
 test "hnsw: recall on synthetic clusters" {
@@ -620,7 +645,7 @@ test "hnsw: recall on synthetic clusters" {
     // Query = cluster-0 center. All 10 returned should be cluster 0.
     const q = centers[0];
     var out: [10]SearchResult = undefined;
-    const n = try h.search(&q, 10, 100, &out);
+    const n = try h.search(&q, 10, 100, &out, null);
     try testing.expectEqual(@as(usize, 10), n);
 
     var correct: usize = 0;
@@ -651,7 +676,7 @@ test "hnsw: results sorted by distance ascending" {
     for (&q) |*x| x.* = rand.floatNorm(f32);
 
     var out: [10]SearchResult = undefined;
-    const got = try h.search(&q, 10, 50, &out);
+    const got = try h.search(&q, 10, 50, &out, null);
     try testing.expect(got > 0);
     for (1..got) |i| {
         try testing.expect(out[i - 1].dist <= out[i].dist);
@@ -735,7 +760,7 @@ test "hnsw: recall vs brute-force on random data" {
 
         // HNSW top-k.
         var hnsw_out: [k]SearchResult = undefined;
-        const got = try h.search(&q, k, 100, &hnsw_out);
+        const got = try h.search(&q, k, 100, &hnsw_out, null);
         try testing.expectEqual(k, got);
 
         // Count overlap.
@@ -773,7 +798,7 @@ test "hnsw: L2 metric yields correct ranking" {
 
     var out: [3]SearchResult = undefined;
     const q = [_]f32{ 1, 1, 0, 0 };
-    const n = try h.search(&q, 3, 50, &out);
+    const n = try h.search(&q, 3, 50, &out, null);
     try testing.expectEqual(@as(usize, 3), n);
     try testing.expectEqual(@as(u32, 1), out[0].id);
     // L2-squared of [1,1] → [1.1,1] is 0.01 + 0 = 0.01
@@ -790,7 +815,7 @@ test "hnsw: dot-product metric yields correct ranking" {
 
     var out: [3]SearchResult = undefined;
     const q = [_]f32{ 1, 0, 0, 0 };
-    const n = try h.search(&q, 3, 50, &out);
+    const n = try h.search(&q, 3, 50, &out, null);
     try testing.expectEqual(@as(usize, 3), n);
     // Highest dot product: id 1 (10·1 = 10). Negated → dist = -10.
     try testing.expectEqual(@as(u32, 1), out[0].id);
@@ -809,6 +834,6 @@ test "hnsw: k larger than index size returns all" {
 
     var out: [50]SearchResult = undefined;
     const q = [_]f32{ 1, 0, 0, 0 };
-    const n = try h.search(&q, 50, 50, &out);
+    const n = try h.search(&q, 50, 50, &out, null);
     try testing.expectEqual(@as(usize, 5), n);
 }

@@ -42,6 +42,16 @@ pub const RegistryError = error{
     MetricMismatch,
 };
 
+/// Outcome of `markTombstoneLocked`.
+pub const TombstoneResult = enum {
+    /// The node was live; it is now tombstoned.
+    deleted,
+    /// The node was already tombstoned; this call was a no-op.
+    noop,
+    /// No node matched the given key in this index.
+    missing,
+};
+
 /// Local RwLock wrapper over std.Io.RwLock. Mirrors src/core/compat.zig's
 /// shape but lives inside the vector module so `zig test` can build this
 /// file standalone (no cross-module import path). Zig 0.16's RwLock
@@ -84,6 +94,17 @@ pub const NamespaceIndex = struct {
     keys: std.ArrayListUnmanaged([]u8),
     /// timestamps[node_id] — from the vec Entry when inserted.
     timestamps: std.ArrayListUnmanaged(u64),
+    /// Reverse lookup: vec key → node_id. Populated on every insertLocked,
+    /// so DELETE-style ops can find the graph node to tombstone in O(1).
+    /// The map's keys are borrowed from `self.keys` (no extra dupe).
+    key_to_node: std.StringHashMapUnmanaged(u32),
+    /// Tombstone bitset: bit i set ⇔ node i is logically deleted.
+    /// Length tracks hnsw.len() — grown on every insertLocked. Search
+    /// traversal skips tombstoned neighbors entirely.
+    tombstones: std.DynamicBitSetUnmanaged,
+    /// Running count of set bits in `tombstones`, kept in sync as a cache
+    /// so `vstats` can report deletion density without re-scanning.
+    tombstone_count: usize,
     /// Metric chosen at namespace creation. Drives the HNSW dist_fn and
     /// determines which query metrics can reuse this index.
     metric: Metric,
@@ -101,6 +122,9 @@ pub const NamespaceIndex = struct {
             .hnsw = Hnsw.init(allocator, p),
             .keys = .empty,
             .timestamps = .empty,
+            .key_to_node = .empty,
+            .tombstones = .{},
+            .tombstone_count = 0,
             .metric = m,
             .lock = .{},
         };
@@ -111,10 +135,18 @@ pub const NamespaceIndex = struct {
         for (self.keys.items) |k| self.allocator.free(k);
         self.keys.deinit(self.allocator);
         self.timestamps.deinit(self.allocator);
+        // key_to_node's keys are borrowed from self.keys — only free the map.
+        self.key_to_node.deinit(self.allocator);
+        self.tombstones.deinit(self.allocator);
     }
 
     pub fn len(self: *const NamespaceIndex) usize {
         return self.hnsw.len();
+    }
+
+    /// Active (non-tombstoned) node count. Use for user-facing stats.
+    pub fn liveCount(self: *const NamespaceIndex) usize {
+        return self.hnsw.len() - self.tombstone_count;
     }
 
     /// Insert a vector under the caller's write-lock. Returns the new node ID.
@@ -132,20 +164,59 @@ pub const NamespaceIndex = struct {
         const node_id = try self.hnsw.insert(vector);
 
         // hnsw.insert already succeeded — ensure side-tables stay in lockstep.
-        // If either append fails we're in an inconsistent state; treat as OOM.
         try self.keys.append(self.allocator, key_copy);
         errdefer {
             _ = self.keys.pop();
         }
         try self.timestamps.append(self.allocator, timestamp);
+        errdefer {
+            _ = self.timestamps.pop();
+        }
+
+        // Grow tombstones bitset to cover the new node. resize with `false`
+        // ensures the new slot is active (not-tombstoned) by default.
+        try self.tombstones.resize(self.allocator, self.hnsw.len(), false);
+
+        // Reverse map uses the just-duped key slice — borrow, don't re-dupe.
+        try self.key_to_node.put(self.allocator, key_copy, node_id);
 
         return node_id;
+    }
+
+    /// Mark the node corresponding to `key` as tombstoned. Returns:
+    ///   .deleted  — key existed and was not already tombstoned
+    ///   .noop     — key existed but was already tombstoned
+    ///   .missing  — key is not in the index
+    /// Caller must hold the write-lock.
+    pub fn markTombstoneLocked(self: *NamespaceIndex, key: []const u8) TombstoneResult {
+        const node_id = self.key_to_node.get(key) orelse return .missing;
+        if (self.tombstones.isSet(node_id)) return .noop;
+        self.tombstones.set(node_id);
+        self.tombstone_count += 1;
+        return .deleted;
+    }
+
+    /// Look up the internal node id for a key under any lock mode.
+    pub fn nodeIdFor(self: *const NamespaceIndex, key: []const u8) ?u32 {
+        return self.key_to_node.get(key);
+    }
+
+    /// Is this node id marked deleted? Callers typically pass the bitset
+    /// directly to `hnsw.search` via the filter parameter; this accessor is
+    /// for explicit single-id checks (debugging, tests).
+    pub fn isTombstoned(self: *const NamespaceIndex, node_id: u32) bool {
+        if (node_id >= self.tombstones.bit_length) return false;
+        return self.tombstones.isSet(node_id);
     }
 
     /// kNN search under the caller's read-lock. Fills `out` with up to `k`
     /// results sorted by ascending distance. Returned `key` slices are
     /// borrowed from the index's keys[] and valid only while the caller
     /// holds the read-lock.
+    ///
+    /// Tombstoned nodes are excluded from results via the filter passed to
+    /// `hnsw.search`. The graph traversal visits them (as path-through-only
+    /// nodes) so graph shape is preserved, but they are never returned.
     pub fn searchLocked(
         self: *NamespaceIndex,
         query: []align(1) const f32,
@@ -155,7 +226,9 @@ pub const NamespaceIndex = struct {
         hnsw_scratch: []hnsw_mod.SearchResult,
     ) !usize {
         if (hnsw_scratch.len < k) return error.ScratchTooSmall;
-        const n = try self.hnsw.search(query, k, ef, hnsw_scratch[0..k]);
+        const filter: ?*const std.DynamicBitSetUnmanaged =
+            if (self.tombstone_count > 0) &self.tombstones else null;
+        const n = try self.hnsw.search(query, k, ef, hnsw_scratch[0..k], filter);
         for (0..n) |i| {
             const r = hnsw_scratch[i];
             out[i] = .{
@@ -177,6 +250,10 @@ pub const NamespaceIndex = struct {
         for (self.keys.items) |k| self.allocator.free(k);
         self.keys.clearRetainingCapacity();
         self.timestamps.clearRetainingCapacity();
+        self.key_to_node.clearRetainingCapacity();
+        self.tombstones.deinit(self.allocator);
+        self.tombstones = .{};
+        self.tombstone_count = 0;
     }
 };
 
@@ -377,4 +454,93 @@ test "namespace index: clearLocked resets" {
 
     idx.clearLocked();
     try testing.expectEqual(@as(usize, 0), idx.len());
+    try testing.expectEqual(@as(usize, 0), idx.tombstone_count);
+    try testing.expect(idx.nodeIdFor("vec:a") == null);
+}
+
+test "namespace index: key_to_node map is populated on insert" {
+    var reg = NamespaceRegistry.init(testing.allocator, .{});
+    defer reg.deinit();
+
+    const idx = try reg.getOrCreate("vec:", .cosine);
+    idx.lock.lock();
+    defer idx.lock.unlock();
+
+    const a = [_]f32{ 1, 0, 0 };
+    const b = [_]f32{ 0, 1, 0 };
+    const a_align: []align(1) const f32 = @ptrCast(&a);
+    const b_align: []align(1) const f32 = @ptrCast(&b);
+    const id_a = try idx.insertLocked("vec:a", a_align, 1);
+    const id_b = try idx.insertLocked("vec:b", b_align, 2);
+
+    try testing.expectEqual(id_a, idx.nodeIdFor("vec:a").?);
+    try testing.expectEqual(id_b, idx.nodeIdFor("vec:b").?);
+    try testing.expect(idx.nodeIdFor("vec:missing") == null);
+}
+
+test "namespace index: markTombstoneLocked semantics" {
+    var reg = NamespaceRegistry.init(testing.allocator, .{});
+    defer reg.deinit();
+
+    const idx = try reg.getOrCreate("vec:", .cosine);
+    idx.lock.lock();
+    defer idx.lock.unlock();
+
+    const v = [_]f32{ 1, 0, 0 };
+    const v_align: []align(1) const f32 = @ptrCast(&v);
+    _ = try idx.insertLocked("vec:a", v_align, 1);
+
+    try testing.expectEqual(TombstoneResult.deleted, idx.markTombstoneLocked("vec:a"));
+    try testing.expectEqual(@as(usize, 1), idx.tombstone_count);
+
+    // Second call is a no-op.
+    try testing.expectEqual(TombstoneResult.noop, idx.markTombstoneLocked("vec:a"));
+    try testing.expectEqual(@as(usize, 1), idx.tombstone_count);
+
+    // Unknown key → missing.
+    try testing.expectEqual(TombstoneResult.missing, idx.markTombstoneLocked("vec:ghost"));
+}
+
+test "namespace index: search excludes tombstoned nodes" {
+    // Insert 3 orthogonal-ish vectors, tombstone the closest, then query:
+    // the next-closest vector should surface at position 0.
+    var reg = NamespaceRegistry.init(testing.allocator, .{ .m = 8, .ef_construction = 50 });
+    defer reg.deinit();
+
+    const idx = try reg.getOrCreate("vec:", .cosine);
+    idx.lock.lock();
+    defer idx.lock.unlock();
+
+    const v_near = [_]f32{ 1, 0.01, 0, 0 };
+    const v_mid = [_]f32{ 1, 0.5, 0, 0 };
+    const v_far = [_]f32{ 0, 1, 0, 0 };
+    const near_a: []align(1) const f32 = @ptrCast(&v_near);
+    const mid_a: []align(1) const f32 = @ptrCast(&v_mid);
+    const far_a: []align(1) const f32 = @ptrCast(&v_far);
+
+    _ = try idx.insertLocked("vec:near", near_a, 100);
+    _ = try idx.insertLocked("vec:mid", mid_a, 200);
+    _ = try idx.insertLocked("vec:far", far_a, 300);
+
+    const q = [_]f32{ 1, 0, 0, 0 };
+    const q_align: []align(1) const f32 = @ptrCast(&q);
+
+    // Sanity: without tombstones, "vec:near" wins.
+    var out: [3]IndexSearchResult = undefined;
+    var scratch: [3]hnsw_mod.SearchResult = undefined;
+    const n_before = try idx.searchLocked(q_align, 3, 50, &out, &scratch);
+    try testing.expectEqual(@as(usize, 3), n_before);
+    try testing.expectEqualStrings("vec:near", out[0].key);
+
+    // Tombstone it; next-closest should now lead.
+    _ = idx.markTombstoneLocked("vec:near");
+    const n_after = try idx.searchLocked(q_align, 3, 50, &out, &scratch);
+    // Only 2 live nodes left but we asked for 3 — should return what's available.
+    try testing.expectEqual(@as(usize, 2), n_after);
+    try testing.expectEqualStrings("vec:mid", out[0].key);
+    try testing.expectEqualStrings("vec:far", out[1].key);
+
+    // liveCount reflects the deletion.
+    try testing.expectEqual(@as(usize, 2), idx.liveCount());
+    try testing.expectEqual(@as(usize, 3), idx.len());
 }

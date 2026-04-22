@@ -280,6 +280,22 @@ pub const Ctx = struct {
         }
     }
 
+    /// Delete a key durably — goes through the WAL and replicates to peers.
+    /// Returns `error.WormViolation` when the target key is immutable; the
+    /// store's WORM check is authoritative. Lock dance mirrors `setDurable`.
+    pub fn deleteDurable(self: *Ctx, key: []const u8) !void {
+        const held = self.saveAndReleaseAllHeldShards();
+        defer self.reacquireAllHeldShards(held);
+
+        try self.store.delete(key);
+
+        if (self.cluster) |c| {
+            c.replicateDelete(key) catch |e| {
+                std.log.warn("procedure delete replication failed: {s}", .{@errorName(e)});
+            };
+        }
+    }
+
     /// Set a key to an integer value. Uses internal scratch buffer.
     pub fn setInt(self: *Ctx, key: []const u8, val: anytype) void {
         const str = std.fmt.bufPrint(&self.int_buf, "{d}", .{val}) catch return;

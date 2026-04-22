@@ -20,6 +20,8 @@ pub const vsim = @import("vsim.zig");
 pub const vinsert = @import("vinsert.zig");
 pub const vstats = @import("vstats.zig");
 pub const vreindex = @import("vreindex.zig");
+pub const vdelete = @import("vdelete.zig");
+pub const vnsdrop = @import("vnsdrop.zig");
 
 pub const ProcedureFn = *const fn (ctx: *Ctx) anyerror!Ctx.Result;
 
@@ -43,6 +45,8 @@ const PROCEDURES = [_]Entry{
     .{ .name = "vinsert", .func = vinsert.execute },
     .{ .name = "vstats", .func = vstats.execute },
     .{ .name = "vreindex", .func = vreindex.execute },
+    .{ .name = "vdelete", .func = vdelete.execute },
+    .{ .name = "vnsdrop", .func = vnsdrop.execute },
 };
 
 /// Look up a procedure by name. O(n) scan — n is tiny at comptime-known size.

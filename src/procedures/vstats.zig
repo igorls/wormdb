@@ -6,7 +6,23 @@
 //! - namespace: key prefix (default: "vec:")
 //!
 //! Returns JSON:
-//!   {"count":1234,"namespace":"vec:","dimensions":1536,"bq_count":1234}
+//!   {
+//!     "namespace":"vec:",
+//!     "count":1234,              ← live entries in the store
+//!     "inserts":1250,            ← per-node vinsert counter (local, not replicated)
+//!     "dimensions":1536,         ← derived from the first vector
+//!     "bq_count":1234,           ← BQ hash companion count
+//!     "hnsw": {                  ← present only when an HNSW index exists
+//!       "metric":"cosine",
+//!       "nodes":1234,            ← total graph nodes (live + tombstoned)
+//!       "live":1200,             ← nodes eligible for search results
+//!       "tombstones":34,         ← deleted nodes awaiting rebuild
+//!       "tombstone_ratio":0.0276
+//!     }
+//!   }
+//!
+//! When `tombstone_ratio` crosses ~25%, run `EXEC vreindex <namespace>`
+//! to reclaim memory and fully discard tombstoned nodes.
 
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
@@ -66,6 +82,42 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     try json.appendSlice(ctx.allocator, ",\"bq_count\":");
     str = std.fmt.bufPrint(&buf, "{d}", .{bq_count}) catch "0";
     try json.appendSlice(ctx.allocator, str);
+
+    // HNSW block — only if a registered index exists for this namespace.
+    if (ctx.vector_registry) |reg| {
+        if (reg.get(namespace)) |ns_idx| {
+            ns_idx.lock.lockShared();
+            defer ns_idx.lock.unlockShared();
+
+            const total = ns_idx.len();
+            const live = ns_idx.liveCount();
+            const tombs = ns_idx.tombstone_count;
+            const ratio: f32 = if (total == 0)
+                0.0
+            else
+                @as(f32, @floatFromInt(tombs)) / @as(f32, @floatFromInt(total));
+
+            try json.appendSlice(ctx.allocator, ",\"hnsw\":{\"metric\":\"");
+            try json.appendSlice(ctx.allocator, ns_idx.metric.name());
+            try json.appendSlice(ctx.allocator, "\",\"nodes\":");
+            str = std.fmt.bufPrint(&buf, "{d}", .{total}) catch "0";
+            try json.appendSlice(ctx.allocator, str);
+
+            try json.appendSlice(ctx.allocator, ",\"live\":");
+            str = std.fmt.bufPrint(&buf, "{d}", .{live}) catch "0";
+            try json.appendSlice(ctx.allocator, str);
+
+            try json.appendSlice(ctx.allocator, ",\"tombstones\":");
+            str = std.fmt.bufPrint(&buf, "{d}", .{tombs}) catch "0";
+            try json.appendSlice(ctx.allocator, str);
+
+            try json.appendSlice(ctx.allocator, ",\"tombstone_ratio\":");
+            str = std.fmt.bufPrint(&buf, "{d:.4}", .{ratio}) catch "0";
+            try json.appendSlice(ctx.allocator, str);
+
+            try json.append(ctx.allocator, '}');
+        }
+    }
 
     try json.append(ctx.allocator, '}');
     return ctx.value(try json.toOwnedSlice(ctx.allocator));

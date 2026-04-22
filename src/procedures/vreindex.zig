@@ -1,6 +1,13 @@
 //! Built-in VREINDEX procedure — bulk-build a namespace's HNSW index.
 //!
-//! EXEC vreindex [<namespace>]
+//! EXEC vreindex [<namespace>] [<metric>]
+//!
+//! - namespace: prefix to rebuild (default: "vec:")
+//! - metric:    override the index metric ("cosine" | "dot" | "l2").
+//!              Optional. When omitted, reuses the existing namespace's
+//!              metric if an index already exists; otherwise defaults to
+//!              cosine. An existing index's metric can't be changed via
+//!              vreindex — drop it first with `EXEC vnsdrop <namespace>`.
 //!
 //! Walks every `<namespace>*` entry in the store, re-inserts each vector
 //! into a fresh HNSW index, and atomically swaps it in for the namespace.
@@ -84,10 +91,19 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const reg = ctx.vector_registry orelse
         return ctx.err("vreindex: vector registry not enabled on this server");
 
-    // Default to cosine metric for a fresh rebuild. If the namespace
-    // already exists with a different metric, getOrCreate returns
-    // MetricMismatch — the caller must drop it first.
-    const ns_idx = reg.getOrCreate(namespace, Metric.cosine) catch |e| {
+    // Determine the metric: explicit arg > existing index's metric > cosine.
+    // Explicit arg is only honored when the namespace is new OR already
+    // matches; metric mutation requires a prior vnsdrop.
+    const explicit_metric: ?Metric = if (ctx.arg(1)) |s|
+        Metric.fromStr(s) orelse return ctx.err("vreindex: unknown metric (use cosine|dot|l2)")
+    else
+        null;
+
+    const existing_metric: ?Metric = if (reg.get(namespace)) |idx| idx.metric else null;
+
+    const effective_metric: Metric = explicit_metric orelse existing_metric orelse .cosine;
+
+    const ns_idx = reg.getOrCreate(namespace, effective_metric) catch |e| {
         return ctx.err(ctx.fmt("vreindex: getOrCreate failed: {s}", .{@errorName(e)}));
     };
 

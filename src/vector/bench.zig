@@ -3,15 +3,22 @@
 //! Measures:
 //!   1. Raw SIMD throughput for cosine/dot/l2 at common embedding dims.
 //!   2. Hamming throughput on binary-quantized vectors.
-//!   3. Full Phase-1 vsearch inner loop (distance + top-K push).
-//!   4. Projected Phase-2.1 two-stage loop (Hamming top-M → exact top-K).
+//!   3. "phase1" — full cosine scan + top-K push (baseline / mode=exact path).
+//!   4. "phase2.1" — Hamming top-M → exact top-K two-stage (matches the
+//!      default `vsearch` mode=auto inner loop).
 //!
 //! Run with:
-//!   zig run bench/vector_bench.zig -O ReleaseFast
+//!   zig run src/vector/bench.zig -O ReleaseFast -lc
 //!
 //! Data is synthetic (normal-distributed random f32). Real embeddings have
-//! tighter score distributions so the heap-admission fast path will fire
-//! more often in production — these numbers are conservative.
+//! tighter score distributions so the heap-admission fast path fires more
+//! often in production — these numbers are conservative.
+//!
+//! Numbers are inner-loop-only: no shard lock acquire/release, no hash-map
+//! walk, no getCopy per stage-2 candidate. Absolute query latency through
+//! the real `vsearch` procedure will be somewhat higher; the relative
+//! speedup (phase1 vs phase2.1) should hold because both paths pay the
+//! same infrastructure overhead.
 
 const std = @import("std");
 const distance = @import("distance.zig");

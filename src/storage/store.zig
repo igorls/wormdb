@@ -736,8 +736,8 @@ test "Store basic operations" {
     const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_store.wal", .{tmp_path});
     defer testing.allocator.free(wal_path);
 
-    const file = try tmp_dir.dir.createFile("test_store.wal", .{});
-    file.close();
+    const file = try compat.Dir.createFile(tmp_dir.dir, "test_store.wal", .{});
+    compat.File.close(file);
 
     const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_store.snapshot", .{tmp_path});
     defer testing.allocator.free(snapshot_path);
@@ -777,8 +777,8 @@ test "WORM enforcement" {
     const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_worm.wal", .{tmp_path});
     defer testing.allocator.free(wal_path);
 
-    const file = try tmp_dir.dir.createFile("test_worm.wal", .{});
-    file.close();
+    const file = try compat.Dir.createFile(tmp_dir.dir, "test_worm.wal", .{});
+    compat.File.close(file);
 
     const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_worm.snapshot", .{tmp_path});
     defer testing.allocator.free(snapshot_path);
@@ -814,8 +814,8 @@ test "Store replay handles overwrite and delete safely" {
     const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_replay_ownership.snapshot", .{tmp_path});
     defer testing.allocator.free(snapshot_path);
 
-    const file = try tmp_dir.dir.createFile("test_replay_ownership.wal", .{});
-    file.close();
+    const file = try compat.Dir.createFile(tmp_dir.dir, "test_replay_ownership.wal", .{});
+    compat.File.close(file);
 
     const config = Config{
         .wal_path = wal_path,
@@ -857,8 +857,8 @@ test "Store restores from snapshot then replays WAL" {
     const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_snapshot_restore.snapshot", .{tmp_path});
     defer testing.allocator.free(snapshot_path);
 
-    const file = try tmp_dir.dir.createFile("test_snapshot_restore.wal", .{});
-    file.close();
+    const file = try compat.Dir.createFile(tmp_dir.dir, "test_snapshot_restore.wal", .{});
+    compat.File.close(file);
 
     const config = Config{
         .wal_path = wal_path,
@@ -900,8 +900,8 @@ test "WAL truncation keeps state correct across restart" {
     const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_wal_truncate.snapshot", .{tmp_path});
     defer testing.allocator.free(snapshot_path);
 
-    const file = try tmp_dir.dir.createFile("test_wal_truncate.wal", .{});
-    file.close();
+    const file = try compat.Dir.createFile(tmp_dir.dir, "test_wal_truncate.wal", .{});
+    compat.File.close(file);
 
     const max_wal_size: usize = 90;
     const config = Config{

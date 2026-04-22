@@ -698,8 +698,8 @@ test "Server SUB/UNSUB command wiring updates subscriber count" {
     const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_server_sub_unsub.wal", .{tmp_path});
     defer testing.allocator.free(wal_path);
 
-    const wal_file = try tmp_dir.dir.createFile("test_server_sub_unsub.wal", .{});
-    wal_file.close();
+    const wal_file = try core.compat.Dir.createFile(tmp_dir.dir, "test_server_sub_unsub.wal", .{});
+    core.compat.File.close(wal_file);
 
     const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_server_sub_unsub.snapshot", .{tmp_path});
     defer testing.allocator.free(snapshot_path);
@@ -740,8 +740,8 @@ test "Server connection cleanup auto-unsubscribes remaining subscriptions" {
     const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_server_conn_cleanup.wal", .{tmp_path});
     defer testing.allocator.free(wal_path);
 
-    const wal_file = try tmp_dir.dir.createFile("test_server_conn_cleanup.wal", .{});
-    wal_file.close();
+    const wal_file = try core.compat.Dir.createFile(tmp_dir.dir, "test_server_conn_cleanup.wal", .{});
+    core.compat.File.close(wal_file);
 
     const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_server_conn_cleanup.snapshot", .{tmp_path});
     defer testing.allocator.free(snapshot_path);
@@ -797,8 +797,8 @@ test "TCP framing handles partial command split across reads" {
     const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_tcp_partial_reads.wal", .{tmp_path});
     defer testing.allocator.free(wal_path);
 
-    const wal_file = try tmp_dir.dir.createFile("test_tcp_partial_reads.wal", .{});
-    wal_file.close();
+    const wal_file = try core.compat.Dir.createFile(tmp_dir.dir, "test_tcp_partial_reads.wal", .{});
+    core.compat.File.close(wal_file);
 
     const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_tcp_partial_reads.snapshot", .{tmp_path});
     defer testing.allocator.free(snapshot_path);
@@ -843,8 +843,8 @@ test "TCP framing handles multiple commands in one read" {
     const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_tcp_multi_commands.wal", .{tmp_path});
     defer testing.allocator.free(wal_path);
 
-    const wal_file = try tmp_dir.dir.createFile("test_tcp_multi_commands.wal", .{});
-    wal_file.close();
+    const wal_file = try core.compat.Dir.createFile(tmp_dir.dir, "test_tcp_multi_commands.wal", .{});
+    core.compat.File.close(wal_file);
 
     const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_tcp_multi_commands.snapshot", .{tmp_path});
     defer testing.allocator.free(snapshot_path);
@@ -888,8 +888,8 @@ test "TCP framing preserves buffered tail across mixed full and partial reads" {
     const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_tcp_mixed_reads.wal", .{tmp_path});
     defer testing.allocator.free(wal_path);
 
-    const wal_file = try tmp_dir.dir.createFile("test_tcp_mixed_reads.wal", .{});
-    wal_file.close();
+    const wal_file = try core.compat.Dir.createFile(tmp_dir.dir, "test_tcp_mixed_reads.wal", .{});
+    core.compat.File.close(wal_file);
 
     const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_tcp_mixed_reads.snapshot", .{tmp_path});
     defer testing.allocator.free(snapshot_path);
@@ -938,8 +938,8 @@ test "TCP framing rejects oversized line and recovers for next valid command" {
     const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_tcp_oversized_line.wal", .{tmp_path});
     defer testing.allocator.free(wal_path);
 
-    const wal_file = try tmp_dir.dir.createFile("test_tcp_oversized_line.wal", .{});
-    wal_file.close();
+    const wal_file = try core.compat.Dir.createFile(tmp_dir.dir, "test_tcp_oversized_line.wal", .{});
+    core.compat.File.close(wal_file);
 
     const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_tcp_oversized_line.snapshot", .{tmp_path});
     defer testing.allocator.free(snapshot_path);

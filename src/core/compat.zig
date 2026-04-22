@@ -81,7 +81,10 @@ pub const File = struct {
     }
 
     pub fn readAll(file: std.Io.File, buf: []u8) !usize {
-        var reader = file.reader(io(), &.{});
+        // Use the streaming reader so successive readAll calls advance the
+        // shared file-seek position (positional reader always reads from
+        // offset 0, which breaks incremental parsing of WAL / snapshot).
+        var reader = file.readerStreaming(io(), &.{});
         var total: usize = 0;
         while (total < buf.len) {
             const slice = reader.interface.readSliceShort(buf[total..]) catch |err| switch (err) {

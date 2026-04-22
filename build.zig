@@ -109,6 +109,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = &.{
             .{ .name = "meshguard", .module = meshguard_mod },
+            .{ .name = "build_options", .module = build_options.createModule() },
         },
     });
 

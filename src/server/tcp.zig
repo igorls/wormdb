@@ -692,7 +692,7 @@ test "Server SUB/UNSUB command wiring updates subscriber count" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
     defer testing.allocator.free(tmp_path);
 
     const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_server_sub_unsub.wal", .{tmp_path});
@@ -734,7 +734,7 @@ test "Server connection cleanup auto-unsubscribes remaining subscriptions" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
     defer testing.allocator.free(tmp_path);
 
     const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_server_conn_cleanup.wal", .{tmp_path});
@@ -791,7 +791,7 @@ test "TCP framing handles partial command split across reads" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
     defer testing.allocator.free(tmp_path);
 
     const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_tcp_partial_reads.wal", .{tmp_path});
@@ -837,7 +837,7 @@ test "TCP framing handles multiple commands in one read" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
     defer testing.allocator.free(tmp_path);
 
     const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_tcp_multi_commands.wal", .{tmp_path});
@@ -882,7 +882,7 @@ test "TCP framing preserves buffered tail across mixed full and partial reads" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
     defer testing.allocator.free(tmp_path);
 
     const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_tcp_mixed_reads.wal", .{tmp_path});
@@ -932,7 +932,7 @@ test "TCP framing rejects oversized line and recovers for next valid command" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
     defer testing.allocator.free(tmp_path);
 
     const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_tcp_oversized_line.wal", .{tmp_path});
@@ -956,7 +956,7 @@ test "TCP framing rejects oversized line and recovers for next valid command" {
 
     var server = Server.init(testing.allocator, &store, &bus, .{});
 
-    var writes: std.ArrayListUnmanaged(u8) = .{};
+    var writes: std.ArrayListUnmanaged(u8) = .empty;
     defer writes.deinit(testing.allocator);
 
     var conn_ctx = Server.ConnectionContext.initWithCapture(testing.allocator, &bus, null, &writes);

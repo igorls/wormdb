@@ -18,6 +18,7 @@
 //!   the connection's authenticated capabilities.
 
 const std = @import("std");
+const compat = @import("../core/compat.zig");
 const c = @cImport({
     @cInclude("sodium.h");
 });
@@ -84,7 +85,7 @@ pub const TokenState = struct {
 
     /// Check if the token is expired based on current time.
     pub fn isExpired(self: *const TokenState) bool {
-        const now: u64 = @intCast(@divFloor(std.time.milliTimestamp(), 1000));
+        const now: u64 = @intCast(@divFloor(compat.nowMs(), 1000));
         return now >= self.exp;
     }
 };
@@ -140,7 +141,7 @@ pub fn verifyAndParse(
     pos += 8;
 
     // Check expiration
-    const now: u64 = @intCast(@divFloor(std.time.milliTimestamp(), 1000));
+    const now: u64 = @intCast(@divFloor(compat.nowMs(), 1000));
     if (now >= exp) return error.TokenExpired;
     if (iat > now + 60) return error.TokenNotYetValid; // 60s clock skew tolerance
 
@@ -177,8 +178,8 @@ pub fn verifyAndParse(
 
     for (0..cap_count) |i| {
         if (pos + 2 > payload.len) return error.MalformedToken;
-        const op = std.meta.intToEnum(Operation, payload[pos]) catch return error.MalformedToken;
-        const match_type = std.meta.intToEnum(MatchType, payload[pos + 1]) catch return error.MalformedToken;
+        const op = compat.intToEnum(Operation, payload[pos]) catch return error.MalformedToken;
+        const match_type = compat.intToEnum(MatchType, payload[pos + 1]) catch return error.MalformedToken;
         pos += 2;
 
         if (pos + 4 > payload.len) return error.MalformedToken;
@@ -326,7 +327,7 @@ test "encode, verify, and parse roundtrip" {
 
     const kp = generateKeypair();
 
-    const now: u64 = @intCast(@divFloor(std.time.milliTimestamp(), 1000));
+    const now: u64 = @intCast(@divFloor(compat.nowMs(), 1000));
     const caps = &[_]Capability{
         .{ .op = .exec, .match_type = .exact, .pattern = "increment" },
         .{ .op = .get, .match_type = .prefix, .pattern = "user:alice:" },
@@ -358,7 +359,7 @@ test "reject expired token" {
     if (c.sodium_init() < -1) return error.SodiumInitFailed;
 
     const kp = generateKeypair();
-    const now: u64 = @intCast(@divFloor(std.time.milliTimestamp(), 1000));
+    const now: u64 = @intCast(@divFloor(compat.nowMs(), 1000));
 
     // Token expired 10 seconds ago
     const token = try encode("bob", now - 100, now - 10, 1, &.{}, &kp.secret_key, testing.allocator);
@@ -375,7 +376,7 @@ test "reject bad signature" {
     const kp1 = generateKeypair();
     const kp2 = generateKeypair(); // Different key
 
-    const now: u64 = @intCast(@divFloor(std.time.milliTimestamp(), 1000));
+    const now: u64 = @intCast(@divFloor(compat.nowMs(), 1000));
     const token = try encode("carol", now, now + 3600, 1, &.{}, &kp1.secret_key, testing.allocator);
     defer testing.allocator.free(token);
 

@@ -146,7 +146,7 @@ pub const Store = struct {
     pub fn set(self: *Store, key: []const u8, value: []const u8, is_worm: bool) StoreError!void {
         const si = shardIndex(key);
         const shard = &self.shards[si];
-        const timestamp: u64 = @intCast(std.time.milliTimestamp());
+        const timestamp: u64 = @intCast(compat.nowMs());
 
         // Phase 1: Check WORM under shard lock
         shard.mutex.lock();
@@ -241,7 +241,7 @@ pub const Store = struct {
 
     fn setInternalLocked(self: *Store, si: usize, key: []const u8, value: []const u8, is_worm: bool) StoreError!void {
         const shard = &self.shards[si];
-        const timestamp: u64 = @intCast(std.time.milliTimestamp());
+        const timestamp: u64 = @intCast(compat.nowMs());
 
         if (shard.data.get(key)) |existing| {
             if (existing.flags.is_worm) return error.WormViolation;
@@ -367,7 +367,7 @@ pub const Store = struct {
         limit: usize,
         alloc: std.mem.Allocator,
     ) ![]ScanResult {
-        var results: std.ArrayListUnmanaged(ScanResult) = .{};
+        var results: std.ArrayListUnmanaged(ScanResult) = .empty;
         errdefer {
             for (results.items) |r| {
                 alloc.free(r.key);
@@ -730,7 +730,7 @@ test "Store basic operations" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
     defer testing.allocator.free(tmp_path);
 
     const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_store.wal", .{tmp_path});
@@ -771,7 +771,7 @@ test "WORM enforcement" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
     defer testing.allocator.free(tmp_path);
 
     const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_worm.wal", .{tmp_path});
@@ -805,7 +805,7 @@ test "Store replay handles overwrite and delete safely" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
     defer testing.allocator.free(tmp_path);
 
     const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_replay_ownership.wal", .{tmp_path});
@@ -848,7 +848,7 @@ test "Store restores from snapshot then replays WAL" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
     defer testing.allocator.free(tmp_path);
 
     const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_snapshot_restore.wal", .{tmp_path});
@@ -891,7 +891,7 @@ test "WAL truncation keeps state correct across restart" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = try tmp_dir.dir.realpathAlloc(testing.allocator, ".");
+    const tmp_path = try compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
     defer testing.allocator.free(tmp_path);
 
     const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_wal_truncate.wal", .{tmp_path});

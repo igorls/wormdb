@@ -6,6 +6,7 @@
 //! - Response: Server responses
 
 const std = @import("std");
+const compat = @import("compat.zig");
 
 /// Timestamp type (milliseconds since epoch)
 pub const Timestamp = u64;
@@ -28,7 +29,7 @@ pub const Entry = struct {
         return .{
             .key = try allocator.dupe(u8, key),
             .value = try allocator.dupe(u8, value),
-            .timestamp = @intCast(std.time.milliTimestamp()),
+            .timestamp = @intCast(compat.nowMs()),
             .flags = .{ .is_worm = is_worm, .is_deleted = false },
         };
     }

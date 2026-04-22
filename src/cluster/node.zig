@@ -75,7 +75,7 @@ const PeerConnection = struct {
     /// Used for replication connections instead of mesh IP when available,
     /// since WireGuard tunnels may not be functional (e.g. Docker).
     real_addr: ?[4]u8,
-    stream: ?std.net.Stream,
+    stream: ?core.compat.net.Stream,
     last_connect_attempt_ns: i128,
     /// Set to true when a new connection is established.
     /// Consumed by replicateWrite to trigger a full-state anti-entropy sync.
@@ -88,27 +88,28 @@ const PeerConnection = struct {
         if (self.stream != null) return;
         if (self.is_dead) return;
 
-        const now = std.time.nanoTimestamp();
+        const now = core.compat.nowNs();
         if (now - self.last_connect_attempt_ns < 2_000_000_000) return;
         self.last_connect_attempt_ns = now;
 
         // Use real network IP (Docker bridge / LAN) if available,
         // fall back to mesh IP (requires WireGuard tunnel).
         const ip = self.real_addr orelse self.mesh_ip;
-        const addr = std.net.Address.initIp4(ip, port);
-        const stream = std.net.tcpConnectToAddress(addr) catch return;
+        const addr = core.compat.net.Address.initIp4(ip, port);
+        const stream = core.compat.net.tcpConnectToAddress(addr) catch return;
 
         // Set send timeout so writeAll to dead peers times out in 2s
         // instead of blocking for 30+ seconds (Linux TCP keepalive default).
         const timeval = std.posix.timeval{ .sec = 2, .usec = 0 };
-        std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeval)) catch {};
+        std.posix.setsockopt(stream.getHandle(), std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeval)) catch {};
 
-        stream.writeAll(&.{ 0x57, 0x52 }) catch {
-            stream.close();
+        var stream_mut = stream;
+        stream_mut.writeAll(&.{ 0x57, 0x52 }) catch {
+            stream_mut.close();
             return;
         };
 
-        self.stream = stream;
+        self.stream = stream_mut;
         self.needs_sync = true;
         std.log.info("cluster: connected to peer {d}.{d}.{d}.{d}:{d}", .{
             ip[0], ip[1], ip[2], ip[3], port,
@@ -123,8 +124,10 @@ const PeerConnection = struct {
     }
 
     fn sendCommand(self: *PeerConnection, cmd: Command) bool {
-        const stream = self.stream orelse return false;
-        wire.writeCommand(stream, cmd) catch {
+        if (self.stream == null) return false;
+        // wire.writeCommand takes an anytype writer with a `.writeAll` method;
+        // core.compat.net.Stream.writeAll requires `*Stream`, so pass by pointer.
+        wire.writeCommand(&self.stream.?, cmd) catch {
             self.disconnect();
             return false;
         };
@@ -441,23 +444,22 @@ pub const Cluster = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var buf: std.ArrayListUnmanaged(u8) = .{};
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
-        const w = buf.writer(allocator);
 
         // Self identity
-        try w.print("self_mesh_ip={d}.{d}.{d}.{d}\n", .{
+        try buf.print(allocator, "self_mesh_ip={d}.{d}.{d}.{d}\n", .{
             self.mesh_ip[0], self.mesh_ip[1], self.mesh_ip[2], self.mesh_ip[3],
         });
-        try w.print("self_port={d}\n", .{self.config.peer_port});
-        try w.writeAll("---\n");
+        try buf.print(allocator, "self_port={d}\n", .{self.config.peer_port});
+        try buf.appendSlice(allocator, "---\n");
 
         // Iterate SWIM membership table
         var iter = self.membership.peers.iterator();
         while (iter.next()) |entry| {
             const peer = entry.value_ptr;
 
-            try w.print("mesh_ip={d}.{d}.{d}.{d}\n", .{
+            try buf.print(allocator, "mesh_ip={d}.{d}.{d}.{d}\n", .{
                 peer.mesh_ip[0], peer.mesh_ip[1], peer.mesh_ip[2], peer.mesh_ip[3],
             });
 
@@ -467,12 +469,12 @@ pub const Cluster = struct {
                 .dead => "dead",
                 .left => "left",
             };
-            try w.print("state={s}\n", .{state_str});
+            try buf.print(allocator, "state={s}\n", .{state_str});
 
             if (peer.gossip_endpoint) |ep| {
                 var ep_buf: [32]u8 = undefined;
                 const ep_str = ep.format(&ep_buf);
-                try w.print("gossip_endpoint={s}\n", .{ep_str});
+                try buf.print(allocator, "gossip_endpoint={s}\n", .{ep_str});
             }
 
             // Check if we have an active WormWire TCP connection to this peer
@@ -480,9 +482,9 @@ pub const Cluster = struct {
                 pc.stream != null
             else
                 false;
-            try w.print("wormwire={s}\n", .{if (has_conn) "connected" else "disconnected"});
+            try buf.print(allocator, "wormwire={s}\n", .{if (has_conn) "connected" else "disconnected"});
 
-            try w.writeAll("---\n");
+            try buf.appendSlice(allocator, "---\n");
         }
 
         return buf.toOwnedSlice(allocator);

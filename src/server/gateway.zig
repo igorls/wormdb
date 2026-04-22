@@ -70,7 +70,7 @@ pub const Gateway = struct {
     fn runLoop(self: *Gateway) void {
         self.running.store(true, .release);
 
-        const addr = std.net.Address.parseIp("0.0.0.0", self.port) catch |err| {
+        const addr = core.compat.net.Address.parseIp("0.0.0.0", self.port) catch |err| {
             std.log.err("Gateway: invalid bind address: {}", .{err});
             return;
         };
@@ -101,13 +101,13 @@ pub const Gateway = struct {
         }
     }
 
-    fn handleConnection(self: *Gateway, conn: std.net.Server.Connection) void {
+    fn handleConnection(self: *Gateway, conn: core.compat.net.ServerCompat.Connection) void {
         var stream = conn.stream;
         defer stream.close();
 
         // Disable Nagle for low-latency request/response
         std.posix.setsockopt(
-            stream.handle,
+            stream.getHandle(),
             std.posix.IPPROTO.TCP,
             std.posix.TCP.NODELAY,
             &std.mem.toBytes(@as(c_int, 1)),
@@ -191,7 +191,7 @@ pub const Gateway = struct {
             }
 
             const cmd_id_raw = payload[0];
-            const cmd_id = std.meta.intToEnum(core.types.CommandId, cmd_id_raw) catch {
+            const cmd_id = core.compat.intToEnum(core.types.CommandId, cmd_id_raw) catch {
                 const err_resp = wireEncodeError("unknown command");
                 sendWsFrame(&stream, 0x02, err_resp) catch return;
                 continue;
@@ -307,13 +307,13 @@ pub const Gateway = struct {
 
             // Step 6: Encode WormWire response and send as WebSocket binary frame
             var resp_buf: [65536]u8 = undefined;
-            var fbs = std.io.fixedBufferStream(&resp_buf);
-            wire.writeResponse(fbs.writer(), resp) catch {
+            var fbw = wire.FixedBufWriter.init(&resp_buf);
+            wire.writeResponse(&fbw, resp) catch {
                 const err_resp = wireEncodeError("response too large");
                 sendWsFrame(&stream, 0x02, err_resp) catch return;
                 continue;
             };
-            sendWsFrame(&stream, 0x02, fbs.getWritten()) catch return;
+            sendWsFrame(&stream, 0x02, fbw.getWritten()) catch return;
         }
     }
 
@@ -325,7 +325,7 @@ pub const Gateway = struct {
         allocated: bool, // true if payload was heap-allocated (needs free)
     };
 
-    fn readWsFrame(stream: *std.net.Stream, allocator: std.mem.Allocator) ?WsFrame {
+    fn readWsFrame(stream: *core.compat.net.Stream, allocator: std.mem.Allocator) ?WsFrame {
         // Read 2 byte header
         var header: [2]u8 = undefined;
         readExact(stream, &header) orelse return null;
@@ -375,7 +375,7 @@ pub const Gateway = struct {
         return .{ .opcode = opcode, .payload = buf, .allocated = true };
     }
 
-    fn sendWsFrame(stream: *std.net.Stream, opcode: u8, payload: []const u8) !void {
+    fn sendWsFrame(stream: *core.compat.net.Stream, opcode: u8, payload: []const u8) !void {
         // Server-to-client frames are NOT masked (RFC 6455 §5.1)
         var header_buf: [10]u8 = undefined;
         var header_len: usize = 2;
@@ -399,13 +399,13 @@ pub const Gateway = struct {
         }
     }
 
-    fn sendWsCloseWithCode(stream: *std.net.Stream, code: u16) !void {
+    fn sendWsCloseWithCode(stream: *core.compat.net.Stream, code: u16) !void {
         var buf: [2]u8 = undefined;
         std.mem.writeInt(u16, &buf, code, .big);
         try sendWsFrame(stream, 0x08, &buf);
     }
 
-    fn readExact(stream: *std.net.Stream, dest: []u8) ?void {
+    fn readExact(stream: *core.compat.net.Stream, dest: []u8) ?void {
         var offset: usize = 0;
         while (offset < dest.len) {
             const n = stream.read(dest[offset..]) catch return null;
@@ -416,7 +416,7 @@ pub const Gateway = struct {
 
     // --- HTTP/WebSocket Handshake ---
 
-    fn readHttpRequest(stream: *std.net.Stream, buf: *[4096]u8) ?[]const u8 {
+    fn readHttpRequest(stream: *core.compat.net.Stream, buf: *[4096]u8) ?[]const u8 {
         var total: usize = 0;
         while (total < buf.len) {
             const n = stream.read(buf[total..]) catch return null;
@@ -482,11 +482,11 @@ pub const Gateway = struct {
     const ConnContext = struct {
         allocator: std.mem.Allocator,
         event_bus: *EventBus,
-        stream: *std.net.Stream,
+        stream: *core.compat.net.Stream,
         subscriptions: std.StringHashMap(u64),
         write_mutex: core.compat.Mutex,
 
-        fn init(allocator: std.mem.Allocator, event_bus: *EventBus, stream: *std.net.Stream) ConnContext {
+        fn init(allocator: std.mem.Allocator, event_bus: *EventBus, stream: *core.compat.net.Stream) ConnContext {
             return .{
                 .allocator = allocator,
                 .event_bus = event_bus,
@@ -538,8 +538,8 @@ pub const Gateway = struct {
 
             // Encode as WormWire event response
             var resp_buf: [65536]u8 = undefined;
-            var fbs = std.io.fixedBufferStream(&resp_buf);
-            wire.writeResponse(fbs.writer(), .{ .event = .{
+            var fbw = wire.FixedBufWriter.init(&resp_buf);
+            wire.writeResponse(&fbw, .{ .event = .{
                 .channel = parsed.channel,
                 .message = parsed.message,
             } }) catch return;
@@ -547,7 +547,7 @@ pub const Gateway = struct {
             // Wrap in WebSocket binary frame and send
             self.write_mutex.lock();
             defer self.write_mutex.unlock();
-            sendWsFrame(self.stream, 0x02, fbs.getWritten()) catch {};
+            sendWsFrame(self.stream, 0x02, fbw.getWritten()) catch {};
         }
 
         fn parseTextEvent(data: []const u8) ?struct { channel: []const u8, message: []const u8 } {

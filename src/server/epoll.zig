@@ -24,13 +24,72 @@ const RECV_BUF_SIZE = 65536;
 const MAX_EVENTS = 256;
 const MAX_CONNS = 4096;
 
+// ── 0.16 compatibility shims for epoll ────────────────────────────────
+// `posix.epoll_*` was removed in 0.16; fall back to the raw linux
+// syscalls (which return usize — errno encoded in the top half).
+
+fn epollCreate1(flags: u32) !posix.fd_t {
+    const rc = linux.epoll_create1(flags);
+    switch (posix.errno(rc)) {
+        .SUCCESS => return @intCast(rc),
+        else => return error.EpollCreateFailed,
+    }
+}
+
+fn epollCtl(epfd: posix.fd_t, op: u32, fd: posix.fd_t, ev: ?*linux.epoll_event) !void {
+    const rc = linux.epoll_ctl(epfd, op, fd, ev);
+    switch (posix.errno(rc)) {
+        .SUCCESS => return,
+        else => return error.EpollCtlFailed,
+    }
+}
+
+fn epollWait(epfd: posix.fd_t, events: []linux.epoll_event, timeout: i32) usize {
+    while (true) {
+        const rc = linux.epoll_wait(epfd, events.ptr, @intCast(events.len), timeout);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return rc,
+            .INTR => continue,
+            else => return 0,
+        }
+    }
+}
+
+/// Replacement for `posix.write` (removed in 0.16). Uses raw libc write().
+fn posixWrite(fd: posix.fd_t, data: []const u8) !usize {
+    while (true) {
+        const rc = std.c.write(fd, data.ptr, data.len);
+        if (rc < 0) {
+            switch (posix.errno(rc)) {
+                .INTR => continue,
+                .AGAIN => return error.WouldBlock,
+                .PIPE => return error.BrokenPipe,
+                .CONNRESET => return error.ConnectionResetByPeer,
+                else => return error.Unexpected,
+            }
+        }
+        return @intCast(rc);
+    }
+}
+
+/// Adapter so `wire.writeResponse` (which takes any writer with `.writeAll`)
+/// can push into an ArrayListUnmanaged (ArrayList.writer() was removed in 0.16).
+const RespBufWriter = struct {
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+
+    pub fn writeAll(self: *RespBufWriter, data: []const u8) !void {
+        try self.buf.appendSlice(self.allocator, data);
+    }
+};
+
 const ConnState = struct {
     fd: posix.fd_t = -1,
     recv_buf: [RECV_BUF_SIZE]u8 = undefined,
     recv_len: usize = 0,
     send_buf: []u8 = &.{},
     send_pos: usize = 0,
-    resp_buf: std.ArrayListUnmanaged(u8) = .{},
+    resp_buf: std.ArrayListUnmanaged(u8) = .empty,
     active: bool = false,
     handshake_done: bool = false,
     /// True when we have data queued to send and are waiting for EPOLLOUT.
@@ -65,35 +124,48 @@ pub const EpollServer = struct {
         bind_address: []const u8,
         port: u16,
     ) !EpollServer {
-        // Create listening socket (non-blocking)
-        const addr = try std.net.Address.parseIp(bind_address, port);
-        const listener_fd = try posix.socket(
-            addr.any.family,
+        // Create listening socket (non-blocking). std.net and posix.socket
+        // were removed in 0.16; parse IP via std.Io.net and build the
+        // sockaddr_in directly, then use the libc wrappers in core.compat.
+        const parsed = try std.Io.net.IpAddress.parse(bind_address, port);
+        const sin_bytes: [4]u8 = switch (parsed) {
+            .ip4 => |ip4| ip4.bytes,
+            .ip6 => return error.Ipv6BindNotSupportedInEpollServer,
+        };
+        const sockaddr_in = posix.sockaddr.in{
+            .family = posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = @bitCast(sin_bytes),
+            .zero = @splat(0),
+        };
+
+        const listener_fd = try core.compat.socket(
+            posix.AF.INET,
             posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
             posix.IPPROTO.TCP,
         );
-        errdefer posix.close(listener_fd);
+        errdefer core.compat.close(listener_fd);
 
         try posix.setsockopt(listener_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-        try posix.bind(listener_fd, &addr.any, addr.getOsSockLen());
-        try posix.listen(listener_fd, 128);
+        try core.compat.bind(listener_fd, @ptrCast(&sockaddr_in), @sizeOf(posix.sockaddr.in));
+        try core.compat.listen(listener_fd, 128);
 
         // Create epoll instance
-        const epoll_fd = try posix.epoll_create1(linux.EPOLL.CLOEXEC);
-        errdefer posix.close(epoll_fd);
+        const epoll_fd = try epollCreate1(linux.EPOLL.CLOEXEC);
+        errdefer core.compat.close(epoll_fd);
 
         // Register listener
         var ev = linux.epoll_event{
             .events = linux.EPOLL.IN,
             .data = .{ .fd = listener_fd },
         };
-        try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, listener_fd, &ev);
+        try epollCtl(epoll_fd, linux.EPOLL.CTL_ADD, listener_fd, &ev);
 
         // Pre-allocate connection pool
         const conns = try allocator.alloc(ConnState, MAX_CONNS);
         for (conns) |*c| c.* = .{};
 
-        var free_slots = std.ArrayListUnmanaged(u16){};
+        var free_slots: std.ArrayListUnmanaged(u16) = .empty;
         try free_slots.ensureTotalCapacity(allocator, MAX_CONNS);
         var i: u16 = 0;
         while (i < MAX_CONNS) : (i += 1) {
@@ -117,10 +189,10 @@ pub const EpollServer = struct {
     }
 
     pub fn deinit(self: *EpollServer) void {
-        posix.close(self.epoll_fd);
-        posix.close(self.listener_fd);
+        core.compat.close(self.epoll_fd);
+        core.compat.close(self.listener_fd);
         for (self.conns) |*c| {
-            if (c.active) posix.close(c.fd);
+            if (c.active) core.compat.close(c.fd);
             if (c.send_buf.len > 0) self.allocator.free(c.send_buf);
         }
         self.allocator.free(self.conns);
@@ -136,8 +208,8 @@ pub const EpollServer = struct {
         const conn = &self.conns[slot];
         if (conn.active) {
             // Remove from epoll (ignore errors — fd may already be removed)
-            posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, conn.fd, null) catch {};
-            posix.close(conn.fd);
+            epollCtl(self.epoll_fd, linux.EPOLL.CTL_DEL, conn.fd, null) catch {};
+            core.compat.close(conn.fd);
             if (conn.send_buf.len > 0) self.allocator.free(conn.send_buf);
             conn.reset();
         }
@@ -147,7 +219,7 @@ pub const EpollServer = struct {
     fn handleAccept(self: *EpollServer) void {
         // Accept as many connections as possible (edge-triggered style)
         while (true) {
-            const client_fd = posix.accept(self.listener_fd, null, null, posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC) catch break;
+            const client_fd = core.compat.accept4(self.listener_fd, posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC) catch break;
 
             // TCP_NODELAY
             posix.setsockopt(client_fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
@@ -162,13 +234,13 @@ pub const EpollServer = struct {
                     .events = linux.EPOLL.IN,
                     .data = .{ .u32 = slot },
                 };
-                posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, client_fd, &ev) catch {
-                    posix.close(client_fd);
+                epollCtl(self.epoll_fd, linux.EPOLL.CTL_ADD, client_fd, &ev) catch {
+                    core.compat.close(client_fd);
                     conn.reset();
                     self.free_slots.appendAssumeCapacity(slot);
                 };
             } else {
-                posix.close(client_fd);
+                core.compat.close(client_fd);
             }
         }
     }
@@ -230,7 +302,7 @@ pub const EpollServer = struct {
             if (conn.recv_len - consumed < frame_len) break;
 
             const cmd_id_byte = hdr[0];
-            const cmd_id: wire.CommandId = std.meta.intToEnum(wire.CommandId, cmd_id_byte) catch {
+            const cmd_id: wire.CommandId = core.compat.intToEnum(wire.CommandId, cmd_id_byte) catch {
                 self.freeSlotAndClose(slot);
                 return;
             };
@@ -249,14 +321,14 @@ pub const EpollServer = struct {
                     error.KeyNotFound => "key not found",
                     error.Corruption => "data corruption",
                 };
-                var w = conn.resp_buf.writer(self.allocator);
+                var w = RespBufWriter{ .buf = &conn.resp_buf, .allocator = self.allocator };
                 wire.writeResponse(&w, .{ .err = err_msg }) catch {};
                 consumed += frame_len;
                 continue;
             };
             defer protocol.deinitResponse(self.allocator, response);
 
-            var w = conn.resp_buf.writer(self.allocator);
+            var w = RespBufWriter{ .buf = &conn.resp_buf, .allocator = self.allocator };
             wire.writeResponse(&w, response) catch {};
             consumed += frame_len;
         }
@@ -272,7 +344,7 @@ pub const EpollServer = struct {
 
         if (conn.resp_buf.items.len > 0) {
             // Try to write immediately (non-blocking)
-            const written = posix.write(conn.fd, conn.resp_buf.items) catch {
+            const written = posixWrite(conn.fd, conn.resp_buf.items) catch {
                 self.freeSlotAndClose(slot);
                 return;
             };
@@ -291,7 +363,7 @@ pub const EpollServer = struct {
                     .events = linux.EPOLL.OUT,
                     .data = .{ .u32 = slot },
                 };
-                posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, conn.fd, &ev) catch {
+                epollCtl(self.epoll_fd, linux.EPOLL.CTL_MOD, conn.fd, &ev) catch {
                     self.freeSlotAndClose(slot);
                 };
             }
@@ -304,7 +376,7 @@ pub const EpollServer = struct {
         if (!conn.active or !conn.write_ready) return;
 
         const remaining = conn.send_buf[conn.send_pos..];
-        const written = posix.write(conn.fd, remaining) catch {
+        const written = posixWrite(conn.fd, remaining) catch {
             self.freeSlotAndClose(slot);
             return;
         };
@@ -321,7 +393,7 @@ pub const EpollServer = struct {
                 .events = linux.EPOLL.IN,
                 .data = .{ .u32 = slot },
             };
-            posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, conn.fd, &ev) catch {
+            epollCtl(self.epoll_fd, linux.EPOLL.CTL_MOD, conn.fd, &ev) catch {
                 self.freeSlotAndClose(slot);
             };
         }
@@ -334,7 +406,7 @@ pub const EpollServer = struct {
         var events: [MAX_EVENTS]linux.epoll_event = undefined;
 
         while (self.running) {
-            const nfds = posix.epoll_wait(self.epoll_fd, &events, -1);
+            const nfds = epollWait(self.epoll_fd, &events, -1);
             if (nfds == 0) continue;
 
             for (events[0..nfds]) |ev| {

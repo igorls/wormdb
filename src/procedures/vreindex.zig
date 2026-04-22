@@ -26,6 +26,7 @@ const Ctx = @import("context.zig").Ctx;
 const distance = @import("../vector/distance.zig");
 const Store = @import("../storage/store.zig").Store;
 const IndexModule = @import("../vector/index.zig");
+const Metric = @import("../vector/metric.zig").Metric;
 
 const DEFAULT_NAMESPACE: []const u8 = "vec:";
 
@@ -83,7 +84,10 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const reg = ctx.vector_registry orelse
         return ctx.err("vreindex: vector registry not enabled on this server");
 
-    const ns_idx = reg.getOrCreate(namespace) catch |e| {
+    // Default to cosine metric for a fresh rebuild. If the namespace
+    // already exists with a different metric, getOrCreate returns
+    // MetricMismatch — the caller must drop it first.
+    const ns_idx = reg.getOrCreate(namespace, Metric.cosine) catch |e| {
         return ctx.err(ctx.fmt("vreindex: getOrCreate failed: {s}", .{@errorName(e)}));
     };
 

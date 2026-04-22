@@ -35,7 +35,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
 
     // Build JSON response — values are already JSON objects from chat_send
     // We return them as a JSON array directly
-    var json: std.ArrayListUnmanaged(u8) = .{};
+    var json: std.ArrayListUnmanaged(u8) = .empty;
     try json.append(ctx.allocator, '[');
 
     for (results, 0..) |r, i| {

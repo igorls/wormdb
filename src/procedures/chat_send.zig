@@ -40,7 +40,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const key_dupe = try ctx.allocator.dupe(u8, key);
 
     // Build message JSON value
-    var json: std.ArrayListUnmanaged(u8) = .{};
+    var json: std.ArrayListUnmanaged(u8) = .empty;
     try json.appendSlice(ctx.allocator, "{\"user\":\"");
     try appendJsonEscaped(&json, ctx.allocator, username);
     try json.appendSlice(ctx.allocator, "\",\"text\":\"");

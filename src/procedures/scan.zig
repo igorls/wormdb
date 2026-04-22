@@ -28,7 +28,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const results = try ctx.scan(prefix, limit);
 
     // Build JSON response
-    var json: std.ArrayListUnmanaged(u8) = .{};
+    var json: std.ArrayListUnmanaged(u8) = .empty;
     try json.append(ctx.allocator, '[');
 
     for (results, 0..) |r, i| {

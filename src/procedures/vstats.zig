@@ -46,7 +46,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const insert_count = ctx.getInt(i64, stats_copy[0..stk_len]) orelse 0;
 
     // Build JSON
-    var json: std.ArrayListUnmanaged(u8) = .{};
+    var json: std.ArrayListUnmanaged(u8) = .empty;
     try json.appendSlice(ctx.allocator, "{\"count\":");
     var buf: [20]u8 = undefined;
     var str = std.fmt.bufPrint(&buf, "{d}", .{vec_count}) catch "0";

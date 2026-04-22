@@ -51,7 +51,7 @@ const ConnState = struct {
     fd: posix.fd_t = -1,
     recv_buf: [RECV_BUF_SIZE]u8 = undefined,
     recv_len: usize = 0,
-    send_buf: std.ArrayListUnmanaged(u8) = .{},
+    send_buf: std.ArrayListUnmanaged(u8) = .empty,
     active: bool = false,
     /// Set to true once the full WormWire handshake (2 bytes) is validated.
     handshake_done: bool = false,
@@ -88,20 +88,37 @@ pub const UringServer = struct {
         bind_address: []const u8,
         port: u16,
     ) !UringServer {
-        // Create listening socket
-        const addr = try std.net.Address.parseIp(bind_address, port);
-        const listener_fd = try posix.socket(
-            addr.any.family,
+        // Create listening socket.
+        // We parse the bind IP using std.Io.net.IpAddress (0.16) and manually
+        // populate a posix sockaddr_in so the remainder of this module can
+        // stay on the raw-socket path.
+        const parsed = try std.Io.net.IpAddress.parse(bind_address, port);
+        const sin_bytes: [4]u8 = switch (parsed) {
+            .ip4 => |ip4| ip4.bytes,
+            .ip6 => return error.Ipv6BindNotSupportedInUringServer,
+        };
+
+        const sockaddr_in = posix.sockaddr.in{
+            .family = posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = @bitCast(sin_bytes),
+            .zero = @splat(0),
+        };
+
+        // posix.socket / bind / listen / close were removed in Zig 0.16.
+        // core.compat wraps the libc externs.
+        const listener_fd = try core.compat.socket(
+            posix.AF.INET,
             posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
             posix.IPPROTO.TCP,
         );
-        errdefer posix.close(listener_fd);
+        errdefer core.compat.close(listener_fd);
 
         // SO_REUSEADDR
         try posix.setsockopt(listener_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
 
-        try posix.bind(listener_fd, &addr.any, addr.getOsSockLen());
-        try posix.listen(listener_fd, 128);
+        try core.compat.bind(listener_fd, @ptrCast(&sockaddr_in), @sizeOf(posix.sockaddr.in));
+        try core.compat.listen(listener_fd, 128);
 
         // Initialize io_uring
         var params = std.mem.zeroes(linux.io_uring_params);
@@ -113,7 +130,7 @@ pub const UringServer = struct {
         for (conns) |*c| c.* = .{};
 
         // Free list (all slots initially free)
-        var free_slots = std.ArrayListUnmanaged(u16){};
+        var free_slots: std.ArrayListUnmanaged(u16) = .empty;
         try free_slots.ensureTotalCapacity(allocator, MAX_CONNS);
         var i: u16 = 0;
         while (i < MAX_CONNS) : (i += 1) {
@@ -138,10 +155,10 @@ pub const UringServer = struct {
 
     pub fn deinit(self: *UringServer) void {
         self.ring.deinit();
-        posix.close(self.listener_fd);
+        core.compat.close(self.listener_fd);
         for (self.conns) |*c| {
             if (c.active) {
-                posix.close(c.fd);
+                core.compat.close(c.fd);
             }
             c.send_buf.deinit(self.allocator);
         }
@@ -246,7 +263,7 @@ pub const UringServer = struct {
 
             // Parse command from the buffer (zero-copy — slices into recv_buf)
             const cmd_id_byte = conn.recv_buf[0];
-            const cmd_id: wire.CommandId = std.meta.intToEnum(wire.CommandId, cmd_id_byte) catch {
+            const cmd_id: wire.CommandId = core.compat.intToEnum(wire.CommandId, cmd_id_byte) catch {
                 // Unknown command — send error, close
                 self.writeError(slot, "unknown command");
                 self.flushAndClose(slot);
@@ -304,9 +321,21 @@ pub const UringServer = struct {
         conn.recv_len = remaining;
     }
 
+    /// Adapter so `wire.writeResponse` (which takes any writer with
+    /// `writeAll`) can push into our ArrayListUnmanaged-backed send buffer.
+    /// ArrayList.writer() was removed in Zig 0.16.
+    const SendBufWriter = struct {
+        buf: *std.ArrayListUnmanaged(u8),
+        allocator: std.mem.Allocator,
+
+        pub fn writeAll(self: *SendBufWriter, data: []const u8) !void {
+            try self.buf.appendSlice(self.allocator, data);
+        }
+    };
+
     fn writeResponse(self: *UringServer, slot: u16, response: Response) void {
         const conn = &self.conns[slot];
-        var writer = conn.send_buf.writer(self.allocator);
+        var writer = SendBufWriter{ .buf = &conn.send_buf, .allocator = self.allocator };
         wire.writeResponse(&writer, response) catch {};
     }
 
@@ -368,19 +397,19 @@ pub const UringServer = struct {
                             conn.fd = client_fd;
                             conn.active = true;
                             self.queueRecv(new_slot) catch {
-                                posix.close(client_fd);
+                                core.compat.close(client_fd);
                                 self.freeSlot(new_slot);
                             };
                         } else {
                             // Pool exhausted — reject
-                            posix.close(client_fd);
+                            core.compat.close(client_fd);
                         }
                     },
                     .recv => {
                         if (res <= 0) {
                             // EOF or error — close connection
                             self.queueClose(slot) catch {
-                                posix.close(self.conns[slot].fd);
+                                core.compat.close(self.conns[slot].fd);
                                 self.freeSlot(slot);
                             };
                             continue;
@@ -394,7 +423,7 @@ pub const UringServer = struct {
                         if (res < 0) {
                             // Send error — close
                             self.queueClose(slot) catch {
-                                posix.close(conn.fd);
+                                core.compat.close(conn.fd);
                                 self.freeSlot(slot);
                             };
                             continue;

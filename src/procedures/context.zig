@@ -14,6 +14,7 @@
 //!   }
 
 const std = @import("std");
+const compat = @import("../core/compat.zig");
 const Store = @import("../storage/store.zig").Store;
 const Response = @import("../core/types.zig").Response;
 const Cluster = @import("../cluster/mod.zig").Cluster;
@@ -346,7 +347,7 @@ pub const Ctx = struct {
 
     /// Current server timestamp in milliseconds since epoch.
     pub fn timestamp(_: *const Ctx) u64 {
-        return @intCast(std.time.milliTimestamp());
+        return @intCast(compat.nowMs());
     }
 
     /// Compare two byte slices for equality.
@@ -375,7 +376,7 @@ pub const Ctx = struct {
         const max = @min(byte_count, self.fmt_buf.len / 2);
         var rand_bytes: [256]u8 = undefined;
         const actual = @min(max, rand_bytes.len);
-        std.crypto.random.bytes(rand_bytes[0..actual]);
+        compat.randomBytes(rand_bytes[0..actual]);
 
         var i: usize = 0;
         for (rand_bytes[0..actual]) |b| {

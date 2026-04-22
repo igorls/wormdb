@@ -262,7 +262,7 @@ fn runHnswDispatch(
 // ╚═══════════════════════════════════════════════════╝
 
 fn emitJson(ctx: *Ctx, results: []const Candidate) !Ctx.Result {
-    var json: std.ArrayListUnmanaged(u8) = .{};
+    var json: std.ArrayListUnmanaged(u8) = .empty;
     try json.append(ctx.allocator, '[');
     for (results, 0..) |r, idx| {
         if (idx > 0) try json.append(ctx.allocator, ',');

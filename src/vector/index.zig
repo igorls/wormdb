@@ -50,16 +50,16 @@ pub const RegistryError = error{
 const RwLock = struct {
     inner: std.Io.RwLock = .init,
 
-    fn lock(self: *RwLock) void {
+    pub fn lock(self: *RwLock) void {
         self.inner.lockUncancelable(io());
     }
-    fn unlock(self: *RwLock) void {
+    pub fn unlock(self: *RwLock) void {
         self.inner.unlock(io());
     }
-    fn lockShared(self: *RwLock) void {
+    pub fn lockShared(self: *RwLock) void {
         self.inner.lockSharedUncancelable(io());
     }
-    fn unlockShared(self: *RwLock) void {
+    pub fn unlockShared(self: *RwLock) void {
         self.inner.unlockShared(io());
     }
 };

@@ -319,7 +319,7 @@ pub const QuicGateway = struct {
         defer arena.deinit();
         const arena_alloc = arena.allocator();
 
-        const cmd_id = std.meta.intToEnum(core.types.CommandId, cmd_id_raw) catch {
+        const cmd_id = core.compat.intToEnum(core.types.CommandId, cmd_id_raw) catch {
             sendResponse(stream, Response{ .err = "unknown command" });
             return;
         };

@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const core = @import("../core/mod.zig");
+const compat = core.compat;
 
 const Command = core.types.Command;
 pub const CommandId = core.types.CommandId;
@@ -50,7 +51,7 @@ pub fn readFrameAlloc(reader: anytype, allocator: std.mem.Allocator) !Command {
         try readExact(reader, payload);
     }
 
-    const cmd_id: CommandId = std.meta.intToEnum(CommandId, cmd_id_byte) catch return error.UnknownCommand;
+    const cmd_id: CommandId = compat.intToEnum(CommandId, cmd_id_byte) catch return error.UnknownCommand;
     return parseCommandPayload(cmd_id, payload, allocator);
 }
 
@@ -74,7 +75,7 @@ pub fn readFrameZeroCopy(reader: anytype, allocator: std.mem.Allocator) !Command
         try readExact(reader, payload);
     }
 
-    const cmd_id: CommandId = std.meta.intToEnum(CommandId, cmd_id_byte) catch return error.UnknownCommand;
+    const cmd_id: CommandId = compat.intToEnum(CommandId, cmd_id_byte) catch return error.UnknownCommand;
     return parseCommandPayloadZeroCopy(cmd_id, payload, allocator);
 }
 
@@ -304,6 +305,27 @@ pub fn parseCommandPayloadZeroCopy(cmd_id: CommandId, payload: []const u8, alloc
     }
 }
 
+/// Minimal fixed-buffer writer with a `.writeAll` method, used by callers
+/// that previously relied on `std.io.fixedBufferStream` (removed in 0.16).
+pub const FixedBufWriter = struct {
+    buf: []u8,
+    pos: usize = 0,
+
+    pub fn init(buf: []u8) FixedBufWriter {
+        return .{ .buf = buf, .pos = 0 };
+    }
+
+    pub fn writeAll(self: *FixedBufWriter, data: []const u8) !void {
+        if (self.pos + data.len > self.buf.len) return error.NoSpaceLeft;
+        @memcpy(self.buf[self.pos..][0..data.len], data);
+        self.pos += data.len;
+    }
+
+    pub fn getWritten(self: *const FixedBufWriter) []const u8 {
+        return self.buf[0..self.pos];
+    }
+};
+
 pub fn writeResponse(writer: anytype, response: Response) !void {
     var w = writer;
     switch (response) {
@@ -429,17 +451,43 @@ fn writeLenPrefixed(writer: anytype, data: []const u8) !void {
     if (data.len > 0) try w.writeAll(data);
 }
 
+/// Test-only helpers replacing `std.io.fixedBufferStream` + `ArrayList.writer`
+/// (both removed in Zig 0.16). These implement just enough of the old
+/// duck-typed reader/writer surface to drive readFrameAlloc/writeCommand.
+const TestListWriter = struct {
+    list: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+
+    pub fn writeAll(self: *TestListWriter, data: []const u8) !void {
+        try self.list.appendSlice(self.allocator, data);
+    }
+};
+
+const TestSliceReader = struct {
+    buffer: []const u8,
+    pos: usize = 0,
+
+    pub fn read(self: *TestSliceReader, dest: []u8) !usize {
+        const remaining = self.buffer.len - self.pos;
+        const n = @min(remaining, dest.len);
+        @memcpy(dest[0..n], self.buffer[self.pos..][0..n]);
+        self.pos += n;
+        return n;
+    }
+};
+
 test "wire write/read roundtrip SET with spaces" {
     const testing = std.testing;
 
-    var bytes: std.ArrayListUnmanaged(u8) = .{};
+    var bytes: std.ArrayListUnmanaged(u8) = .empty;
     defer bytes.deinit(testing.allocator);
 
     const cmd = Command{ .set = .{ .key = "k", .value = "hello world", .worm = true } };
-    try writeCommand(bytes.writer(testing.allocator), cmd);
+    var writer = TestListWriter{ .list = &bytes, .allocator = testing.allocator };
+    try writeCommand(&writer, cmd);
 
-    var in_stream = std.io.fixedBufferStream(bytes.items);
-    const parsed = try readFrameAlloc(in_stream.reader(), testing.allocator);
+    var reader = TestSliceReader{ .buffer = bytes.items };
+    const parsed = try readFrameAlloc(&reader, testing.allocator);
     defer switch (parsed) {
         .set => |p| {
             testing.allocator.free(p.key);
@@ -460,6 +508,6 @@ test "wire rejects oversized declared payload" {
     frame[0] = @intFromEnum(CommandId.get);
     std.mem.writeInt(u32, frame[1..5], MAX_PAYLOAD_LENGTH + 1, .big);
 
-    var in_stream = std.io.fixedBufferStream(&frame);
-    try testing.expectError(error.PayloadTooLarge, readFrameAlloc(in_stream.reader(), testing.allocator));
+    var reader = TestSliceReader{ .buffer = &frame };
+    try testing.expectError(error.PayloadTooLarge, readFrameAlloc(&reader, testing.allocator));
 }

@@ -19,6 +19,7 @@ const build_options = @import("build_options");
 const QuicGateway = wormdb.server.QuicGateway;
 const auth = wormdb.server.auth;
 const Cluster = wormdb.cluster.Cluster;
+const NamespaceRegistry = wormdb.vector.NamespaceRegistry;
 
 const PersistenceMode = wormdb.core.config.PersistenceMode;
 const Backend = wormdb.core.config.Backend;
@@ -203,6 +204,11 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
     var event_bus = EventBus.init(allocator);
     defer event_bus.deinit();
 
+    // Per-namespace HNSW index registry. Lazy-populated by vinsert/vreindex;
+    // cold namespaces with no vectors inserted cost nothing.
+    var vector_registry = NamespaceRegistry.init(allocator, .{});
+    defer vector_registry.deinit();
+
     // Initialize cluster if enabled
     var cluster: ?Cluster = null;
     if (cfg.cluster.name != null) {
@@ -231,6 +237,7 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
     var server = Server.init(allocator, &store, &event_bus, .{
         .port = port,
         .cluster = if (cluster) |*c| c else null,
+        .vector_registry = &vector_registry,
     });
 
     // Log startup info

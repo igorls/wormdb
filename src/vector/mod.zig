@@ -12,6 +12,9 @@ pub const TopK = topk.TopK;
 pub const hnsw = @import("hnsw.zig");
 pub const Hnsw = hnsw.Hnsw;
 pub const HnswParams = hnsw.HnswParams;
+pub const index = @import("index.zig");
+pub const NamespaceIndex = index.NamespaceIndex;
+pub const NamespaceRegistry = index.NamespaceRegistry;
 
 // Re-export commonly used functions
 pub const cosine = distance.cosine;

@@ -13,6 +13,7 @@ const EventBus = event.EventBus;
 const Command = core.types.Command;
 const Response = core.types.Response;
 const Cluster = cluster_mod.Cluster;
+const NamespaceRegistry = @import("../vector/index.zig").NamespaceRegistry;
 
 /// Execute context — bundles the dependencies needed for command execution.
 pub const ExecContext = struct {
@@ -20,6 +21,9 @@ pub const ExecContext = struct {
     store: *Store,
     event_bus: *EventBus,
     cluster: ?*Cluster,
+    /// Per-namespace HNSW index registry (optional). Procedures that do
+    /// vector search consult this first; null → BQ or brute-force paths.
+    vector_registry: ?*NamespaceRegistry = null,
     /// Authenticated identity (from SCT subject). Null if unauthenticated.
     identity: ?[]const u8 = null,
 };
@@ -149,6 +153,7 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
                 ctx.identity,
                 ctx.cluster,
                 ctx.event_bus,
+                ctx.vector_registry,
             );
             defer proc_ctx.deinit(); // auto-unlock all shard locks
             const result = proc_fn(&proc_ctx) catch |e| {

@@ -21,6 +21,7 @@ pub const ServerConfig = struct {
     port: u16 = 6389,
     max_connections: usize = 1024,
     cluster: ?*Cluster = null,
+    vector_registry: ?*@import("../vector/index.zig").NamespaceRegistry = null,
     /// Number of worker threads. 0 = auto (cpu_count * 2, capped at 64).
     worker_count: usize = 0,
 };
@@ -41,14 +42,14 @@ pub const Server = struct {
 
     /// Bounded queue for accepted connections awaiting worker pickup.
     const ConnQueue = struct {
-        items: [CONN_QUEUE_CAP]std.net.Server.Connection = undefined,
+        items: [CONN_QUEUE_CAP]core.compat.net.ServerCompat.Connection = undefined,
         head: usize = 0,
         tail: usize = 0,
         count: usize = 0,
         mutex: core.compat.Mutex = .{},
         futex: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
-        fn push(self: *ConnQueue, conn: std.net.Server.Connection) bool {
+        fn push(self: *ConnQueue, conn: core.compat.net.ServerCompat.Connection) bool {
             self.mutex.lock();
             defer self.mutex.unlock();
             if (self.count >= CONN_QUEUE_CAP) return false;
@@ -57,11 +58,11 @@ pub const Server = struct {
             self.count += 1;
             // Wake one worker
             _ = self.futex.fetchAdd(1, .release);
-            std.Thread.Futex.wake(&self.futex, 1);
+            core.compat.Futex.wake(&self.futex, 1);
             return true;
         }
 
-        fn pop(self: *ConnQueue) ?std.net.Server.Connection {
+        fn pop(self: *ConnQueue) ?core.compat.net.ServerCompat.Connection {
             self.mutex.lock();
             defer self.mutex.unlock();
             if (self.count == 0) return null;
@@ -77,13 +78,13 @@ pub const Server = struct {
     const ConnectionContext = struct {
         allocator: std.mem.Allocator,
         event_bus: *EventBus,
-        stream: ?*std.net.Stream,
+        stream: ?*core.compat.net.Stream,
         write_capture: ?*std.ArrayListUnmanaged(u8),
         write_mutex: core.compat.Mutex,
         subscriptions: std.StringHashMap(u64),
         binary_mode: bool,
 
-        fn init(allocator: std.mem.Allocator, event_bus: *EventBus, stream: ?*std.net.Stream) ConnectionContext {
+        fn init(allocator: std.mem.Allocator, event_bus: *EventBus, stream: ?*core.compat.net.Stream) ConnectionContext {
             return .{
                 .allocator = allocator,
                 .event_bus = event_bus,
@@ -98,7 +99,7 @@ pub const Server = struct {
         fn initWithCapture(
             allocator: std.mem.Allocator,
             event_bus: *EventBus,
-            stream: ?*std.net.Stream,
+            stream: ?*core.compat.net.Stream,
             write_capture: *std.ArrayListUnmanaged(u8),
         ) ConnectionContext {
             return .{
@@ -232,7 +233,7 @@ pub const Server = struct {
     pub fn run(self: *Server) !void {
         self.running.store(true, .release);
 
-        const addr = try std.net.Address.parseIp(self.config.bind_address, self.config.port);
+        const addr = try core.compat.net.Address.parseIp(self.config.bind_address, self.config.port);
         var listener = try addr.listen(.{ .reuse_address = true });
         defer listener.deinit();
 
@@ -266,7 +267,7 @@ pub const Server = struct {
         // Shutdown: wake all workers so they exit
         for (self.workers) |*w| {
             _ = self.conn_queue.futex.fetchAdd(1, .release);
-            std.Thread.Futex.wake(&self.conn_queue.futex, 1);
+            core.compat.Futex.wake(&self.conn_queue.futex, 1);
             w.join();
         }
         self.allocator.free(self.workers);
@@ -279,7 +280,7 @@ pub const Server = struct {
                 self.handleConnection(conn);
             } else {
                 // Wait for new connections
-                std.Thread.Futex.timedWait(&self.conn_queue.futex, self.conn_queue.futex.load(.acquire), 10_000_000) catch {};
+                core.compat.Futex.timedWait(&self.conn_queue.futex, self.conn_queue.futex.load(.acquire), 10_000_000);
             }
         }
         // Drain remaining connections on shutdown
@@ -292,12 +293,12 @@ pub const Server = struct {
         self.running.store(false, .release);
     }
 
-    fn handleConnection(self: *Server, conn: std.net.Server.Connection) void {
+    fn handleConnection(self: *Server, conn: core.compat.net.ServerCompat.Connection) void {
         var stream = conn.stream;
 
         // Disable Nagle's algorithm — critical for low-latency request/response.
         // Without this, small response packets get buffered for up to 40ms.
-        const fd = stream.handle;
+        const fd = stream.getHandle();
         std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
         var conn_ctx = ConnectionContext.init(self.allocator, self.event_bus, &stream);
         defer conn_ctx.deinit();
@@ -330,9 +331,9 @@ pub const Server = struct {
         conn_ctx.writeAllLocked("-ERR binary protocol required\r\n");
     }
 
-    fn handleBinaryConnection(self: *Server, stream: *std.net.Stream, conn_ctx: *ConnectionContext) void {
+    fn handleBinaryConnection(self: *Server, stream: *core.compat.net.Stream, conn_ctx: *ConnectionContext) void {
         const ReadAdapter = struct {
-            stream: *std.net.Stream,
+            stream: *core.compat.net.Stream,
 
             pub fn read(adapter: *@This(), dest: []u8) !usize {
                 return adapter.stream.read(dest);
@@ -343,7 +344,7 @@ pub const Server = struct {
         // Buffered write adapter: coalesces small writes (frame header + length
         // prefix + data) into a single sendmsg syscall per response.
         const WriteAdapter = struct {
-            s: *std.net.Stream,
+            s: *core.compat.net.Stream,
             buf: [4096]u8 = undefined,
             end: usize = 0,
 
@@ -424,9 +425,9 @@ pub const Server = struct {
     /// Applies SET/DEL directly to the store without re-replicating (anti-echo).
     /// Emits local PUB/SUB events for replicated writes so local subscribers
     /// (e.g. WebSocket-connected clients) get real-time notifications.
-    fn handleReplicationConnection(self: *Server, stream: *std.net.Stream) void {
+    fn handleReplicationConnection(self: *Server, stream: *core.compat.net.Stream) void {
         const ReadAdapter = struct {
-            stream: *std.net.Stream,
+            stream: *core.compat.net.Stream,
 
             pub fn read(adapter: *@This(), dest: []u8) !usize {
                 return adapter.stream.read(dest);
@@ -517,7 +518,7 @@ pub const Server = struct {
         }
     }
 
-    fn handleTextConnection(self: *Server, stream: *std.net.Stream, conn_ctx: *ConnectionContext, initial: [2]u8) void {
+    fn handleTextConnection(self: *Server, stream: *core.compat.net.Stream, conn_ctx: *ConnectionContext, initial: [2]u8) void {
         var read_buf: [TEXT_READ_BUF_SIZE]u8 = undefined;
         read_buf[0] = initial[0];
         read_buf[1] = initial[1];
@@ -680,6 +681,7 @@ pub const Server = struct {
                 .store = self.store,
                 .event_bus = self.event_bus,
                 .cluster = self.cluster,
+                .vector_registry = self.config.vector_registry,
             }, cmd),
         };
     }

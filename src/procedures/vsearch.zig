@@ -31,12 +31,17 @@ const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
 const distance = @import("../vector/distance.zig");
 const topk_mod = @import("../vector/topk.zig");
+const hnsw_mod = @import("../vector/hnsw.zig");
 const Store = @import("../storage/store.zig").Store;
 
 const MAX_TOP_K: usize = 100;
 const DEFAULT_NAMESPACE: []const u8 = "vec:";
 const BQ_PREFIX: []const u8 = "bq:";
 const STAGE1_OVERSAMPLE: usize = 10;
+/// HNSW ef (beam width) factor relative to M (= top_k × STAGE1_OVERSAMPLE).
+/// HNSW recall tracks ef closely; we reuse the same oversample budget so
+/// the stage-1→stage-2 shape stays consistent across dispatch paths.
+const HNSW_EF_SEARCH_FACTOR: usize = 1;
 const DECAY_TIME_CONSTANT_HOURS: f32 = 168.0; // ~1 week time constant
 
 const Metric = enum {
@@ -191,6 +196,77 @@ fn onExactMatch(
 }
 
 // ╔═══════════════════════════════════════════════════╗
+// ║  HNSW dispatch                                     ║
+// ╚═══════════════════════════════════════════════════╝
+
+const IndexModule = @import("../vector/index.zig");
+
+/// Stage 1 via HNSW + stage 2 exact refine. Returns true if the heap was
+/// populated from HNSW; false if the index is empty (caller falls back to
+/// BQ or brute-force).
+///
+/// Holds `ns_idx.lock` in shared mode only while reading the stage-1
+/// candidate set and duping keys — then releases before `ctx.getCopy`
+/// calls, which lock shards. Short critical section, no lock interleaving
+/// with store shards.
+fn runHnswDispatch(
+    ctx: *Ctx,
+    ns_idx: *IndexModule.NamespaceIndex,
+    query_vec: []align(1) const f32,
+    top_k: usize,
+    metric: Metric,
+    decay: f32,
+    now_ms: u64,
+    heap: *TopKCandidate,
+) !bool {
+    const stage1_size = top_k * STAGE1_OVERSAMPLE;
+
+    // Scratch buffers for the HNSW call.
+    const raw_buf = try ctx.allocator.alloc(IndexModule.IndexSearchResult, stage1_size);
+    const hnsw_scratch = try ctx.allocator.alloc(hnsw_mod.SearchResult, stage1_size);
+    const ef = stage1_size * HNSW_EF_SEARCH_FACTOR;
+
+    const n_stage1 = blk: {
+        ns_idx.lock.lockShared();
+        defer ns_idx.lock.unlockShared();
+        if (ns_idx.len() == 0) break :blk @as(usize, 0);
+        break :blk try ns_idx.searchLocked(query_vec, stage1_size, ef, raw_buf, hnsw_scratch);
+    };
+
+    if (n_stage1 == 0) return false;
+
+    // Dupe keys out of the index before touching the store — the borrowed
+    // key slices are only valid under the read-lock, and we released it.
+    const stage1_keys = try ctx.allocator.alloc([]u8, n_stage1);
+    const stage1_ts = try ctx.allocator.alloc(u64, n_stage1);
+    {
+        ns_idx.lock.lockShared();
+        defer ns_idx.lock.unlockShared();
+        // n_stage1 <= ns_idx.len() at entry; the only mutation that can have
+        // happened in the gap is an insert, which only appends — existing
+        // indices remain valid.
+        for (raw_buf[0..n_stage1], 0..) |r, i| {
+            stage1_keys[i] = try ctx.allocator.dupe(u8, r.key);
+            stage1_ts[i] = r.timestamp;
+        }
+    }
+
+    // Stage 2: exact refine (no index lock held).
+    for (0..n_stage1) |i| {
+        const vec_bytes = (try ctx.getCopy(stage1_keys[i])) orelse continue;
+        const vec = distance.bytesToF32(vec_bytes) orelse continue;
+        if (vec.len != query_vec.len) continue;
+
+        const raw_sim = computeExactSim(metric, query_vec, vec);
+        const score = applyDecay(raw_sim, stage1_ts[i], decay, now_ms);
+
+        heap.push(.{ .key = stage1_keys[i], .score = score, .timestamp = stage1_ts[i] });
+    }
+
+    return true;
+}
+
+// ╔═══════════════════════════════════════════════════╗
 // ║  JSON emission                                     ║
 // ╚═══════════════════════════════════════════════════╝
 
@@ -277,7 +353,34 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
 
     const now_ms = ctx.timestamp();
 
-    // ── Stage 1: BQ prefilter (auto mode only) ───────────────────
+    // ── Stage 1A: HNSW (auto mode, namespace has registered index) ──
+    // Preferred path when available — ~5-50× faster than BQ at large N.
+    // Stage-1 ranking uses cosine distance regardless of the user's metric;
+    // stage-2 refine re-ranks with the requested metric. The oversample
+    // matches the BQ path so the refine phase sees a consistent candidate
+    // budget across dispatch strategies.
+    if (mode == .auto) {
+        if (ctx.vector_registry) |reg| {
+            if (reg.get(namespace)) |ns_idx| {
+                if (try runHnswDispatch(
+                    ctx,
+                    ns_idx,
+                    query_vec,
+                    top_k,
+                    metric,
+                    decay,
+                    now_ms,
+                    &final_heap,
+                )) {
+                    return emitJson(ctx, final_heap.sortedDesc());
+                }
+                // runHnswDispatch returned false → index is empty; fall
+                // through to BQ / brute-force paths.
+            }
+        }
+    }
+
+    // ── Stage 1B: BQ prefilter (auto mode only) ──────────────────
     if (mode == .auto) {
         const query_bq_size = distance.binaryQuantizedSize(query_vec.len);
         const query_bq = try ctx.allocator.alloc(u8, query_bq_size);

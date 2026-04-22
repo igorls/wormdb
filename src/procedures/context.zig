@@ -18,6 +18,7 @@ const Store = @import("../storage/store.zig").Store;
 const Response = @import("../core/types.zig").Response;
 const Cluster = @import("../cluster/mod.zig").Cluster;
 const EventBus = @import("../event/mod.zig").EventBus;
+const NamespaceRegistry = @import("../vector/index.zig").NamespaceRegistry;
 
 const shardIndexFn = @import("../storage/store.zig").shardIndex;
 
@@ -33,6 +34,9 @@ pub const Ctx = struct {
     cluster: ?*Cluster = null,
     /// Event bus for pub/sub emission from procedures. Null in tests.
     event_bus: ?*EventBus = null,
+    /// Per-namespace HNSW index registry. Null → procedures fall back to
+    /// BQ prefilter or brute-force search. See src/vector/index.zig.
+    vector_registry: ?*NamespaceRegistry = null,
 
     // Lock tracking — max 16 distinct shards per procedure.
     // lockKey/lockKeys records shard indices here so they auto-unlock on deinit().
@@ -63,6 +67,7 @@ pub const Ctx = struct {
         id: ?[]const u8,
         cluster: ?*Cluster,
         event_bus: ?*EventBus,
+        vector_registry: ?*NamespaceRegistry,
     ) Ctx {
         return .{
             .store = store,
@@ -71,6 +76,7 @@ pub const Ctx = struct {
             ._identity = id,
             .cluster = cluster,
             .event_bus = event_bus,
+            .vector_registry = vector_registry,
         };
     }
 
@@ -422,7 +428,7 @@ test "Ctx arg helpers" {
     const testing = std.testing;
     var store: Store = undefined; // not accessed in arg tests
     const args = &[_][]const u8{ "hello", "42", "bad" };
-    var ctx = Ctx.init(&store, args, testing.allocator, null, null, null);
+    var ctx = Ctx.init(&store, args, testing.allocator, null, null, null, null);
     defer ctx.deinit();
 
     try testing.expectEqualStrings("hello", ctx.arg(0).?);

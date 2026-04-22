@@ -154,7 +154,7 @@ pub const Hnsw = struct {
     // ║  Node allocation                                   ║
     // ╚═══════════════════════════════════════════════════╝
 
-    fn allocateNode(self: *Hnsw, vector: []const f32, level: u8) !Node {
+    fn allocateNode(self: *Hnsw, vector: []align(1) const f32, level: u8) !Node {
         // Aligned vector buffer (16-byte alignment sufficient for AVX2 loads).
         const vec_buf = try self.allocator.alignedAlloc(f32, .@"16", vector.len);
         errdefer self.allocator.free(vec_buf);
@@ -296,10 +296,14 @@ pub const Hnsw = struct {
 
     /// Insert a vector. Returns the assigned node ID.
     ///
+    /// Accepts align(1) input — caller may pass vectors reinterpreted from
+    /// a byte buffer (e.g. via `distance.bytesToF32`). The index copies
+    /// into an aligned buffer internally.
+    ///
     /// Thread safety: caller must serialize inserts. Searches on the same
     /// graph from other threads are unsafe during insert (the graph shape
     /// is mutating).
-    pub fn insert(self: *Hnsw, vector: []const f32) !u32 {
+    pub fn insert(self: *Hnsw, vector: []align(1) const f32) !u32 {
         if (self.dim == 0) {
             self.dim = vector.len;
         } else if (vector.len != self.dim) {

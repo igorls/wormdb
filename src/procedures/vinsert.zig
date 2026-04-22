@@ -104,6 +104,29 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
         try ctx.setDurable(bq_key_stable, bq_buf);
     }
 
+    // ── Incrementally update the HNSW index (if enabled) ─────────
+    // The `vec` slice reinterprets `vec_bytes` as align(1) f32 — safe
+    // because bytesToF32 already validated the length. hnsw.insert copies
+    // into aligned storage internally.
+    //
+    // Failure here (OOM, dim mismatch from mixed-data namespace) is logged
+    // and swallowed: the store and BQ writes have already succeeded, so
+    // future vsearch calls can still serve this vector via the BQ prefilter
+    // path. Users can rebuild via EXEC vreindex.
+    if (ctx.vector_registry) |reg| {
+        const ns_idx = reg.getOrCreate(namespace) catch |e| blk: {
+            std.log.warn("vinsert: getOrCreate for '{s}' failed: {s}", .{ namespace, @errorName(e) });
+            break :blk null;
+        };
+        if (ns_idx) |idx| {
+            idx.lock.lock();
+            defer idx.lock.unlock();
+            _ = idx.insertLocked(vec_key_stable, vec, ctx.timestamp()) catch |e| {
+                std.log.warn("vinsert: HNSW insert for '{s}' failed: {s}", .{ vec_key_stable, @errorName(e) });
+            };
+        }
+    }
+
     // ── Increment vector count ───────────────────────────────────
     // Local-only counter (ctx.set bypasses cluster replication). Each node
     // maintains its own count; authoritative totals should use `vstats`'s

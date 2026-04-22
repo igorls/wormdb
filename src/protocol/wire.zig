@@ -200,6 +200,46 @@ fn parseCommandPayload(cmd_id: CommandId, payload: []const u8, allocator: std.me
             }
             return .{ .auth = token };
         },
+        .vinsert => {
+            // VINSERT payload:
+            //   [key][vector][1B flags][namespace][metric][8B timestamp]
+            const key = try readBytesField(payload, &pos, allocator);
+            errdefer allocator.free(key);
+            const vector = try readBytesField(payload, &pos, allocator);
+            errdefer allocator.free(vector);
+
+            if (pos + 1 > payload.len) return error.Corruption;
+            const flags = payload[pos];
+            pos += 1;
+            if ((flags & 0b1111_1110) != 0) return error.InvalidFlags;
+
+            const namespace = try readBytesField(payload, &pos, allocator);
+            errdefer allocator.free(namespace);
+            const metric = try readBytesField(payload, &pos, allocator);
+            errdefer allocator.free(metric);
+
+            if (pos + 8 > payload.len) return error.Corruption;
+            const ts = std.mem.readInt(u64, payload[pos..][0..8], .big);
+            pos += 8;
+            if (pos != payload.len) return error.Corruption;
+
+            return .{ .vinsert = .{
+                .key = key,
+                .vector = vector,
+                .worm = (flags & 0x01) != 0,
+                .namespace = namespace,
+                .metric = metric,
+                .timestamp = ts,
+            } };
+        },
+        .vdelete => {
+            const key = try readBytesField(payload, &pos, allocator);
+            errdefer allocator.free(key);
+            const namespace = try readBytesField(payload, &pos, allocator);
+            errdefer allocator.free(namespace);
+            if (pos != payload.len) return error.Corruption;
+            return .{ .vdelete = .{ .key = key, .namespace = namespace } };
+        },
     }
 }
 
@@ -301,6 +341,41 @@ pub fn parseCommandPayloadZeroCopy(cmd_id: CommandId, payload: []const u8, alloc
             const token = try sliceBytesField(payload, &pos);
             if (pos != payload.len) return error.Corruption;
             return .{ .auth = @constCast(token) };
+        },
+        .vinsert => {
+            const key = try sliceBytesField(payload, &pos);
+            const vector = try sliceBytesField(payload, &pos);
+
+            if (pos + 1 > payload.len) return error.Corruption;
+            const flags = payload[pos];
+            pos += 1;
+            if ((flags & 0b1111_1110) != 0) return error.InvalidFlags;
+
+            const namespace = try sliceBytesField(payload, &pos);
+            const metric = try sliceBytesField(payload, &pos);
+
+            if (pos + 8 > payload.len) return error.Corruption;
+            const ts = std.mem.readInt(u64, payload[pos..][0..8], .big);
+            pos += 8;
+            if (pos != payload.len) return error.Corruption;
+
+            return .{ .vinsert = .{
+                .key = @constCast(key),
+                .vector = @constCast(vector),
+                .worm = (flags & 0x01) != 0,
+                .namespace = @constCast(namespace),
+                .metric = @constCast(metric),
+                .timestamp = ts,
+            } };
+        },
+        .vdelete => {
+            const key = try sliceBytesField(payload, &pos);
+            const namespace = try sliceBytesField(payload, &pos);
+            if (pos != payload.len) return error.Corruption;
+            return .{ .vdelete = .{
+                .key = @constCast(key),
+                .namespace = @constCast(namespace),
+            } };
         },
     }
 }
@@ -432,6 +507,38 @@ pub fn writeCommand(writer: anytype, cmd: Command) !void {
             try writeHeader(w, @intFromEnum(CommandId.auth), @intCast(4 + token.len));
             try writeLenPrefixed(w, token);
         },
+        .vinsert => |params| {
+            // [key][vec][1B flags][ns][metric][8B ts]
+            var payload_len: usize = 0;
+            payload_len += 4 + params.key.len;
+            payload_len += 4 + params.vector.len;
+            payload_len += 1;
+            payload_len += 4 + params.namespace.len;
+            payload_len += 4 + params.metric.len;
+            payload_len += 8;
+            if (payload_len > MAX_PAYLOAD_LENGTH) return error.PayloadTooLarge;
+
+            try writeHeader(w, @intFromEnum(CommandId.vinsert), @intCast(payload_len));
+            try writeLenPrefixed(w, params.key);
+            try writeLenPrefixed(w, params.vector);
+            const flags: u8 = if (params.worm) 0x01 else 0x00;
+            try w.writeAll(&[_]u8{flags});
+            try writeLenPrefixed(w, params.namespace);
+            try writeLenPrefixed(w, params.metric);
+            var ts_buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, ts_buf[0..8], params.timestamp, .big);
+            try w.writeAll(&ts_buf);
+        },
+        .vdelete => |params| {
+            var payload_len: usize = 0;
+            payload_len += 4 + params.key.len;
+            payload_len += 4 + params.namespace.len;
+            if (payload_len > MAX_PAYLOAD_LENGTH) return error.PayloadTooLarge;
+
+            try writeHeader(w, @intFromEnum(CommandId.vdelete), @intCast(payload_len));
+            try writeLenPrefixed(w, params.key);
+            try writeLenPrefixed(w, params.namespace);
+        },
     }
 }
 
@@ -510,4 +617,73 @@ test "wire rejects oversized declared payload" {
 
     var reader = TestSliceReader{ .buffer = &frame };
     try testing.expectError(error.PayloadTooLarge, readFrameAlloc(&reader, testing.allocator));
+}
+
+test "wire roundtrip VINSERT" {
+    const testing = std.testing;
+
+    var bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer bytes.deinit(testing.allocator);
+
+    // Representative vector bytes: 4 f32 = 16 bytes, with values that would
+    // exercise the full u8 range (catches endianness bugs).
+    const vec_bytes = [_]u8{ 0x12, 0x34, 0x56, 0x78, 0xAB, 0xCD, 0xEF, 0x10, 0x00, 0xFF, 0x7F, 0x80, 0xCA, 0xFE, 0xBA, 0xBE };
+    const cmd = Command{ .vinsert = .{
+        .key = "vec:articles:doc-1",
+        .vector = &vec_bytes,
+        .worm = true,
+        .namespace = "vec:articles:",
+        .metric = "cosine",
+        .timestamp = 0x0123_4567_89AB_CDEF,
+    } };
+
+    var writer = TestListWriter{ .list = &bytes, .allocator = testing.allocator };
+    try writeCommand(&writer, cmd);
+
+    var reader = TestSliceReader{ .buffer = bytes.items };
+    const parsed = try readFrameAlloc(&reader, testing.allocator);
+    defer switch (parsed) {
+        .vinsert => |p| {
+            testing.allocator.free(p.key);
+            testing.allocator.free(p.vector);
+            testing.allocator.free(p.namespace);
+            testing.allocator.free(p.metric);
+        },
+        else => {},
+    };
+
+    try testing.expectEqualStrings("vec:articles:doc-1", parsed.vinsert.key);
+    try testing.expectEqualSlices(u8, &vec_bytes, parsed.vinsert.vector);
+    try testing.expect(parsed.vinsert.worm);
+    try testing.expectEqualStrings("vec:articles:", parsed.vinsert.namespace);
+    try testing.expectEqualStrings("cosine", parsed.vinsert.metric);
+    try testing.expectEqual(@as(u64, 0x0123_4567_89AB_CDEF), parsed.vinsert.timestamp);
+}
+
+test "wire roundtrip VDELETE" {
+    const testing = std.testing;
+
+    var bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer bytes.deinit(testing.allocator);
+
+    const cmd = Command{ .vdelete = .{
+        .key = "vec:articles:doc-1",
+        .namespace = "vec:articles:",
+    } };
+
+    var writer = TestListWriter{ .list = &bytes, .allocator = testing.allocator };
+    try writeCommand(&writer, cmd);
+
+    var reader = TestSliceReader{ .buffer = bytes.items };
+    const parsed = try readFrameAlloc(&reader, testing.allocator);
+    defer switch (parsed) {
+        .vdelete => |p| {
+            testing.allocator.free(p.key);
+            testing.allocator.free(p.namespace);
+        },
+        else => {},
+    };
+
+    try testing.expectEqualStrings("vec:articles:doc-1", parsed.vdelete.key);
+    try testing.expectEqualStrings("vec:articles:", parsed.vdelete.namespace);
 }

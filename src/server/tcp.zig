@@ -15,6 +15,8 @@ const EventBus = event.EventBus;
 const Command = core.types.Command;
 const Response = core.types.Response;
 const Cluster = cluster_mod.Cluster;
+const vector_ops = @import("../procedures/vector_ops.zig");
+const Metric = @import("../vector/metric.zig").Metric;
 
 pub const ServerConfig = struct {
     bind_address: []const u8 = "0.0.0.0",
@@ -510,8 +512,48 @@ pub const Server = struct {
 
                     wire.writeResponse(stream, .ok) catch return;
                 },
+                .vinsert => |params| {
+                    const metric_enum = Metric.fromStr(params.metric) orelse {
+                        wire.writeResponse(stream, .{ .err = "vinsert: unknown metric" }) catch return;
+                        continue;
+                    };
+                    vector_ops.applyVinsert(
+                        self.store,
+                        null, // don't re-replicate — this IS the replication
+                        self.event_bus,
+                        self.config.vector_registry,
+                        self.allocator,
+                        .{
+                            .key = params.key,
+                            .vector = params.vector,
+                            .worm = params.worm,
+                            .namespace = params.namespace,
+                            .metric = metric_enum,
+                            .timestamp = params.timestamp,
+                            .replicate = false, // anti-echo boundary
+                        },
+                    ) catch |e| {
+                        std.log.warn("replication: applyVinsert failed: {s}", .{@errorName(e)});
+                    };
+                    wire.writeResponse(stream, .ok) catch return;
+                },
+                .vdelete => |params| {
+                    vector_ops.applyVdelete(
+                        self.store,
+                        null,
+                        self.event_bus,
+                        self.config.vector_registry,
+                        self.allocator,
+                        params.key,
+                        params.namespace,
+                        false,
+                    ) catch |e| {
+                        std.log.warn("replication: applyVdelete failed: {s}", .{@errorName(e)});
+                    };
+                    wire.writeResponse(stream, .ok) catch return;
+                },
                 else => {
-                    // Only SET/DEL are valid replication commands
+                    // Only SET/DEL/VINSERT/VDELETE are valid replication commands
                     wire.writeResponse(stream, .{ .err = "unsupported replication command" }) catch return;
                 },
             }

@@ -54,6 +54,8 @@ pub const Command = union(enum) {
     exec: ExecParams, // EXEC <procedure> <args...>
     save: void, // SAVE (manual snapshot)
     auth: []const u8, // AUTH <token> (binary SCT)
+    vinsert: VinsertParams, // VINSERT <key> <vec> <flags> <ns> <metric> <timestamp>
+    vdelete: VdeleteParams, // VDELETE <key> <namespace>
 
     pub const SetParams = struct {
         key: []const u8,
@@ -69,6 +71,23 @@ pub const Command = union(enum) {
     pub const ExecParams = struct {
         procedure: []const u8,
         args: []const []const u8,
+    };
+
+    /// Parameters for the VINSERT wire command. The timestamp is carried
+    /// explicitly (unlike SET, which re-times on each peer) so HNSW
+    /// side-table entries stay consistent across the cluster.
+    pub const VinsertParams = struct {
+        key: []const u8,
+        vector: []const u8, // raw f32 bytes — length validated by the applier
+        worm: bool = true,
+        namespace: []const u8,
+        metric: []const u8, // "cosine" | "dot" | "l2"
+        timestamp: Timestamp,
+    };
+
+    pub const VdeleteParams = struct {
+        key: []const u8,
+        namespace: []const u8,
     };
 };
 
@@ -86,6 +105,8 @@ pub const CommandId = enum(u8) {
     cluster_peers = 0x0A,
     save = 0x0B,
     auth = 0x0C,
+    vinsert = 0x0D,
+    vdelete = 0x0E,
 };
 
 /// Maximum accepted binary payload length (16 MiB)

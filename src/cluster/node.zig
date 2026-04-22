@@ -307,57 +307,51 @@ pub const Cluster = struct {
         WgConfig.teardown(WgConfig.DEFAULT_IFNAME) catch {};
     }
 
-    /// Replicate a SET to all alive peers via WormWire.
-    /// Also triggers anti-entropy full-state sync on newly connected peers.
-    pub fn replicateWrite(self: *Cluster, key: []const u8, value: []const u8, is_worm: bool) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    /// Reconcile the peer map from SWIM membership, then for every peer
+    /// (alive or newly resurrected): connect + run anti-entropy if needed.
+    /// Caller must hold `self.mutex`.
+    ///
+    /// Shared by `replicateWrite`, `replicateVinsert`, and `replicateVdelete`
+    /// so any replicable event can wake a dormant peer and trigger sync.
+    fn ensurePeersConnectedLocked(self: *Cluster) void {
+        // ── Reconcile peer map from SWIM ──
+        var swim_iter = self.membership.peers.iterator();
+        while (swim_iter.next()) |swim_entry| {
+            const swim_peer = swim_entry.value_ptr;
+            if (swim_peer.state != .alive) continue;
 
-        // Check SWIM membership for peers that exist in gossip but not in our
-        // replication peers map. This handles two cases:
-        // 1. onPeerJoin never fired (e.g. restart race condition)
-        // 2. A dead peer has returned to alive
-        {
-            var swim_iter = self.membership.peers.iterator();
-            while (swim_iter.next()) |swim_entry| {
-                const swim_peer = swim_entry.value_ptr;
-                if (swim_peer.state != .alive) continue;
+            const real_addr: ?[4]u8 = if (swim_peer.gossip_endpoint) |ep| ep.addr else null;
 
-                const real_addr: ?[4]u8 = if (swim_peer.gossip_endpoint) |ep| ep.addr else null;
-
-                if (self.peers.getPtr(swim_peer.mesh_ip)) |pc| {
-                    // Existing peer: clear dead flag if needed
-                    if (pc.is_dead) {
-                        pc.is_dead = false;
-                        pc.needs_sync = true;
-                        if (real_addr != null) pc.real_addr = real_addr;
-                        var ip_buf: [15]u8 = undefined;
-                        const ip_str = WgIp.formatIp(swim_peer.mesh_ip, &ip_buf);
-                        std.log.info("cluster: peer alive again {s}", .{ip_str});
-                    }
-                } else {
-                    // New peer not in map — add it (onPeerJoin missed it)
-                    self.peers.put(swim_peer.mesh_ip, PeerConnection{
-                        .mesh_ip = swim_peer.mesh_ip,
-                        .real_addr = real_addr,
-                        .stream = null,
-                        .last_connect_attempt_ns = 0,
-                        .needs_sync = true,
-                        .is_dead = false,
-                    }) catch {};
+            if (self.peers.getPtr(swim_peer.mesh_ip)) |pc| {
+                if (pc.is_dead) {
+                    pc.is_dead = false;
+                    pc.needs_sync = true;
+                    if (real_addr != null) pc.real_addr = real_addr;
                     var ip_buf: [15]u8 = undefined;
                     const ip_str = WgIp.formatIp(swim_peer.mesh_ip, &ip_buf);
-                    std.log.info("cluster: discovered peer from SWIM {s}", .{ip_str});
+                    std.log.info("cluster: peer alive again {s}", .{ip_str});
                 }
+            } else {
+                self.peers.put(swim_peer.mesh_ip, PeerConnection{
+                    .mesh_ip = swim_peer.mesh_ip,
+                    .real_addr = real_addr,
+                    .stream = null,
+                    .last_connect_attempt_ns = 0,
+                    .needs_sync = true,
+                    .is_dead = false,
+                }) catch {};
+                var ip_buf: [15]u8 = undefined;
+                const ip_str = WgIp.formatIp(swim_peer.mesh_ip, &ip_buf);
+                std.log.info("cluster: discovered peer from SWIM {s}", .{ip_str});
             }
         }
 
+        // ── Connect + anti-entropy sync per peer ──
         var iter = self.peers.iterator();
         while (iter.next()) |entry| {
             var peer = entry.value_ptr;
             peer.connect(self.config.peer_port);
 
-            // Anti-entropy: on fresh connection, dump full state to this peer.
             if (peer.needs_sync and peer.stream != null) {
                 peer.needs_sync = false;
                 var ip_buf: [15]u8 = undefined;
@@ -385,12 +379,62 @@ pub const Cluster = struct {
 
                 std.log.info("cluster: anti-entropy sync sent {d} keys to {s}", .{ sync_ctx.synced, ip_str });
             }
+        }
+    }
 
+    /// Replicate a SET to all alive peers via WormWire.
+    /// Also triggers anti-entropy full-state sync on newly connected peers.
+    pub fn replicateWrite(self: *Cluster, key: []const u8, value: []const u8, is_worm: bool) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.ensurePeersConnectedLocked();
+
+        var iter = self.peers.iterator();
+        while (iter.next()) |entry| {
+            var peer = entry.value_ptr;
             _ = peer.sendCommand(.{ .set = .{
                 .key = key,
                 .value = value,
                 .worm = is_worm,
             } });
+        }
+    }
+
+    /// Replicate a VINSERT to all alive peers. Carries vector bytes +
+    /// metric + origin timestamp so peers update store + BQ + HNSW as a
+    /// single unit. Triggers anti-entropy sync if a peer needs it.
+    pub fn replicateVinsert(
+        self: *Cluster,
+        params: Command.VinsertParams,
+    ) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.ensurePeersConnectedLocked();
+
+        var iter = self.peers.iterator();
+        while (iter.next()) |entry| {
+            var peer = entry.value_ptr;
+            _ = peer.sendCommand(.{ .vinsert = params });
+        }
+    }
+
+    /// Replicate a VDELETE to all alive peers.
+    pub fn replicateVdelete(
+        self: *Cluster,
+        key: []const u8,
+        namespace: []const u8,
+    ) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.ensurePeersConnectedLocked();
+
+        var iter = self.peers.iterator();
+        while (iter.next()) |entry| {
+            var peer = entry.value_ptr;
+            _ = peer.sendCommand(.{ .vdelete = .{ .key = key, .namespace = namespace } });
         }
     }
 

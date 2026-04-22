@@ -119,6 +119,16 @@ pub fn deinitCommand(allocator: std.mem.Allocator, cmd: Command) void {
             allocator.free(params.procedure);
         },
         .auth => |token| allocator.free(token),
+        .vinsert => |params| {
+            allocator.free(params.key);
+            allocator.free(params.vector);
+            allocator.free(params.namespace);
+            allocator.free(params.metric);
+        },
+        .vdelete => |params| {
+            allocator.free(params.key);
+            allocator.free(params.namespace);
+        },
     }
 }
 

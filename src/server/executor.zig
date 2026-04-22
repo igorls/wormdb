@@ -14,6 +14,8 @@ const Command = core.types.Command;
 const Response = core.types.Response;
 const Cluster = cluster_mod.Cluster;
 const NamespaceRegistry = @import("../vector/index.zig").NamespaceRegistry;
+const vector_ops = @import("../procedures/vector_ops.zig");
+const Metric = @import("../vector/metric.zig").Metric;
 
 /// Execute context — bundles the dependencies needed for command execution.
 pub const ExecContext = struct {
@@ -171,6 +173,52 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
             // AUTH is handled at the connection/gateway layer, not the executor.
             // If it reaches here, the transport didn't intercept it.
             return Response{ .err = "AUTH must be sent over gateway" };
+        },
+        .vinsert => |params| blk: {
+            const metric_enum = Metric.fromStr(params.metric) orelse {
+                break :blk Response{ .err = try ctx.allocator.dupe(u8, "vinsert: unknown metric (use cosine|dot|l2)") };
+            };
+            vector_ops.applyVinsert(
+                ctx.store,
+                ctx.cluster,
+                ctx.event_bus,
+                ctx.vector_registry,
+                ctx.allocator,
+                .{
+                    .key = params.key,
+                    .vector = params.vector,
+                    .worm = params.worm,
+                    .namespace = params.namespace,
+                    .metric = metric_enum,
+                    .timestamp = params.timestamp,
+                    .replicate = true, // client-originated → propagate
+                },
+            ) catch |err| {
+                break :blk switch (err) {
+                    error.InvalidVectorBytes => Response{ .err = try ctx.allocator.dupe(u8, "vinsert: invalid vector bytes (must be non-empty, len % 4 == 0)") },
+                    error.WormViolation => Response{ .err = try ctx.allocator.dupe(u8, "WORM violation: vector key is immutable") },
+                    else => Response{ .err = try ctx.allocator.dupe(u8, @errorName(err)) },
+                };
+            };
+            break :blk .ok;
+        },
+        .vdelete => |params| blk: {
+            vector_ops.applyVdelete(
+                ctx.store,
+                ctx.cluster,
+                ctx.event_bus,
+                ctx.vector_registry,
+                ctx.allocator,
+                params.key,
+                params.namespace,
+                true, // client-originated → propagate
+            ) catch |err| {
+                break :blk switch (err) {
+                    error.WormViolation => Response{ .err = try ctx.allocator.dupe(u8, "WORM violation: vector key is immutable") },
+                    else => Response{ .err = try ctx.allocator.dupe(u8, @errorName(err)) },
+                };
+            };
+            break :blk .ok;
         },
     };
 }

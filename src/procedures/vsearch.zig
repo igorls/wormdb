@@ -1,8 +1,8 @@
 //! Built-in VSEARCH procedure — brute-force vector similarity search
 //!
-//! Scans all vectors under a namespace prefix, computes similarity to a
-//! query vector, optionally applies time-decay scoring, and returns the
-//! top-K most similar entries as JSON.
+//! Scans all vectors under a namespace prefix via a callback iterator (no
+//! arena copies), ranks candidates through a bounded top-K min-heap, and
+//! returns the K highest-scoring entries as JSON.
 //!
 //! EXEC vsearch <query_key> <top_k> [<namespace>] [<metric>] [<decay>]
 //!
@@ -15,16 +15,17 @@
 //! Returns JSON array sorted by descending score:
 //!   [{"k":"vec:ns:id","s":0.95,"ts":1709...}, ...]
 //!
-//! The score includes both semantic similarity and optional temporal recency.
+//! The score combines semantic similarity with optional temporal recency.
 
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
 const distance = @import("../vector/distance.zig");
+const topk_mod = @import("../vector/topk.zig");
+const Store = @import("../storage/store.zig").Store;
 
 const MAX_TOP_K: usize = 100;
 const DEFAULT_NAMESPACE: []const u8 = "vec:";
 
-/// Distance metric selector.
 const Metric = enum {
     cosine,
     dot,
@@ -37,12 +38,77 @@ const Metric = enum {
     }
 };
 
-/// A single search result candidate.
 const Candidate = struct {
-    key: []const u8,
+    key: []const u8, // arena-owned copy
     score: f32,
     timestamp: u64,
 };
+
+fn candidateScore(c: Candidate) f32 {
+    return c.score;
+}
+
+const TopKCandidate = topk_mod.TopK(Candidate, candidateScore);
+
+/// State passed through the scan callback. The callback is a top-level
+/// function with no closure — it unpacks the context from *anyopaque.
+const ScanCtx = struct {
+    query_key: []const u8,
+    query_vec: []align(1) const f32,
+    metric: Metric,
+    decay: f32,
+    now_ms: u64,
+    heap: *TopKCandidate,
+    allocator: std.mem.Allocator,
+    oom: bool,
+};
+
+fn onMatch(
+    raw_ctx: *anyopaque,
+    key: []const u8,
+    value: []const u8,
+    timestamp: u64,
+    is_worm: bool,
+) Store.ScanAction {
+    _ = is_worm;
+    const sc: *ScanCtx = @ptrCast(@alignCast(raw_ctx));
+
+    // Skip the query key itself.
+    if (std.mem.eql(u8, key, sc.query_key)) return .cont;
+
+    // Parse vector; skip non-vector or dim-mismatched values.
+    const vec = distance.bytesToF32(value) orelse return .cont;
+    if (vec.len != sc.query_vec.len) return .cont;
+
+    const raw_sim = switch (sc.metric) {
+        .cosine => distance.cosine(sc.query_vec, vec),
+        .dot => distance.dot(sc.query_vec, vec),
+        .l2 => blk: {
+            // Invert so higher = more similar (for ranking).
+            const d = distance.l2Squared(sc.query_vec, vec);
+            break :blk 1.0 / (1.0 + d);
+        },
+    };
+
+    const score = if (sc.decay > 0.0) blk: {
+        const age_ms = if (sc.now_ms > timestamp) sc.now_ms - timestamp else 0;
+        const age_hours: f32 = @as(f32, @floatFromInt(age_ms)) / 3_600_000.0;
+        // Exponential decay, time constant = 168h (half-life ≈ 116h).
+        const recency = @exp(-age_hours / 168.0);
+        break :blk (1.0 - sc.decay) * raw_sim + sc.decay * recency;
+    } else raw_sim;
+
+    // Admission check before duping the key — avoids O(N) arena allocs
+    // when most candidates won't make the heap.
+    if (score <= sc.heap.thresholdScore()) return .cont;
+
+    const key_copy = sc.allocator.dupe(u8, key) catch {
+        sc.oom = true;
+        return .stop;
+    };
+    sc.heap.push(.{ .key = key_copy, .score = score, .timestamp = timestamp });
+    return .cont;
+}
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     // ── Parse arguments ──────────────────────────────────────────
@@ -58,90 +124,50 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
 
     const metric = if (ctx.arg(3)) |m| Metric.fromStr(m) else Metric.cosine;
 
-    // Decay factor λ: final_score = (1-λ)×similarity + λ×recency
-    // where recency = exp(-age_hours / 168) (half-life ≈ 1 week)
     var decay: f32 = 0.0;
     if (ctx.arg(4)) |d| {
         decay = std.fmt.parseFloat(f32, d) catch 0.0;
         decay = @min(@max(decay, 0.0), 1.0);
     }
 
-    // ── Load query vector ────────────────────────────────────────
-    ctx.lockKey(query_key);
-    const query_bytes = ctx.get(query_key) orelse
+    // ── Load query vector into arena (locks internally) ──────────
+    // Must copy before scan — scanPrefixCallback locks every shard and
+    // would deadlock against a held query-shard lock.
+    const query_bytes = (try ctx.getCopy(query_key)) orelse
         return ctx.err("vsearch: query key not found");
 
     const query_vec = distance.bytesToF32(query_bytes) orelse
         return ctx.err("vsearch: query value is not a valid f32 vector (byte length must be multiple of 4)");
 
-    // ── Scan namespace for candidates ────────────────────────────
-    // Use the store's prefix scan to get all matching keys.
-    // This locks each shard independently — safe and non-blocking.
-    const scan_results = try ctx.scan(namespace, 0); // 0 = no limit
+    // ── Bounded top-K heap ───────────────────────────────────────
+    const heap_buf = try ctx.allocator.alloc(Candidate, top_k);
+    var heap = TopKCandidate.init(heap_buf);
 
-    // ── Build min-heap of top-K candidates ───────────────────────
-    var heap: std.ArrayListUnmanaged(Candidate) = .{};
+    // ── Callback scan (borrowed slices, zero bulk copies) ────────
+    var sc = ScanCtx{
+        .query_key = query_key,
+        .query_vec = query_vec,
+        .metric = metric,
+        .decay = decay,
+        .now_ms = ctx.timestamp(),
+        .heap = &heap,
+        .allocator = ctx.allocator,
+        .oom = false,
+    };
+    ctx.scanCallback(namespace, @ptrCast(&sc), onMatch);
+    if (sc.oom) return ctx.err("vsearch: out of memory during scan");
 
-    const now_ms = ctx.timestamp();
+    const results = heap.sortedDesc();
 
-    for (scan_results) |entry| {
-        // Skip the query key itself
-        if (std.mem.eql(u8, entry.key, query_key)) continue;
-
-        // Parse vector from value bytes
-        const vec = distance.bytesToF32(entry.value) orelse continue;
-
-        // Compute raw similarity
-        const raw_sim = switch (metric) {
-            .cosine => distance.cosine(query_vec, vec),
-            .dot => distance.dot(query_vec, vec),
-            .l2 => blk: {
-                // L2: invert so higher = more similar (for ranking)
-                const d = distance.l2Squared(query_vec, vec);
-                break :blk 1.0 / (1.0 + d);
-            },
-        };
-
-        // Apply temporal decay if requested
-        const score = if (decay > 0.0) blk: {
-            const age_ms = if (now_ms > entry.timestamp) now_ms - entry.timestamp else 0;
-            const age_hours: f32 = @as(f32, @floatFromInt(age_ms)) / 3_600_000.0;
-            // Exponential decay with ~1 week half-life (168 hours)
-            const recency = @exp(-age_hours / 168.0);
-            break :blk (1.0 - decay) * raw_sim + decay * recency;
-        } else raw_sim;
-
-        // Maintain top-K via simple insertion (fine for brute-force Phase 1)
-        try heap.append(ctx.allocator, .{
-            .key = entry.key,
-            .score = score,
-            .timestamp = entry.timestamp,
-        });
-    }
-
-    // Sort descending by score
-    std.sort.heap(Candidate, heap.items, {}, struct {
-        fn greaterThan(_: void, a: Candidate, b: Candidate) bool {
-            return a.score > b.score;
-        }
-    }.greaterThan);
-
-    // Trim to top_k
-    const result_count = @min(heap.items.len, top_k);
-    const results = heap.items[0..result_count];
-
-    // ── Build JSON response ──────────────────────────────────────
+    // ── JSON response ────────────────────────────────────────────
     var json: std.ArrayListUnmanaged(u8) = .{};
     try json.append(ctx.allocator, '[');
-
     for (results, 0..) |r, idx| {
         if (idx > 0) try json.append(ctx.allocator, ',');
-
         try json.appendSlice(ctx.allocator, "{\"k\":\"");
         try appendJsonEscaped(&json, ctx.allocator, r.key);
         try json.appendSlice(ctx.allocator, "\",\"s\":");
 
-        // Score with 6 decimal places
         var score_buf: [32]u8 = undefined;
         const score_str = std.fmt.bufPrint(&score_buf, "{d:.6}", .{r.score}) catch "0";
         try json.appendSlice(ctx.allocator, score_str);
@@ -153,12 +179,10 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
 
         try json.append(ctx.allocator, '}');
     }
-
     try json.append(ctx.allocator, ']');
     return ctx.value(try json.toOwnedSlice(ctx.allocator));
 }
 
-/// Escape a string for safe JSON embedding.
 fn appendJsonEscaped(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, s: []const u8) !void {
     for (s) |c| {
         switch (c) {

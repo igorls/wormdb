@@ -7,6 +7,8 @@
 //! using the key convention: vec:<namespace>:<id>
 
 pub const distance = @import("distance.zig");
+pub const topk = @import("topk.zig");
+pub const TopK = topk.TopK;
 
 // Re-export commonly used functions
 pub const cosine = distance.cosine;

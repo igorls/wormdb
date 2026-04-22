@@ -36,11 +36,12 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
         }
     }
 
-    // Stored count (from vinsert tracking)
-    const stats_key = ctx.fmt("{s}stats:count", .{namespace});
+    // Stored count (from vinsert tracking) — lives under the reserved
+    // __meta: prefix, outside any user-visible namespace.
+    const stats_key = ctx.fmt("__meta:{s}count", .{namespace});
     var stats_copy: [512]u8 = undefined;
-    const stk_len = @min(stats_key.len, stats_copy.len);
-    @memcpy(stats_copy[0..stk_len], stats_key[0..stk_len]);
+    const stk_len = stats_key.len;
+    @memcpy(stats_copy[0..stk_len], stats_key);
     ctx.lockKey(stats_copy[0..stk_len]);
     const insert_count = ctx.getInt(i64, stats_copy[0..stk_len]) orelse 0;
 

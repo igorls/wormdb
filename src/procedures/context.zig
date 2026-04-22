@@ -16,6 +16,8 @@
 const std = @import("std");
 const Store = @import("../storage/store.zig").Store;
 const Response = @import("../core/types.zig").Response;
+const Cluster = @import("../cluster/mod.zig").Cluster;
+const EventBus = @import("../event/mod.zig").EventBus;
 
 const shardIndexFn = @import("../storage/store.zig").shardIndex;
 
@@ -25,6 +27,12 @@ pub const Ctx = struct {
     allocator: std.mem.Allocator,
     /// Authenticated identity (SCT subject). Null if unauthenticated.
     _identity: ?[]const u8,
+    /// Cluster handle — when present, `setDurable`/`setDurableWorm` replicate
+    /// their writes to peers (matches wire-level SET semantics). Null in
+    /// single-node mode or tests.
+    cluster: ?*Cluster = null,
+    /// Event bus for pub/sub emission from procedures. Null in tests.
+    event_bus: ?*EventBus = null,
 
     // Lock tracking — max 16 distinct shards per procedure.
     // lockKey/lockKeys records shard indices here so they auto-unlock on deinit().
@@ -39,13 +47,30 @@ pub const Ctx = struct {
 
     pub const Result = Response;
 
+    /// Held-lock snapshot. Returned by saveAndReleaseAllHeldShards so the
+    /// procedure can re-acquire after an operation (store.set + replicate)
+    /// that briefly needs no locks held.
+    pub const HeldLocks = struct {
+        indices: [MAX_LOCKS]usize,
+        count: usize,
+    };
+
     /// Initialize a context for a single procedure call.
-    pub fn init(store: *Store, args: []const []const u8, allocator: std.mem.Allocator, id: ?[]const u8) Ctx {
+    pub fn init(
+        store: *Store,
+        args: []const []const u8,
+        allocator: std.mem.Allocator,
+        id: ?[]const u8,
+        cluster: ?*Cluster,
+        event_bus: ?*EventBus,
+    ) Ctx {
         return .{
             .store = store,
             .args = args,
             .allocator = allocator,
             ._identity = id,
+            .cluster = cluster,
+            .event_bus = event_bus,
         };
     }
 
@@ -142,6 +167,44 @@ pub const Ctx = struct {
         }
     }
 
+    /// Release ALL currently-held shard locks and return a snapshot for
+    /// later re-acquisition. Used by durable+replicated writes, which need
+    /// no shard locks held during the cluster call — `replicateWrite` may
+    /// trigger an anti-entropy `iterateAll` that locks every shard, which
+    /// deadlocks against any locks held by the calling procedure.
+    fn saveAndReleaseAllHeldShards(self: *Ctx) HeldLocks {
+        var held: HeldLocks = .{ .indices = undefined, .count = self.lock_count };
+        @memcpy(held.indices[0..held.count], self.locked_shards[0..self.lock_count]);
+
+        // Release in reverse order (LIFO) to mirror deinit().
+        while (self.lock_count > 0) {
+            self.lock_count -= 1;
+            self.store.shards[self.locked_shards[self.lock_count]].mutex.unlock();
+        }
+        return held;
+    }
+
+    /// Re-acquire shard locks in ascending index order. Sorting is required
+    /// for deadlock safety against concurrent multi-shard lockers, which use
+    /// ascending-order acquisition (see `lockKeys2` and the anti-entropy
+    /// `iterateAll` loop). Small-n insertion sort — count is ≤ MAX_LOCKS (16).
+    fn reacquireAllHeldShards(self: *Ctx, held_in: HeldLocks) void {
+        var held = held_in;
+        for (1..held.count) |i| {
+            const x = held.indices[i];
+            var j = i;
+            while (j > 0 and held.indices[j - 1] > x) : (j -= 1) {
+                held.indices[j] = held.indices[j - 1];
+            }
+            held.indices[j] = x;
+        }
+        for (held.indices[0..held.count]) |si| {
+            self.store.shards[si].mutex.lock();
+            self.locked_shards[self.lock_count] = si;
+            self.lock_count += 1;
+        }
+    }
+
     // ╔═══════════════════════════════════════════════╗
     // ║  Store Access                                  ║
     // ╚═══════════════════════════════════════════════╝
@@ -150,6 +213,14 @@ pub const Ctx = struct {
     pub fn get(self: *Ctx, key: []const u8) ?[]const u8 {
         const entry = self.store.getUnsafe(key) orelse return null;
         return entry.value;
+    }
+
+    /// Get an arena-owned copy of a key's value. Locks, copies, and unlocks
+    /// internally — safe to call without holding any locks, and the returned
+    /// slice remains valid after subsequent scans/writes. Use this when the
+    /// value must outlive operations that re-lock shards (e.g. scanPrefix).
+    pub fn getCopy(self: *Ctx, key: []const u8) !?[]const u8 {
+        return self.store.getValueDupe(key, self.allocator);
     }
 
     /// Get the value for a key parsed as an integer.
@@ -165,23 +236,41 @@ pub const Ctx = struct {
         self.store.setUnsafe(key, val, false) catch {};
     }
 
-    /// Set a key durably — goes through the full WAL path.
-    /// Data survives server restarts. Caller must hold the key's shard lock.
-    /// The shard lock is temporarily released for the WAL write (store.set acquires its own).
+    /// Set a key durably — goes through the full WAL path and (if a cluster
+    /// handle is attached) replicates the write to peers. Matches wire-level
+    /// SET semantics: local commit is authoritative; replication failures
+    /// are logged but do not fail the write.
+    ///
+    /// All currently-held shard locks are released for the duration of the
+    /// store.set + replicate. This is required because `replicateWrite` can
+    /// trigger an anti-entropy scan that locks every shard — holding any
+    /// shard lock through the call would deadlock the same thread.
     pub fn setDurable(self: *Ctx, key: []const u8, val: []const u8) !void {
-        // Release shard lock — store.set() acquires it internally
-        const si = shardIndexFn(key);
-        self.releaseShard(si);
-        defer self.acquireShard(si); // Re-acquire after WAL write
+        const held = self.saveAndReleaseAllHeldShards();
+        defer self.reacquireAllHeldShards(held);
+
         try self.store.set(key, val, false);
+
+        if (self.cluster) |c| {
+            c.replicateWrite(key, val, false) catch |e| {
+                std.log.warn("procedure replication failed: {s}", .{@errorName(e)});
+            };
+        }
     }
 
-    /// Set a key durably as WORM (immutable once written).
+    /// Set a key durably as WORM (immutable once written). Replicated like
+    /// `setDurable`; see that method's docs for the lock-dance rationale.
     pub fn setDurableWorm(self: *Ctx, key: []const u8, val: []const u8) !void {
-        const si = shardIndexFn(key);
-        self.releaseShard(si);
-        defer self.acquireShard(si);
+        const held = self.saveAndReleaseAllHeldShards();
+        defer self.reacquireAllHeldShards(held);
+
         try self.store.set(key, val, true);
+
+        if (self.cluster) |c| {
+            c.replicateWrite(key, val, true) catch |e| {
+                std.log.warn("procedure replication failed: {s}", .{@errorName(e)});
+            };
+        }
     }
 
     /// Set a key to an integer value. Uses internal scratch buffer.
@@ -265,6 +354,16 @@ pub const Ctx = struct {
         return self._identity;
     }
 
+    /// Publish an event to all subscribers of `channel`. No-op if the event
+    /// bus is unattached (tests, single-node builds). Errors are logged and
+    /// swallowed — pub/sub is best-effort from the procedure's perspective.
+    pub fn publish(self: *Ctx, channel: []const u8, message: []const u8) void {
+        const bus = self.event_bus orelse return;
+        bus.publish(channel, message) catch |e| {
+            std.log.warn("procedure publish to '{s}' failed: {s}", .{ channel, @errorName(e) });
+        };
+    }
+
     /// Generate random hex string. Returns a slice from the fmt scratch buffer.
     pub fn randomHex(self: *Ctx, byte_count: usize) []const u8 {
         const max = @min(byte_count, self.fmt_buf.len / 2);
@@ -293,6 +392,26 @@ pub const Ctx = struct {
         return self.store.scanPrefix(prefix, limit, self.allocator);
     }
 
+    /// Callback-based prefix scan — yields borrowed key/value slices (no
+    /// arena copy). See Store.scanPrefixCallback for the callback contract.
+    ///
+    /// The caller MUST NOT hold any shard locks when calling this — the scan
+    /// will deadlock against its own held lock (same contract as `scan`).
+    pub fn scanCallback(
+        self: *Ctx,
+        prefix: []const u8,
+        context: *anyopaque,
+        callback: *const fn (
+            context: *anyopaque,
+            key: []const u8,
+            value: []const u8,
+            timestamp: u64,
+            is_worm: bool,
+        ) Store.ScanAction,
+    ) void {
+        self.store.scanPrefixCallback(prefix, context, callback);
+    }
+
     /// Count keys matching a prefix. Lightweight — no allocation.
     pub fn countKeys(self: *Ctx, prefix: []const u8) usize {
         return self.store.countPrefix(prefix);
@@ -303,7 +422,7 @@ test "Ctx arg helpers" {
     const testing = std.testing;
     var store: Store = undefined; // not accessed in arg tests
     const args = &[_][]const u8{ "hello", "42", "bad" };
-    var ctx = Ctx.init(&store, args, testing.allocator, null);
+    var ctx = Ctx.init(&store, args, testing.allocator, null, null, null);
     defer ctx.deinit();
 
     try testing.expectEqualStrings("hello", ctx.arg(0).?);

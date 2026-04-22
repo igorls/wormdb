@@ -142,7 +142,14 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
             const proc_fn = procedures.registry.lookup(params.procedure) orelse {
                 break :blk Response{ .err = try ctx.allocator.dupe(u8, "unknown procedure") };
             };
-            var proc_ctx = procedures.context.Ctx.init(ctx.store, params.args, ctx.allocator, ctx.identity);
+            var proc_ctx = procedures.context.Ctx.init(
+                ctx.store,
+                params.args,
+                ctx.allocator,
+                ctx.identity,
+                ctx.cluster,
+                ctx.event_bus,
+            );
             defer proc_ctx.deinit(); // auto-unlock all shard locks
             const result = proc_fn(&proc_ctx) catch |e| {
                 break :blk Response{ .err = try ctx.allocator.dupe(u8, @errorName(e)) };

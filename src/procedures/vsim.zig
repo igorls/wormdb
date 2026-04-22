@@ -34,6 +34,11 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const vec_b = distance.bytesToF32(bytes_b) orelse
         return ctx.err("vsim: key_b is not a valid f32 vector");
 
+    // Both keys are explicit — a dim mismatch is almost always a bug.
+    // Fail loudly rather than silently truncating to the shared prefix.
+    if (vec_a.len != vec_b.len)
+        return ctx.err("vsim: vector dimensions differ (a vs b)");
+
     const result: f32 = if (std.mem.eql(u8, metric_str, "dot"))
         distance.dot(vec_a, vec_b)
     else if (std.mem.eql(u8, metric_str, "l2"))

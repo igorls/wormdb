@@ -423,6 +423,49 @@ pub const Store = struct {
         return try results.toOwnedSlice(alloc);
     }
 
+    /// Control flow return from a scan callback.
+    pub const ScanAction = enum { cont, stop };
+
+    /// Callback-based prefix scan — yields borrowed key/value slices to the
+    /// callback while the matching shard is still locked. Zero allocations,
+    /// zero copies. Suitable for hot paths (vector search, index rebuild)
+    /// where arena-duping every matching value would be prohibitive.
+    ///
+    /// The callback MUST NOT:
+    ///   - Retain the slices after returning (memory is only valid during the call)
+    ///   - Call any Store method that acquires shard locks (deadlock risk)
+    ///   - Block on long-running work (the shard is locked, blocking writers)
+    ///
+    /// Returns `.stop` from the callback to halt iteration early.
+    pub fn scanPrefixCallback(
+        self: *Store,
+        prefix: []const u8,
+        context: *anyopaque,
+        callback: *const fn (
+            context: *anyopaque,
+            key: []const u8,
+            value: []const u8,
+            timestamp: u64,
+            is_worm: bool,
+        ) ScanAction,
+    ) void {
+        for (&self.shards) |*shard| {
+            shard.mutex.lock();
+            defer shard.mutex.unlock();
+
+            var iter = shard.data.iterator();
+            while (iter.next()) |entry| {
+                const e = entry.value_ptr.*;
+                if (e.key.len >= prefix.len and std.mem.eql(u8, e.key[0..prefix.len], prefix)) {
+                    switch (callback(context, e.key, e.value, e.timestamp, e.flags.is_worm)) {
+                        .cont => {},
+                        .stop => return,
+                    }
+                }
+            }
+        }
+    }
+
     /// Count keys matching a prefix. Lightweight — no allocation, no value copying.
     pub fn countPrefix(self: *Store, prefix: []const u8) usize {
         var total: usize = 0;

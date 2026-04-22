@@ -16,15 +16,21 @@
 //! 5. Returns OK
 //!
 //! Key layout:
-//!   vec:ns:id      → raw f32 bytes (the full vector)
-//!   bq:ns:id       → binary-quantized hash (1 bit per dimension)
-//!   vec:stats:count → total vectors inserted
+//!   vec:ns:id             → raw f32 bytes (the full vector)
+//!   bq:vec:ns:id          → binary-quantized hash (1 bit per dimension)
+//!   __meta:vec:ns:count   → total vectors inserted (reserved __meta: prefix
+//!                           keeps stats out of any user-scannable namespace)
 
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
 const distance = @import("../vector/distance.zig");
 
 const DEFAULT_NAMESPACE: []const u8 = "vec:";
+
+// Max length for the user-supplied id. Keeps formatted keys well under the
+// ctx.fmt scratch buffer (512B) across "vec:", "bq:vec:", "__meta:vec:" forms.
+const MAX_ID_LEN: usize = 256;
+const MAX_NAMESPACE_LEN: usize = 128;
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     // ── Parse arguments ──────────────────────────────────────────
@@ -34,6 +40,9 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const vec_bytes = ctx.arg(1) orelse
         return ctx.err("vinsert requires at least 2 args: <key> <vector_bytes> [worm] [namespace]");
 
+    if (id.len == 0 or id.len > MAX_ID_LEN)
+        return ctx.err("vinsert: id must be 1..256 bytes");
+
     // Validate vector bytes
     if (vec_bytes.len == 0 or vec_bytes.len % 4 != 0)
         return ctx.err("vinsert: vector must be a non-empty f32 byte array (length multiple of 4)");
@@ -42,24 +51,29 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const is_worm = if (ctx.arg(2)) |w| !std.mem.eql(u8, w, "0") else true;
 
     const namespace = ctx.arg(3) orelse DEFAULT_NAMESPACE;
+    if (namespace.len > MAX_NAMESPACE_LEN)
+        return ctx.err("vinsert: namespace too long (max 128 bytes)");
 
     // ── Build keys ───────────────────────────────────────────────
     const vec_key = ctx.fmt("{s}{s}", .{ namespace, id });
     var vec_key_copy: [512]u8 = undefined;
-    const vk_len = @min(vec_key.len, vec_key_copy.len);
-    @memcpy(vec_key_copy[0..vk_len], vec_key[0..vk_len]);
+    const vk_len = vec_key.len;
+    @memcpy(vec_key_copy[0..vk_len], vec_key);
     const vec_key_stable = vec_key_copy[0..vk_len];
 
     const bq_key = ctx.fmt("bq:{s}{s}", .{ namespace, id });
     var bq_key_copy: [512]u8 = undefined;
-    const bq_len = @min(bq_key.len, bq_key_copy.len);
-    @memcpy(bq_key_copy[0..bq_len], bq_key[0..bq_len]);
+    const bq_len = bq_key.len;
+    @memcpy(bq_key_copy[0..bq_len], bq_key);
     const bq_key_stable = bq_key_copy[0..bq_len];
 
-    const stats_key = ctx.fmt("{s}stats:count", .{namespace});
+    // Stats key lives under __meta: — never scanned by vsearch, so it can't
+    // pollute results even when the count's decimal ASCII happens to parse
+    // as a 1-, 2-, or 3-dim f32 vector.
+    const stats_key = ctx.fmt("__meta:{s}count", .{namespace});
     var stats_key_copy: [512]u8 = undefined;
-    const sk_len = @min(stats_key.len, stats_key_copy.len);
-    @memcpy(stats_key_copy[0..sk_len], stats_key[0..sk_len]);
+    const sk_len = stats_key.len;
+    @memcpy(stats_key_copy[0..sk_len], stats_key);
     const stats_key_stable = stats_key_copy[0..sk_len];
 
     // ── Lock all involved shards ────────────────────────────────
@@ -91,8 +105,18 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     }
 
     // ── Increment vector count ───────────────────────────────────
+    // Local-only counter (ctx.set bypasses cluster replication). Each node
+    // maintains its own count; authoritative totals should use `vstats`'s
+    // `count` field (derived from a prefix scan) rather than `inserts`.
     const count = ctx.getInt(i64, stats_key_stable) orelse 0;
     ctx.setInt(stats_key_stable, count + 1);
+
+    // ── Emit inserted event ──────────────────────────────────────
+    // Channel naming: `<namespace>inserted`. Subscribers on a prefix like
+    // `vec:articles:` see every new vector under that namespace; a broader
+    // `vec:` subscription catches all vector inserts.
+    const event_channel = ctx.fmt("{s}inserted", .{namespace});
+    ctx.publish(event_channel, vec_key_stable);
 
     return ctx.ok();
 }

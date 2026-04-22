@@ -25,7 +25,12 @@ const ZERO: F32xN = @splat(0.0);
 
 /// Cosine similarity: dot(a,b) / (‖a‖ × ‖b‖)
 /// Returns value in [-1.0, 1.0]. Returns 0.0 for zero-length or zero-norm inputs.
-pub fn cosine(a: []const f32, b: []const f32) f32 {
+///
+/// Accepts align(1) slices — vectors recovered from raw byte storage have
+/// no guaranteed alignment beyond 1. On x86 the compiler lowers the SIMD
+/// loads to `vmovups` (unaligned), which is 0–5% slower than `vmovaps`;
+/// on ARM NEON there's no aligned/unaligned distinction.
+pub fn cosine(a: []align(1) const f32, b: []align(1) const f32) f32 {
     const len = @min(a.len, b.len);
     if (len == 0) return 0.0;
 
@@ -67,7 +72,7 @@ pub fn cosine(a: []const f32, b: []const f32) f32 {
 
 /// Inner (dot) product: Σ a[i] × b[i]
 /// Equivalent to cosine similarity when both vectors are L2-normalized.
-pub fn dot(a: []const f32, b: []const f32) f32 {
+pub fn dot(a: []align(1) const f32, b: []align(1) const f32) f32 {
     const len = @min(a.len, b.len);
     if (len == 0) return 0.0;
 
@@ -96,7 +101,7 @@ pub fn dot(a: []const f32, b: []const f32) f32 {
 
 /// Squared Euclidean distance: Σ (a[i] - b[i])²
 /// Returns the squared distance (avoids sqrt for ranking — monotonic).
-pub fn l2Squared(a: []const f32, b: []const f32) f32 {
+pub fn l2Squared(a: []align(1) const f32, b: []align(1) const f32) f32 {
     const len = @min(a.len, b.len);
     if (len == 0) return 0.0;
 
@@ -122,7 +127,7 @@ pub fn l2Squared(a: []const f32, b: []const f32) f32 {
 }
 
 /// Euclidean (L2) distance: √(Σ (a[i] - b[i])²)
-pub fn l2(a: []const f32, b: []const f32) f32 {
+pub fn l2(a: []align(1) const f32, b: []align(1) const f32) f32 {
     return @sqrt(l2Squared(a, b));
 }
 
@@ -171,7 +176,7 @@ pub fn hammingSimilarity(a: []const u8, b: []const u8) f32 {
 /// Quantize an f32 vector to binary (1 bit per dimension).
 /// Each bit is 1 if the corresponding float is >= 0, else 0.
 /// Output length: ceil(input.len / 8) bytes.
-pub fn binaryQuantize(vec: []const f32, out: []u8) void {
+pub fn binaryQuantize(vec: []align(1) const f32, out: []u8) void {
     const byte_count = (vec.len + 7) / 8;
     const actual = @min(byte_count, out.len);
 
@@ -198,16 +203,19 @@ pub fn binaryQuantizedSize(dimensions: usize) usize {
 // ╚═══════════════════════════════════════════════════╝
 
 /// Interpret raw bytes (from WormDB value) as an f32 slice.
-/// Returns null if the byte length is not a multiple of 4.
-pub fn bytesToF32(bytes: []const u8) ?[]const f32 {
+/// Returns an align(1) slice — the input byte buffer has no alignment
+/// guarantee, and the SIMD loads in the distance functions handle
+/// unaligned data fine. Returns null if the byte length is 0 or not a
+/// multiple of 4.
+pub fn bytesToF32(bytes: []const u8) ?[]align(1) const f32 {
     if (bytes.len == 0) return null;
     if (bytes.len % 4 != 0) return null;
-    const ptr: [*]const f32 = @ptrCast(@alignCast(bytes.ptr));
+    const ptr: [*]align(1) const f32 = @ptrCast(bytes.ptr);
     return ptr[0 .. bytes.len / 4];
 }
 
 /// Interpret an f32 slice as raw bytes (for storing in WormDB).
-pub fn f32ToBytes(vec: []const f32) []const u8 {
+pub fn f32ToBytes(vec: []align(1) const f32) []const u8 {
     const ptr: [*]const u8 = @ptrCast(vec.ptr);
     return ptr[0 .. vec.len * 4];
 }

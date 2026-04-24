@@ -17,6 +17,7 @@ pub const vsearch = @import("vsearch.zig");
 pub const vsim = @import("vsim.zig");
 pub const vinsert = @import("vinsert.zig");
 pub const vstats = @import("vstats.zig");
+pub const memory = @import("memory.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

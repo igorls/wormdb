@@ -22,6 +22,7 @@ pub const vstats = @import("vstats.zig");
 pub const vreindex = @import("vreindex.zig");
 pub const vdelete = @import("vdelete.zig");
 pub const vnsdrop = @import("vnsdrop.zig");
+pub const memory = @import("memory.zig");
 
 pub const ProcedureFn = *const fn (ctx: *Ctx) anyerror!Ctx.Result;
 
@@ -47,6 +48,13 @@ const PROCEDURES = [_]Entry{
     .{ .name = "vreindex", .func = vreindex.execute },
     .{ .name = "vdelete", .func = vdelete.execute },
     .{ .name = "vnsdrop", .func = vnsdrop.execute },
+    .{ .name = "mem_init", .func = memory.memInit },
+    .{ .name = "mem_add", .func = memory.memAdd },
+    .{ .name = "mem_get", .func = memory.memGet },
+    .{ .name = "mem_query", .func = memory.memQuery },
+    .{ .name = "mem_stats", .func = memory.memStats },
+    .{ .name = "mem_drop", .func = memory.memDrop },
+    .{ .name = "mem_capabilities", .func = memory.memCapabilities },
 };
 
 /// Look up a procedure by name. O(n) scan — n is tiny at comptime-known size.

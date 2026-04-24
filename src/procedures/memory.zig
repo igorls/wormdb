@@ -1,0 +1,904 @@
+//! Agent-memory procedures — in-database primitives for building AI
+//! memory systems on top of WormDB.
+//!
+//! Each `mem_add` call atomically writes a doc, its metadata, and its
+//! embedding — plus publishing an "added" event — in one EXEC round-trip.
+//! Queries join vector similarity with the stored doc/metadata in-process,
+//! so clients never re-fetch docs to enrich search results.
+//!
+//! ── Key layout ──────────────────────────────────────────────────────
+//!   mem:<ns>:<id>             doc body (WORM by default)
+//!   mem:<ns>:<id>:meta        metadata JSON (mutable; raw passthrough)
+//!   vec:mem:<ns>:<id>         embedding (raw f32 bytes)
+//!   bq:vec:mem:<ns>:<id>      BQ companion (written by applyVinsert)
+//!   __meta:mem:<ns>:config    {"embedder_id":"...","metric":"...","created_at":N}
+//!
+//! ── Procedure surface ───────────────────────────────────────────────
+//!   mem_init         <ns> <embedder_id> <metric>
+//!   mem_add          <ns> <doc_id> <text> <embedding> [<meta_json>] [<worm>]
+//!   mem_get          <ns> <doc_id>
+//!   mem_query        <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>]
+//!   mem_stats        <ns>
+//!   mem_drop         <ns>
+//!   mem_capabilities
+//!
+//! ── Design notes ────────────────────────────────────────────────────
+//! * Chunking lives on the client. `mem_add` indexes one chunk; clients
+//!   that think in sessions call `mem_add` N times with derived ids.
+//! * `mem_init` is optional/lazy: the metric defaults to cosine on first
+//!   add. Calling mem_init up front lets you pre-declare for fail-fast.
+//! * Embedder identity is captured in config for reporting. Mixed-embedder
+//!   inserts are prevented operationally (by the client) + by dim-freeze
+//!   on the vector layer when models have different dims.
+//! * mem_query skips the BQ prefilter — HNSW is eagerly created by
+//!   mem_init, so cold-start (post-restart until vreindex) is the only
+//!   HNSW-absent case, and brute-force is the simpler fallback there.
+
+const std = @import("std");
+const Ctx = @import("context.zig").Ctx;
+const vector_ops = @import("vector_ops.zig");
+const distance = @import("../vector/distance.zig");
+const topk_mod = @import("../vector/topk.zig");
+const hnsw_mod = @import("../vector/hnsw.zig");
+const metric_mod = @import("../vector/metric.zig");
+const IndexModule = @import("../vector/index.zig");
+const Store = @import("../storage/store.zig").Store;
+
+const Metric = metric_mod.Metric;
+
+// ╔═══════════════════════════════════════════════════╗
+// ║  Constants                                         ║
+// ╚═══════════════════════════════════════════════════╝
+
+const MAX_NS_LEN: usize = 64;
+const MAX_DOC_ID_LEN: usize = 256;
+const MAX_EMBEDDER_ID_LEN: usize = 128;
+const MAX_TOP_K: usize = 100;
+const DEFAULT_SNIPPET_CHARS: i64 = 512;
+const DECAY_TIME_CONSTANT_HOURS: f32 = 168.0;
+const HNSW_EF_SEARCH_FACTOR: usize = 10;
+
+// ╔═══════════════════════════════════════════════════╗
+// ║  Input validation                                  ║
+// ╚═══════════════════════════════════════════════════╝
+
+/// Allow alphanumeric plus `- _ . /` — enough for model names like
+/// `sentence-transformers/all-MiniLM-L6-v2` and slug-style namespace
+/// names. Reject `:` so key construction can't collide with segment
+/// separators. Reject controls and `"` / `\` so JSON serialization of
+/// these values into config is safe without escape logic.
+fn isSafeToken(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or
+        (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or
+        c == '-' or c == '_' or c == '.' or c == '/';
+}
+
+fn validateNs(ns: []const u8) bool {
+    if (ns.len == 0 or ns.len > MAX_NS_LEN) return false;
+    for (ns) |c| if (!isSafeToken(c)) return false;
+    return true;
+}
+
+fn validateDocId(id: []const u8) bool {
+    if (id.len == 0 or id.len > MAX_DOC_ID_LEN) return false;
+    for (id) |c| if (!isSafeToken(c)) return false;
+    return true;
+}
+
+fn validateEmbedderId(id: []const u8) bool {
+    if (id.len == 0 or id.len > MAX_EMBEDDER_ID_LEN) return false;
+    for (id) |c| if (!isSafeToken(c)) return false;
+    return true;
+}
+
+// ╔═══════════════════════════════════════════════════╗
+// ║  JSON helpers                                      ║
+// ╚═══════════════════════════════════════════════════╝
+
+fn appendJsonEscaped(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try list.appendSlice(alloc, "\\\""),
+            '\\' => try list.appendSlice(alloc, "\\\\"),
+            '\n' => try list.appendSlice(alloc, "\\n"),
+            '\r' => try list.appendSlice(alloc, "\\r"),
+            '\t' => try list.appendSlice(alloc, "\\t"),
+            else => {
+                if (c < 0x20) {
+                    try list.appendSlice(alloc, "\\u00");
+                    const hex = "0123456789abcdef";
+                    try list.append(alloc, hex[c >> 4]);
+                    try list.append(alloc, hex[c & 0x0f]);
+                } else {
+                    try list.append(alloc, c);
+                }
+            },
+        }
+    }
+}
+
+fn writeUsize(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, n: usize) !void {
+    var buf: [32]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d}", .{n}) catch "0";
+    try list.appendSlice(alloc, s);
+}
+
+fn writeU64(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, n: u64) !void {
+    var buf: [20]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d}", .{n}) catch "0";
+    try list.appendSlice(alloc, s);
+}
+
+/// Extract a string field value from our own config JSON. Relies on the
+/// format we generate: `"<field>":"<value>"` with values that passed
+/// validateEmbedderId / known metric names, so no escape handling needed.
+/// Returns null if the field isn't present.
+fn extractConfigField(json: []const u8, field: []const u8) ?[]const u8 {
+    var needle_buf: [96]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\":\"", .{field}) catch return null;
+    const start = std.mem.indexOf(u8, json, needle) orelse return null;
+    const value_start = start + needle.len;
+    const tail = json[value_start..];
+    const end = std.mem.indexOfScalar(u8, tail, '"') orelse return null;
+    return tail[0..end];
+}
+
+// ╔═══════════════════════════════════════════════════╗
+// ║  Distance + decay shared with vsearch              ║
+// ╚═══════════════════════════════════════════════════╝
+
+inline fn applyDecay(raw_sim: f32, timestamp: u64, decay: f32, now_ms: u64) f32 {
+    if (decay <= 0.0) return raw_sim;
+    const age_ms = if (now_ms > timestamp) now_ms - timestamp else 0;
+    const age_hours: f32 = @as(f32, @floatFromInt(age_ms)) / 3_600_000.0;
+    const recency = @exp(-age_hours / DECAY_TIME_CONSTANT_HOURS);
+    return (1.0 - decay) * raw_sim + decay * recency;
+}
+
+inline fn computeExactSim(metric: Metric, q: []align(1) const f32, v: []align(1) const f32) f32 {
+    return switch (metric) {
+        .cosine => distance.cosine(q, v),
+        .dot => distance.dot(q, v),
+        .l2 => blk: {
+            const d = distance.l2Squared(q, v);
+            break :blk 1.0 / (1.0 + d);
+        },
+    };
+}
+
+// ╔═══════════════════════════════════════════════════╗
+// ║  mem_capabilities                                  ║
+// ╚═══════════════════════════════════════════════════╝
+
+pub fn memCapabilities(ctx: *Ctx) anyerror!Ctx.Result {
+    const json =
+        \\{"name":"wormdb-agent-memory","version":"1",
+        \\"retrieval_unit":"chunk",
+        \\"temporal_decay":true,
+        \\"verbatim":true,
+        \\"local":true,
+        \\"structured_facts":false,
+        \\"metrics":["cosine","dot","l2"]}
+    ;
+    return ctx.value(json);
+}
+
+// ╔═══════════════════════════════════════════════════╗
+// ║  mem_init                                          ║
+// ╚═══════════════════════════════════════════════════╝
+
+pub fn memInit(ctx: *Ctx) anyerror!Ctx.Result {
+    const ns = ctx.arg(0) orelse
+        return ctx.err("mem_init requires: <ns> <embedder_id> <metric>");
+    const embedder_id = ctx.arg(1) orelse
+        return ctx.err("mem_init requires: <ns> <embedder_id> <metric>");
+    const metric_str = ctx.arg(2) orelse
+        return ctx.err("mem_init requires: <ns> <embedder_id> <metric>");
+
+    if (!validateNs(ns))
+        return ctx.err("mem_init: ns must be 1..64 bytes, chars in [A-Za-z0-9._/-]");
+    if (!validateEmbedderId(embedder_id))
+        return ctx.err("mem_init: embedder_id must be 1..128 bytes, chars in [A-Za-z0-9._/-]");
+    const metric = Metric.fromStr(metric_str) orelse
+        return ctx.err("mem_init: unknown metric (cosine|dot|l2)");
+
+    const config_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
+    defer ctx.allocator.free(config_key);
+
+    // ── Idempotent-if-matching check ────────────────────────────
+    // The shard lock is released by setDurable's internal dance,
+    // so only the read is protected here. Concurrent inits with
+    // matching inputs converge to the same final config.
+    const existing = try ctx.getCopy(config_key);
+    if (existing) |cfg| {
+        const cfg_embedder = extractConfigField(cfg, "embedder_id") orelse "";
+        const cfg_metric = extractConfigField(cfg, "metric") orelse "";
+        if (!std.mem.eql(u8, cfg_embedder, embedder_id))
+            return ctx.err("mem_init: embedder_id differs from existing namespace config");
+        if (!std.mem.eql(u8, cfg_metric, metric.name()))
+            return ctx.err("mem_init: metric differs from existing namespace config");
+        return ctx.ok();
+    }
+
+    // ── Freeze the vector namespace with the declared metric ────
+    // This is what makes mem_init fail-fast useful: without it, the
+    // metric freezes only on the first mem_add. With it, a second
+    // mem_init with a different metric errors immediately.
+    if (ctx.vector_registry) |reg| {
+        const vec_ns = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
+        defer ctx.allocator.free(vec_ns);
+        _ = reg.getOrCreate(vec_ns, metric) catch |e| {
+            return ctx.err(ctx.fmt("mem_init: registry error: {s}", .{@errorName(e)}));
+        };
+    }
+
+    // ── Build + persist the config JSON ─────────────────────────
+    var cfg: std.ArrayListUnmanaged(u8) = .empty;
+    defer cfg.deinit(ctx.allocator);
+    try cfg.appendSlice(ctx.allocator, "{\"embedder_id\":\"");
+    try cfg.appendSlice(ctx.allocator, embedder_id);
+    try cfg.appendSlice(ctx.allocator, "\",\"metric\":\"");
+    try cfg.appendSlice(ctx.allocator, metric.name());
+    try cfg.appendSlice(ctx.allocator, "\",\"created_at\":");
+    try writeU64(&cfg, ctx.allocator, ctx.timestamp());
+    try cfg.append(ctx.allocator, '}');
+
+    try ctx.setDurable(config_key, cfg.items);
+    return ctx.ok();
+}
+
+// ╔═══════════════════════════════════════════════════╗
+// ║  mem_add                                           ║
+// ╚═══════════════════════════════════════════════════╝
+
+pub fn memAdd(ctx: *Ctx) anyerror!Ctx.Result {
+    const ns = ctx.arg(0) orelse
+        return ctx.err("mem_add requires: <ns> <doc_id> <text> <embedding> [<meta_json>] [<worm>]");
+    const doc_id = ctx.arg(1) orelse
+        return ctx.err("mem_add requires: <ns> <doc_id> <text> <embedding> [<meta_json>] [<worm>]");
+    const text = ctx.arg(2) orelse
+        return ctx.err("mem_add requires: <ns> <doc_id> <text> <embedding> [<meta_json>] [<worm>]");
+    const embedding = ctx.arg(3) orelse
+        return ctx.err("mem_add requires: <ns> <doc_id> <text> <embedding> [<meta_json>] [<worm>]");
+    const meta_json: []const u8 = ctx.arg(4) orelse "";
+    const is_worm = if (ctx.arg(5)) |w| !std.mem.eql(u8, w, "0") else true;
+
+    if (!validateNs(ns))
+        return ctx.err("mem_add: invalid ns");
+    if (!validateDocId(doc_id))
+        return ctx.err("mem_add: invalid doc_id");
+
+    // ── Pick metric from config (default cosine if no init) ─────
+    const metric: Metric = blk: {
+        const cfg_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
+        defer ctx.allocator.free(cfg_key);
+        const cfg = (try ctx.getCopy(cfg_key)) orelse break :blk .cosine;
+        const m_str = extractConfigField(cfg, "metric") orelse break :blk .cosine;
+        break :blk Metric.fromStr(m_str) orelse .cosine;
+    };
+
+    // ── Build derived keys ──────────────────────────────────────
+    const doc_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}", .{ ns, doc_id });
+    defer ctx.allocator.free(doc_key);
+    const meta_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}:meta", .{ ns, doc_id });
+    defer ctx.allocator.free(meta_key);
+    const vec_key = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:{s}", .{ ns, doc_id });
+    defer ctx.allocator.free(vec_key);
+    const vec_namespace = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
+    defer ctx.allocator.free(vec_namespace);
+    const channel = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:added", .{ns});
+    defer ctx.allocator.free(channel);
+
+    // ── Vector first: applyVinsert runs all pre-checks (dim +
+    //    metric freeze). A failure here writes nothing; the doc
+    //    and meta paths below are only reached on success. This
+    //    is the correctness-over-speed ordering — under WORM the
+    //    doc_key write would otherwise become a permanent orphan
+    //    if the vector insert failed after it.
+    vector_ops.applyVinsert(
+        ctx.store,
+        ctx.cluster,
+        ctx.event_bus,
+        ctx.vector_registry,
+        ctx.allocator,
+        .{
+            .key = vec_key,
+            .vector = embedding,
+            .worm = is_worm,
+            .namespace = vec_namespace,
+            .metric = metric,
+            .timestamp = ctx.timestamp(),
+            .replicate = true,
+        },
+    ) catch |err| {
+        return switch (err) {
+            error.InvalidVectorBytes => ctx.err("mem_add: embedding must be non-empty f32 bytes (len multiple of 4)"),
+            error.WormViolation => ctx.err("mem_add: doc_id already exists (WORM; drop namespace to replace)"),
+            error.DimensionMismatch => ctx.err("mem_add: embedding dim does not match the namespace"),
+            else => ctx.err(ctx.fmt("mem_add: vector insert failed: {s}", .{@errorName(err)})),
+        };
+    };
+
+    // ── Doc body ────────────────────────────────────────────────
+    if (is_worm) {
+        ctx.setDurableWorm(doc_key, text) catch |err| switch (err) {
+            error.WormViolation => {
+                // Vector was already applied — it now has no doc body.
+                // Surface a clear message; operator can mem_drop to recover.
+                return ctx.err("mem_add: doc_id already exists (WORM) — vector written but doc body refused; consider mem_drop");
+            },
+            else => return ctx.err(ctx.fmt("mem_add: doc write failed: {s}", .{@errorName(err)})),
+        };
+    } else {
+        ctx.setDurable(doc_key, text) catch |err| {
+            return ctx.err(ctx.fmt("mem_add: doc write failed: {s}", .{@errorName(err)}));
+        };
+    }
+
+    // ── Metadata (always mutable) ───────────────────────────────
+    if (meta_json.len > 0) {
+        ctx.setDurable(meta_key, meta_json) catch |err| {
+            return ctx.err(ctx.fmt("mem_add: meta write failed: {s}", .{@errorName(err)}));
+        };
+    }
+
+    // ── Publish to namespace channel ────────────────────────────
+    ctx.publish(channel, doc_id);
+    return ctx.ok();
+}
+
+// ╔═══════════════════════════════════════════════════╗
+// ║  mem_get                                           ║
+// ╚═══════════════════════════════════════════════════╝
+
+pub fn memGet(ctx: *Ctx) anyerror!Ctx.Result {
+    const ns = ctx.arg(0) orelse return ctx.err("mem_get requires: <ns> <doc_id>");
+    const doc_id = ctx.arg(1) orelse return ctx.err("mem_get requires: <ns> <doc_id>");
+
+    if (!validateNs(ns)) return ctx.err("mem_get: invalid ns");
+    if (!validateDocId(doc_id)) return ctx.err("mem_get: invalid doc_id");
+
+    const doc_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}", .{ ns, doc_id });
+    defer ctx.allocator.free(doc_key);
+    const meta_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}:meta", .{ ns, doc_id });
+    defer ctx.allocator.free(meta_key);
+
+    // Acquire both shards in deterministic order; read atomically.
+    ctx.lockKeys2(doc_key, meta_key);
+    const doc_slice = ctx.get(doc_key) orelse return ctx.err("mem_get: doc_id not found");
+    const doc_copy = try ctx.allocator.dupe(u8, doc_slice);
+    const ts = ctx.getTimestamp(doc_key) orelse 0;
+    const meta_slice = ctx.get(meta_key);
+    const meta_copy: ?[]u8 = if (meta_slice) |m| try ctx.allocator.dupe(u8, m) else null;
+
+    // Build JSON. meta is inserted raw — it was stored as-is from the
+    // client, and re-escaping would double-encode. Garbage in, garbage out.
+    var json: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer json.deinit(ctx.allocator);
+    try json.appendSlice(ctx.allocator, "{\"id\":\"");
+    try appendJsonEscaped(&json, ctx.allocator, doc_id);
+    try json.appendSlice(ctx.allocator, "\",\"text\":\"");
+    try appendJsonEscaped(&json, ctx.allocator, doc_copy);
+    try json.appendSlice(ctx.allocator, "\",\"meta\":");
+    if (meta_copy) |m| {
+        try json.appendSlice(ctx.allocator, m);
+    } else {
+        try json.appendSlice(ctx.allocator, "null");
+    }
+    try json.appendSlice(ctx.allocator, ",\"ts\":");
+    try writeU64(&json, ctx.allocator, ts);
+    try json.append(ctx.allocator, '}');
+
+    return ctx.value(try json.toOwnedSlice(ctx.allocator));
+}
+
+// ╔═══════════════════════════════════════════════════╗
+// ║  mem_query                                         ║
+// ╚═══════════════════════════════════════════════════╝
+
+const QueryCandidate = struct {
+    key: []const u8, // arena-owned — `vec:mem:<ns>:<id>`
+    score: f32,
+    timestamp: u64,
+};
+
+fn candidateScore(c: QueryCandidate) f32 {
+    return c.score;
+}
+
+const TopKCandidate = topk_mod.TopK(QueryCandidate, candidateScore);
+
+const BruteScanCtx = struct {
+    query_vec: []align(1) const f32,
+    metric: Metric,
+    decay: f32,
+    now_ms: u64,
+    heap: *TopKCandidate,
+    allocator: std.mem.Allocator,
+    oom: bool,
+};
+
+fn onBruteMatch(
+    raw_ctx: *anyopaque,
+    key: []const u8,
+    value: []const u8,
+    timestamp: u64,
+    is_worm: bool,
+) Store.ScanAction {
+    _ = is_worm;
+    const sc: *BruteScanCtx = @ptrCast(@alignCast(raw_ctx));
+    const vec = distance.bytesToF32(value) orelse return .cont;
+    if (vec.len != sc.query_vec.len) return .cont;
+
+    const raw_sim = computeExactSim(sc.metric, sc.query_vec, vec);
+    const score = applyDecay(raw_sim, timestamp, sc.decay, sc.now_ms);
+
+    if (score <= sc.heap.thresholdScore()) return .cont;
+
+    const key_copy = sc.allocator.dupe(u8, key) catch {
+        sc.oom = true;
+        return .stop;
+    };
+    sc.heap.push(.{ .key = key_copy, .score = score, .timestamp = timestamp });
+    return .cont;
+}
+
+/// HNSW dispatch mirrors vsearch.zig's `runHnswDispatch`. Kept as a
+/// private helper here to avoid a shared dependency cycle; if mem_query
+/// and vsearch grow together, the next refactor is a `vector/search.zig`
+/// module that both call into.
+fn runHnswDispatch(
+    ctx: *Ctx,
+    ns_idx: *IndexModule.NamespaceIndex,
+    query_vec: []align(1) const f32,
+    top_k: usize,
+    metric: Metric,
+    decay: f32,
+    now_ms: u64,
+    heap: *TopKCandidate,
+) !bool {
+    const stage1_size = top_k * HNSW_EF_SEARCH_FACTOR;
+    const raw_buf = try ctx.allocator.alloc(IndexModule.IndexSearchResult, stage1_size);
+    const hnsw_scratch = try ctx.allocator.alloc(hnsw_mod.SearchResult, stage1_size);
+    const ef = stage1_size;
+
+    const n_stage1 = blk: {
+        ns_idx.lock.lockShared();
+        defer ns_idx.lock.unlockShared();
+        if (ns_idx.len() == 0) break :blk @as(usize, 0);
+        break :blk try ns_idx.searchLocked(query_vec, stage1_size, ef, raw_buf, hnsw_scratch);
+    };
+
+    if (n_stage1 == 0) return false;
+
+    const stage1_keys = try ctx.allocator.alloc([]u8, n_stage1);
+    const stage1_ts = try ctx.allocator.alloc(u64, n_stage1);
+    {
+        ns_idx.lock.lockShared();
+        defer ns_idx.lock.unlockShared();
+        for (raw_buf[0..n_stage1], 0..) |r, i| {
+            stage1_keys[i] = try ctx.allocator.dupe(u8, r.key);
+            stage1_ts[i] = r.timestamp;
+        }
+    }
+
+    for (0..n_stage1) |i| {
+        const vec_bytes = (try ctx.getCopy(stage1_keys[i])) orelse continue;
+        const vec = distance.bytesToF32(vec_bytes) orelse continue;
+        if (vec.len != query_vec.len) continue;
+
+        const raw_sim = computeExactSim(metric, query_vec, vec);
+        const score = applyDecay(raw_sim, stage1_ts[i], decay, now_ms);
+        heap.push(.{ .key = stage1_keys[i], .score = score, .timestamp = stage1_ts[i] });
+    }
+
+    return true;
+}
+
+pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
+    const ns = ctx.arg(0) orelse
+        return ctx.err("mem_query requires: <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>]");
+    const embedding = ctx.arg(1) orelse
+        return ctx.err("mem_query requires: <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>]");
+    const top_k_raw = ctx.argInt(usize, 2) orelse
+        return ctx.err("mem_query: k must be a positive integer");
+
+    if (!validateNs(ns)) return ctx.err("mem_query: invalid ns");
+
+    const top_k = @min(if (top_k_raw == 0) @as(usize, 10) else top_k_raw, MAX_TOP_K);
+
+    var decay: f32 = 0.0;
+    if (ctx.arg(3)) |d| {
+        decay = std.fmt.parseFloat(f32, d) catch 0.0;
+        decay = @min(@max(decay, 0.0), 1.0);
+    }
+
+    var min_score: f32 = -std.math.inf(f32);
+    if (ctx.arg(4)) |m| {
+        min_score = std.fmt.parseFloat(f32, m) catch -std.math.inf(f32);
+    }
+
+    // snippet_chars: positive = cap; 0 = full text; negative = omit doc.
+    var snippet_chars: i64 = DEFAULT_SNIPPET_CHARS;
+    if (ctx.arg(5)) |s| {
+        snippet_chars = std.fmt.parseInt(i64, s, 10) catch DEFAULT_SNIPPET_CHARS;
+    }
+
+    const query_vec = distance.bytesToF32(embedding) orelse
+        return ctx.err("mem_query: embedding must be non-empty f32 bytes (len multiple of 4)");
+
+    // Resolve metric: config metric wins; default cosine.
+    const metric: Metric = blk: {
+        const cfg_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
+        defer ctx.allocator.free(cfg_key);
+        const cfg = (try ctx.getCopy(cfg_key)) orelse break :blk .cosine;
+        const m_str = extractConfigField(cfg, "metric") orelse break :blk .cosine;
+        break :blk Metric.fromStr(m_str) orelse .cosine;
+    };
+
+    const vec_namespace = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
+    defer ctx.allocator.free(vec_namespace);
+
+    const final_buf = try ctx.allocator.alloc(QueryCandidate, top_k);
+    var final_heap = TopKCandidate.init(final_buf);
+
+    const now_ms = ctx.timestamp();
+
+    // ── Stage 1: HNSW if available ──────────────────────────────
+    var used_hnsw = false;
+    if (ctx.vector_registry) |reg| {
+        if (reg.get(vec_namespace)) |ns_idx| {
+            if (ns_idx.metric == metric and ns_idx.len() > 0) {
+                used_hnsw = try runHnswDispatch(
+                    ctx,
+                    ns_idx,
+                    query_vec,
+                    top_k,
+                    metric,
+                    decay,
+                    now_ms,
+                    &final_heap,
+                );
+            }
+        }
+    }
+
+    // ── Fallback: brute-force prefix scan ───────────────────────
+    // Triggered on cold-start (post-restart before vreindex) or when
+    // no index has ever been created for this namespace.
+    if (!used_hnsw) {
+        var brute_sc = BruteScanCtx{
+            .query_vec = query_vec,
+            .metric = metric,
+            .decay = decay,
+            .now_ms = now_ms,
+            .heap = &final_heap,
+            .allocator = ctx.allocator,
+            .oom = false,
+        };
+        ctx.scanCallback(vec_namespace, @ptrCast(&brute_sc), onBruteMatch);
+        if (brute_sc.oom) return ctx.err("mem_query: out of memory during brute-force scan");
+    }
+
+    // ── Enrich results with doc + meta lookups ──────────────────
+    const ns_prefix = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
+    defer ctx.allocator.free(ns_prefix);
+
+    const results = final_heap.sortedDesc();
+
+    var json: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer json.deinit(ctx.allocator);
+    try json.append(ctx.allocator, '[');
+
+    var emitted: usize = 0;
+    for (results) |r| {
+        if (r.score < min_score) continue;
+
+        // Strip "vec:mem:<ns>:" prefix to recover the doc_id.
+        if (r.key.len <= ns_prefix.len) continue;
+        if (!std.mem.startsWith(u8, r.key, ns_prefix)) continue;
+        const doc_id = r.key[ns_prefix.len..];
+
+        const doc_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}", .{ ns, doc_id });
+        defer ctx.allocator.free(doc_key);
+        const meta_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}:meta", .{ ns, doc_id });
+        defer ctx.allocator.free(meta_key);
+
+        const doc_bytes = try ctx.getCopy(doc_key); // may be null if vec was orphaned
+        const meta_bytes = try ctx.getCopy(meta_key);
+
+        if (emitted > 0) try json.append(ctx.allocator, ',');
+        try json.appendSlice(ctx.allocator, "{\"id\":\"");
+        try appendJsonEscaped(&json, ctx.allocator, doc_id);
+        try json.appendSlice(ctx.allocator, "\",\"score\":");
+        var score_buf: [32]u8 = undefined;
+        const score_str = std.fmt.bufPrint(&score_buf, "{d:.6}", .{r.score}) catch "0";
+        try json.appendSlice(ctx.allocator, score_str);
+        try json.appendSlice(ctx.allocator, ",\"ts\":");
+        try writeU64(&json, ctx.allocator, r.timestamp);
+
+        // Doc text (subject to snippet_chars).
+        if (snippet_chars >= 0) {
+            try json.appendSlice(ctx.allocator, ",\"doc\":");
+            if (doc_bytes) |d| {
+                try json.append(ctx.allocator, '"');
+                const max_len: usize = if (snippet_chars == 0) d.len else @min(d.len, @as(usize, @intCast(snippet_chars)));
+                try appendJsonEscaped(&json, ctx.allocator, d[0..max_len]);
+                try json.append(ctx.allocator, '"');
+            } else {
+                try json.appendSlice(ctx.allocator, "null");
+            }
+        }
+
+        // Metadata — passthrough raw JSON (client-supplied).
+        try json.appendSlice(ctx.allocator, ",\"meta\":");
+        if (meta_bytes) |m| {
+            try json.appendSlice(ctx.allocator, m);
+        } else {
+            try json.appendSlice(ctx.allocator, "null");
+        }
+
+        try json.append(ctx.allocator, '}');
+        emitted += 1;
+    }
+    try json.append(ctx.allocator, ']');
+
+    return ctx.value(try json.toOwnedSlice(ctx.allocator));
+}
+
+// ╔═══════════════════════════════════════════════════╗
+// ║  mem_stats                                         ║
+// ╚═══════════════════════════════════════════════════╝
+
+pub fn memStats(ctx: *Ctx) anyerror!Ctx.Result {
+    const ns = ctx.arg(0) orelse return ctx.err("mem_stats requires: <ns>");
+    if (!validateNs(ns)) return ctx.err("mem_stats: invalid ns");
+
+    const vec_namespace = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
+    defer ctx.allocator.free(vec_namespace);
+    const doc_prefix = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:", .{ns});
+    defer ctx.allocator.free(doc_prefix);
+    const config_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
+    defer ctx.allocator.free(config_key);
+
+    // Counts: `mem:<ns>:` covers both docs and :meta entries, so divide
+    // by two on average. Simpler to report the raw prefix count and let
+    // the client interpret — call it `doc_keys`.
+    const doc_keys = ctx.countKeys(doc_prefix);
+    const vec_count = ctx.countKeys(vec_namespace);
+
+    const config_bytes = try ctx.getCopy(config_key);
+
+    // Dimension — derive from first vec (matches vstats).
+    var dimensions: usize = 0;
+    const first_vec = try ctx.scan(vec_namespace, 1);
+    if (first_vec.len > 0) {
+        if (distance.bytesToF32(first_vec[0].value)) |vec| {
+            dimensions = vec.len;
+        }
+    }
+
+    var json: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer json.deinit(ctx.allocator);
+    try json.appendSlice(ctx.allocator, "{\"namespace\":\"");
+    try appendJsonEscaped(&json, ctx.allocator, ns);
+    try json.appendSlice(ctx.allocator, "\",\"vectors\":");
+    try writeUsize(&json, ctx.allocator, vec_count);
+    try json.appendSlice(ctx.allocator, ",\"doc_keys\":");
+    try writeUsize(&json, ctx.allocator, doc_keys);
+    try json.appendSlice(ctx.allocator, ",\"dimensions\":");
+    try writeUsize(&json, ctx.allocator, dimensions);
+
+    try json.appendSlice(ctx.allocator, ",\"config\":");
+    if (config_bytes) |cfg| {
+        try json.appendSlice(ctx.allocator, cfg);
+    } else {
+        try json.appendSlice(ctx.allocator, "null");
+    }
+
+    // HNSW block.
+    if (ctx.vector_registry) |reg| {
+        if (reg.get(vec_namespace)) |ns_idx| {
+            ns_idx.lock.lockShared();
+            defer ns_idx.lock.unlockShared();
+
+            try json.appendSlice(ctx.allocator, ",\"hnsw\":{\"metric\":\"");
+            try json.appendSlice(ctx.allocator, ns_idx.metric.name());
+            try json.appendSlice(ctx.allocator, "\",\"nodes\":");
+            try writeUsize(&json, ctx.allocator, ns_idx.len());
+            try json.appendSlice(ctx.allocator, ",\"live\":");
+            try writeUsize(&json, ctx.allocator, ns_idx.liveCount());
+            try json.appendSlice(ctx.allocator, ",\"tombstones\":");
+            try writeUsize(&json, ctx.allocator, ns_idx.tombstone_count);
+            try json.append(ctx.allocator, '}');
+        }
+    }
+
+    try json.append(ctx.allocator, '}');
+    return ctx.value(try json.toOwnedSlice(ctx.allocator));
+}
+
+// ╔═══════════════════════════════════════════════════╗
+// ║  mem_drop                                          ║
+// ╚═══════════════════════════════════════════════════╝
+
+const DropCtx = struct {
+    keys: std.ArrayListUnmanaged([]u8),
+    allocator: std.mem.Allocator,
+    oom: bool,
+};
+
+fn collectDropKey(
+    raw_ctx: *anyopaque,
+    key: []const u8,
+    value: []const u8,
+    timestamp: u64,
+    is_worm: bool,
+) Store.ScanAction {
+    _ = value;
+    _ = timestamp;
+    _ = is_worm;
+    const sc: *DropCtx = @ptrCast(@alignCast(raw_ctx));
+    const k = sc.allocator.dupe(u8, key) catch {
+        sc.oom = true;
+        return .stop;
+    };
+    sc.keys.append(sc.allocator, k) catch {
+        sc.allocator.free(k);
+        sc.oom = true;
+        return .stop;
+    };
+    return .cont;
+}
+
+pub fn memDrop(ctx: *Ctx) anyerror!Ctx.Result {
+    const ns = ctx.arg(0) orelse return ctx.err("mem_drop requires: <ns>");
+    if (!validateNs(ns)) return ctx.err("mem_drop: invalid ns");
+
+    const mem_prefix = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:", .{ns});
+    defer ctx.allocator.free(mem_prefix);
+    const vec_prefix = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
+    defer ctx.allocator.free(vec_prefix);
+    const bq_prefix = try std.fmt.allocPrint(ctx.allocator, "bq:vec:mem:{s}:", .{ns});
+    defer ctx.allocator.free(bq_prefix);
+    const config_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
+    defer ctx.allocator.free(config_key);
+
+    // ── Drop the HNSW index ─────────────────────────────────────
+    var index_dropped = false;
+    if (ctx.vector_registry) |reg| {
+        if (reg.get(vec_prefix) != null) {
+            reg.remove(vec_prefix);
+            index_dropped = true;
+        }
+    }
+
+    // ── Collect + delete under each prefix ──────────────────────
+    var total_deleted: usize = 0;
+    var skipped_worm: usize = 0;
+    var errors: usize = 0;
+
+    const prefixes = [_][]const u8{ mem_prefix, vec_prefix, bq_prefix };
+    for (prefixes) |prefix| {
+        var collector = DropCtx{
+            .keys = .empty,
+            .allocator = ctx.allocator,
+            .oom = false,
+        };
+        defer {
+            for (collector.keys.items) |k| collector.allocator.free(k);
+            collector.keys.deinit(collector.allocator);
+        }
+        ctx.scanCallback(prefix, @ptrCast(&collector), collectDropKey);
+        if (collector.oom) return ctx.err("mem_drop: out of memory collecting keys");
+
+        for (collector.keys.items) |k| {
+            ctx.deleteDurable(k) catch |e| switch (e) {
+                error.WormViolation => skipped_worm += 1,
+                else => errors += 1,
+            };
+        }
+        total_deleted += collector.keys.items.len - skipped_worm - errors;
+    }
+
+    // ── Config key (store.delete is idempotent for missing keys) ──
+    ctx.deleteDurable(config_key) catch |e| switch (e) {
+        error.WormViolation => skipped_worm += 1,
+        else => errors += 1,
+    };
+
+    // ── Response ────────────────────────────────────────────────
+    var json: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer json.deinit(ctx.allocator);
+    try json.appendSlice(ctx.allocator, "{\"namespace\":\"");
+    try appendJsonEscaped(&json, ctx.allocator, ns);
+    try json.appendSlice(ctx.allocator, "\",\"index_dropped\":");
+    try json.appendSlice(ctx.allocator, if (index_dropped) "true" else "false");
+    try json.appendSlice(ctx.allocator, ",\"deleted\":");
+    try writeUsize(&json, ctx.allocator, total_deleted);
+    try json.appendSlice(ctx.allocator, ",\"skipped_worm\":");
+    try writeUsize(&json, ctx.allocator, skipped_worm);
+    try json.appendSlice(ctx.allocator, ",\"errors\":");
+    try writeUsize(&json, ctx.allocator, errors);
+    try json.append(ctx.allocator, '}');
+    return ctx.value(try json.toOwnedSlice(ctx.allocator));
+}
+
+test {
+    std.testing.refAllDecls(@This());
+}
+
+// ╔═══════════════════════════════════════════════════╗
+// ║  Tests — pure helpers                              ║
+// ╚═══════════════════════════════════════════════════╝
+
+const testing = std.testing;
+
+test "validateNs accepts safe tokens" {
+    try testing.expect(validateNs("articles"));
+    try testing.expect(validateNs("user_memories"));
+    try testing.expect(validateNs("ns-1"));
+    try testing.expect(validateNs("a.b.c"));
+    try testing.expect(validateNs("sessions/demo"));
+}
+
+test "validateNs rejects empty, too-long, colons, and control chars" {
+    try testing.expect(!validateNs(""));
+    const too_long = "a" ** (MAX_NS_LEN + 1);
+    try testing.expect(!validateNs(too_long));
+    try testing.expect(!validateNs("has:colon"));
+    try testing.expect(!validateNs("has space"));
+    try testing.expect(!validateNs("has\"quote"));
+    try testing.expect(!validateNs("has\nnewline"));
+}
+
+test "validateDocId mirrors ns rules but with longer cap" {
+    try testing.expect(validateDocId("doc-001"));
+    try testing.expect(validateDocId("session/42/chunk-3"));
+    try testing.expect(!validateDocId(""));
+    try testing.expect(!validateDocId("has:colon"));
+}
+
+test "validateEmbedderId accepts common model names" {
+    try testing.expect(validateEmbedderId("text-embedding-3-large"));
+    try testing.expect(validateEmbedderId("sentence-transformers/all-MiniLM-L6-v2"));
+    try testing.expect(validateEmbedderId("bge-m3.v1"));
+    try testing.expect(!validateEmbedderId(""));
+    try testing.expect(!validateEmbedderId("has:colon"));
+}
+
+test "extractConfigField pulls string field from our own JSON layout" {
+    const cfg = "{\"embedder_id\":\"bge-m3\",\"metric\":\"cosine\",\"created_at\":12345}";
+    try testing.expectEqualStrings("bge-m3", extractConfigField(cfg, "embedder_id").?);
+    try testing.expectEqualStrings("cosine", extractConfigField(cfg, "metric").?);
+    try testing.expect(extractConfigField(cfg, "missing") == null);
+}
+
+test "appendJsonEscaped handles quotes, backslashes, and control chars" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    try appendJsonEscaped(&buf, testing.allocator, "hello\"world\\and\nnewline\t");
+    try testing.expectEqualStrings("hello\\\"world\\\\and\\nnewline\\t", buf.items);
+}
+
+test "applyDecay: lambda=0 is a no-op" {
+    const s = applyDecay(0.8, 1000, 0.0, 2000);
+    try testing.expectApproxEqAbs(@as(f32, 0.8), s, 1e-6);
+}
+
+test "applyDecay: lambda=1 returns pure recency in [0,1]" {
+    const now: u64 = 10_000_000_000; // ~116 days in ms
+    const ts: u64 = now; // zero age
+    const s = applyDecay(0.5, ts, 1.0, now);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), s, 1e-6);
+
+    // 116 days at a 1-week time constant → exp(-~16.5) ≈ 7e-8 ≪ 0.01
+    const s_old = applyDecay(0.5, 0, 1.0, now);
+    try testing.expect(s_old < 0.01);
+
+    // One time-constant (168 h) → exp(-1) ≈ 0.368
+    const one_tau_ms: u64 = 168 * 3_600_000;
+    const s_tau = applyDecay(0.5, 0, 1.0, one_tau_ms);
+    try testing.expectApproxEqAbs(@as(f32, 0.3679), s_tau, 0.001);
+}

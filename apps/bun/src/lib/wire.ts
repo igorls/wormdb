@@ -112,7 +112,10 @@ export function encodeCommandFrame(command: ParsedCommand): Bytes {
       payload.set(key, off); off += key.length;
       writeUint32BE(payload, off, vec.length); off += 4;
       payload.set(vec, off); off += vec.length;
-      payload[off] = command.worm ? 0x01 : 0x00; off += 1;
+      let flags = 0;
+      if (command.worm) flags |= 0x01;
+      if (command.async) flags |= 0x02;
+      payload[off] = flags; off += 1;
       writeUint32BE(payload, off, ns.length); off += 4;
       payload.set(ns, off); off += ns.length;
       writeUint32BE(payload, off, metric.length); off += 4;

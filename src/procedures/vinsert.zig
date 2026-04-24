@@ -72,6 +72,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
         return switch (err) {
             error.InvalidVectorBytes => ctx.err("vinsert: vector must be a non-empty f32 byte array (length multiple of 4)"),
             error.WormViolation => ctx.err("vinsert: key already exists (vectors are immutable)"),
+            error.DimensionMismatch => ctx.err("vinsert: vector dimension does not match the namespace's frozen dim"),
             else => ctx.err(ctx.fmt("vinsert: {s}", .{@errorName(err)})),
         };
     };

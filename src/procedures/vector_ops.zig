@@ -28,6 +28,10 @@ pub const VectorOpError = error{
     OutOfMemory,
     IoError,
     WormViolation,
+    /// The vector's length (in f32 units) differs from the dimension
+    /// frozen on the namespace's first insert. Checked BEFORE the store
+    /// write so a WORM-mode mismatch can't become a permanent ghost entry.
+    DimensionMismatch,
 };
 
 /// Parameters for `applyVinsert`. Matches Command.VinsertParams's shape
@@ -60,6 +64,19 @@ pub fn applyVinsert(
     // ── Validate ─────────────────────────────────────────────────
     if (args.vector.len == 0 or args.vector.len % 4 != 0)
         return error.InvalidVectorBytes;
+
+    // ── Pre-check dim against the frozen namespace dimension ─────
+    // Fails fast BEFORE any store write. Critical for WORM inserts:
+    // a mismatched vector under WORM would be permanent and invisible
+    // to HNSW stage-2 refine (vec.len != query.len filter).
+    if (registry) |reg| {
+        if (reg.get(args.namespace)) |ns_idx| {
+            if (ns_idx.expectedDim()) |d| {
+                const incoming_dim = args.vector.len / 4;
+                if (incoming_dim != d) return error.DimensionMismatch;
+            }
+        }
+    }
 
     // ── Store the vec entry ──────────────────────────────────────
     store.set(args.key, args.vector, args.worm) catch |e| {

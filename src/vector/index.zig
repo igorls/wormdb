@@ -40,6 +40,12 @@ pub const RegistryError = error{
     /// must drop the namespace (via `vreindex` with a new first insert,
     /// or a future `vnsdrop` op) and start fresh.
     MetricMismatch,
+    /// Returned when an insert's vector length differs from the dimension
+    /// frozen on the namespace's first insert. Each namespace's HNSW graph
+    /// is built against one dimension; variable-dim vectors would become
+    /// invisible to stage-2 refine (silent drop) and, under WORM, would be
+    /// permanently stuck in the store. Dim is frozen eagerly to fail loudly.
+    DimensionMismatch,
     /// Serialized block failed structural validation (unknown metric byte,
     /// torn counts, etc).
     CorruptIndex,
@@ -113,6 +119,12 @@ pub const NamespaceIndex = struct {
     /// Metric chosen at namespace creation. Drives the HNSW dist_fn and
     /// determines which query metrics can reuse this index.
     metric: Metric,
+    /// Embedding dimension frozen on the first `insertLocked` call (null
+    /// until then). All subsequent inserts must match. Mutated only under
+    /// the write lock; readers use `expectedDim()` which acquires the
+    /// shared lock. Snapshot-restored indexes derive this from the first
+    /// resolvable vector in `readFromLocked`.
+    dim: ?usize,
     /// Held exclusively for inserts; shared for searches.
     lock: RwLock,
 
@@ -131,6 +143,7 @@ pub const NamespaceIndex = struct {
             .tombstones = .{},
             .tombstone_count = 0,
             .metric = m,
+            .dim = null,
             .lock = .{},
         };
     }
@@ -157,16 +170,27 @@ pub const NamespaceIndex = struct {
     /// Insert a vector under the caller's write-lock. Returns the new node ID.
     /// The `key` is duped into the index's allocator; caller retains ownership
     /// of the passed-in slice.
+    ///
+    /// Freezes `self.dim` on the first call; subsequent inserts with a
+    /// different `vector.len` return `error.DimensionMismatch` (the graph
+    /// is single-dim, so accepting mismatches would silently drop them at
+    /// query time — worse under WORM, where the store entry is permanent).
     pub fn insertLocked(
         self: *NamespaceIndex,
         key: []const u8,
         vector: []align(1) const f32,
         timestamp: u64,
     ) !u32 {
+        if (self.dim) |d| {
+            if (vector.len != d) return RegistryError.DimensionMismatch;
+        }
+
         const key_copy = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(key_copy);
 
         const node_id = try self.hnsw.insert(vector);
+        // hnsw.insert succeeded — freeze dim on the first successful insert.
+        if (self.dim == null) self.dim = vector.len;
 
         // hnsw.insert already succeeded — ensure side-tables stay in lockstep.
         try self.keys.append(self.allocator, key_copy);
@@ -204,6 +228,16 @@ pub const NamespaceIndex = struct {
     /// Look up the internal node id for a key under any lock mode.
     pub fn nodeIdFor(self: *const NamespaceIndex, key: []const u8) ?u32 {
         return self.key_to_node.get(key);
+    }
+
+    /// The frozen embedding dimension for this namespace, or null if no
+    /// insert has happened yet. Takes the shared lock; safe to call
+    /// concurrently with readers. Callers use this to pre-check inserts
+    /// before touching the store, failing fast on dim mismatches.
+    pub fn expectedDim(self: *NamespaceIndex) ?usize {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        return self.dim;
     }
 
     /// Is this node id marked deleted? Callers typically pass the bitset
@@ -259,6 +293,9 @@ pub const NamespaceIndex = struct {
         self.tombstones.deinit(self.allocator);
         self.tombstones = .{};
         self.tombstone_count = 0;
+        // Dimension must re-freeze on the next insert — `vreindex` may be
+        // used to switch a namespace's dim during a full rebuild.
+        self.dim = null;
     }
 
     // ╔═══════════════════════════════════════════════════╗
@@ -453,6 +490,20 @@ pub const NamespaceIndex = struct {
             try key_to_node.put(allocator, k, @intCast(idx));
         }
 
+        // ── Derive dim from the first resolvable vector. The snapshot
+        //    format doesn't carry dim explicitly; scanning keys in order
+        //    and taking the first non-null resolve is cheap (~one KV lookup)
+        //    and robust against tombstoned or missing entries.
+        var derived_dim: ?usize = null;
+        for (keys.items) |k| {
+            if (outer_resolve(outer_ctx, k)) |bytes| {
+                if (bytes.len > 0 and bytes.len % 4 == 0) {
+                    derived_dim = bytes.len / 4;
+                    break;
+                }
+            }
+        }
+
         return .{
             .allocator = allocator,
             .hnsw = hnsw,
@@ -462,6 +513,7 @@ pub const NamespaceIndex = struct {
             .tombstones = tombstones,
             .tombstone_count = tombstone_count,
             .metric = metric,
+            .dim = derived_dim,
             .lock = .{},
         };
     }
@@ -861,6 +913,75 @@ test "namespace index: search excludes tombstoned nodes" {
     try testing.expectEqual(@as(usize, 3), idx.len());
 }
 
+test "namespace index: expectedDim is null before any insert" {
+    var reg = NamespaceRegistry.init(testing.allocator, .{});
+    defer reg.deinit();
+
+    const idx = try reg.getOrCreate("vec:", .cosine);
+    try testing.expect(idx.expectedDim() == null);
+}
+
+test "namespace index: dim freezes on first insert" {
+    var reg = NamespaceRegistry.init(testing.allocator, .{ .m = 4, .ef_construction = 30 });
+    defer reg.deinit();
+
+    const idx = try reg.getOrCreate("vec:", .cosine);
+    idx.lock.lock();
+    defer idx.lock.unlock();
+
+    const v = [_]f32{ 1, 0, 0, 0 };
+    const v_align: []align(1) const f32 = @ptrCast(&v);
+    _ = try idx.insertLocked("vec:a", v_align, 1);
+
+    try testing.expectEqual(@as(?usize, 4), idx.dim);
+}
+
+test "namespace index: insertLocked rejects mismatched dim" {
+    var reg = NamespaceRegistry.init(testing.allocator, .{ .m = 4, .ef_construction = 30 });
+    defer reg.deinit();
+
+    const idx = try reg.getOrCreate("vec:", .cosine);
+    idx.lock.lock();
+    defer idx.lock.unlock();
+
+    const v4 = [_]f32{ 1, 0, 0, 0 };
+    const v3 = [_]f32{ 1, 0, 0 };
+    const v4_align: []align(1) const f32 = @ptrCast(&v4);
+    const v3_align: []align(1) const f32 = @ptrCast(&v3);
+
+    _ = try idx.insertLocked("vec:a", v4_align, 1);
+    try testing.expectError(
+        RegistryError.DimensionMismatch,
+        idx.insertLocked("vec:b", v3_align, 2),
+    );
+    // Failed insert must not have corrupted the graph: count unchanged.
+    try testing.expectEqual(@as(usize, 1), idx.len());
+}
+
+test "namespace index: clearLocked resets dim for rebuild under new dim" {
+    var reg = NamespaceRegistry.init(testing.allocator, .{ .m = 4, .ef_construction = 30 });
+    defer reg.deinit();
+
+    const idx = try reg.getOrCreate("vec:", .cosine);
+    idx.lock.lock();
+    defer idx.lock.unlock();
+
+    const v4 = [_]f32{ 1, 0, 0, 0 };
+    const v3 = [_]f32{ 1, 0, 0 };
+    const v4_align: []align(1) const f32 = @ptrCast(&v4);
+    const v3_align: []align(1) const f32 = @ptrCast(&v3);
+
+    _ = try idx.insertLocked("vec:a", v4_align, 1);
+    try testing.expectEqual(@as(?usize, 4), idx.dim);
+
+    idx.clearLocked();
+    try testing.expect(idx.dim == null);
+
+    // A different dim is now acceptable after clear.
+    _ = try idx.insertLocked("vec:b", v3_align, 2);
+    try testing.expectEqual(@as(?usize, 3), idx.dim);
+}
+
 
 // ╔═══════════════════════════════════════════════════╗
 // ║  Registry serialization tests                      ║
@@ -971,5 +1092,10 @@ test "registry: writeTo/readFrom roundtrip preserves indexes" {
     try testing.expect(!vec_idx.isTombstoned(vec_idx.nodeIdFor("vec:a").?));
     try testing.expectEqual(@as(u64, 1000), vec_idx.timestamps.items[vec_idx.nodeIdFor("vec:a").?]);
     try testing.expectEqual(@as(usize, 1), articles_idx.len());
+
+    // Dim should have been derived from the first resolvable vector
+    // during readFromLocked — both namespaces used 4-dim vectors.
+    try testing.expectEqual(@as(?usize, 4), vec_idx.dim);
+    try testing.expectEqual(@as(?usize, 4), articles_idx.dim);
 }
 

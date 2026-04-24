@@ -83,6 +83,11 @@ pub const Command = union(enum) {
         namespace: []const u8,
         metric: []const u8, // "cosine" | "dot" | "l2"
         timestamp: Timestamp,
+        /// If true and the namespace hasn't chosen a mode yet, the HNSW
+        /// build is handed to a background worker so VINSERT returns as
+        /// soon as the store+BQ writes complete. The first insert to a
+        /// namespace locks the mode; subsequent inserts ignore this flag.
+        is_async: bool = false,
     };
 
     pub const VdeleteParams = struct {

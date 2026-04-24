@@ -1,0 +1,66 @@
+# Vector benchmark: WormDB vs Qdrant, both in docker, harness drives them.
+#
+# Usage (from repo root):
+#   zig build -Dquic=false                        # produce zig-out/bin/wormdb
+#   docker compose -f bench/vector/docker-compose.yml build
+#   docker compose -f bench/vector/docker-compose.yml run --rm harness \
+#       --adapter wormdb --mode exact --dataset sift-128-euclidean
+#   docker compose -f bench/vector/docker-compose.yml run --rm harness \
+#       --adapter qdrant --mode exact --dataset sift-128-euclidean
+#   docker compose -f bench/vector/docker-compose.yml down -v
+
+services:
+  wormdb:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: wormdb:bench
+    container_name: vbench-wormdb
+    command: ["--port", "6389", "--data", "/data", "--persistence", "none"]
+    networks: [bench-net]
+    tmpfs:
+      - /data:size=4g
+    healthcheck:
+      test: ["CMD-SHELL", "echo PING | nc -w1 localhost 6389 || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 2s
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.1
+    container_name: vbench-qdrant
+    environment:
+      QDRANT__STORAGE__STORAGE_PATH: /qdrant/storage
+      QDRANT__STORAGE__ON_DISK_PAYLOAD: "false"
+    networks: [bench-net]
+    tmpfs:
+      - /qdrant/storage:size=4g
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' 2>/dev/null || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 2s
+
+  harness:
+    build:
+      context: ../..
+      dockerfile: bench/vector/Dockerfile
+    image: wormdb-vector-bench:latest
+    container_name: vbench-harness
+    depends_on:
+      wormdb: { condition: service_healthy }
+      qdrant: { condition: service_healthy }
+    environment:
+      WORMDB_HOST: wormdb
+      WORMDB_PORT: "6389"
+      QDRANT_URL: "http://qdrant:6333"
+    volumes:
+      - ./data:/work/bench/vector/data
+      - ./results:/work/bench/vector/results
+    networks: [bench-net]
+
+networks:
+  bench-net:
+    driver: bridge

@@ -47,6 +47,10 @@ pub const VinsertArgs = struct {
     /// local apply succeeds. False for peer-received frames to break the
     /// replication loop.
     replicate: bool,
+    /// Opt-in: if true AND the namespace is already async OR this is the
+    /// first VINSERT to the namespace, hand the HNSW build to the background
+    /// worker. Store + BQ writes still complete synchronously.
+    is_async: bool = false,
 };
 
 /// Apply a VINSERT locally: write vec + BQ to the store, update HNSW,
@@ -111,11 +115,44 @@ pub fn applyVinsert(
             break :blk null;
         };
         if (ns_idx) |idx| {
-            idx.lock.lock();
-            defer idx.lock.unlock();
-            _ = idx.insertLocked(args.key, vec_f32, args.timestamp) catch |e| {
-                std.log.warn("applyVinsert: HNSW insert '{s}': {s}", .{ args.key, @errorName(e) });
-            };
+            // First VINSERT that requests async flips the namespace into
+            // async mode. Once set, subsequent requests follow the namespace's
+            // mode regardless of their own flag (avoids mixing semantics).
+            if (args.is_async and !idx.async_mode) {
+                idx.enableAsyncMode() catch |e| {
+                    std.log.warn("applyVinsert: enableAsyncMode '{s}': {s}", .{ args.namespace, @errorName(e) });
+                };
+            }
+
+            if (idx.async_mode) {
+                // Hand off to background worker. Copy key + vector bytes so
+                // the request arena can deallocate without affecting the
+                // queued job.
+                const key_copy = idx.allocator.dupe(u8, args.key) catch |e| blk2: {
+                    std.log.warn("applyVinsert: async key dup failed: {s}", .{@errorName(e)});
+                    break :blk2 null;
+                };
+                if (key_copy) |kc| {
+                    const vec_copy = idx.allocator.dupe(u8, args.vector) catch |e| blk2: {
+                        idx.allocator.free(kc);
+                        std.log.warn("applyVinsert: async vec dup failed: {s}", .{@errorName(e)});
+                        break :blk2 null;
+                    };
+                    if (vec_copy) |vc| {
+                        idx.enqueueAsync(kc, vc, args.timestamp) catch |e| {
+                            idx.allocator.free(kc);
+                            idx.allocator.free(vc);
+                            std.log.warn("applyVinsert: enqueueAsync '{s}': {s}", .{ args.key, @errorName(e) });
+                        };
+                    }
+                }
+            } else {
+                idx.lock.lock();
+                defer idx.lock.unlock();
+                _ = idx.insertLocked(args.key, vec_f32, args.timestamp) catch |e| {
+                    std.log.warn("applyVinsert: HNSW insert '{s}': {s}", .{ args.key, @errorName(e) });
+                };
+            }
         }
     }
 
@@ -142,6 +179,7 @@ pub fn applyVinsert(
                 .namespace = args.namespace,
                 .metric = args.metric.name(),
                 .timestamp = args.timestamp,
+                .is_async = args.is_async,
             }) catch |e| {
                 std.log.warn("applyVinsert: cluster replication: {s}", .{@errorName(e)});
             };

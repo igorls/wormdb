@@ -192,6 +192,7 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
                     .metric = metric_enum,
                     .timestamp = params.timestamp,
                     .replicate = true, // client-originated → propagate
+                    .is_async = params.is_async,
                 },
             ) catch |err| {
                 break :blk switch (err) {

@@ -16,6 +16,7 @@ const enum CommandCode {
   Pub = 0x08,
   Exec = 0x09,
   ClusterPeers = 0x0A,
+  Vinsert = 0x0D,
 }
 
 const enum ResponseCode {
@@ -81,7 +82,11 @@ export function encodeCommandFrame(command: ParsedCommand): Bytes {
     }
     case "EXEC": {
       const proc = encodeUtf8(command.procedure);
-      const encodedArgs = command.args.map(encodeUtf8);
+      // Args may be strings or raw Uint8Array (for binary payloads like
+      // vector embeddings). The wire format carries raw bytes regardless.
+      const encodedArgs: Uint8Array[] = command.args.map((a) =>
+        typeof a === "string" ? encodeUtf8(a) : a,
+      );
       let size = 4 + proc.length + 4;
       for (const a of encodedArgs) size += 4 + a.length;
       const payload = new Uint8Array(size);
@@ -94,6 +99,26 @@ export function encodeCommandFrame(command: ParsedCommand): Bytes {
         payload.set(a, off); off += a.length;
       }
       return writeFrame(CommandCode.Exec, payload);
+    }
+    case "VINSERT": {
+      const key = encodeUtf8(command.key);
+      const vec = command.vector;
+      const ns = encodeUtf8(command.namespace);
+      const metric = encodeUtf8(command.metric);
+      const size = 4 + key.length + 4 + vec.length + 1 + 4 + ns.length + 4 + metric.length + 8;
+      const payload = new Uint8Array(size);
+      let off = 0;
+      writeUint32BE(payload, off, key.length); off += 4;
+      payload.set(key, off); off += key.length;
+      writeUint32BE(payload, off, vec.length); off += 4;
+      payload.set(vec, off); off += vec.length;
+      payload[off] = command.worm ? 0x01 : 0x00; off += 1;
+      writeUint32BE(payload, off, ns.length); off += 4;
+      payload.set(ns, off); off += ns.length;
+      writeUint32BE(payload, off, metric.length); off += 4;
+      payload.set(metric, off); off += metric.length;
+      writeUint64BE(payload, off, command.timestamp); off += 8;
+      return writeFrame(CommandCode.Vinsert, payload);
     }
     default:
       return assertNever(command);
@@ -205,6 +230,10 @@ function encodeLenPrefixedUtf8(value: string): Bytes {
 
 function writeUint32BE(target: Bytes, offset: number, value: number): void {
   new DataView(target.buffer, target.byteOffset, target.byteLength).setUint32(offset, value, false);
+}
+
+function writeUint64BE(target: Bytes, offset: number, value: bigint): void {
+  new DataView(target.buffer, target.byteOffset, target.byteLength).setBigUint64(offset, value, false);
 }
 
 function readUint32BE(source: Bytes, offset: number): number {

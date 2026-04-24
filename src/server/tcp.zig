@@ -531,6 +531,7 @@ pub const Server = struct {
                             .metric = metric_enum,
                             .timestamp = params.timestamp,
                             .replicate = false, // anti-echo boundary
+                            .is_async = params.is_async,
                         },
                     ) catch |e| {
                         std.log.warn("replication: applyVinsert failed: {s}", .{@errorName(e)});

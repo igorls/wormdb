@@ -8,7 +8,17 @@ export type ParsedCommand =
   | { kind: "CLUSTER_PEERS" }
   | { kind: "SET"; key: string; value: string; worm: boolean }
   | { kind: "PUB"; channel: string; message: string }
-  | { kind: "EXEC"; procedure: string; args: string[] };
+  | { kind: "EXEC"; procedure: string; args: (string | Uint8Array)[] }
+  | {
+      kind: "VINSERT";
+      key: string;
+      vector: Uint8Array;
+      worm: boolean;
+      namespace: string;
+      metric: "cosine" | "dot" | "l2";
+      timestamp: bigint;
+      async: boolean;
+    };
 
 export function parseCommand(command: string): ParsedCommand {
   const parts = command.trim().split(/\s+/);

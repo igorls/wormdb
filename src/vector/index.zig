@@ -98,6 +98,27 @@ pub const IndexSearchResult = struct {
     timestamp: u64,
 };
 
+/// A pending insert job for the async HNSW worker. Owns its key and vector
+/// bytes (worker frees after insertLocked). Timestamp comes from the
+/// originating VINSERT so async-built indexes keep the same time order as
+/// sync-built ones.
+const PendingInsert = struct {
+    key: []u8,
+    vector: []u8, // raw f32 bytes; insertLocked will reinterpret
+    timestamp: u64,
+};
+
+/// Async HNSW queue + drainer state. Lives behind `NamespaceIndex.async_queue`;
+/// allocated lazily on transition to async mode.
+const AsyncQueue = struct {
+    items: std.ArrayListUnmanaged(PendingInsert) = .empty,
+    scratch: std.ArrayListUnmanaged(PendingInsert) = .empty, // worker-owned swap buffer
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+    shutdown: bool = false,
+    pending: std.atomic.Value(usize) = .init(0), // for vstats (lock-free read)
+};
+
 pub const NamespaceIndex = struct {
     allocator: std.mem.Allocator,
     hnsw: Hnsw,
@@ -127,6 +148,17 @@ pub const NamespaceIndex = struct {
     dim: ?usize,
     /// Held exclusively for inserts; shared for searches.
     lock: RwLock,
+    /// True ⇔ VINSERTs hand the HNSW build to the background worker. Set
+    /// on the first VINSERT that carries the async flag; once true, never
+    /// flips back. The store + BQ writes still happen synchronously — only
+    /// the graph update is deferred. Queries remain consistent with the
+    /// graph's current state; items in `async_queue.items` are invisible
+    /// to `vsearch` until the worker drains them.
+    async_mode: bool,
+    /// Allocated on transition to async_mode=true; nil otherwise. Holds
+    /// the pending job queue + the worker thread handle.
+    async_queue: ?*AsyncQueue,
+    async_worker: ?std.Thread,
 
     pub fn init(allocator: std.mem.Allocator, params: HnswParams, m: Metric) NamespaceIndex {
         // Override params.dist_fn with the chosen metric so the two can't
@@ -145,10 +177,34 @@ pub const NamespaceIndex = struct {
             .metric = m,
             .dim = null,
             .lock = .{},
+            .async_mode = false,
+            .async_queue = null,
+            .async_worker = null,
         };
     }
 
     pub fn deinit(self: *NamespaceIndex) void {
+        // Shut down the async worker BEFORE tearing down the graph it writes to.
+        if (self.async_queue) |q| {
+            const zio = io();
+            q.mutex.lockUncancelable(zio);
+            q.shutdown = true;
+            q.cond.signal(zio);
+            q.mutex.unlock(zio);
+
+            if (self.async_worker) |t| t.join();
+
+            // Anything still on the queue at shutdown couldn't be drained
+            // (crash-like conditions, or worker failed). Free the owned bytes.
+            for (q.items.items) |item| {
+                self.allocator.free(item.key);
+                self.allocator.free(item.vector);
+            }
+            q.items.deinit(self.allocator);
+            q.scratch.deinit(self.allocator);
+            self.allocator.destroy(q);
+        }
+
         self.hnsw.deinit();
         for (self.keys.items) |k| self.allocator.free(k);
         self.keys.deinit(self.allocator);
@@ -156,6 +212,91 @@ pub const NamespaceIndex = struct {
         // key_to_node's keys are borrowed from self.keys — only free the map.
         self.key_to_node.deinit(self.allocator);
         self.tombstones.deinit(self.allocator);
+    }
+
+    /// Idempotently enable async mode: allocate the queue + spawn worker
+    /// if this is the first call. Caller need not hold any lock; this
+    /// function serializes its own setup via the AsyncQueue's mutex.
+    pub fn enableAsyncMode(self: *NamespaceIndex) !void {
+        if (@atomicLoad(bool, &self.async_mode, .acquire)) return;
+
+        const queue = try self.allocator.create(AsyncQueue);
+        errdefer self.allocator.destroy(queue);
+        queue.* = .{};
+
+        const worker = try std.Thread.spawn(.{}, asyncWorkerLoop, .{self});
+        // Spawn succeeded — publish queue + flag + handle in one burst, then
+        // flip async_mode last so enqueue paths can read queue without races.
+        self.async_queue = queue;
+        self.async_worker = worker;
+        @atomicStore(bool, &self.async_mode, true, .release);
+    }
+
+    /// Enqueue a pending insert for the background worker. Caller passes
+    /// ownership of key + vector byte slices — the worker frees them after
+    /// insertLocked.
+    pub fn enqueueAsync(self: *NamespaceIndex, key: []u8, vector: []u8, timestamp: u64) !void {
+        const q = self.async_queue orelse return error.AsyncNotEnabled;
+        const zio = io();
+        q.mutex.lockUncancelable(zio);
+        defer q.mutex.unlock(zio);
+        try q.items.append(self.allocator, .{ .key = key, .vector = vector, .timestamp = timestamp });
+        _ = q.pending.fetchAdd(1, .monotonic);
+        q.cond.signal(zio);
+    }
+
+    /// Non-blocking snapshot of pending-insert count. `vstats` surfaces this.
+    pub fn pendingAsyncCount(self: *const NamespaceIndex) usize {
+        const q = self.async_queue orelse return 0;
+        return q.pending.load(.monotonic);
+    }
+
+    fn asyncWorkerLoop(self: *NamespaceIndex) void {
+        const q = self.async_queue orelse return;
+        const distance = @import("distance.zig");
+        const zio = io();
+
+        while (true) {
+            // Wait for work or shutdown.
+            q.mutex.lockUncancelable(zio);
+            while (q.items.items.len == 0 and !q.shutdown) {
+                q.cond.waitUncancelable(zio, &q.mutex);
+            }
+            const is_shutdown = q.shutdown;
+            // Swap: the worker takes everything queued so producers can
+            // keep enqueuing into a fresh list while we drain.
+            const tmp = q.items;
+            q.items = q.scratch;
+            q.scratch = tmp;
+            q.mutex.unlock(zio);
+
+            if (q.scratch.items.len > 0) {
+                const drained = q.scratch.items.len;
+
+                // One write-lock acquisition for the entire drain batch.
+                self.lock.lock();
+                for (q.scratch.items) |item| {
+                    const vec_f32 = distance.bytesToF32(item.vector) orelse {
+                        std.log.warn("async hnsw: invalid vector bytes for key '{s}'", .{item.key});
+                        continue;
+                    };
+                    _ = self.insertLocked(item.key, vec_f32, item.timestamp) catch |e| {
+                        std.log.warn("async hnsw: insert '{s}' failed: {s}", .{ item.key, @errorName(e) });
+                    };
+                }
+                self.lock.unlock();
+
+                // Free the owned copies now that the graph has the data.
+                for (q.scratch.items) |item| {
+                    self.allocator.free(item.key);
+                    self.allocator.free(item.vector);
+                }
+                q.scratch.clearRetainingCapacity();
+                _ = q.pending.fetchSub(drained, .monotonic);
+            }
+
+            if (is_shutdown) break;
+        }
     }
 
     pub fn len(self: *const NamespaceIndex) usize {
@@ -515,6 +656,9 @@ pub const NamespaceIndex = struct {
             .metric = metric,
             .dim = derived_dim,
             .lock = .{},
+            .async_mode = false,
+            .async_queue = null,
+            .async_worker = null,
         };
     }
 };

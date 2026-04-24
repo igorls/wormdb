@@ -197,13 +197,18 @@ pub const Ctx = struct {
     /// `iterateAll` loop). Small-n insertion sort — count is ≤ MAX_LOCKS (16).
     fn reacquireAllHeldShards(self: *Ctx, held_in: HeldLocks) void {
         var held = held_in;
-        for (1..held.count) |i| {
-            const x = held.indices[i];
-            var j = i;
-            while (j > 0 and held.indices[j - 1] > x) : (j -= 1) {
-                held.indices[j] = held.indices[j - 1];
+        // Skip sort when count <= 1 — `for (1..0)` underflows on count==0,
+        // which happens when a procedure uses deleteDurable with no prior
+        // lockKey (e.g. vnsdrop's scan-then-delete pattern).
+        if (held.count > 1) {
+            for (1..held.count) |i| {
+                const x = held.indices[i];
+                var j = i;
+                while (j > 0 and held.indices[j - 1] > x) : (j -= 1) {
+                    held.indices[j] = held.indices[j - 1];
+                }
+                held.indices[j] = x;
             }
-            held.indices[j] = x;
         }
         for (held.indices[0..held.count]) |si| {
             self.store.shards[si].mutex.lock();

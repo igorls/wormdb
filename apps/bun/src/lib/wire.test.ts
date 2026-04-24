@@ -88,6 +88,60 @@ describe("encodeCommandFrame", () => {
     }
   });
 
+  test("encodes VINSERT with expected layout", () => {
+    const key = "vec:articles:doc-1";
+    const vector = new Uint8Array([0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40]); // 1.0, 2.0
+    const namespace = "vec:articles:";
+    const metric = "cosine" as const;
+    const timestamp = 0x0123456789abcdefn;
+
+    const frame = encodeCommandFrame({
+      kind: "VINSERT",
+      key,
+      vector,
+      worm: true,
+      namespace,
+      metric,
+      timestamp,
+    });
+
+    expect(frame[0]).toBe(0x0d);
+
+    const payloadLen = new DataView(frame.buffer, frame.byteOffset + 1, 4).getUint32(0, false);
+    expect(payloadLen).toBe(frame.length - 5);
+
+    let off = 5;
+    const keyLen = new DataView(frame.buffer, frame.byteOffset + off, 4).getUint32(0, false);
+    expect(keyLen).toBe(key.length);
+    off += 4;
+    expect(new TextDecoder().decode(frame.subarray(off, off + keyLen))).toBe(key);
+    off += keyLen;
+
+    const vecLen = new DataView(frame.buffer, frame.byteOffset + off, 4).getUint32(0, false);
+    expect(vecLen).toBe(vector.length);
+    off += 4;
+    expect(Array.from(frame.subarray(off, off + vecLen))).toEqual(Array.from(vector));
+    off += vecLen;
+
+    expect(frame[off]).toBe(0x01); // worm
+    off += 1;
+
+    const nsLen = new DataView(frame.buffer, frame.byteOffset + off, 4).getUint32(0, false);
+    expect(nsLen).toBe(namespace.length);
+    off += 4;
+    expect(new TextDecoder().decode(frame.subarray(off, off + nsLen))).toBe(namespace);
+    off += nsLen;
+
+    const metricLen = new DataView(frame.buffer, frame.byteOffset + off, 4).getUint32(0, false);
+    expect(metricLen).toBe(metric.length);
+    off += 4;
+    expect(new TextDecoder().decode(frame.subarray(off, off + metricLen))).toBe(metric);
+    off += metricLen;
+
+    const ts = new DataView(frame.buffer, frame.byteOffset + off, 8).getBigUint64(0, false);
+    expect(ts).toBe(timestamp);
+  });
+
   test("throws for unsupported command variant at runtime", () => {
     expect(() => encodeCommandFrame({ kind: "INVALID" } as unknown as ParsedCommand)).toThrow(
       "Unhandled variant",

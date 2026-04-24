@@ -211,7 +211,8 @@ fn parseCommandPayload(cmd_id: CommandId, payload: []const u8, allocator: std.me
             if (pos + 1 > payload.len) return error.Corruption;
             const flags = payload[pos];
             pos += 1;
-            if ((flags & 0b1111_1110) != 0) return error.InvalidFlags;
+            // Bit 0: WORM. Bit 1: async HNSW build request. Rest reserved.
+            if ((flags & 0b1111_1100) != 0) return error.InvalidFlags;
 
             const namespace = try readBytesField(payload, &pos, allocator);
             errdefer allocator.free(namespace);
@@ -230,6 +231,7 @@ fn parseCommandPayload(cmd_id: CommandId, payload: []const u8, allocator: std.me
                 .namespace = namespace,
                 .metric = metric,
                 .timestamp = ts,
+                .is_async = (flags & 0x02) != 0,
             } };
         },
         .vdelete => {
@@ -349,7 +351,7 @@ pub fn parseCommandPayloadZeroCopy(cmd_id: CommandId, payload: []const u8, alloc
             if (pos + 1 > payload.len) return error.Corruption;
             const flags = payload[pos];
             pos += 1;
-            if ((flags & 0b1111_1110) != 0) return error.InvalidFlags;
+            if ((flags & 0b1111_1100) != 0) return error.InvalidFlags;
 
             const namespace = try sliceBytesField(payload, &pos);
             const metric = try sliceBytesField(payload, &pos);
@@ -366,6 +368,7 @@ pub fn parseCommandPayloadZeroCopy(cmd_id: CommandId, payload: []const u8, alloc
                 .namespace = @constCast(namespace),
                 .metric = @constCast(metric),
                 .timestamp = ts,
+                .is_async = (flags & 0x02) != 0,
             } };
         },
         .vdelete => {
@@ -521,7 +524,9 @@ pub fn writeCommand(writer: anytype, cmd: Command) !void {
             try writeHeader(w, @intFromEnum(CommandId.vinsert), @intCast(payload_len));
             try writeLenPrefixed(w, params.key);
             try writeLenPrefixed(w, params.vector);
-            const flags: u8 = if (params.worm) 0x01 else 0x00;
+            var flags: u8 = 0;
+            if (params.worm) flags |= 0x01;
+            if (params.is_async) flags |= 0x02;
             try w.writeAll(&[_]u8{flags});
             try writeLenPrefixed(w, params.namespace);
             try writeLenPrefixed(w, params.metric);

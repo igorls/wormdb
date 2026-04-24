@@ -1,4 +1,4 @@
-import { parseCommand } from "./command";
+import { parseCommand, type ParsedCommand } from "./command";
 import {
   WIRE_MAGIC,
   concatBytes,
@@ -80,10 +80,38 @@ export class WormClient {
 
   async send(command: string): Promise<WormResponse> {
     if (this.keepAlive) {
-      return this.sendPersistent(command);
+      return this.sendPersistent(parseCommand(command));
     }
 
-    return this.sendOneShot(command);
+    return this.sendOneShotParsed(parseCommand(command));
+  }
+
+  async sendCommand(parsed: ParsedCommand): Promise<WormResponse> {
+    if (this.keepAlive) {
+      return this.sendPersistent(parsed);
+    }
+    return this.sendOneShotParsed(parsed);
+  }
+
+  async vinsertNative(
+    key: string,
+    vector: Uint8Array,
+    options: {
+      worm?: boolean;
+      namespace?: string;
+      metric?: "cosine" | "dot" | "l2";
+      timestamp?: bigint;
+    } = {},
+  ): Promise<WormResponse> {
+    return this.sendCommand({
+      kind: "VINSERT",
+      key,
+      vector,
+      worm: options.worm ?? true,
+      namespace: options.namespace ?? "vec:",
+      metric: options.metric ?? "cosine",
+      timestamp: options.timestamp ?? BigInt(Date.now()),
+    });
   }
 
   async close(): Promise<void> {
@@ -102,8 +130,7 @@ export class WormClient {
     this.inbound = new Uint8Array(0);
   }
 
-  private async sendOneShot(command: string): Promise<WormResponse> {
-    const parsed = parseCommand(command);
+  private async sendOneShotParsed(parsed: ParsedCommand): Promise<WormResponse> {
     const outboundFrame = concatBytes([WIRE_MAGIC, encodeCommandFrame(parsed)]);
 
     return await new Promise<WormResponse>(async (resolve, reject) => {
@@ -183,8 +210,7 @@ export class WormClient {
     });
   }
 
-  private async sendPersistent(command: string): Promise<WormResponse> {
-    const parsed = parseCommand(command);
+  private async sendPersistent(parsed: ParsedCommand): Promise<WormResponse> {
     const outboundFrame = encodeCommandFrame(parsed);
     const socket = await this.getOrCreateSocket();
 

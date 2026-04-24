@@ -20,6 +20,7 @@ pub const vsim = @import("vsim.zig");
 pub const vinsert = @import("vinsert.zig");
 pub const vstats = @import("vstats.zig");
 pub const vreindex = @import("vreindex.zig");
+pub const vrabitq = @import("vrabitq.zig");
 pub const vdelete = @import("vdelete.zig");
 pub const vnsdrop = @import("vnsdrop.zig");
 pub const memory = @import("memory.zig");
@@ -46,6 +47,7 @@ const PROCEDURES = [_]Entry{
     .{ .name = "vinsert", .func = vinsert.execute },
     .{ .name = "vstats", .func = vstats.execute },
     .{ .name = "vreindex", .func = vreindex.execute },
+    .{ .name = "vrabitq", .func = vrabitq.execute },
     .{ .name = "vdelete", .func = vdelete.execute },
     .{ .name = "vnsdrop", .func = vnsdrop.execute },
     .{ .name = "mem_init", .func = memory.memInit },

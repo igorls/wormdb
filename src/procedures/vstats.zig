@@ -115,6 +115,26 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
             str = std.fmt.bufPrint(&buf, "{d:.4}", .{ratio}) catch "0";
             try json.appendSlice(ctx.allocator, str);
 
+            try json.appendSlice(ctx.allocator, ",\"async\":");
+            try json.appendSlice(ctx.allocator, if (ns_idx.async_mode) "true" else "false");
+            try json.appendSlice(ctx.allocator, ",\"pending\":");
+            str = std.fmt.bufPrint(&buf, "{d}", .{ns_idx.pendingAsyncCount()}) catch "0";
+            try json.appendSlice(ctx.allocator, str);
+
+            // Report RaBitQ params state so operators can confirm
+            // `EXEC vrabitq` has run and check the seed used.
+            if (ns_idx.rabitq_params) |p| {
+                try json.appendSlice(ctx.allocator, ",\"rabitq\":{\"dim\":");
+                str = std.fmt.bufPrint(&buf, "{d}", .{p.dim}) catch "0";
+                try json.appendSlice(ctx.allocator, str);
+                try json.appendSlice(ctx.allocator, ",\"seed\":");
+                str = std.fmt.bufPrint(&buf, "{d}", .{p.seed}) catch "0";
+                try json.appendSlice(ctx.allocator, str);
+                try json.append(ctx.allocator, '}');
+            } else {
+                try json.appendSlice(ctx.allocator, ",\"rabitq\":null");
+            }
+
             try json.append(ctx.allocator, '}');
         }
     }

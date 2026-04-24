@@ -56,6 +56,7 @@ pub const Command = union(enum) {
     auth: []const u8, // AUTH <token> (binary SCT)
     vinsert: VinsertParams, // VINSERT <key> <vec> <flags> <ns> <metric> <timestamp>
     vdelete: VdeleteParams, // VDELETE <key> <namespace>
+    vbulkinsert: VbulkinsertParams, // VBULKINSERT <ns> <metric> <flags> <count> [<key> <vec> <ts>]×N
 
     pub const SetParams = struct {
         key: []const u8,
@@ -94,6 +95,23 @@ pub const Command = union(enum) {
         key: []const u8,
         namespace: []const u8,
     };
+
+    /// Parameters for VBULKINSERT. Shares namespace / metric / flags across
+    /// all items to amortize per-frame wire + parse cost. The first item
+    /// establishes the namespace's async mode (same rule as single VINSERT).
+    pub const VbulkinsertParams = struct {
+        namespace: []const u8,
+        metric: []const u8,
+        worm: bool = false,
+        is_async: bool = false,
+        items: []const BulkItem,
+
+        pub const BulkItem = struct {
+            key: []const u8,
+            vector: []const u8,
+            timestamp: Timestamp,
+        };
+    };
 };
 
 /// WormWire command IDs (binary protocol)
@@ -112,6 +130,7 @@ pub const CommandId = enum(u8) {
     auth = 0x0C,
     vinsert = 0x0D,
     vdelete = 0x0E,
+    vbulkinsert = 0x0F,
 };
 
 /// Maximum accepted binary payload length (16 MiB)

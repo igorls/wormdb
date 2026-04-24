@@ -18,6 +18,7 @@ pub const HnswParams = hnsw.HnswParams;
 pub const index = @import("index.zig");
 pub const NamespaceIndex = index.NamespaceIndex;
 pub const NamespaceRegistry = index.NamespaceRegistry;
+pub const rabitq = @import("rabitq.zig");
 
 // Re-export commonly used functions
 pub const cosine = distance.cosine;

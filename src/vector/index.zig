@@ -28,10 +28,12 @@
 const std = @import("std");
 const hnsw_mod = @import("hnsw.zig");
 const metric_mod = @import("metric.zig");
+const rabitq_mod = @import("rabitq.zig");
 
 pub const Hnsw = hnsw_mod.Hnsw;
 pub const HnswParams = hnsw_mod.HnswParams;
 pub const Metric = metric_mod.Metric;
+pub const RabitqParams = rabitq_mod.RabitqParams;
 
 pub const RegistryError = error{
     /// Returned by `getOrCreate` when the caller supplies a metric that
@@ -159,6 +161,12 @@ pub const NamespaceIndex = struct {
     /// the pending job queue + the worker thread handle.
     async_queue: ?*AsyncQueue,
     async_worker: ?std.Thread,
+    /// Frozen RaBitQ parameters (centroid + random orthogonal rotation).
+    /// Null until `setRabitqParams` is called (via the `vrabitq`
+    /// procedure). Once installed, `applyVinsert` encodes new bq entries
+    /// with `rabitq.encode` and `vsearch` scores via `rabitq.estimateL2Sq`
+    /// instead of the raw Hamming prefilter. Owned by this struct.
+    rabitq_params: ?*RabitqParams,
 
     pub fn init(allocator: std.mem.Allocator, params: HnswParams, m: Metric) NamespaceIndex {
         // Override params.dist_fn with the chosen metric so the two can't
@@ -180,6 +188,7 @@ pub const NamespaceIndex = struct {
             .async_mode = false,
             .async_queue = null,
             .async_worker = null,
+            .rabitq_params = null,
         };
     }
 
@@ -212,6 +221,28 @@ pub const NamespaceIndex = struct {
         // key_to_node's keys are borrowed from self.keys — only free the map.
         self.key_to_node.deinit(self.allocator);
         self.tombstones.deinit(self.allocator);
+        if (self.rabitq_params) |p| {
+            p.deinit();
+            self.allocator.destroy(p);
+        }
+    }
+
+    /// Install a full set of RaBitQ parameters (centroid + rotation).
+    /// Takes ownership of the passed-in struct — caller must not deinit
+    /// or destroy. Replaces any previous params (old allocations freed).
+    /// Caller holds the write-lock.
+    pub fn setRabitqParams(self: *NamespaceIndex, new_params: *RabitqParams) void {
+        if (self.rabitq_params) |old| {
+            old.deinit();
+            self.allocator.destroy(old);
+        }
+        self.rabitq_params = new_params;
+    }
+
+    /// Read-only access to the installed params under the caller's lock
+    /// (shared is fine). Returns null if `vrabitq` has not run yet.
+    pub fn getRabitqParams(self: *const NamespaceIndex) ?*const RabitqParams {
+        return self.rabitq_params;
     }
 
     /// Idempotently enable async mode: allocate the queue + spawn worker
@@ -243,6 +274,36 @@ pub const NamespaceIndex = struct {
         try q.items.append(self.allocator, .{ .key = key, .vector = vector, .timestamp = timestamp });
         _ = q.pending.fetchAdd(1, .monotonic);
         q.cond.signal(zio);
+    }
+
+    /// Batch-enqueue for bulk inserts: a single mutex acquisition for N
+    /// items. Duplicates key and vector bytes (bulk frame buffer is arena
+    /// memory that will be freed when the request completes).
+    pub fn enqueueAsyncBatch(
+        self: *NamespaceIndex,
+        items: []const @import("../core/mod.zig").types.Command.VbulkinsertParams.BulkItem,
+    ) !void {
+        const q = self.async_queue orelse return error.AsyncNotEnabled;
+        const zio = io();
+
+        // Pre-dupe so we don't hold the queue mutex while allocating.
+        var owned: std.ArrayListUnmanaged(PendingInsert) = .empty;
+        defer owned.deinit(self.allocator);
+        try owned.ensureTotalCapacity(self.allocator, items.len);
+        for (items) |item| {
+            const key_copy = try self.allocator.dupe(u8, item.key);
+            errdefer self.allocator.free(key_copy);
+            const vec_copy = try self.allocator.dupe(u8, item.vector);
+            errdefer self.allocator.free(vec_copy);
+            owned.appendAssumeCapacity(.{ .key = key_copy, .vector = vec_copy, .timestamp = item.timestamp });
+        }
+
+        q.mutex.lockUncancelable(zio);
+        defer q.mutex.unlock(zio);
+        try q.items.appendSlice(self.allocator, owned.items);
+        _ = q.pending.fetchAdd(items.len, .monotonic);
+        q.cond.signal(zio);
+        owned.clearRetainingCapacity();
     }
 
     /// Non-blocking snapshot of pending-insert count. `vstats` surfaces this.
@@ -443,7 +504,7 @@ pub const NamespaceIndex = struct {
     // ║  Serialization                                     ║
     // ╚═══════════════════════════════════════════════════╝
 
-    /// Per-namespace block format:
+    /// Per-namespace block format (WDBHNSW2):
     ///   [1B metric]                                 (0=cosine, 1=dot, 2=l2)
     ///   [4B node_count]                             (canonical; used by reader
     ///                                               to preallocate key table
@@ -456,6 +517,11 @@ pub const NamespaceIndex = struct {
     ///   [hnsw graph block]                          (Hnsw.writeTo — repeats
     ///                                               node_count internally for
     ///                                               self-containment)
+    ///   [1B has_rabitq]                             (0=absent, 1=present)
+    ///   If has_rabitq == 1:
+    ///     [4B dim][8B seed]
+    ///     [dim × 4B centroid f32s, little-endian]
+    ///     [dim × dim × 4B rotation f32s, row-major, little-endian]
     ///
     /// Why keys first: Hnsw.readFrom resolves each node's vector by node_id
     /// via a callback. If keys came after the graph, the callback couldn't
@@ -510,6 +576,23 @@ pub const NamespaceIndex = struct {
         }
 
         try self.hnsw.writeTo(w);
+
+        // ── RaBitQ params trailer ────────────────────────────────────
+        if (self.rabitq_params) |p| {
+            try w.writeAll(&[_]u8{1});
+            var dim_buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, dim_buf[0..4], p.dim, .little);
+            try w.writeAll(&dim_buf);
+            var seed_buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, seed_buf[0..8], p.seed, .little);
+            try w.writeAll(&seed_buf);
+            // Bit-cast each f32 to u32 so the stream is little-endian on
+            // any host. Centroid first, then rotation.
+            try writeF32Slice(w, p.centroid);
+            try writeF32Slice(w, p.rotation);
+        } else {
+            try w.writeAll(&[_]u8{0});
+        }
     }
 
     /// Resolver context used internally during readFromLocked — bridges
@@ -645,6 +728,45 @@ pub const NamespaceIndex = struct {
             }
         }
 
+        // ── RaBitQ params trailer ────────────────────────────────────
+        var rabitq_params_ptr: ?*RabitqParams = null;
+        var has_rabitq_buf: [1]u8 = undefined;
+        try readAllExact(reader, &has_rabitq_buf);
+        if (has_rabitq_buf[0] == 1) {
+            var dim_buf: [4]u8 = undefined;
+            try readAllExact(reader, &dim_buf);
+            const dim_u32 = std.mem.readInt(u32, dim_buf[0..4], .little);
+            var seed_buf: [8]u8 = undefined;
+            try readAllExact(reader, &seed_buf);
+            const seed = std.mem.readInt(u64, seed_buf[0..8], .little);
+
+            const dim_usize: usize = @intCast(dim_u32);
+            const centroid = try allocator.alloc(f32, dim_usize);
+            errdefer allocator.free(centroid);
+            try readF32Slice(reader, centroid);
+
+            const rotation = try allocator.alloc(f32, dim_usize * dim_usize);
+            errdefer allocator.free(rotation);
+            try readF32Slice(reader, rotation);
+
+            const p = try allocator.create(RabitqParams);
+            errdefer allocator.destroy(p);
+            p.* = .{
+                .allocator = allocator,
+                .centroid = centroid,
+                .rotation = rotation,
+                .dim = dim_u32,
+                .seed = seed,
+            };
+            rabitq_params_ptr = p;
+            // If the graph never resolved a vector (empty namespace), fall
+            // back to the params' dim so later inserts know what shape to
+            // accept.
+            if (derived_dim == null) derived_dim = dim_usize;
+        } else if (has_rabitq_buf[0] != 0) {
+            return error.CorruptIndex;
+        }
+
         return .{
             .allocator = allocator,
             .hnsw = hnsw,
@@ -659,9 +781,28 @@ pub const NamespaceIndex = struct {
             .async_mode = false,
             .async_queue = null,
             .async_worker = null,
+            .rabitq_params = rabitq_params_ptr,
         };
     }
 };
+
+fn writeF32Slice(writer: anytype, slice: []const f32) !void {
+    var buf: [4]u8 = undefined;
+    for (slice) |x| {
+        const bits: u32 = @bitCast(x);
+        std.mem.writeInt(u32, &buf, bits, .little);
+        try writer.writeAll(&buf);
+    }
+}
+
+fn readF32Slice(reader: anytype, dest: []f32) !void {
+    var buf: [4]u8 = undefined;
+    for (dest) |*slot| {
+        try readAllExact(reader, &buf);
+        const bits = std.mem.readInt(u32, &buf, .little);
+        slot.* = @bitCast(bits);
+    }
+}
 
 fn readAllExact(reader: anytype, dest: []u8) !void {
     var pos: usize = 0;
@@ -770,7 +911,9 @@ pub const NamespaceRegistry = struct {
     /// Magic + subversion marker that begins the HNSW section when
     /// embedded in a snapshot. Distinct from the outer WDBSNAP1/2 magic
     /// so a bare "is there HNSW data here?" check is cheap.
-    pub const HNSW_MARKER = "WDBHNSW1";
+    /// WDBHNSW2 extends WDBHNSW1 with a per-namespace RaBitQ params
+    /// trailer (1-byte presence flag, optional centroid + rotation).
+    pub const HNSW_MARKER = "WDBHNSW2";
 
     /// Serialize every namespace index into `writer`:
     ///   [8B HNSW_MARKER]
@@ -1243,3 +1386,75 @@ test "registry: writeTo/readFrom roundtrip preserves indexes" {
     try testing.expectEqual(@as(?usize, 4), articles_idx.dim);
 }
 
+test "registry: writeTo/readFrom preserves installed RabitqParams" {
+    const alloc = testing.allocator;
+
+    var src_reg = NamespaceRegistry.init(alloc, .{ .m = 4, .ef_construction = 50 });
+    defer src_reg.deinit();
+
+    var key_to_bytes: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer key_to_bytes.deinit(alloc);
+
+    const v = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
+    const v_bytes_ptr: [*]const u8 = @ptrCast(&v);
+    const v_bytes = v_bytes_ptr[0 .. 4 * @sizeOf(f32)];
+    try key_to_bytes.put(alloc, "vec:x", v_bytes);
+
+    const v_align: []align(1) const f32 = @ptrCast(&v);
+
+    {
+        const idx = try src_reg.getOrCreate("vec:", .l2);
+        idx.lock.lock();
+        defer idx.lock.unlock();
+        _ = try idx.insertLocked("vec:x", v_align, 42);
+
+        // Install a handcrafted RabitqParams so the serde is exercised
+        // end-to-end without requiring the vrabitq procedure.
+        const centroid = try idx.allocator.alloc(f32, 4);
+        centroid[0] = 0.5;
+        centroid[1] = 0.5;
+        centroid[2] = 0.5;
+        centroid[3] = 0.5;
+        const rotation = try rabitq_mod.generateRotation(idx.allocator, 4, 0x9999);
+        const p = try idx.allocator.create(RabitqParams);
+        p.* = .{
+            .allocator = idx.allocator,
+            .centroid = centroid,
+            .rotation = rotation,
+            .dim = 4,
+            .seed = 0x9999,
+        };
+        idx.setRabitqParams(p);
+    }
+
+    // Serialize.
+    var harness = RegSerdeHarness{};
+    defer harness.buf.deinit(alloc);
+    var writer = RegSerdeHarness.Writer{ .h = &harness, .alloc = alloc };
+    try src_reg.writeTo(&writer);
+
+    // Deserialize into a fresh registry.
+    var dst_reg = NamespaceRegistry.init(alloc, .{ .m = 4, .ef_construction = 50 });
+    defer dst_reg.deinit();
+
+    var resolver = KeyResolver{ .map = &key_to_bytes };
+    var reader = RegSerdeHarness.Reader{ .h = &harness };
+    try dst_reg.readFrom(&reader, KeyResolver.resolve, @ptrCast(&resolver));
+
+    const restored = dst_reg.get("vec:").?;
+    try testing.expect(restored.rabitq_params != null);
+    const rp = restored.rabitq_params.?;
+    try testing.expectEqual(@as(u32, 4), rp.dim);
+    try testing.expectEqual(@as(u64, 0x9999), rp.seed);
+    try testing.expectEqual(@as(usize, 4), rp.centroid.len);
+    try testing.expectEqual(@as(usize, 16), rp.rotation.len);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), rp.centroid[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), rp.centroid[3], 1e-6);
+
+    // Rotation should be identical bit-for-bit given deterministic seed.
+    const expected_rotation = try rabitq_mod.generateRotation(alloc, 4, 0x9999);
+    defer alloc.free(expected_rotation);
+    for (rp.rotation, expected_rotation) |got, want| {
+        try testing.expectApproxEqAbs(want, got, 1e-7);
+    }
+}

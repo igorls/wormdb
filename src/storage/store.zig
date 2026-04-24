@@ -27,7 +27,7 @@ const SNAPSHOT_VERSION: u32 = 2;
 
 /// Optional back-reference to the per-namespace HNSW registry. When set,
 /// writeSnapshot appends the HNSW trailer after the KV section; loadSnapshot
-/// restores it when it finds the WDBHNSW1 marker. Populated via
+/// restores it when it finds the WDBHNSW2 marker. Populated via
 /// `Store.attachVectorRegistry` after both are constructed (main.zig).
 const hnsw_index_mod = @import("../vector/index.zig");
 pub const NamespaceRegistry = hnsw_index_mod.NamespaceRegistry;
@@ -797,7 +797,7 @@ pub const Store = struct {
         // ── v2 HNSW trailer (optional) ──
         // v1 files have nothing after the last KV entry; readFrom would
         // hit EOF and we'd swallow the error below. v2 files have a
-        // WDBHNSW1-marked block that restores the registry.
+        // WDBHNSW{1,2}-marked block that restores the registry.
         if (version >= 2 and self.vector_registry != null) {
             var reader = FileReader{ .file = snapshot_file };
             const resolver = KvResolver{ .store = self };

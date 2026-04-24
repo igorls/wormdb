@@ -18,6 +18,14 @@ export type ParsedCommand =
       metric: "cosine" | "dot" | "l2";
       timestamp: bigint;
       async: boolean;
+    }
+  | {
+      kind: "VBULKINSERT";
+      namespace: string;
+      metric: "cosine" | "dot" | "l2";
+      worm: boolean;
+      async: boolean;
+      items: { key: string; vector: Uint8Array; timestamp: bigint }[];
     };
 
 export function parseCommand(command: string): ParsedCommand {

@@ -24,6 +24,7 @@ type Args = {
   topK: number;
   dataDir: string;
   resultsDir: string;
+  asyncInsert: boolean;
 };
 
 function parseArgs(argv: string[]): Args {
@@ -38,6 +39,7 @@ function parseArgs(argv: string[]): Args {
     topK: 10,
     dataDir: "./data",
     resultsDir: "./results",
+    asyncInsert: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const t = argv[i];
@@ -53,6 +55,7 @@ function parseArgs(argv: string[]): Args {
       case "--topK": a.topK = Number(n()); break;
       case "--data-dir": a.dataDir = n(); break;
       case "--results-dir": a.resultsDir = n(); break;
+      case "--async": a.asyncInsert = true; break;
     }
   }
   return a;
@@ -124,6 +127,7 @@ async function main(): Promise<void> {
     mode: args.mode,
     metric: ds.metric,
     dim,
+    asyncInsert: args.asyncInsert,
   };
 
   const adapter = buildAdapter(args.adapter);
@@ -230,25 +234,54 @@ async function main(): Promise<void> {
     insertQps,
     waitUntilQueryableMs: waitMs,
     perEf,
-    notes: noteFor(args.adapter, args.mode),
+    notes: noteFor(args.adapter, args.mode, args.asyncInsert),
     startedAt,
     finishedAt,
   };
 
-  const outPath = `${args.resultsDir}/${args.dataset}/${args.adapter}-${args.mode}.json`;
+  const suffix = args.asyncInsert ? "-async" : "";
+  const outPath = `${args.resultsDir}/${args.dataset}/${args.adapter}-${args.mode}${suffix}.json`;
   await Bun.write(outPath, JSON.stringify(result, null, 2));
   console.log(`\nWrote ${outPath}`);
 }
 
-function noteFor(adapter: Args["adapter"], mode: AdapterMode): string[] {
+function noteFor(adapter: Args["adapter"], mode: AdapterMode, asyncInsert: boolean): string[] {
   const notes: string[] = [];
   if (adapter === "wormdb") {
-    notes.push("HNSW built inline during VINSERT; time-until-queryable == 0.");
-    notes.push("ef_search is currently a build-time constant; --efs ignored at query time.");
-    if (mode === "quantized") notes.push("WormDB quantized = 1-bit binary quantization (Hamming prefilter → exact rerank).");
+    if (asyncInsert) {
+      notes.push("HNSW built asynchronously via background worker; insert acks after store+BQ only.");
+      notes.push("time-until-queryable measured by polling `vstats.hnsw.pending == 0`.");
+    } else {
+      notes.push("HNSW built inline during VINSERT; time-until-queryable == 0.");
+    }
+    switch (mode) {
+      case "exact":
+        notes.push("exact mode: full-precision brute-force scan. No HNSW, no quantization.");
+        break;
+      case "hnsw":
+        notes.push("hnsw mode: HNSW graph search + full-precision rerank on top-M candidates. NO quantization.");
+        break;
+      case "bq":
+        notes.push("bq mode: 1-bit binary-quantized Hamming prefilter on ALL vectors + full-precision rerank on top-M. Skips the HNSW graph even when present — this is the only genuinely quantized WormDB path.");
+        break;
+      case "quantized":
+        notes.push("quantized mode is Qdrant-only; runtime will have rejected this.");
+        break;
+    }
   } else {
     notes.push("Qdrant HNSW built asynchronously; time-until-queryable measured via probe-poll.");
-    if (mode === "quantized") notes.push("Qdrant quantized = scalar int8 (much milder than 1-bit BQ).");
+    switch (mode) {
+      case "exact":
+      case "hnsw":
+        notes.push("Full-precision HNSW (no quantization_config on the collection).");
+        break;
+      case "quantized":
+        notes.push("scalar(int8) quantization configured; Qdrant does two-pass search with internal rerank.");
+        break;
+      case "bq":
+        notes.push("bq mode is WormDB-only; runtime will have rejected this.");
+        break;
+    }
   }
   return notes;
 }

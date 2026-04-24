@@ -30,6 +30,7 @@ type BunSocketHandlers = {
   data?(socket: BunSocket, data: SocketData): void;
   close?(socket: BunSocket): void;
   error?(socket: BunSocket, error: Error): void;
+  drain?(socket: BunSocket): void;
 };
 
 type BunGlobal = {
@@ -70,6 +71,15 @@ export class WormClient {
     reject: (reason?: unknown) => void;
     timeout: ReturnType<typeof setTimeout>;
   }> = [];
+
+  /**
+   * Backlog for partial writes: when `socket.write(data)` returns less than
+   * `data.length`, the TCP send buffer is full. We hold the remainder here
+   * and flush it from the `drain` callback. Anything pushed while a backlog
+   * exists is appended — ordering is preserved because we always drain
+   * front-to-back before calling `socket.write` again.
+   */
+  private writeBacklog: Bytes[] = [];
 
   constructor(options: WormClientOptions) {
     this.host = options.host;
@@ -113,6 +123,30 @@ export class WormClient {
       metric: options.metric ?? "cosine",
       timestamp: options.timestamp ?? BigInt(Date.now()),
       async: options.async ?? false,
+    });
+  }
+
+  async vbulkinsertNative(
+    items: { key: string; vector: Uint8Array; timestamp?: bigint }[],
+    options: {
+      worm?: boolean;
+      namespace?: string;
+      metric?: "cosine" | "dot" | "l2";
+      async?: boolean;
+    } = {},
+  ): Promise<WormResponse> {
+    const now = BigInt(Date.now());
+    return this.sendCommand({
+      kind: "VBULKINSERT",
+      namespace: options.namespace ?? "vec:",
+      metric: options.metric ?? "cosine",
+      worm: options.worm ?? false,
+      async: options.async ?? false,
+      items: items.map((it) => ({
+        key: it.key,
+        vector: it.vector,
+        timestamp: it.timestamp ?? now,
+      })),
     });
   }
 
@@ -168,13 +202,28 @@ export class WormClient {
         });
       };
 
+      let pendingBytes: Bytes | null = outboundFrame;
+      const writeChunk = (socket: BunSocket): void => {
+        if (pendingBytes == null) return;
+        const written = socket.write(pendingBytes);
+        if (written < 0) return;
+        if (written < pendingBytes.length) {
+          pendingBytes = pendingBytes.subarray(written);
+        } else {
+          pendingBytes = null;
+        }
+      };
+
       try {
         socketRef = await Bun.connect({
           hostname: this.host,
           port: this.port,
           socket: {
             open(socket) {
-              socket.write(outboundFrame);
+              writeChunk(socket);
+            },
+            drain(socket) {
+              writeChunk(socket);
             },
             data(_socket, chunk) {
               inbound = concatBytes([inbound, toBytes(chunk)]);
@@ -223,10 +272,11 @@ export class WormClient {
 
       this.pendingQueue.push({ resolve, reject, timeout });
 
-      // Write synchronously — TCP guarantees ordered delivery.
-      // No need for a promise chain that adds microtask overhead per op.
+      // Write respecting Bun's backpressure contract: `socket.write` may
+      // return less than data.length when the TCP send buffer is full.
+      // The remainder is queued in writeBacklog and flushed from drain.
       try {
-        socket.write(outboundFrame);
+        this.writeOrQueue(socket, outboundFrame);
       } catch (err) {
         const pending = this.pendingQueue.pop();
         if (pending) {
@@ -235,6 +285,43 @@ export class WormClient {
         }
       }
     });
+  }
+
+  /**
+   * Write `data` to `socket`, handling Bun's partial-write protocol: if
+   * `socket.write` returns less than data.length, the remainder is queued
+   * in `writeBacklog` and flushed when `drain` fires. If a backlog already
+   * exists, the new chunk is appended to preserve wire ordering.
+   */
+  private writeOrQueue(socket: BunSocket, data: Bytes): void {
+    if (this.writeBacklog.length > 0) {
+      // Keep queueing — drain handler is responsible for flushing in order.
+      this.writeBacklog.push(data);
+      return;
+    }
+    const written = socket.write(data);
+    if (written < 0) throw new Error("socket.write failed");
+    if (written < data.length) {
+      this.writeBacklog.push(data.subarray(written));
+    }
+  }
+
+  /** Flush queued chunks after a drain event; stop on the next partial. */
+  private flushBacklog(socket: BunSocket): void {
+    while (this.writeBacklog.length > 0) {
+      const chunk = this.writeBacklog[0];
+      const written = socket.write(chunk);
+      if (written < 0) {
+        // Error — drop and let the next send surface it.
+        this.writeBacklog.shift();
+        continue;
+      }
+      if (written < chunk.length) {
+        this.writeBacklog[0] = chunk.subarray(written);
+        return; // wait for next drain
+      }
+      this.writeBacklog.shift();
+    }
   }
 
   private async getOrCreateSocket(): Promise<BunSocket> {
@@ -279,14 +366,19 @@ export class WormClient {
             pending.resolve(decodeResponse(frame.code, frame.payload));
           }
         },
+        drain: (socket) => {
+          this.flushBacklog(socket);
+        },
         close: () => {
           this.socket = null;
           this.connectPromise = null;
+          this.writeBacklog = [];
           this.rejectAllPending(new ClientConnectionClosedError());
         },
         error: (_socket, err) => {
           this.socket = null;
           this.connectPromise = null;
+          this.writeBacklog = [];
           this.rejectAllPending(err);
         },
       },

@@ -17,6 +17,7 @@ const enum CommandCode {
   Exec = 0x09,
   ClusterPeers = 0x0A,
   Vinsert = 0x0D,
+  Vbulkinsert = 0x0F,
 }
 
 const enum ResponseCode {
@@ -122,6 +123,38 @@ export function encodeCommandFrame(command: ParsedCommand): Bytes {
       payload.set(metric, off); off += metric.length;
       writeUint64BE(payload, off, command.timestamp); off += 8;
       return writeFrame(CommandCode.Vinsert, payload);
+    }
+    case "VBULKINSERT": {
+      const ns = encodeUtf8(command.namespace);
+      const metric = encodeUtf8(command.metric);
+      let size = 4 + ns.length + 4 + metric.length + 1 + 4;
+      const encodedKeys: Bytes[] = [];
+      for (const it of command.items) {
+        const k = encodeUtf8(it.key);
+        encodedKeys.push(k);
+        size += 4 + k.length + 4 + it.vector.length + 8;
+      }
+      const payload = new Uint8Array(size);
+      let off = 0;
+      writeUint32BE(payload, off, ns.length); off += 4;
+      payload.set(ns, off); off += ns.length;
+      writeUint32BE(payload, off, metric.length); off += 4;
+      payload.set(metric, off); off += metric.length;
+      let flags = 0;
+      if (command.worm) flags |= 0x01;
+      if (command.async) flags |= 0x02;
+      payload[off] = flags; off += 1;
+      writeUint32BE(payload, off, command.items.length); off += 4;
+      for (let i = 0; i < command.items.length; i += 1) {
+        const key = encodedKeys[i];
+        const it = command.items[i];
+        writeUint32BE(payload, off, key.length); off += 4;
+        payload.set(key, off); off += key.length;
+        writeUint32BE(payload, off, it.vector.length); off += 4;
+        payload.set(it.vector, off); off += it.vector.length;
+        writeUint64BE(payload, off, it.timestamp); off += 8;
+      }
+      return writeFrame(CommandCode.Vbulkinsert, payload);
     }
     default:
       return assertNever(command);

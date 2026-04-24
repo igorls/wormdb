@@ -221,5 +221,30 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
             };
             break :blk .ok;
         },
+        .vbulkinsert => |params| blk: {
+            const metric_enum = Metric.fromStr(params.metric) orelse {
+                break :blk Response{ .err = try ctx.allocator.dupe(u8, "vbulkinsert: unknown metric (use cosine|dot|l2)") };
+            };
+            vector_ops.applyVbulkinsert(
+                ctx.store,
+                ctx.cluster,
+                ctx.event_bus,
+                ctx.vector_registry,
+                ctx.allocator,
+                params.namespace,
+                metric_enum,
+                params.worm,
+                params.is_async,
+                params.items,
+                true, // client-originated → propagate
+            ) catch |err| {
+                break :blk switch (err) {
+                    error.InvalidVectorBytes => Response{ .err = try ctx.allocator.dupe(u8, "vbulkinsert: invalid vector bytes (must be non-empty, len % 4 == 0)") },
+                    error.WormViolation => Response{ .err = try ctx.allocator.dupe(u8, "WORM violation: vector key is immutable") },
+                    else => Response{ .err = try ctx.allocator.dupe(u8, @errorName(err)) },
+                };
+            };
+            break :blk .ok;
+        },
     };
 }

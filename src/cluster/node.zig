@@ -507,6 +507,24 @@ pub const Cluster = struct {
         }
     }
 
+    /// Replicate a VBULKINSERT to all alive peers. Best-effort — individual
+    /// peer failures are swallowed so one stuck peer can't block writes.
+    pub fn replicateVbulkinsert(
+        self: *Cluster,
+        params: Command.VbulkinsertParams,
+    ) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.ensurePeersConnectedLocked();
+
+        var iter = self.peers.iterator();
+        while (iter.next()) |entry| {
+            var peer = entry.value_ptr;
+            _ = peer.sendCommand(.{ .vbulkinsert = params });
+        }
+    }
+
     /// Replicate a VDELETE to all alive peers.
     pub fn replicateVdelete(
         self: *Cluster,

@@ -242,6 +242,60 @@ fn parseCommandPayload(cmd_id: CommandId, payload: []const u8, allocator: std.me
             if (pos != payload.len) return error.Corruption;
             return .{ .vdelete = .{ .key = key, .namespace = namespace } };
         },
+        .vbulkinsert => {
+            // VBULKINSERT payload:
+            //   [namespace][metric][1B flags][4B count]
+            //   For each item: [key][vector][8B timestamp]
+            const namespace = try readBytesField(payload, &pos, allocator);
+            errdefer allocator.free(namespace);
+            const metric = try readBytesField(payload, &pos, allocator);
+            errdefer allocator.free(metric);
+
+            if (pos + 1 > payload.len) return error.Corruption;
+            const flags = payload[pos];
+            pos += 1;
+            if ((flags & 0b1111_1100) != 0) return error.InvalidFlags;
+
+            if (pos + 4 > payload.len) return error.Corruption;
+            const count_u32 = std.mem.readInt(u32, payload[pos..][0..4], .big);
+            pos += 4;
+            const count: usize = @intCast(count_u32);
+
+            const items = try allocator.alloc(Command.VbulkinsertParams.BulkItem, count);
+            errdefer {
+                for (items, 0..) |it, i| {
+                    if (i >= count) break;
+                    if (it.key.len > 0) allocator.free(@constCast(it.key));
+                    if (it.vector.len > 0) allocator.free(@constCast(it.vector));
+                }
+                allocator.free(items);
+            }
+
+            for (items) |*it| {
+                it.key = &.{};
+                it.vector = &.{};
+                it.timestamp = 0;
+            }
+
+            for (items) |*it| {
+                const key = try readBytesField(payload, &pos, allocator);
+                it.key = key;
+                const vector = try readBytesField(payload, &pos, allocator);
+                it.vector = vector;
+                if (pos + 8 > payload.len) return error.Corruption;
+                it.timestamp = std.mem.readInt(u64, payload[pos..][0..8], .big);
+                pos += 8;
+            }
+            if (pos != payload.len) return error.Corruption;
+
+            return .{ .vbulkinsert = .{
+                .namespace = namespace,
+                .metric = metric,
+                .worm = (flags & 0x01) != 0,
+                .is_async = (flags & 0x02) != 0,
+                .items = items,
+            } };
+        },
     }
 }
 
@@ -379,6 +433,10 @@ pub fn parseCommandPayloadZeroCopy(cmd_id: CommandId, payload: []const u8, alloc
                 .key = @constCast(key),
                 .namespace = @constCast(namespace),
             } };
+        },
+        .vbulkinsert => {
+            // Variable-length items array needs allocation — delegate.
+            return parseCommandPayload(cmd_id, payload, allocator);
         },
     }
 }
@@ -543,6 +601,37 @@ pub fn writeCommand(writer: anytype, cmd: Command) !void {
             try writeHeader(w, @intFromEnum(CommandId.vdelete), @intCast(payload_len));
             try writeLenPrefixed(w, params.key);
             try writeLenPrefixed(w, params.namespace);
+        },
+        .vbulkinsert => |params| {
+            var payload_len: usize = 0;
+            payload_len += 4 + params.namespace.len;
+            payload_len += 4 + params.metric.len;
+            payload_len += 1; // flags
+            payload_len += 4; // count
+            for (params.items) |it| {
+                payload_len += 4 + it.key.len;
+                payload_len += 4 + it.vector.len;
+                payload_len += 8;
+            }
+            if (payload_len > MAX_PAYLOAD_LENGTH) return error.PayloadTooLarge;
+
+            try writeHeader(w, @intFromEnum(CommandId.vbulkinsert), @intCast(payload_len));
+            try writeLenPrefixed(w, params.namespace);
+            try writeLenPrefixed(w, params.metric);
+            var flags: u8 = 0;
+            if (params.worm) flags |= 0x01;
+            if (params.is_async) flags |= 0x02;
+            try w.writeAll(&[_]u8{flags});
+            var count_buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, count_buf[0..4], @intCast(params.items.len), .big);
+            try w.writeAll(&count_buf);
+            for (params.items) |it| {
+                try writeLenPrefixed(w, it.key);
+                try writeLenPrefixed(w, it.vector);
+                var ts_buf: [8]u8 = undefined;
+                std.mem.writeInt(u64, ts_buf[0..8], it.timestamp, .big);
+                try w.writeAll(&ts_buf);
+            }
         },
     }
 }

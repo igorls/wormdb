@@ -30,6 +30,7 @@
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
 const distance = @import("../vector/distance.zig");
+const rabitq = @import("../vector/rabitq.zig");
 const topk_mod = @import("../vector/topk.zig");
 const hnsw_mod = @import("../vector/hnsw.zig");
 const metric_mod = @import("../vector/metric.zig");
@@ -40,7 +41,7 @@ pub const Metric = metric_mod.Metric;
 const MAX_TOP_K: usize = 100;
 const DEFAULT_NAMESPACE: []const u8 = "vec:";
 const BQ_PREFIX: []const u8 = "bq:";
-const STAGE1_OVERSAMPLE: usize = 10;
+const STAGE1_OVERSAMPLE: usize = 20;
 /// HNSW ef (beam width) factor relative to M (= top_k × STAGE1_OVERSAMPLE).
 /// HNSW recall tracks ef closely; we reuse the same oversample budget so
 /// the stage-1→stage-2 shape stays consistent across dispatch paths.
@@ -48,11 +49,28 @@ const HNSW_EF_SEARCH_FACTOR: usize = 1;
 const DECAY_TIME_CONSTANT_HOURS: f32 = 168.0; // ~1 week time constant
 
 const Mode = enum {
-    auto, // BQ prefilter if available, else brute-force
-    exact, // brute-force only
+    /// HNSW graph search if an index exists, else RaBitQ/BQ prefilter,
+    /// else brute-force. The "normal" path. The BQ fallback always
+    /// reranks the top-M candidates with full-precision distances.
+    auto,
+    /// Full-precision brute-force scan over the namespace. No BQ, no HNSW.
+    exact,
+    /// Force the quantized prefilter path. When the namespace has
+    /// RaBitQ params installed and metric=l2, scores candidates via
+    /// the unbiased estimator with NO rerank — returns the top-K
+    /// directly from estimated distances. Otherwise falls back to
+    /// Hamming + exact rerank.
+    bq,
+    /// Quantized prefilter followed by full-precision rerank of the
+    /// top-M candidates. Same recall as `auto` when BQ is the chosen
+    /// dispatch; exposed as an explicit mode so benchmarks can A/B
+    /// pure-estimator vs estimator-plus-rerank.
+    bq_rerank,
 
     fn fromStr(s: []const u8) Mode {
         if (std.mem.eql(u8, s, "exact")) return .exact;
+        if (std.mem.eql(u8, s, "bq")) return .bq;
+        if (std.mem.eql(u8, s, "bq_rerank")) return .bq_rerank;
         return .auto;
     }
 };
@@ -106,8 +124,24 @@ const BQScanCtx = struct {
     allocator: std.mem.Allocator,
     oom: bool,
     saw_any: usize,
+    /// Length of the pure-code format this scan accepts. Entries of
+    /// any other size are skipped — in particular we must NOT treat a
+    /// 24B RaBitQ entry as a 16B legacy code even though the byte
+    /// prefix "looks like" a code. The semantics differ: legacy codes
+    /// are `sign(v[i])`; RaBitQ codes are `sign(R·(v-c)/||v-c||)[i]`.
+    /// Hamming between the two bit distributions is uncorrelated.
+    code_bytes: usize,
 };
 
+// TODO(tests): procedure-level integration tests for vsearch don't
+// exist in this codebase yet. Three cross-format correctness cases
+// rely on `onBQMatch` / `onRabitqMatch` silently rejecting the wrong
+// size: (a) metric=cosine with RaBitQ params installed, (b) restart
+// without snapshot so params are lost but bq entries are still 24B,
+// (c) legacy 16B entries present in a namespace that later got
+// vrabitq'd. Each currently relies on code review; adding a harness
+// that boots a Ctx + Store + Registry would let all three regress
+// loudly.
 fn onBQMatch(
     raw_ctx: *anyopaque,
     bq_key: []const u8,
@@ -117,7 +151,13 @@ fn onBQMatch(
 ) Store.ScanAction {
     _ = is_worm;
     const sc: *BQScanCtx = @ptrCast(@alignCast(raw_ctx));
-    sc.saw_any += 1;
+
+    // Skip anything that isn't the exact legacy format. RaBitQ entries
+    // (code_bytes + 8) are rotated-residual signs and are meaningless
+    // under naive sign(query) Hamming — if a namespace is entirely
+    // RaBitQ-format but params got lost (crash-without-snapshot), we
+    // want `saw_any == 0` so the caller falls through to brute-force.
+    if (bq_value.len != sc.code_bytes) return .cont;
 
     // Derive the vec key by stripping the 3-byte "bq:" prefix.
     if (bq_key.len <= BQ_PREFIX.len) return .cont;
@@ -125,13 +165,67 @@ fn onBQMatch(
 
     if (std.mem.eql(u8, vec_key, sc.query_key)) return .cont;
 
-    // Different-dim vectors produce different-sized BQ hashes — skip.
-    if (bq_value.len != sc.query_bq.len) return .cont;
+    sc.saw_any += 1;
 
     const ham_dist = distance.hamming(sc.query_bq, bq_value);
-    const total_bits: f32 = @floatFromInt(bq_value.len * 8);
+    const total_bits: f32 = @floatFromInt(sc.code_bytes * 8);
     const sim = 1.0 - @as(f32, @floatFromInt(ham_dist)) / total_bits;
     const score = applyDecay(sim, timestamp, sc.decay, sc.now_ms);
+
+    if (score <= sc.heap.thresholdScore()) return .cont;
+
+    const key_copy = sc.allocator.dupe(u8, vec_key) catch {
+        sc.oom = true;
+        return .stop;
+    };
+    sc.heap.push(.{ .key = key_copy, .score = score, .timestamp = timestamp });
+    return .cont;
+}
+
+// ╔═══════════════════════════════════════════════════╗
+// ║  Stage 1 — RaBitQ estimator scan (L2 only)         ║
+// ╚═══════════════════════════════════════════════════╝
+
+const RabitqScanCtx = struct {
+    q_rot_unit: []const f32,
+    q_l2: f32,
+    query_key: []const u8,
+    code_bytes: usize,
+    dim: usize,
+    decay: f32,
+    now_ms: u64,
+    heap: *TopKCandidate,
+    allocator: std.mem.Allocator,
+    oom: bool,
+    saw_any: usize,
+};
+
+fn onRabitqMatch(
+    raw_ctx: *anyopaque,
+    bq_key: []const u8,
+    bq_value: []const u8,
+    timestamp: u64,
+    is_worm: bool,
+) Store.ScanAction {
+    _ = is_worm;
+    const sc: *RabitqScanCtx = @ptrCast(@alignCast(raw_ctx));
+    sc.saw_any += 1;
+
+    if (bq_key.len <= BQ_PREFIX.len) return .cont;
+    const vec_key = bq_key[BQ_PREFIX.len..];
+    if (std.mem.eql(u8, vec_key, sc.query_key)) return .cont;
+
+    // Only process RaBitQ-format entries; skip legacy 16-byte codes
+    // silently — they were written before `vrabitq` ran on this namespace.
+    const enc = rabitq.parse(bq_value, sc.dim) orelse return .cont;
+
+    const d2_est = rabitq.estimateL2Sq(sc.q_rot_unit, sc.q_l2, enc.code, enc.l2_norm, enc.corr);
+    // Convert squared distance to [0, 1] similarity so the heap
+    // semantics (higher=better) match the Hamming path. Clamp negative
+    // estimator noise at d²=0 → sim=1.
+    const d2_clamped: f32 = if (d2_est < 0.0) 0.0 else d2_est;
+    const raw_sim: f32 = 1.0 / (1.0 + d2_clamped);
+    const score = applyDecay(raw_sim, timestamp, sc.decay, sc.now_ms);
 
     if (score <= sc.heap.thresholdScore()) return .cont;
 
@@ -383,50 +477,152 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
         }
     }
 
-    // ── Stage 1B: BQ prefilter (auto mode only) ──────────────────
-    if (mode == .auto) {
-        const query_bq_size = distance.binaryQuantizedSize(query_vec.len);
-        const query_bq = try ctx.allocator.alloc(u8, query_bq_size);
-        distance.binaryQuantize(query_vec, query_bq);
+    // ── Stage 1B: Quantized prefilter ───────────────────────────
+    // Enters when caller explicitly asked for bq/bq_rerank OR when auto
+    // mode fell through (no HNSW, metric mismatch). Full exact mode
+    // skips this and goes straight to the brute-force scan below.
+    //
+    // Dispatch:
+    //   - RaBitQ params installed + metric=l2 → unbiased estimator
+    //   - No RaBitQ params → legacy Hamming prefilter (works for any metric)
+    //   - RaBitQ params installed + metric≠l2 → SKIP quantized path.
+    //     The stored codes are `sign(R·(v-c)/||v-c||)`, uncorrelated with
+    //     `sign(query)`, so naive-Hamming on a non-rotated query would
+    //     return near-random top-M. Fall through to brute-force; users
+    //     querying cosine/dot on a RaBitQ namespace pay the full-precision
+    //     scan cost until a per-metric encoder is added.
+    if (mode == .auto or mode == .bq or mode == .bq_rerank) {
+        const ns_idx_opt: ?*IndexModule.NamespaceIndex =
+            if (ctx.vector_registry) |reg| reg.get(namespace) else null;
 
-        const stage1_size = top_k * STAGE1_OVERSAMPLE;
-        const stage1_buf = try ctx.allocator.alloc(Candidate, stage1_size);
-        var stage1_heap = TopKCandidate.init(stage1_buf);
-
-        // Construct bq prefix in the arena so it outlives the scan call.
-        const bq_prefix = try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ BQ_PREFIX, namespace });
-
-        var bq_sc = BQScanCtx{
-            .query_bq = query_bq,
-            .query_key = query_key,
-            .decay = decay,
-            .now_ms = now_ms,
-            .heap = &stage1_heap,
-            .allocator = ctx.allocator,
-            .oom = false,
-            .saw_any = 0,
-        };
-        ctx.scanCallback(bq_prefix, @ptrCast(&bq_sc), onBQMatch);
-        if (bq_sc.oom) return ctx.err("vsearch: out of memory during BQ stage");
-
-        if (bq_sc.saw_any > 0) {
-            // ── Stage 2: exact refine on top-M ───────────────────
-            const candidates = stage1_heap.sortedDesc();
-            for (candidates) |cand| {
-                const vec_bytes = (try ctx.getCopy(cand.key)) orelse continue;
-                const vec = distance.bytesToF32(vec_bytes) orelse continue;
-                if (vec.len != query_vec.len) continue;
-
-                const raw_sim = computeExactSim(metric, query_vec, vec);
-                const score = applyDecay(raw_sim, cand.timestamp, decay, now_ms);
-
-                // `cand.key` is already arena-owned — reuse directly.
-                final_heap.push(.{ .key = cand.key, .score = score, .timestamp = cand.timestamp });
+        // Branch on whether RaBitQ params are installed. The lock is
+        // held for the full stage-1 scan in the RaBitQ branch so a
+        // concurrent `EXEC vrabitq` can't free the params out from
+        // under us (it takes the exclusive lock via setRabitqParams).
+        // The scan itself only touches store shard locks, not the
+        // namespace lock, so the extended critical section doesn't
+        // risk deadlock.
+        const has_params = blk: {
+            if (ns_idx_opt) |idx| {
+                idx.lock.lockShared();
+                const got = idx.rabitq_params != null;
+                if (!got) idx.lock.unlockShared();
+                break :blk got;
             }
+            break :blk false;
+        };
 
-            return emitJson(ctx, final_heap.sortedDesc());
+        // Case 1: params installed but metric ≠ L2 → drop BQ entirely.
+        if (has_params and metric != .l2) {
+            // Release the shared lock before falling through. The
+            // brute-force scan below doesn't need it.
+            ns_idx_opt.?.lock.unlockShared();
+            // Fall through (no `return`) so the brute-force block runs.
+        } else if (has_params) {
+            // Case 2: RaBitQ estimator path (L2).
+            defer ns_idx_opt.?.lock.unlockShared();
+            const p = ns_idx_opt.?.rabitq_params.?;
+            if (p.dim != query_vec.len) {
+                // Dim mismatch — shouldn't happen in practice (freeze
+                // is shared with the graph), but skip the BQ stage and
+                // fall through to brute-force if it does.
+            } else {
+                const stage1_size = top_k * STAGE1_OVERSAMPLE;
+                const stage1_buf = try ctx.allocator.alloc(Candidate, stage1_size);
+                var stage1_heap = TopKCandidate.init(stage1_buf);
+
+                const bq_prefix = try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ BQ_PREFIX, namespace });
+
+                const dim = query_vec.len;
+                const q_residual = try ctx.allocator.alloc(f32, dim);
+                const q_rot_unit = try ctx.allocator.alloc(f32, dim);
+                const q_l2 = rabitq.prepareQuery(query_vec, p, q_residual, q_rot_unit);
+
+                var rq_sc = RabitqScanCtx{
+                    .q_rot_unit = q_rot_unit,
+                    .q_l2 = q_l2,
+                    .query_key = query_key,
+                    .code_bytes = rabitq.codeBytes(dim),
+                    .dim = dim,
+                    .decay = decay,
+                    .now_ms = now_ms,
+                    .heap = &stage1_heap,
+                    .allocator = ctx.allocator,
+                    .oom = false,
+                    .saw_any = 0,
+                };
+                ctx.scanCallback(bq_prefix, @ptrCast(&rq_sc), onRabitqMatch);
+
+                if (rq_sc.oom) return ctx.err("vsearch: out of memory during BQ stage");
+
+                if (rq_sc.saw_any > 0) {
+                    const skip_rerank = (mode == .bq);
+                    const candidates = stage1_heap.sortedDesc();
+                    if (skip_rerank) {
+                        for (candidates) |cand| {
+                            final_heap.push(.{ .key = cand.key, .score = cand.score, .timestamp = cand.timestamp });
+                        }
+                    } else {
+                        for (candidates) |cand| {
+                            const vec_bytes = (try ctx.getCopy(cand.key)) orelse continue;
+                            const vec = distance.bytesToF32(vec_bytes) orelse continue;
+                            if (vec.len != query_vec.len) continue;
+                            const raw_sim = computeExactSim(metric, query_vec, vec);
+                            const score = applyDecay(raw_sim, cand.timestamp, decay, now_ms);
+                            final_heap.push(.{ .key = cand.key, .score = score, .timestamp = cand.timestamp });
+                        }
+                    }
+                    return emitJson(ctx, final_heap.sortedDesc());
+                }
+                // Fall through (empty namespace → brute-force, which
+                // will produce no results but maintains consistent
+                // behavior with the no-params path).
+            }
         }
-        // Fall through: no BQ hashes exist in this namespace → brute-force.
+
+        // Case 3: no params installed → legacy Hamming prefilter.
+        if (!has_params) {
+            const query_bq_size = distance.binaryQuantizedSize(query_vec.len);
+            const query_bq = try ctx.allocator.alloc(u8, query_bq_size);
+            distance.binaryQuantize(query_vec, query_bq);
+
+            const stage1_size = top_k * STAGE1_OVERSAMPLE;
+            const stage1_buf = try ctx.allocator.alloc(Candidate, stage1_size);
+            var stage1_heap = TopKCandidate.init(stage1_buf);
+
+            const bq_prefix = try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ BQ_PREFIX, namespace });
+
+            var bq_sc = BQScanCtx{
+                .query_bq = query_bq,
+                .query_key = query_key,
+                .decay = decay,
+                .now_ms = now_ms,
+                .heap = &stage1_heap,
+                .allocator = ctx.allocator,
+                .oom = false,
+                .saw_any = 0,
+                .code_bytes = query_bq_size,
+            };
+            ctx.scanCallback(bq_prefix, @ptrCast(&bq_sc), onBQMatch);
+            if (bq_sc.oom) return ctx.err("vsearch: out of memory during BQ stage");
+
+            if (bq_sc.saw_any > 0) {
+                const candidates = stage1_heap.sortedDesc();
+                for (candidates) |cand| {
+                    const vec_bytes = (try ctx.getCopy(cand.key)) orelse continue;
+                    const vec = distance.bytesToF32(vec_bytes) orelse continue;
+                    if (vec.len != query_vec.len) continue;
+                    const raw_sim = computeExactSim(metric, query_vec, vec);
+                    const score = applyDecay(raw_sim, cand.timestamp, decay, now_ms);
+                    final_heap.push(.{ .key = cand.key, .score = score, .timestamp = cand.timestamp });
+                }
+                return emitJson(ctx, final_heap.sortedDesc());
+            }
+            // Fall through to brute-force when no bq:* entries exist.
+        }
+
+        // All reachable BQ branches have either returned a result or
+        // fallen through to brute-force below.
     }
 
     // ── Brute-force path (mode=exact or auto-fallback) ───────────

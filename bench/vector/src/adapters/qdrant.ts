@@ -66,7 +66,11 @@ export class QdrantAdapter implements Adapter {
           always_ram: true,
         },
       };
+    } else if (config.mode === "bq") {
+      throw new Error("qdrant adapter: 'bq' is a WormDB-only label; use 'quantized' (scalar int8) or 'exact'/'hnsw'");
     }
+    // "exact" and "hnsw" both map to Qdrant's default full-precision HNSW
+    // (no quantization config). The distinction only matters for WormDB.
 
     await this.client.createCollection(COLLECTION, params as Parameters<QdrantClient["createCollection"]>[1]);
   }

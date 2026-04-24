@@ -553,8 +553,29 @@ pub const Server = struct {
                     };
                     wire.writeResponse(stream, .ok) catch return;
                 },
+                .vbulkinsert => |params| {
+                    const metric_enum = Metric.fromStr(params.metric) orelse {
+                        wire.writeResponse(stream, .{ .err = "vbulkinsert: unknown metric" }) catch return;
+                        continue;
+                    };
+                    vector_ops.applyVbulkinsert(
+                        self.store,
+                        null, // don't re-replicate
+                        self.event_bus,
+                        self.config.vector_registry,
+                        self.allocator,
+                        params.namespace,
+                        metric_enum,
+                        params.worm,
+                        params.is_async,
+                        params.items,
+                        false, // anti-echo boundary
+                    ) catch |e| {
+                        std.log.warn("replication: applyVbulkinsert failed: {s}", .{@errorName(e)});
+                    };
+                    wire.writeResponse(stream, .ok) catch return;
+                },
                 else => {
-                    // Only SET/DEL/VINSERT/VDELETE are valid replication commands
                     wire.writeResponse(stream, .{ .err = "unsupported replication command" }) catch return;
                 },
             }

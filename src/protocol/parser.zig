@@ -129,6 +129,15 @@ pub fn deinitCommand(allocator: std.mem.Allocator, cmd: Command) void {
             allocator.free(params.key);
             allocator.free(params.namespace);
         },
+        .vbulkinsert => |params| {
+            allocator.free(params.namespace);
+            allocator.free(params.metric);
+            for (params.items) |it| {
+                allocator.free(it.key);
+                allocator.free(it.vector);
+            }
+            allocator.free(params.items);
+        },
     }
 }
 

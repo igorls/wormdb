@@ -17,10 +17,54 @@ const std = @import("std");
 const Store = @import("../storage/store.zig").Store;
 const Cluster = @import("../cluster/mod.zig").Cluster;
 const EventBus = @import("../event/mod.zig").EventBus;
-const NamespaceRegistry = @import("../vector/index.zig").NamespaceRegistry;
+const index_mod = @import("../vector/index.zig");
+const NamespaceRegistry = index_mod.NamespaceRegistry;
+const NamespaceIndex = index_mod.NamespaceIndex;
 const distance = @import("../vector/distance.zig");
+const rabitq = @import("../vector/rabitq.zig");
 const Metric = @import("../vector/metric.zig").Metric;
 const core = @import("../core/mod.zig");
+
+/// Encode a vector's BQ companion into a newly-allocated, caller-owned
+/// buffer. Chooses the RaBitQ path (24-byte format on 128-dim) when the
+/// namespace has installed params, falling back to naive 1-bit sign
+/// quantization (16-byte on 128-dim) otherwise.
+///
+/// Must be called with `ns_idx` either null (unindexed namespace) or
+/// pointing at the registry entry whose params we'll consult. Takes the
+/// shared lock internally.
+fn encodeBqOwned(
+    allocator: std.mem.Allocator,
+    vec_f32: []align(1) const f32,
+    ns_idx: ?*NamespaceIndex,
+) ![]u8 {
+    if (ns_idx) |idx| {
+        idx.lock.lockShared();
+        defer idx.lock.unlockShared();
+        if (idx.rabitq_params) |p| {
+            if (p.dim == vec_f32.len) {
+                // Full RaBitQ encode: code + l2 + corr.
+                const out = try allocator.alloc(u8, rabitq.encodedSize(vec_f32.len));
+                errdefer allocator.free(out);
+
+                const residual = try allocator.alloc(f32, vec_f32.len);
+                defer allocator.free(residual);
+                const rotated = try allocator.alloc(f32, vec_f32.len);
+                defer allocator.free(rotated);
+
+                const code_slice = out[0..rabitq.codeBytes(vec_f32.len)];
+                const enc = rabitq.encode(vec_f32, p, residual, rotated, code_slice);
+                rabitq.serialize(enc, out);
+                return out;
+            }
+        }
+    }
+    // No params (or dim mismatch) — naive sign BQ.
+    const out = try allocator.alloc(u8, distance.binaryQuantizedSize(vec_f32.len));
+    errdefer allocator.free(out);
+    distance.binaryQuantize(vec_f32, out);
+    return out;
+}
 
 pub const VectorOpError = error{
     InvalidVectorBytes,
@@ -97,10 +141,9 @@ pub fn applyVinsert(
     defer allocator.free(bq_key);
 
     const vec_f32 = distance.bytesToF32(args.vector).?; // already validated
-    const bq_size = distance.binaryQuantizedSize(vec_f32.len);
-    const bq_buf = try allocator.alloc(u8, bq_size);
+    const ns_idx_for_bq: ?*NamespaceIndex = if (registry) |reg| reg.get(args.namespace) else null;
+    const bq_buf = try encodeBqOwned(allocator, vec_f32, ns_idx_for_bq);
     defer allocator.free(bq_buf);
-    distance.binaryQuantize(vec_f32, bq_buf);
 
     store.set(bq_key, bq_buf, args.worm) catch |e| {
         std.log.warn("applyVinsert: BQ store failed for '{s}': {s}", .{ bq_key, @errorName(e) });
@@ -182,6 +225,120 @@ pub fn applyVinsert(
                 .is_async = args.is_async,
             }) catch |e| {
                 std.log.warn("applyVinsert: cluster replication: {s}", .{@errorName(e)});
+            };
+        }
+    }
+}
+
+/// Apply a VBULKINSERT locally: write vec + BQ for each item, then do ONE
+/// namespace lock acquisition for the HNSW update (sync) or ONE queue
+/// lock acquisition (async). Amortizes per-frame wire parse + per-item
+/// lock/signal overhead.
+///
+/// Error semantics differ slightly from single-VINSERT: best-effort on
+/// individual items. WORM violations and invalid-bytes errors are logged
+/// per-item and do not abort the batch. Caller gets a single OK even if
+/// some items failed; operators see the warnings in logs.
+pub fn applyVbulkinsert(
+    store: *Store,
+    cluster: ?*Cluster,
+    event_bus: ?*EventBus,
+    registry: ?*NamespaceRegistry,
+    allocator: std.mem.Allocator,
+    namespace: []const u8,
+    metric: Metric,
+    worm: bool,
+    is_async: bool,
+    items: []const Command.VbulkinsertParams.BulkItem,
+    replicate: bool,
+) !void {
+    if (items.len == 0) return;
+
+    // ── Phase 1: store.set(vec) + store.set(bq) for each item ────
+    // These use per-key shard locks; parallel shards don't block each
+    // other. No namespace lock held here.
+    const ns_idx_for_bq: ?*NamespaceIndex = if (registry) |reg| reg.get(namespace) else null;
+    var dim_check: ?usize = null;
+    for (items) |item| {
+        if (item.vector.len == 0 or item.vector.len % 4 != 0) {
+            std.log.warn("applyVbulkinsert: invalid vector bytes for '{s}' (skipping)", .{item.key});
+            continue;
+        }
+        if (dim_check) |d| {
+            if (item.vector.len != d) {
+                std.log.warn("applyVbulkinsert: vector-length mismatch for '{s}' (skipping)", .{item.key});
+                continue;
+            }
+        } else dim_check = item.vector.len;
+
+        store.set(item.key, item.vector, worm) catch |e| {
+            std.log.warn("applyVbulkinsert: store vec '{s}' failed: {s}", .{ item.key, @errorName(e) });
+            continue;
+        };
+
+        const bq_key = std.fmt.allocPrint(allocator, "bq:{s}", .{item.key}) catch continue;
+        defer allocator.free(bq_key);
+        const vec_f32 = distance.bytesToF32(item.vector).?;
+        const bq_buf = encodeBqOwned(allocator, vec_f32, ns_idx_for_bq) catch continue;
+        defer allocator.free(bq_buf);
+        store.set(bq_key, bq_buf, worm) catch |e| {
+            std.log.warn("applyVbulkinsert: store bq '{s}' failed: {s}", .{ bq_key, @errorName(e) });
+        };
+    }
+
+    // ── Phase 2: HNSW update ─────────────────────────────────────
+    if (registry) |reg| {
+        const ns_idx = reg.getOrCreate(namespace, metric) catch |e| blk: {
+            std.log.warn("applyVbulkinsert: getOrCreate '{s}': {s}", .{ namespace, @errorName(e) });
+            break :blk null;
+        };
+        if (ns_idx) |idx| {
+            if (is_async and !idx.async_mode) {
+                idx.enableAsyncMode() catch |e| {
+                    std.log.warn("applyVbulkinsert: enableAsyncMode: {s}", .{@errorName(e)});
+                };
+            }
+
+            if (idx.async_mode) {
+                // Batch-enqueue under a single queue mutex acquisition.
+                idx.enqueueAsyncBatch(items) catch |e| {
+                    std.log.warn("applyVbulkinsert: enqueueAsyncBatch: {s}", .{@errorName(e)});
+                };
+            } else {
+                // Single write-lock cycle for the whole batch.
+                idx.lock.lock();
+                defer idx.lock.unlock();
+                for (items) |item| {
+                    const vec_f32 = distance.bytesToF32(item.vector) orelse continue;
+                    _ = idx.insertLocked(item.key, vec_f32, item.timestamp) catch |e| {
+                        std.log.warn("applyVbulkinsert: HNSW insert '{s}': {s}", .{ item.key, @errorName(e) });
+                    };
+                }
+            }
+        }
+    }
+
+    // ── Phase 3: events + replication (per-item, same as single VINSERT) ──
+    if (event_bus) |bus| {
+        const channel = std.fmt.allocPrint(allocator, "{s}inserted", .{namespace}) catch null;
+        if (channel) |ch| {
+            defer allocator.free(ch);
+            for (items) |item| {
+                bus.publish(ch, item.key) catch {};
+            }
+        }
+    }
+
+    if (replicate) {
+        if (cluster) |c| {
+            c.replicateVbulkinsert(.{
+                .namespace = namespace,
+                .metric = metric.name(),
+                .worm = worm,
+                .is_async = is_async,
+                .items = items,
+            }) catch |e| {
+                std.log.warn("applyVbulkinsert: cluster replication: {s}", .{@errorName(e)});
             };
         }
     }

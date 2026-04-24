@@ -176,6 +176,13 @@ pub fn hammingSimilarity(a: []const u8, b: []const u8) f32 {
 /// Quantize an f32 vector to binary (1 bit per dimension).
 /// Each bit is 1 if the corresponding float is >= 0, else 0.
 /// Output length: ceil(input.len / 8) bytes.
+///
+/// Limitation: this is "naive" sign quantization — it only produces a
+/// useful signal when the input distribution has components on both sides
+/// of zero. Unsigned data (SIFT, TF-IDF, pixel intensities) will collapse
+/// to a single hash per value range, making Hamming distance useless as
+/// a similarity proxy. For those use cases, see `binaryQuantizeCentered`
+/// which subtracts a dataset centroid first (RaBitQ phase 1).
 pub fn binaryQuantize(vec: []align(1) const f32, out: []u8) void {
     const byte_count = (vec.len + 7) / 8;
     const actual = @min(byte_count, out.len);
@@ -186,6 +193,36 @@ pub fn binaryQuantize(vec: []align(1) const f32, out: []u8) void {
         inline for (0..8) |bit| {
             const dim = base + bit;
             if (dim < vec.len and vec[dim] >= 0.0) {
+                byte |= (@as(u8, 1) << @intCast(7 - bit));
+            }
+        }
+        out[byte_idx] = byte;
+    }
+}
+
+/// Centroid-subtracted binary quantization (RaBitQ without rotation).
+/// For each dimension: bit = sign(vec[i] - centroid[i]). This ensures
+/// the output has a meaningful bit distribution even when `vec` has
+/// uniformly-signed components. A fair prefilter for non-centered data
+/// like SIFT features.
+///
+/// `centroid` must be the same length as `vec`. Callers pass the
+/// namespace's frozen centroid — see `NamespaceIndex.centroid`.
+pub fn binaryQuantizeCentered(
+    vec: []align(1) const f32,
+    centroid: []align(1) const f32,
+    out: []u8,
+) void {
+    std.debug.assert(centroid.len == vec.len);
+    const byte_count = (vec.len + 7) / 8;
+    const actual = @min(byte_count, out.len);
+
+    for (0..actual) |byte_idx| {
+        var byte: u8 = 0;
+        const base = byte_idx * 8;
+        inline for (0..8) |bit| {
+            const dim = base + bit;
+            if (dim < vec.len and (vec[dim] - centroid[dim]) >= 0.0) {
                 byte |= (@as(u8, 1) << @intCast(7 - bit));
             }
         }

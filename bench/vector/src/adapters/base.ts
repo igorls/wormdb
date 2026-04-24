@@ -6,7 +6,25 @@ export type BuildProgress = {
   elapsedMs: number;
 };
 
-export type AdapterMode = "exact" | "quantized";
+/**
+ * Bench modes — named to reflect what each adapter ACTUALLY does, not
+ * what the vendor's marketing label claims.
+ *
+ * WormDB:
+ *   exact    — EXEC vsearch mode=exact; brute-force full-precision scan.
+ *   hnsw     — EXEC vsearch mode=auto; HNSW graph + full-precision rerank.
+ *              NO quantization in this path.
+ *   bq       — EXEC vsearch mode=bq; forced 1-bit binary quantization
+ *              Hamming prefilter + full-precision rerank on candidates.
+ *              This is WormDB's genuinely quantized path.
+ *
+ * Qdrant:
+ *   exact    — collection without quantization config; full-precision HNSW.
+ *   hnsw     — same as exact for Qdrant (alias for clarity).
+ *   quantized — collection with scalar(int8) quantization enabled.
+ *              Genuine quantization (4× compression).
+ */
+export type AdapterMode = "exact" | "hnsw" | "bq" | "quantized";
 
 export type AdapterConfig = {
   mode: AdapterMode;
@@ -14,6 +32,14 @@ export type AdapterConfig = {
   dim: number;
   m?: number;
   efConstruction?: number;
+  /**
+   * If true, VINSERT requests set the async flag — server queues the HNSW
+   * build to a background worker and acks after store+BQ. Adapter is
+   * responsible for waitUntilQueryable() honestly reporting the lag.
+   * Qdrant is always async by default; this flag is only honored by the
+   * WormDB adapter.
+   */
+  asyncInsert?: boolean;
 };
 
 export type QueryResult = {

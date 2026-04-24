@@ -103,6 +103,7 @@ describe("encodeCommandFrame", () => {
       namespace,
       metric,
       timestamp,
+      async: false,
     });
 
     expect(frame[0]).toBe(0x0d);
@@ -140,6 +141,34 @@ describe("encodeCommandFrame", () => {
 
     const ts = new DataView(frame.buffer, frame.byteOffset + off, 8).getBigUint64(0, false);
     expect(ts).toBe(timestamp);
+  });
+
+  test("encodes VINSERT async flag in bit 1 of the flags byte", () => {
+    const vec = new Uint8Array([0, 0, 0x80, 0x3f]);
+    const asyncFrame = encodeCommandFrame({
+      kind: "VINSERT",
+      key: "k",
+      vector: vec,
+      worm: false,
+      namespace: "vec:",
+      metric: "l2",
+      timestamp: 0n,
+      async: true,
+    });
+    const syncFrame = encodeCommandFrame({
+      kind: "VINSERT",
+      key: "k",
+      vector: vec,
+      worm: false,
+      namespace: "vec:",
+      metric: "l2",
+      timestamp: 0n,
+      async: false,
+    });
+    // Payload layout up to flags byte: [4B key_len][key][4B vec_len][vec][flags]
+    const flagsOffset = 5 + 4 + 1 + 4 + vec.length;
+    expect(asyncFrame[flagsOffset]).toBe(0x02);
+    expect(syncFrame[flagsOffset]).toBe(0x00);
   });
 
   test("throws for unsupported command variant at runtime", () => {

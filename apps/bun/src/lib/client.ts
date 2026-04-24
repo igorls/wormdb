@@ -101,6 +101,7 @@ export class WormClient {
       namespace?: string;
       metric?: "cosine" | "dot" | "l2";
       timestamp?: bigint;
+      async?: boolean;
     } = {},
   ): Promise<WormResponse> {
     return this.sendCommand({
@@ -111,6 +112,7 @@ export class WormClient {
       namespace: options.namespace ?? "vec:",
       metric: options.metric ?? "cosine",
       timestamp: options.timestamp ?? BigInt(Date.now()),
+      async: options.async ?? false,
     });
   }
 

@@ -138,6 +138,14 @@ pub fn parse(bytes: []const u8, dim: usize) ?Encoded {
 /// modified Gram-Schmidt on i.i.d. Gaussian rows. O(d³) one-time cost
 /// per namespace; ~2M ops for d=128.
 ///
+/// Note: we evaluated the RaBitQ paper's recommended randomized
+/// Walsh-Hadamard rotation as an alternative. On SIFT-128 it gave
+/// identical bq recall (0.348) and slightly worse bq_rerank recall
+/// (0.933 vs 0.939) — Gram-Schmidt-on-Gaussian samples the orthogonal
+/// group more uniformly, which appears to help the rerank stage's
+/// candidate set quality. Walsh-Hadamard would only matter if we
+/// exploit its O(d log d) apply via FHT, which we don't yet.
+///
 /// Returns a row-major buffer owned by the caller.
 pub fn generateRotation(allocator: Allocator, dim: usize, seed: u64) ![]f32 {
     if (dim == 0) return error.InvalidDimension;

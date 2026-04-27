@@ -32,6 +32,13 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// SIMD lane width — 8 × f32 = 256 bits (AVX2 baseline).
+/// On AVX-512 hardware, LLVM may further auto-widen.
+const LANES: usize = 8;
+const F32xN = @Vector(LANES, f32);
+const U32xN = @Vector(LANES, u32);
+const ZERO: F32xN = @splat(0.0);
+
 // ╔═══════════════════════════════════════════════════╗
 // ║  Types                                             ║
 // ╚═══════════════════════════════════════════════════╝
@@ -172,18 +179,27 @@ pub fn generateRotation(allocator: Allocator, dim: usize, seed: u64) ![]f32 {
 }
 
 /// Compute `out = rotation @ v`. All three slices have length `dim`;
-/// `rotation` is row-major d×d (length `dim * dim`). Scalar reference —
-/// vectorize once the correctness tests pin the shape.
+/// `rotation` is row-major d×d (length `dim * dim`). 8-wide SIMD over
+/// the inner dot product; LLVM auto-widens to AVX-512 when available.
 pub fn applyRotation(rotation: []const f32, v: []align(1) const f32, out: []f32) void {
     const dim = v.len;
     std.debug.assert(out.len == dim);
     std.debug.assert(rotation.len == dim * dim);
 
+    const vec_dim = dim - (dim % LANES);
+
     var i: usize = 0;
     while (i < dim) : (i += 1) {
-        const row = rotation[i * dim ..][0..dim];
-        var s: f32 = 0.0;
-        for (0..dim) |k| s += row[k] * v[k];
+        const row = rotation[i * dim ..];
+        var acc: F32xN = ZERO;
+        var k: usize = 0;
+        while (k < vec_dim) : (k += LANES) {
+            const r_chunk: F32xN = row[k..][0..LANES].*;
+            const v_chunk: F32xN = v[k..][0..LANES].*;
+            acc = @mulAdd(F32xN, r_chunk, v_chunk, acc);
+        }
+        var s = @reduce(.Add, acc);
+        while (k < dim) : (k += 1) s += row[k] * v[k];
         out[i] = s;
     }
 }
@@ -214,12 +230,31 @@ pub fn encode(
     std.debug.assert(rotated_scratch.len == dim);
     std.debug.assert(code_out.len == codeBytes(dim));
 
-    // residual = v − c
-    for (0..dim) |i| residual_scratch[i] = v[i] - params.centroid[i];
+    const vec_dim = dim - (dim % LANES);
 
-    // l2 = ||residual||
-    var sum_sq: f32 = 0.0;
-    for (residual_scratch) |x| sum_sq += x * x;
+    // residual = v − c (8-wide)
+    {
+        var i: usize = 0;
+        while (i < vec_dim) : (i += LANES) {
+            const v_chunk: F32xN = v[i..][0..LANES].*;
+            const c_chunk: F32xN = params.centroid[i..][0..LANES].*;
+            residual_scratch[i..][0..LANES].* = v_chunk - c_chunk;
+        }
+        while (i < dim) : (i += 1) residual_scratch[i] = v[i] - params.centroid[i];
+    }
+
+    // l2² = Σ residual[i]² (8-wide)
+    const sum_sq: f32 = blk: {
+        var acc: F32xN = ZERO;
+        var i: usize = 0;
+        while (i < vec_dim) : (i += LANES) {
+            const r: F32xN = residual_scratch[i..][0..LANES].*;
+            acc = @mulAdd(F32xN, r, r, acc);
+        }
+        var s = @reduce(.Add, acc);
+        while (i < dim) : (i += 1) s += residual_scratch[i] * residual_scratch[i];
+        break :blk s;
+    };
     const l2 = @sqrt(sum_sq);
 
     // Degenerate: v sits at the centroid. No direction to quantize; the
@@ -229,25 +264,62 @@ pub fn encode(
     @memset(code_out, 0);
     if (l2 < 1e-20) return .{ .code = code_out, .l2_norm = 0.0, .corr = 1.0 };
 
-    // Normalize residual in place: residual_scratch = residual / l2
-    const inv_l2 = 1.0 / l2;
-    for (residual_scratch) |*x| x.* *= inv_l2;
+    // Normalize residual in place: residual_scratch *= 1/l2 (8-wide)
+    {
+        const inv_l2 = 1.0 / l2;
+        const inv_v: F32xN = @splat(inv_l2);
+        var i: usize = 0;
+        while (i < vec_dim) : (i += LANES) {
+            const r: F32xN = residual_scratch[i..][0..LANES].*;
+            residual_scratch[i..][0..LANES].* = r * inv_v;
+        }
+        while (i < dim) : (i += 1) residual_scratch[i] *= inv_l2;
+    }
 
     // rotated = R @ residual_unit
     const resid_unit_bytes: []align(1) const f32 = @ptrCast(residual_scratch);
     applyRotation(params.rotation, resid_unit_bytes, rotated_scratch);
 
-    // Quantize + accumulate Σ |rotated[i]|
-    var abs_sum: f32 = 0.0;
-    for (0..dim) |i| {
-        const r = rotated_scratch[i];
-        abs_sum += @abs(r);
-        if (r >= 0.0) {
-            const byte_idx = i / 8;
-            const bit_mask: u8 = @as(u8, 1) << @intCast(7 - (i % 8));
-            code_out[byte_idx] |= bit_mask;
+    // Quantize (1-bit code) + accumulate Σ |rotated[i]|.
+    // Per byte (8 dims): pack signs branchlessly via the f32 sign bit,
+    // and accumulate |r| via @abs across the lane.
+    const SHIFTS: U32xN = .{ 7, 6, 5, 4, 3, 2, 1, 0 };
+    const SIGN_BIT: U32xN = @splat(0x80000000);
+    const ONE_U32: U32xN = @splat(1);
+    var abs_acc: F32xN = ZERO;
+    {
+        var i: usize = 0;
+        while (i < vec_dim) : (i += LANES) {
+            const r_chunk: F32xN = rotated_scratch[i..][0..LANES].*;
+            abs_acc += @abs(r_chunk);
+
+            // bit = 1 iff r_chunk[k] >= 0. The f32 sign bit is set iff
+            // negative, so invert it and isolate the LSB.
+            const r_bits: U32xN = @bitCast(r_chunk);
+            const non_neg: U32xN = (~r_bits >> @splat(@as(u5, 31))) & ONE_U32;
+            const positioned: U32xN = non_neg << @intCast(SHIFTS);
+            // (Note: if the sign bit was set and value was -0, we'd
+            // record bit=0 — semantically v[k] is treated as < 0, which
+            // is fine as a tiebreak.)
+            _ = SIGN_BIT;
+            const byte: u8 = @intCast(@reduce(.Or, positioned));
+            code_out[i / 8] = byte;
+        }
+        // Tail: scalar fallback when dim is not a multiple of 8.
+        while (i < dim) : (i += 1) {
+            const r = rotated_scratch[i];
+            // abs accumulation via scalar path (not lane-merged with abs_acc).
+            const abs_r = @abs(r);
+            // Fold into a single lane of abs_acc to avoid a separate scalar tally.
+            var single: [LANES]f32 = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
+            single[0] = abs_r;
+            abs_acc += @as(F32xN, single);
+            if (r >= 0.0) {
+                code_out[i / 8] |= @as(u8, 1) << @intCast(7 - (i % 8));
+            }
         }
     }
+    const abs_sum = @reduce(.Add, abs_acc);
 
     const inv_sqrt_d: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
     const corr = abs_sum * inv_sqrt_d;
@@ -277,18 +349,48 @@ pub fn prepareQuery(
     std.debug.assert(residual_scratch.len == dim);
     std.debug.assert(q_rot_unit_out.len == dim);
 
-    for (0..dim) |i| residual_scratch[i] = q[i] - params.centroid[i];
-    var sum_sq: f32 = 0.0;
-    for (residual_scratch) |x| sum_sq += x * x;
-    const l2 = @sqrt(sum_sq);
+    const vec_dim = dim - (dim % LANES);
+
+    // residual = q - centroid (8-wide)
+    {
+        var i: usize = 0;
+        while (i < vec_dim) : (i += LANES) {
+            const q_chunk: F32xN = q[i..][0..LANES].*;
+            const c_chunk: F32xN = params.centroid[i..][0..LANES].*;
+            residual_scratch[i..][0..LANES].* = q_chunk - c_chunk;
+        }
+        while (i < dim) : (i += 1) residual_scratch[i] = q[i] - params.centroid[i];
+    }
+
+    // l2² (8-wide)
+    const l2 = blk: {
+        var acc: F32xN = ZERO;
+        var i: usize = 0;
+        while (i < vec_dim) : (i += LANES) {
+            const r: F32xN = residual_scratch[i..][0..LANES].*;
+            acc = @mulAdd(F32xN, r, r, acc);
+        }
+        var s = @reduce(.Add, acc);
+        while (i < dim) : (i += 1) s += residual_scratch[i] * residual_scratch[i];
+        break :blk @sqrt(s);
+    };
 
     if (l2 < 1e-20) {
         @memset(q_rot_unit_out, 0);
         return 0.0;
     }
 
-    const inv_l2 = 1.0 / l2;
-    for (residual_scratch) |*x| x.* *= inv_l2;
+    // Normalize residual_scratch *= 1/l2 (8-wide)
+    {
+        const inv_l2 = 1.0 / l2;
+        const inv_v: F32xN = @splat(inv_l2);
+        var i: usize = 0;
+        while (i < vec_dim) : (i += LANES) {
+            const r: F32xN = residual_scratch[i..][0..LANES].*;
+            residual_scratch[i..][0..LANES].* = r * inv_v;
+        }
+        while (i < dim) : (i += 1) residual_scratch[i] *= inv_l2;
+    }
 
     const resid_unit: []align(1) const f32 = @ptrCast(residual_scratch);
     applyRotation(params.rotation, resid_unit, q_rot_unit_out);
@@ -296,9 +398,14 @@ pub fn prepareQuery(
 }
 
 /// Estimate squared L2 distance from a prepared query to an encoded
-/// database point. `dim` is redundant with `code.len * 8` when dim is a
-/// multiple of 8 but the explicit arg handles non-multiple cases
-/// without trailing-bit edge cases.
+/// database point. This is the per-candidate hot path called once per
+/// stored vector during a stage-1 BQ scan — vectorized aggressively.
+///
+/// Strategy: for each byte of the code (8 dimensions), build a sign
+/// vector `s ∈ {-1, +1}^8` from the bits and accumulate
+/// `acc += s * q_rot_unit[i..i+8]` via FMA. The sign vector is built
+/// branchlessly by mapping `bit_set` to a u32 mask and XOR-flipping
+/// the sign bit of the corresponding q lane.
 pub fn estimateL2Sq(
     q_rot_unit: []const f32,
     q_l2: f32,
@@ -307,14 +414,50 @@ pub fn estimateL2Sq(
     v_corr: f32,
 ) f32 {
     const dim = q_rot_unit.len;
+    const vec_dim = dim - (dim % LANES);
 
-    // ip_raw = Σᵢ (2·code_i − 1) · q_rot_unit[i]
-    //        = Σ_{bit set} q_rot_unit[i] − Σ_{bit unset} q_rot_unit[i]
-    var ip_raw: f32 = 0.0;
-    for (0..dim) |i| {
+    var acc: F32xN = ZERO;
+
+    // Per-byte unpack: bits 7..0 (MSB-first) map to lanes 0..7.
+    // We compute, for each lane k, mask_lane[k] = 0xFFFFFFFF if bit clear,
+    // 0 if bit set. XOR mask_lane with 0x80000000 selects the sign:
+    //   bit set   → mask=0       → XOR with 0x80000000 ⇒ FLIPPED later? No.
+    // Cleaner: precompute per-lane shift to extract bit, then map to
+    // (1 - 2·bit) ∈ {-1, +1} as f32. Inline-for-8 produces a fully
+    // unrolled, branchless sign builder.
+    const SIGN_BIT: U32xN = @splat(0x80000000);
+
+    var i: usize = 0;
+    while (i < vec_dim) : (i += LANES) {
+        const byte: u32 = code[i / 8];
+        // Per lane k: extract bit (7 - k). Build per-lane mask in
+        // {0, 1} where 1 = "bit set" = "DB component non-negative" =
+        // "no sign flip on q".
+        var bit_mask: U32xN = undefined;
+        inline for (0..LANES) |k| {
+            const bit_set: u32 = (byte >> @as(u5, @intCast(7 - k))) & 1;
+            bit_mask[k] = bit_set;
+        }
+        // flip[k] = 0x80000000 if bit clear (DB negative → flip q's sign),
+        //          0          if bit set   (DB non-negative → keep q sign).
+        // Equivalently: flip = (1 ^ bit_mask) << 31.
+        const ones: U32xN = @splat(1);
+        const inv_bit: U32xN = bit_mask ^ ones;
+        const flip: U32xN = inv_bit << @splat(@as(u5, 31));
+        _ = SIGN_BIT;
+
+        const q_chunk: F32xN = q_rot_unit[i..][0..LANES].*;
+        const q_bits: U32xN = @bitCast(q_chunk);
+        const flipped_q: F32xN = @bitCast(q_bits ^ flip);
+        acc += flipped_q;
+    }
+    var ip_raw = @reduce(.Add, acc);
+
+    // Tail (only if dim % 8 != 0).
+    while (i < dim) : (i += 1) {
         const byte_idx = i / 8;
-        const bit_mask: u8 = @as(u8, 1) << @intCast(7 - (i % 8));
-        if ((code[byte_idx] & bit_mask) != 0) {
+        const bit_set = (code[byte_idx] >> @as(u3, @intCast(7 - (i % 8)))) & 1;
+        if (bit_set != 0) {
             ip_raw += q_rot_unit[i];
         } else {
             ip_raw -= q_rot_unit[i];

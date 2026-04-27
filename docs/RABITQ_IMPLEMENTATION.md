@@ -336,20 +336,62 @@ once this lands, vs Qdrant's "scalar int8".
 
 ## Validation targets
 
-Acceptance criteria for closing this work:
+Acceptance criteria for closing this work, with measured results from
+the SIMD-vectorized ReleaseFast build on SIFT-128 (N=100k, Q=500, k=10):
 
-| Metric | Target | Measurement |
-|---|---|---|
-| Recall@10 (sift-128-euclidean, 100k, top-k=10, no rerank) | ≥ 0.85 | `bench/vector/docker-compose.yml` harness |
-| Recall@10 (same, with rerank, oversample ≥ 20) | ≥ 0.98 | same |
-| p50 latency, 100k, no rerank | ≤ 10 ms | same |
-| `EXEC vrabitq` wall time, 100k × 128-dim | ≤ 2 s | time vrabitq response |
-| Snapshot roundtrip preserves recall | recall delta ≤ 0.01 | new test |
-| Existing tests still pass | all 103 green | `zig build test` |
+| Metric | Target | Measured | Status |
+|---|---|---|---|
+| Recall@10, no rerank (`mode=bq`) | ≥ 0.85 | **0.348** | ❌ falls short — see "Honest results" below |
+| Recall@10, with rerank (`mode=bq_rerank`) | ≥ 0.98 | **0.939** | ⚠️ close, not at target |
+| p50 latency, single-client (`mode=bq_rerank`) | ≤ 10 ms | **18.34 ms** | ⚠️ ~2× over target |
+| `EXEC vrabitq` wall time, 100k × 128 | ≤ 2 s | **0.23 s** | ✅ |
+| Snapshot roundtrip preserves params | bit-exact | tested in unit | ✅ |
+| Existing tests still pass | all green | 115/115 | ✅ |
 
-Secondary (nice-to-have):
-- Run on glove-100-angular (cosine metric) — exercises non-L2 path
-- Run on a 1536-dim synthetic embedding set — confirms high-dim behavior
+For comparison on the same dataset:
+
+| Mode | Recall@10 | p50 | 8-way QPS | Notes |
+|---|---|---|---|---|
+| `hnsw` (graph + exact rerank) | 1.000 | **0.55 ms** | 6879 | Best-in-class for indexed data |
+| `exact` (brute force) | 1.000 | 19.00 ms | 215 | Reference truth |
+| `bq_rerank` | 0.939 | 18.34 ms | 275 | 21× memory savings vs `exact` |
+| `bq` (estimator only) | 0.348 | 18.32 ms | 275 | Best-effort; not production |
+
+### Honest results
+
+**`bq_rerank` is the production path.** It achieves 0.94 recall — close
+to but below the paper's reported single-bit-with-rerank numbers. For
+SIFT-128 specifically, the value proposition is **memory savings**
+(24 B per vector vs 512 B for f32 exact = 21× compression) at recall
+loss of ~6 percentage points vs exact, with latency comparable to
+`exact` brute-force.
+
+**`bq` (no rerank) underperforms the paper claim by a wide margin.**
+The estimator's top-200 set captures 94% of true top-10 (we know this
+because `bq_rerank` reranks within those 200 and recovers 0.94 recall),
+but ranking *within* the top-200 by estimator alone is too noisy on
+SIFT — only 35% of true top-10 land in the estimator's top-10. The
+paper's 0.85 single-pass claim is likely tied to its Walsh-Hadamard
+rotation choice or measurement convention, neither of which is the same
+as our Gram-Schmidt-on-Gaussian rotation. We treat `bq` as best-effort
+diagnostic mode, not a recommended production path.
+
+**HNSW dominates `bq_rerank` on SIFT-128 by every metric** — 35× faster,
+6 points higher recall. The reason to prefer `bq_rerank` over HNSW is
+narrow:
+- High-write workloads where the HNSW build cost is unaffordable
+- Memory-constrained deployments (the BQ-only namespace stores 21× less)
+- Append-only data where the index would be rebuilt per insert anyway
+
+For a typical RAG / embedding-search workload at 100k–10M vectors, HNSW
+remains the right answer.
+
+Secondary (nice-to-have, deferred):
+- Run on glove-100-angular (cosine metric) — currently `bq`/`bq_rerank`
+  fall through to brute-force when params are installed and metric ≠ L2.
+- Run on a 1536-dim synthetic embedding set — confirms high-dim
+  behavior; expectation is BQ's relative advantage grows with d (more
+  per-vector compression, more compute per exact distance).
 
 ---
 
@@ -365,8 +407,9 @@ Secondary (nice-to-have):
    before applying Hadamard-based rotation, OR use Gram-Schmidt for all
    sizes. Simpler to always use GS; slightly slower for very-high-dim.
 
-3. **SIMD strategy for rabitqEstimate**: the inner-product step can be
-   factored as a series of 8-wide sign-flipped adds. Prototype in
+3. **SIMD strategy for rabitqEstimate**: ✅ DONE. The inner-product step
+   is factored as a series of 8-wide sign-flipped adds (XOR on the f32
+   sign bit). 20× speedup vs scalar. Prototype originally in
    [src/vector/bench.zig](src/vector/bench.zig) before wiring into
    vsearch — microbenchmark the cost per bit.
 

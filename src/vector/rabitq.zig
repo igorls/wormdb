@@ -91,10 +91,17 @@ pub fn codeBytes(dim: usize) usize {
 
 /// Serialize an encoded vector into `out`. Caller supplies a buffer of
 /// exactly `encodedSize(dim)` bytes.
+///
+/// Common pattern: callers pass `code_out = full_buf[0..codeBytes(dim)]`
+/// to `encode`, then call `serialize(enc, full_buf)`. In that case the
+/// code is already at the right offset — we only need to write the
+/// scalar trailer. Detect that aliasing and skip the redundant memcpy.
 pub fn serialize(enc: Encoded, out: []u8) void {
     const cb = enc.code.len;
     std.debug.assert(out.len == cb + 8);
-    @memcpy(out[0..cb], enc.code);
+    if (enc.code.ptr != out.ptr) {
+        @memcpy(out[0..cb], enc.code);
+    }
     // Store scalars as little-endian f32 bit-patterns so the format
     // is portable across architectures.
     std.mem.writeInt(u32, out[cb..][0..4], @bitCast(enc.l2_norm), .little);

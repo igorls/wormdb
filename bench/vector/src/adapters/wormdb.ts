@@ -36,18 +36,20 @@ function metricStr(m: DistanceMetric): "l2" | "cosine" | "dot" {
  * WormDB's `EXEC vsearch`. Each branch is named after what the server
  * actually does, not any marketing label.
  *
- *   exact     → brute-force full-precision scan (server mode=exact)
- *   hnsw      → HNSW graph + full-precision rerank (server mode=auto)
- *   bq        → forced 1-bit BQ prefilter + full-precision rerank (mode=bq)
- *   quantized → reject; Qdrant-only label
+ *   exact      → brute-force full-precision scan (server mode=exact)
+ *   hnsw       → HNSW graph + full-precision rerank (server mode=auto)
+ *   bq         → quantized prefilter, NO rerank (server mode=bq)
+ *   bq_rerank  → quantized prefilter + full-precision rerank (server mode=bq_rerank)
+ *   quantized  → reject; Qdrant-only label
  */
-function modeArg(mode: AdapterMode): "exact" | "auto" | "bq" {
+function modeArg(mode: AdapterMode): "exact" | "auto" | "bq" | "bq_rerank" {
   switch (mode) {
     case "exact": return "exact";
     case "hnsw": return "auto";
     case "bq": return "bq";
+    case "bq_rerank": return "bq_rerank";
     case "quantized":
-      throw new Error("wormdb adapter: 'quantized' is a Qdrant-only label; use 'hnsw' or 'bq'");
+      throw new Error("wormdb adapter: 'quantized' is a Qdrant-only label; use 'hnsw', 'bq', or 'bq_rerank'");
   }
 }
 
@@ -129,17 +131,18 @@ export class WormdbAdapter implements Adapter {
       }
     }
 
-    // For bq mode, compute the centroid and re-quantize all BQ hashes so
-    // the prefilter is actually useful. Without this, SIFT-like unsigned
-    // data collapses every hash to the same value → recall ≈ 0.
-    if (this.cfg.mode === "bq") {
+    // For bq / bq_rerank modes, install RaBitQ params (centroid +
+    // rotation) and re-encode all BQ hashes so the prefilter is
+    // actually useful. Without this, SIFT-like unsigned data collapses
+    // every hash to the same value → recall ≈ 0.
+    if (this.cfg.mode === "bq" || this.cfg.mode === "bq_rerank") {
       const rabitqStart = Bun.nanoseconds();
       const resp = await this.client.send(`EXEC vrabitq ${NAMESPACE}`);
       if (resp.type !== "bulk") {
         throw new Error(`vrabitq failed: ${JSON.stringify(resp)}`);
       }
       const rabitqMs = (Bun.nanoseconds() - rabitqStart) / 1e6;
-      console.log(`  vrabitq (centroid + re-quantize): ${rabitqMs.toFixed(0)}ms  ${resp.value}`);
+      console.log(`  vrabitq (centroid + rotation + re-encode): ${rabitqMs.toFixed(0)}ms  ${resp.value}`);
     }
 
     return { insertMs: (Bun.nanoseconds() - start) / 1e6 };

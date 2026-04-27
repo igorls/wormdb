@@ -11,20 +11,24 @@ export type BuildProgress = {
  * what the vendor's marketing label claims.
  *
  * WormDB:
- *   exact    — EXEC vsearch mode=exact; brute-force full-precision scan.
- *   hnsw     — EXEC vsearch mode=auto; HNSW graph + full-precision rerank.
- *              NO quantization in this path.
- *   bq       — EXEC vsearch mode=bq; forced 1-bit binary quantization
- *              Hamming prefilter + full-precision rerank on candidates.
- *              This is WormDB's genuinely quantized path.
+ *   exact      — EXEC vsearch mode=exact; brute-force full-precision scan.
+ *   hnsw       — EXEC vsearch mode=auto; HNSW graph + full-precision rerank.
+ *                NO quantization in this path.
+ *   bq         — EXEC vsearch mode=bq. With RaBitQ params installed, scores
+ *                via the unbiased estimator and returns top-K directly (NO
+ *                rerank). Without params, falls back to Hamming prefilter +
+ *                full-precision rerank.
+ *   bq_rerank  — EXEC vsearch mode=bq_rerank; quantized prefilter (RaBitQ
+ *                or Hamming) + full-precision rerank on candidates. Higher
+ *                recall than bq, more work per query.
  *
  * Qdrant:
- *   exact    — collection without quantization config; full-precision HNSW.
- *   hnsw     — same as exact for Qdrant (alias for clarity).
+ *   exact     — collection without quantization config; full-precision HNSW.
+ *   hnsw      — same as exact for Qdrant (alias for clarity).
  *   quantized — collection with scalar(int8) quantization enabled.
- *              Genuine quantization (4× compression).
+ *                Genuine quantization (4× compression).
  */
-export type AdapterMode = "exact" | "hnsw" | "bq" | "quantized";
+export type AdapterMode = "exact" | "hnsw" | "bq" | "bq_rerank" | "quantized";
 
 export type AdapterConfig = {
   mode: AdapterMode;

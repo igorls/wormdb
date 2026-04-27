@@ -262,7 +262,10 @@ function noteFor(adapter: Args["adapter"], mode: AdapterMode, asyncInsert: boole
         notes.push("hnsw mode: HNSW graph search + full-precision rerank on top-M candidates. NO quantization.");
         break;
       case "bq":
-        notes.push("bq mode: 1-bit binary-quantized Hamming prefilter on ALL vectors + full-precision rerank on top-M. Skips the HNSW graph even when present — this is the only genuinely quantized WormDB path.");
+        notes.push("bq mode: RaBitQ unbiased estimator scores all bq:* entries; returns top-K directly (NO rerank). Falls back to Hamming prefilter + rerank when RaBitQ params aren't installed.");
+        break;
+      case "bq_rerank":
+        notes.push("bq_rerank mode: quantized prefilter (RaBitQ estimator if params installed, else Hamming) + full-precision rerank on top-M. Higher recall than bq, more work per query.");
         break;
       case "quantized":
         notes.push("quantized mode is Qdrant-only; runtime will have rejected this.");
@@ -279,7 +282,8 @@ function noteFor(adapter: Args["adapter"], mode: AdapterMode, asyncInsert: boole
         notes.push("scalar(int8) quantization configured; Qdrant does two-pass search with internal rerank.");
         break;
       case "bq":
-        notes.push("bq mode is WormDB-only; runtime will have rejected this.");
+      case "bq_rerank":
+        notes.push("bq / bq_rerank modes are WormDB-only; runtime will have rejected this.");
         break;
     }
   }

@@ -1,0 +1,9 @@
+[submodule "deps/libwtf"]
+	path = deps/libwtf
+	url = https://github.com/andrewmd5/libwtf.git
+[submodule "deps/msquic"]
+	path = deps/msquic
+	url = https://github.com/microsoft/msquic.git
+[submodule "deps/meshguard"]
+	path = deps/meshguard
+	url = https://github.com/igorls/meshguard

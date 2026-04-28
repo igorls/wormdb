@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
 
     // MeshGuard library module (embedded mesh networking)
     const meshguard_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = "../meshguard/src/lib.zig" },
+        .root_source_file = .{ .cwd_relative = "deps/meshguard/src/lib.zig" },
         .target = target,
         .optimize = optimize,
         .link_libc = true,

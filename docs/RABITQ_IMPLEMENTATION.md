@@ -386,9 +386,14 @@ narrow:
 For a typical RAG / embedding-search workload at 100k–10M vectors, HNSW
 remains the right answer.
 
-Secondary (nice-to-have, deferred):
-- Run on glove-100-angular (cosine metric) — currently `bq`/`bq_rerank`
-  fall through to brute-force when params are installed and metric ≠ L2.
+Secondary (nice-to-have, partly delivered):
+- ✅ Cosine metric: vrabitq + applyVinsert + vsearch now pre-normalize
+  cosine namespaces to the unit sphere, so `cos = 1 − L²/2` recovers
+  cosine ranking from the L2² estimator. Bench validation on a cosine
+  dataset still pending.
+- Dot product: deferred. Would need per-vector inner-product factors
+  stored at encode time so the centroid-residual decomposition adds
+  back the missing magnitude term.
 - Run on a 1536-dim synthetic embedding set — confirms high-dim
   behavior; expectation is BQ's relative advantage grows with d (more
   per-vector compression, more compute per exact distance).

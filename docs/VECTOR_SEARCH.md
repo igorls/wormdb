@@ -1,26 +1,33 @@
-# WormDB Vector Search — Roadmap & Architecture
+# WormDB Vector Search — Current Architecture & Roadmap
 
 > Distributed WORM-native vector search in a single static binary.
 
 ---
 
-## What We Have (Phase 1 — Complete)
+## What We Have
 
-Phase 1 delivers working brute-force vector search with SIMD-accelerated distance computation,
-temporal decay scoring, binary quantization, and four procedures — all with zero changes to
-the wire protocol, store engine, or snapshot format.
+WormDB now has a full local vector stack: SIMD distance kernels, WORM-default vector inserts, binary quantization, RaBitQ, per-namespace HNSW indexes, snapshot v2 graph persistence, native vector wire commands, and procedure wrappers for operational workflows. Raw vectors remain durable KV entries; indexes and quantized companions are derived serving structures.
 
 ### Files
 
 ```
 src/vector/
 ├── mod.zig              # Module re-exports
-└── distance.zig         # SIMD distance functions (315 lines, 13 tests)
+├── distance.zig         # SIMD distance functions + BQ helpers
+├── hnsw.zig             # HNSW graph construction/search + serialization
+├── index.zig            # Namespace registry, tombstones, snapshot blocks
+├── metric.zig           # cosine/dot/l2 metric dispatch
+├── rabitq.zig           # RaBitQ encode/estimate/serialization helpers
+└── topk.zig             # Bounded top-K heap
 
 src/procedures/
 ├── vinsert.zig          # Insert vector (WORM by default) + BQ hash
-├── vsearch.zig          # Brute-force ANN + temporal decay scoring
+├── vsearch.zig          # HNSW -> BQ/RaBitQ -> brute-force dispatch
 ├── vsim.zig             # Pairwise similarity between two vectors
+├── vreindex.zig         # Rebuild namespace HNSW from KV entries
+├── vrabitq.zig          # Install RaBitQ params and re-encode bq entries
+├── vdelete.zig          # Delete/tombstone non-WORM vectors
+├── vnsdrop.zig          # Drop namespace index, optionally purge data
 └── vstats.zig           # Vector namespace statistics
 ```
 
@@ -38,6 +45,11 @@ src/procedures/
 | Namespace isolation | ✅ | Key prefix convention (`vec:<ns>:<id>`) |
 | Vector statistics | ✅ | Count, dimensions, insert count per namespace |
 | Byte ↔ f32 conversion | ✅ | Zero-copy interpretation of stored bytes |
+| HNSW graph index | ✅ | Per-namespace in-memory graph with tombstones |
+| Snapshot v2 graph persistence | ✅ | HNSW graph, tombstones, timestamps, and RaBitQ params |
+| Native vector wire commands | ✅ | `VINSERT`, `VDELETE`, `VBULKINSERT` |
+| Vector replication apply path | ✅ | Native vector frames update store + BQ + HNSW on peers |
+| RaBitQ 1-bit estimator | ✅ | `EXEC vrabitq`; `mode=bq` and `mode=bq_rerank` |
 
 ### Usage
 
@@ -56,21 +68,18 @@ EXEC vsim vec:doc-001 vec:doc-002 cosine
 EXEC vstats vec:articles:
 ```
 
-### Limitations
+### Current limitations
 
-- **O(N) scan** — searches all vectors in namespace on every query
-- **No index structure** — every query recomputes distances from scratch
-- **Single-node only** — no distributed scatter-gather yet
-- **No filtered search** — can't combine metadata predicates with ANN
-- **Practical ceiling** — good up to ~50K-100K vectors per namespace
+- **Search is node-local** — vector writes replicate, but `vsearch` does not scatter to peers and merge top-K results yet.
+- **Snapshot-bound graph recovery** — snapshot v2 restores HNSW/RaBitQ state, but WAL-only vector writes after the latest snapshot require `vreindex` after recovery if they must be present in HNSW immediately.
+- **Filtered ANN is not first-class** — metadata-aware search still needs the planned filter expression path.
+- **Deletes use tombstones** — `VDELETE`/`vdelete` tombstone graph nodes for non-WORM vectors; compaction is via rebuild/drop flows.
 
 ---
 
-## Phase 2 — HNSW Index + RaBitQ (Next)
+## Phase 2 — HNSW Index + RaBitQ (Implemented)
 
-**Goal**: Sub-millisecond approximate search on millions of vectors.
-
-**Estimated effort**: 4-6 weeks
+**Goal**: Sub-millisecond approximate search on large namespaces with a durable rebuild/restore path.
 
 ### 2.1 HNSW Graph Index
 
@@ -82,8 +91,8 @@ Every major vector database (Pinecone, Qdrant, Weaviate, Milvus) uses it.
 ```
 src/vector/
 ├── hnsw.zig             # HNSW graph construction + search
-├── hnsw_node.zig        # Node structure (neighbors, level)
-├── hnsw_params.zig      # Configuration (M, ef_construction, ef_search)
+├── index.zig            # Namespace registry, locks, tombstones, snapshot IO
+├── topk.zig             # Top-K heap
 └── distance.zig         # (existing) — SIMD distance kernels
 ```
 
@@ -101,15 +110,15 @@ src/vector/
 
 #### Implementation Checklist
 
-- [ ] **Node structure** — ID, level, neighbor lists (fixed `[M]` arrays per level)
-- [ ] **Graph construction** — Greedy insertion with heuristic neighbor selection
-- [ ] **Multi-layer search** — Top-down traversal from entry point
-- [ ] **ef_search parameter** — Controls search beam width (recall vs. speed)
-- [ ] **Deletion support** — Lazy tombstones (mark deleted, skip during search, compact later)
-- [ ] **Thread-safe reads** — Multiple search threads, single writer thread
-- [ ] **Serialization** — Save/load graph to snapshot format for persistence across restarts
-- [ ] **Integration with `vinsert`** — Auto-add to HNSW index on vector insertion
-- [ ] **Integration with `vsearch`** — Use HNSW when index exists, fallback to brute-force
+- [x] **Node structure** — IDs, levels, neighbor lists, and side tables
+- [x] **Graph construction** — Greedy insertion with heuristic neighbor selection
+- [x] **Multi-layer search** — Top-down traversal from entry point
+- [x] **ef_search parameter** — Controls search beam width (recall vs. speed)
+- [x] **Deletion support** — Lazy tombstones, skipped during traversal/search
+- [x] **Thread-safe reads** — Per-namespace lock allows concurrent search and serialized mutation
+- [x] **Serialization** — Save/load graph through snapshot format v2
+- [x] **Integration with `vinsert`** — Auto-add to HNSW index on vector insertion
+- [x] **Integration with `vsearch`** — HNSW fast path with BQ/RaBitQ/brute-force fallback
 
 #### Performance Targets
 
@@ -131,7 +140,7 @@ and distance computation via bitwise operations.
 ```
 src/vector/
 ├── rabitq.zig           # RaBitQ encoding/decoding
-├── rabitq_index.zig     # Quantized index for fast pre-filtering
+├── index.zig            # Per-namespace RaBitQ params persistence
 └── distance.zig         # (existing) + RaBitQ distance estimator
 ```
 
@@ -153,13 +162,13 @@ Compression: float32 (32 bits/dim) → 1 bit/dim = 32× reduction
 
 #### Implementation Checklist
 
-- [ ] **Centroid computation** — Running mean, updated incrementally on inserts
-- [ ] **Random orthogonal matrix** — Generate once per index, persist in snapshot
-- [ ] **1-bit quantization** — Sign pattern extraction after rotation
-- [ ] **Distance estimator** — Asymmetric: query in float, database in bits
-- [ ] **Correction factors** — Per-vector norm and bias terms for accuracy
-- [ ] **SIMD Hamming for quantized search** — `POPCNT(XOR)` path (already have `hamming()`)
-- [ ] **Two-pass search** — BQ pre-filter → re-rank with full vectors top candidates
+- [x] **Centroid computation** — `vrabitq` scans the namespace and freezes params
+- [x] **Random orthogonal matrix** — Generated once per namespace and persisted in snapshot v2
+- [x] **1-bit quantization** — Sign pattern extraction after rotation
+- [x] **Distance estimator** — Asymmetric query-float/database-bit estimate for L2 namespaces
+- [x] **Correction factors** — Per-vector norm and correction terms stored in `bq:*`
+- [x] **SIMD Hamming foundation** — `POPCNT(XOR)` path remains available for naive BQ
+- [x] **Two search modes** — `mode=bq` for estimator-only, `mode=bq_rerank` for exact rerank
 - [ ] **Extended RaBitQ (2-4 bit)** — Higher accuracy option for smaller datasets
 
 #### Memory Impact
@@ -194,36 +203,17 @@ Filter analysis ──┤
 - [ ] **Auto-selection** — Estimate selectivity, pick cheapest strategy
 - [ ] **`vsearch` integration** — Add optional `filter` argument
 
-### 2.4 Native Wire Command
+### 2.4 Native Vector Wire Commands
 
-Move vector search from EXEC overhead to a dedicated WormWire command for hot-path optimization.
+Native write-path vector commands are implemented and reserve the `0x0D`-`0x0F` command range:
 
-#### Protocol Extension
+| ID | Command | Purpose |
+|---|---|---|
+| `0x0D` | `VINSERT` | Store vector bytes, encode BQ/RaBitQ companion, update HNSW, publish event, replicate |
+| `0x0E` | `VDELETE` | Delete/tombstone a non-WORM vector and replicate the tombstone path |
+| `0x0F` | `VBULKINSERT` | Batch vector inserts to amortize frame parsing and namespace locks |
 
-```
-Command ID:  0x0D  VSEARCH
-Payload:     [4B query_vec_len] [query_vec_bytes]
-             [1B metric]       (0=cosine, 1=dot, 2=l2)
-             [4B top_k]
-             [4B namespace_len] [namespace]
-             [4B filter_len]   [filter_expr]    (0 = no filter)
-             [1B flags]        (bit 0: temporal_decay)
-
-Response:    VALUE — binary packed results
-             [4B result_count]
-             For each result:
-               [4B key_len] [key]
-               [4B score (f32 IEEE 754)]
-               [8B timestamp (u64 BE)]
-```
-
-#### Implementation Checklist
-
-- [ ] **New `CommandId.vsearch = 0x0D`** in `types.zig`
-- [ ] **Wire parser** in `wire.zig` — read/write VSEARCH frames
-- [ ] **Executor integration** — Direct dispatch in `server/executor.zig`
-- [ ] **Bun client support** — `client.ts` VSEARCH command
-- [ ] **Binary response format** — Avoid JSON serialization overhead
+Direct native `VSEARCH` remains a future hot-path optimization. Until that lands, search stays behind `EXEC vsearch`, which is still useful because the procedure can return JSON-like diagnostics and preserve compatibility with existing clients.
 
 ---
 
@@ -286,7 +276,7 @@ modified or deleted. This means:
 - [ ] **Result merging** — Merge top-K from all nodes, re-rank
 - [ ] **Parallel scatter** — Fan-out to all peers simultaneously
 - [ ] **Timeout handling** — Return partial results if a node is slow
-- [ ] **Vector replication** — Replicate `vinsert` events to peers
+- [x] **Vector replication** — Replicate native `VINSERT`/`VDELETE`/`VBULKINSERT` frames to peers
 - [ ] **Cluster-aware `vstats`** — Aggregate stats across all nodes
 - [ ] **Benchmark: latency vs. node count** — Quantify scatter-gather overhead
 

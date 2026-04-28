@@ -1,6 +1,6 @@
 # Clustering
 
-WormDB's cluster mode is optional. When enabled, nodes discover each other via SWIM gossip over UDP and replicate writes over persistent WormWire TCP connections. There is no external coordinator — no ZooKeeper, no etcd, no leader election.
+WormDB's cluster mode is optional. When enabled, nodes use embedded meshguard for identity, SWIM gossip over UDP, WireGuard tunnel setup, and WormWire TCP replication. There is no external coordinator — no ZooKeeper, no etcd, no leader election.
 
 ## Forming a Cluster
 
@@ -92,6 +92,10 @@ This is an **eventually consistent** model. If a node crashes after local commit
 | `--cluster <name>`   | Enable cluster mode with this cluster name  | Disabled |
 | `--seed <host:port>` | Gossip endpoint of an existing node to join | None     |
 | `--replicas <n>`     | Replication factor hint (`0` = all peers)   | `0`      |
+| `--gossip-port <n>`  | UDP port for SWIM gossip                    | `51821`  |
+| `--wg-port <n>`      | WireGuard listen port used by meshguard     | `51830`  |
+
+Org-trust certificate issuance and enforcement is available in meshguard. WormDB currently runs the embedded cluster path in open mode; exposing meshguard org-trust configuration through WormDB CLI/config is tracked as follow-up work.
 
 ## Node Identity
 

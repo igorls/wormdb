@@ -6,14 +6,17 @@ A fast, distributed key-value store built in Zig. Encrypted replication, zero-co
 - **WormWire protocol** — Binary framing over TCP, zero-copy capable
 - **Pub/Sub streaming** — Real-time event channels with subscription management
 - **Encrypted clustering** — P2P replication via meshguard (SWIM gossip + ChaCha20-Poly1305)
-- **Org trust** — Mint certificates, add nodes with one command, revoke instantly
+- **Org trust foundation** — meshguard certificate model, with WormDB-side enforcement wiring in progress
 - **Vector search** — SIMD-accelerated (AVX2/NEON) with BQ prefilter and HNSW graph index; per-namespace cosine/dot/L2
 - **Stored procedures** — Server-side transactional ops via `EXEC`, compiled into the binary
 
 ## Quick Start
 
 ```bash
-# Build (requires Zig 0.15+, libsodium)
+# Fetch in-tree dependencies
+git submodule update --init --recursive
+
+# Build (requires Zig 0.16+, libsodium)
 zig build -Doptimize=ReleaseSmall
 
 # Run tests
@@ -63,7 +66,12 @@ Response:    [ 1B Response Code ] [ 4B Payload Length (BE) ] [ payload... ]
 | `0x07` | UNSUB          | `[4B channel_len] [channel]`                                                |
 | `0x08` | PUB            | `[4B channel_len] [channel] [4B msg_len] [message]`                         |
 | `0x09` | EXEC           | `[4B proc_len] [proc_name] [4B arg_count] [ [4B arg_len] [arg] ... ]`       |
+| `0x0A` | CLUSTER PEERS  | _(empty)_                                                                   |
 | `0x0B` | SAVE           | _(empty — manual snapshot flush)_                                           |
+| `0x0C` | AUTH           | `[4B token_len] [token]`                                                     |
+| `0x0D` | VINSERT        | `[key] [vector] [1B flags] [namespace] [metric] [8B timestamp]`              |
+| `0x0E` | VDELETE        | `[key] [namespace]`                                                          |
+| `0x0F` | VBULKINSERT    | `[namespace] [metric] [1B flags] [4B count] [ [key] [vector] [8B ts] ... ]` |
 
 ### Response Codes
 
@@ -75,7 +83,7 @@ Response:    [ 1B Response Code ] [ 4B Payload Length (BE) ] [ payload... ]
 | `0x03` | ERR     | UTF-8 error string                      |
 | `0x04` | EVENT   | Unsolicited pub/sub push                |
 
-All multi-byte integers use **big endian** (network byte order). Maximum payload: **16 MiB**.
+In the native vector commands, `key`, `vector`, `namespace`, and `metric` are normal WormWire length-prefixed byte fields: `[4B len] [bytes]`. The vector flags byte uses bit `0x01` for WORM and bit `0x02` to request async HNSW construction. All multi-byte integers use **big endian** (network byte order). Maximum payload: **16 MiB**.
 
 ## Clustering
 
@@ -98,29 +106,22 @@ wormdb --port 6390 --data ./data2 --cluster myapp --seed 10.0.0.1:51821
 wormdb --port 6391 --data ./data3 --cluster myapp --seed 10.0.0.1:51821
 ```
 
-### Org Trust (Zero-Config Scaling)
+### Org Trust (MeshGuard)
 
-For production clusters, use org certificates for secure, effortless node management:
+WormDB embeds meshguard for identity, SWIM gossip, and WireGuard tunnel setup. The current WormDB CLI runs the embedded cluster path in open mode; org-trust certificate issuance and enforcement lives in meshguard and is the next WormDB-side configuration surface to wire through.
+
+MeshGuard's standalone CLI flow is:
 
 ```bash
 # One-time: create org keypair
-wormdb keygen-org
+meshguard org-keygen
 # → cluster-org.key (secret)  +  cluster-org.pub (share with seeds)
 
-# Start seed with org trust enforcement
-wormdb --port 6389 --data ./data1 --cluster myapp \
-    --gossip-port 51821 --org-trust cluster-org.pub
-
 # Mint certificate for a new node
-wormdb cert-sign --org-key cluster-org.key \
-    --node-pub ./data2/identity.pub --name node-2
+meshguard org-sign ./data2/identity.pub --name node-2
 
-# Start new node — auto-joins, auto-replicates
-wormdb --port 6390 --data ./data2 --cluster myapp \
-    --seed 10.0.0.1:51821 --cert node-2.cert
-
-# Revoke a node (instant cluster-wide eviction)
-wormdb cert-revoke --org-key cluster-org.key --node-pub <pubkey>
+# Trust the org on a meshguard node
+meshguard trust cluster-org.pub --org
 ```
 
 ### Docker Compose
@@ -188,7 +189,7 @@ bq:vec:<namespace>:<id>      → 1-bit-per-dim BQ hash
 __meta:<namespace>:count     → per-node insert counter (local, not replicated)
 ```
 
-The HNSW index lives in-memory only; `vreindex` rebuilds it from the `vec:*` entries (which are replicated and persisted).
+The HNSW graph is a serving index derived from the durable `vec:*` entries. Snapshot format v2 persists the graph, tombstones, and RaBitQ parameters when a snapshot is written; `vreindex` still rebuilds the graph from KV entries after raw `SET` ingest, WAL-only catch-up since the last snapshot, or manual recovery.
 
 ### Per-namespace metric
 
@@ -230,11 +231,9 @@ HNSW recall@10 = 1.000 on a rigorous brute-force ground-truth check (400 random 
 
 ### Current limitations
 
-- **Replication is data-only**: raw KV SETs replicate via WormWire; the HNSW graph on peers doesn't update automatically. Run `EXEC vreindex` on peers after ingest bursts or on startup. Peers fall back to BQ prefilter in the meantime.
-- **In-memory HNSW**: indexes are lost on restart. Durability lives in the store; the graph is a cached derivation, rebuilt explicitly via `EXEC vreindex <namespace>`. Until rebuilt, `vsearch` falls through to the BQ prefilter automatically — correct but slower.
-- **Insert-only HNSW**: `DELETE` on a vec key removes the store entry; the HNSW keeps the node until the next `vreindex`. Orphaned IDs are filtered at refine time (getCopy returns null). WORM-default inserts (the typical case) never delete.
-
-Dedicated `VINSERT`/`VDELETE` wire commands and graph serialization (snapshot format v2) are the tracked production-grade follow-ups.
+- **Cluster-wide search is not scatter-gather yet**: vector writes replicate through native WormWire vector frames, but `vsearch` answers from the local node. A distributed coordinator that fans out to peers and merges top-K results is still planned.
+- **Index restore is snapshot-bound**: snapshot v2 restores HNSW/RaBitQ state, but WAL replay after the most recent snapshot does not replay vector-index mutations. Run `EXEC vreindex <namespace>` after large raw ingests or recovery from an old snapshot.
+- **Deletes are tombstone-based**: `VDELETE`/`EXEC vdelete` tombstone non-WORM vectors in HNSW and remove store entries. WORM-default vectors remain immutable; use `EXEC vnsdrop <namespace> 1` only for best-effort namespace purges where skipped WORM entries are acceptable.
 
 ## Architecture
 
@@ -319,21 +318,26 @@ Default client port is `6389` (avoids Redis `6379` collision). Override with `--
 - [x] Bun reference client + admin UI
 - [x] QUIC/WebTransport gateway
 - [x] Docker containerization
-- [x] meshguard cluster integration (SWIM + encrypted replication + org trust)
+- [x] meshguard cluster integration (SWIM + encrypted replication)
 - [x] Stored procedures (`EXEC`) with replication + event-bus from the procedure context
 - [x] Vector search — SIMD distances, BQ prefilter, HNSW graph index, per-namespace metric
 - [x] `vreindex` bulk rebuild for HNSW
+- [x] Native vector wire commands (`VINSERT`, `VDELETE`, `VBULKINSERT`) with replication-aware apply paths
+- [x] Snapshot format v2 for HNSW graphs, tombstones, and RaBitQ parameters
+- [x] RaBitQ 1-bit quantization (`EXEC vrabitq`) with `bq` and `bq_rerank` query modes
+- [x] Namespace drop and tombstone lifecycle (`vdelete`, `vnsdrop`)
 
 ### 🚧 In Progress
 
-- [ ] Dedicated `VINSERT`/`VDELETE` wire commands (replication-aware vector ops; currently peers must `vreindex` to sync HNSW state)
-- [ ] HNSW graph serialization (snapshot format v2) — current indexes are in-memory only
+- [ ] Formal review/acceptance for WP-009 meshguard cluster integration
+- [ ] Protocol-level integration tests for pipelined commands with interleaved `EVENT` frames
+- [ ] Live server integration tests for native vector wire commands and cluster anti-echo
+- [ ] WormDB-side org-trust configuration for meshguard certificates
 
 ### 📋 Planned
 
-- [ ] Namespace drop (`vnsdrop`) + tombstone-based delete for non-WORM vectors
 - [ ] Merkle-tree consistency checks across peers
-- [ ] Pipeline + EVENT interleave integration tests
+- [ ] Cluster-wide vector scatter-gather search
 - [ ] Web dashboard
 - [ ] Backup/restore
 
@@ -353,8 +357,8 @@ zig test src/vector/index.zig
 # Vector search microbench (ReleaseFast)
 zig run src/vector/bench.zig -O ReleaseFast -lc
 
-# Local cluster test
-./test-local.sh
+# Local cluster smoke testing is being refreshed for WormWire-only clients.
+# Until then, start nodes manually and verify with the Bun client commands above.
 
 # Docker cluster test
 docker compose up -d
@@ -363,9 +367,9 @@ docker compose -f docker-compose.bench.yml run --rm benchmark
 
 ## Dependencies
 
-- **Zig 0.15+** — Language and build system
+- **Zig 0.16+** — Language and build system
 - **libsodium** — Crypto primitives (ChaCha20-Poly1305, Ed25519)
-- **meshguard** — P2P mesh networking (SWIM gossip, encrypted messaging)
+- **meshguard** — P2P mesh networking (SWIM gossip, encrypted messaging), vendored as `deps/meshguard`
 
 ## Troubleshooting
 
@@ -374,7 +378,7 @@ docker compose -f docker-compose.bench.yml run --rm benchmark
 | Port already in use           | `wormdb --port <other-port>`                                     |
 | Permission denied on data dir | Check `--data` directory permissions                             |
 | Bun client connection refused | Verify `--host`/`--port` and that WormDB is running              |
-| Node won't join cluster       | Verify seed address, gossip port reachability, and cert validity |
+| Node won't join cluster       | Verify seed address, gossip port reachability, and WireGuard permissions |
 
 ## License
 

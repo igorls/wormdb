@@ -17,6 +17,10 @@ Every WormDB command has a 1-byte integer ID and a defined payload layout. All v
 | `0x09` | `EXEC`           | Execute a stored procedure              |
 | `0x0A` | `CLUSTER PEERS`  | Detailed peer information               |
 | `0x0B` | `SAVE`           | Trigger manual snapshot                 |
+| `0x0C` | `AUTH`           | Authenticate with a binary SCT token    |
+| `0x0D` | `VINSERT`        | Native vector insert                    |
+| `0x0E` | `VDELETE`        | Native vector delete/tombstone          |
+| `0x0F` | `VBULKINSERT`    | Native bulk vector insert               |
 
 ## Payload Layouts
 
@@ -66,6 +70,47 @@ where each arg = [4B arg_len][arg bytes]
 - `ok` (0x00) — success with no data (e.g., transfer)
 - `value` (0x01) — success with data (e.g., increment returns the new value)
 - `err` (0x03) — procedure-specific error (e.g., `"insufficient_funds"`, `"unknown procedure"`)
+
+### AUTH
+
+```text
+[4B token_len][token bytes]
+```
+
+`AUTH` carries a binary signed client token. It is intercepted by transports that support authentication; if it reaches the generic executor, the server returns `err` (0x03) because auth must be handled at the connection or gateway layer.
+
+### VINSERT
+
+```text
+[key][vector][1B flags][namespace][metric][8B timestamp]
+```
+
+`key`, `vector`, `namespace`, and `metric` are length-prefixed fields. `vector` is raw little-endian `f32` bytes. `metric` is the UTF-8 string `cosine`, `dot`, or `l2`.
+
+**Flags byte**:
+
+- Bit 0 (`0x01`): WORM flag — if set, the vector key is immutable
+- Bit 1 (`0x02`): async HNSW build request for the namespace
+- Bits 2–7: reserved, must be `0`
+
+The timestamp is an unsigned 64-bit big-endian integer carried by the originator so replicated HNSW side tables keep stable ordering across peers.
+
+### VDELETE
+
+```text
+[key][namespace]
+```
+
+Both fields are length-prefixed. The command deletes the stored vector key and tombstones its HNSW node when the namespace has an index. WORM-protected vectors return `err` (0x03).
+
+### VBULKINSERT
+
+```text
+[namespace][metric][1B flags][4B count]
+for each item: [key][vector][8B timestamp]
+```
+
+`namespace`, `metric`, `key`, and `vector` are length-prefixed fields. The flags byte uses the same bits as `VINSERT`, but applies to every item in the batch. The bulk command amortizes frame parsing and namespace locking across many vector inserts.
 
 ### No-Payload Commands — `STATUS`, `CLUSTER STATUS`, `CLUSTER PEERS`, `SAVE`
 

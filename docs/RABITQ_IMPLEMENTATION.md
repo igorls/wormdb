@@ -1,13 +1,11 @@
-# RaBitQ Implementation Plan
+# RaBitQ Implementation Notes
 
-> **Goal**: bring WormDB's binary-quantization (BQ) path from phase-1
-> (centroid subtraction only, recall ~0.60 on SIFT-128) up to
-> paper-complete RaBitQ (recall 0.85+ at 1-bit, single-pass search
-> without a full-precision rerank).
+> **Status**: implemented for L2 namespaces. `EXEC vrabitq <namespace>`
+> computes RaBitQ params, re-encodes existing `bq:*` entries, and snapshot
+> format v2 persists the params alongside HNSW graph state.
 >
-> **Status going in**: phase-1 shipped in session ending 2026-04-24.
-> Search the repo for `binaryQuantizeCentered` and `EXEC vrabitq` to see
-> what exists today.
+> **Modes**: `mode=bq` uses the estimator directly; `mode=bq_rerank`
+> uses RaBitQ to choose candidates and then performs exact stage-2 rerank.
 >
 > **Reference paper**: Gao & Long, *"RaBitQ: Quantizing High-Dimensional
 > Vectors with a Theoretical Error Bound for Approximate Nearest Neighbor
@@ -21,18 +19,19 @@
 
 ---
 
-## What exists today (phase-1 baseline)
+## What exists today
 
 ### Code paths
 
 | File | What it does now |
 |---|---|
-| [src/vector/distance.zig](src/vector/distance.zig) | `binaryQuantize` (naive sign), `binaryQuantizeCentered` (sign after centroid subtraction), `hammingDistance` |
-| [src/vector/index.zig](src/vector/index.zig) | `NamespaceIndex.centroid: ?[]f32` + `setCentroid` |
-| [src/procedures/vrabitq.zig](src/procedures/vrabitq.zig) | `EXEC vrabitq <ns>` — scans all vectors, computes centroid (running sum / count), re-quantizes every `bq:*` entry, installs the centroid on the namespace |
-| [src/procedures/vsearch.zig](src/procedures/vsearch.zig) | BQ prefilter path uses centered quantization for the query when `ns_idx.centroid` is set |
-| [src/procedures/vector_ops.zig](src/procedures/vector_ops.zig) | `applyVinsert` uses centered quantization for new inserts when the namespace has a frozen centroid |
-| [bench/vector/src/adapters/wormdb.ts](bench/vector/src/adapters/wormdb.ts) | Harness calls `EXEC vrabitq` after build when `mode === "bq"` |
+| [src/vector/rabitq.zig](src/vector/rabitq.zig) | RaBitQ params, rotation generation, encode/parse, and distance estimator |
+| [src/vector/distance.zig](src/vector/distance.zig) | Naive BQ and Hamming primitives used by the fallback path |
+| [src/vector/index.zig](src/vector/index.zig) | Stores per-namespace `RabitqParams` and persists them in snapshot v2 |
+| [src/procedures/vrabitq.zig](src/procedures/vrabitq.zig) | `EXEC vrabitq <ns>` scans vectors, computes params, re-encodes `bq:*`, and installs params atomically |
+| [src/procedures/vsearch.zig](src/procedures/vsearch.zig) | Uses RaBitQ estimates for `mode=bq`; uses exact rerank for `mode=bq_rerank` |
+| [src/procedures/vector_ops.zig](src/procedures/vector_ops.zig) | New inserts use installed RaBitQ params when encoding BQ companions |
+| [bench/vector/src/adapters/wormdb.ts](bench/vector/src/adapters/wormdb.ts) | Harness can benchmark exact, BQ, and `bq_rerank` modes |
 
 ### What the measurements say
 
@@ -42,23 +41,23 @@ Benchmarks on sift-128-euclidean, N=100k, Q=500, top-k=10:
   (expected — SIFT values are all ≥ 0 so every hash is identical)
 - **Centered BQ** (phase 1, this session): recall = **0.600**
   (matches paper expectations for 1-bit without rotation)
-- **Paper target with full RaBitQ at 1-bit**: recall ≈ **0.85–0.90**
+- **Paper target with full RaBitQ at 1-bit**: recall ~= **0.85-0.90**
   on SIFT-128 with random rotation + unbiased distance estimator
 
-The 0.60 → 0.85+ jump is what this plan delivers.
+The implemented RaBitQ path is designed to close that centered-BQ gap while keeping `bq_rerank` available when exact refinement is worth the extra pass.
 
-### What's intentionally limited in phase 1
+### What was intentionally limited in phase 1
 
 - No random rotation — bits are correlated across dimensions for
   structured data (SIFT features, image descriptors). Rotation
   decorrelates them.
-- No correction factors — we use BQ hashes purely as a Hamming prefilter,
-  then do an exact rerank on the top-M candidates via
+- No correction factors — phase 1 used BQ hashes purely as a Hamming prefilter,
+  then did an exact rerank on the top-M candidates via
   `ctx.getCopy + computeExactSim`. The paper's contribution is that
   correction factors make the distance estimate unbiased so the rerank
   is unnecessary for most queries.
-- Centroid not persisted in snapshots. Restart + `vreindex` won't
-  re-install a centroid; user must re-run `EXEC vrabitq`.
+- Centroid/rotation persistence was missing in phase 1. Snapshot v2 now
+  persists full `RabitqParams` with the namespace index.
 
 ---
 
@@ -112,7 +111,7 @@ which is ~20× faster than computing the exact distance.
 
 ---
 
-## Implementation plan — step by step
+## Implementation notes — step by step
 
 ### Step 1: storage format decisions
 
@@ -321,11 +320,12 @@ format changes.
 
 ### Step 9: documentation
 
-Update [docs/VECTOR_SEARCH.md](docs/VECTOR_SEARCH.md) phase-2 checklist:
+Current [docs/VECTOR_SEARCH.md](docs/VECTOR_SEARCH.md) phase-2 status:
 - [x] binary quantization (phase 1, centered)
 - [x] per-namespace centroid + `vrabitq` procedure
-- [ ] random orthogonal rotation → new task from this plan
-- [ ] bias-correction factors → new task from this plan
+- [x] random orthogonal rotation
+- [x] bias-correction factors
+- [x] snapshot v2 persistence for RaBitQ params
 - [ ] extended RaBitQ (multi-bit codes) → deferred to phase 3
 
 Also update [docs/IN_DB_PROCEDURES_ADVANTAGE.md](docs/IN_DB_PROCEDURES_ADVANTAGE.md)

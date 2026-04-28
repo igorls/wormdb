@@ -201,9 +201,10 @@ in the contract itself.
 
 ## Limitations + follow-ups
 
-- **HNSW is in-memory only.** Durability lives in the KV store. After
-  restart, queries fall through to brute-force until `vreindex` rebuilds
-  the graph. Tracked by the existing HNSW serialization follow-up.
+- **HNSW is a derived serving index.** Snapshot v2 persists the graph,
+  tombstones, and RaBitQ params, but WAL-only changes after the most
+  recent snapshot still need `vreindex` if you want the graph fully
+  caught up after recovery.
 - **No partial-failure rollback** in `mem_add`. Vector-first ordering
   means the common failure case (dim mismatch) fails cleanly before any
   write, but vector-lands-then-doc-fails leaves an orphan. `mem_drop`

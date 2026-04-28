@@ -18,6 +18,8 @@ Command-line options for the `wormdb` binary.
 | `--cluster <name>`     | string  | disabled     | Enable cluster mode with the given cluster name        |
 | `--seed <host:port>`   | address | none         | Gossip endpoint of an existing node to join            |
 | `--replicas <n>`       | integer | `0`          | Replication factor hint (`0` = replicate to all peers) |
+| `--gossip-port <n>`    | integer | `51821`      | UDP port for SWIM gossip                               |
+| `--wg-port <n>`        | integer | `51830`      | WireGuard listen port used by meshguard                |
 | `--io-uring`           | flag    | off          | Legacy shortcut for `--backend uring`                  |
 | `--help`, `-h`         | flag    | —            | Show help text                                         |
 

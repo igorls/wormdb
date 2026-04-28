@@ -52,8 +52,23 @@ fn encodeBqOwned(
                 const rotated = try allocator.alloc(f32, vec_f32.len);
                 defer allocator.free(rotated);
 
+                // Cosine namespaces pre-normalize so the bit pattern
+                // matches the unit-sphere representation that vrabitq
+                // captured for the centroid + the query path uses.
+                const encode_input: []align(1) const f32 = if (idx.metric == .cosine) blk: {
+                    const norm_buf = allocator.alloc(f32, vec_f32.len) catch break :blk vec_f32;
+                    if (!rabitq.normalizeInto(vec_f32, norm_buf)) {
+                        allocator.free(norm_buf);
+                        // Zero vector — fall back to encoding raw (will
+                        // produce the all-zero degenerate code).
+                        break :blk vec_f32;
+                    }
+                    break :blk @ptrCast(norm_buf);
+                } else vec_f32;
+                defer if (encode_input.ptr != vec_f32.ptr) allocator.free(@constCast(encode_input));
+
                 const code_slice = out[0..rabitq.codeBytes(vec_f32.len)];
-                const enc = rabitq.encode(vec_f32, p, residual, rotated, code_slice);
+                const enc = rabitq.encode(encode_input, p, residual, rotated, code_slice);
                 rabitq.serialize(enc, out);
                 return out;
             }

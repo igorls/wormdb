@@ -198,6 +198,12 @@ const RabitqScanCtx = struct {
     allocator: std.mem.Allocator,
     oom: bool,
     saw_any: usize,
+    /// True iff the namespace was vrabitq'd in cosine mode (vectors
+    /// pre-normalized to the unit sphere). Converts the estimator's
+    /// L2² output to cosine via `cos = 1 - L²/2` instead of the
+    /// generic `1/(1+d²)` mapping. Cosine score is in [-1, 1] so we
+    /// shift to [0, 1] to keep the TopK heap semantics consistent.
+    cosine_score: bool,
 };
 
 fn onRabitqMatch(
@@ -220,11 +226,16 @@ fn onRabitqMatch(
     const enc = rabitq.parse(bq_value, sc.dim) orelse return .cont;
 
     const d2_est = rabitq.estimateL2Sq(sc.q_rot_unit, sc.q_l2, enc.code, enc.l2_norm, enc.corr);
-    // Convert squared distance to [0, 1] similarity so the heap
-    // semantics (higher=better) match the Hamming path. Clamp negative
-    // estimator noise at d²=0 → sim=1.
     const d2_clamped: f32 = if (d2_est < 0.0) 0.0 else d2_est;
-    const raw_sim: f32 = 1.0 / (1.0 + d2_clamped);
+
+    const raw_sim: f32 = if (sc.cosine_score) blk: {
+        // On the unit sphere: L²(q, v) = 2(1 - q·v), so q·v = 1 - L²/2.
+        // Map cosine ∈ [-1, 1] to score ∈ [0, 1] via (cos + 1) / 2.
+        const cos_est = 1.0 - d2_clamped * 0.5;
+        const cos_clamped: f32 = if (cos_est > 1.0) 1.0 else if (cos_est < -1.0) -1.0 else cos_est;
+        break :blk (cos_clamped + 1.0) * 0.5;
+    } else 1.0 / (1.0 + d2_clamped);
+
     const score = applyDecay(raw_sim, timestamp, sc.decay, sc.now_ms);
 
     if (score <= sc.heap.thresholdScore()) return .cont;
@@ -512,14 +523,16 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
             break :blk false;
         };
 
-        // Case 1: params installed but metric ≠ L2 → drop BQ entirely.
-        if (has_params and metric != .l2) {
-            // Release the shared lock before falling through. The
-            // brute-force scan below doesn't need it.
+        // Case 1: params installed but metric is unsupported by the
+        // estimator → drop BQ entirely. Today only L2 and cosine are
+        // wired; dot product is deferred (would need per-vector inner
+        // product factors stored at encode time).
+        const rabitq_metric_ok = (metric == .l2) or (metric == .cosine);
+        if (has_params and !rabitq_metric_ok) {
             ns_idx_opt.?.lock.unlockShared();
             // Fall through (no `return`) so the brute-force block runs.
         } else if (has_params) {
-            // Case 2: RaBitQ estimator path (L2).
+            // Case 2: RaBitQ estimator path (L2 or cosine).
             defer ns_idx_opt.?.lock.unlockShared();
             const p = ns_idx_opt.?.rabitq_params.?;
             if (p.dim != query_vec.len) {
@@ -536,7 +549,21 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
                 const dim = query_vec.len;
                 const q_residual = try ctx.allocator.alloc(f32, dim);
                 const q_rot_unit = try ctx.allocator.alloc(f32, dim);
-                const q_l2 = rabitq.prepareQuery(query_vec, p, q_residual, q_rot_unit);
+
+                // Cosine namespaces pre-normalized at encode time, so
+                // the query also normalizes before residual/rotation
+                // computation. The estimator's L2² output then maps to
+                // cosine via `cos = 1 - L²/2` on the unit sphere.
+                const prepare_input: []align(1) const f32 = if (metric == .cosine) blk: {
+                    const norm_buf = try ctx.allocator.alloc(f32, dim);
+                    if (!rabitq.normalizeInto(query_vec, norm_buf)) {
+                        // Zero query — degenerate; treat as if all
+                        // candidates are equidistant.
+                    }
+                    break :blk @ptrCast(norm_buf);
+                } else query_vec;
+
+                const q_l2 = rabitq.prepareQuery(prepare_input, p, q_residual, q_rot_unit);
 
                 var rq_sc = RabitqScanCtx{
                     .q_rot_unit = q_rot_unit,
@@ -550,6 +577,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
                     .allocator = ctx.allocator,
                     .oom = false,
                     .saw_any = 0,
+                    .cosine_score = (metric == .cosine),
                 };
                 ctx.scanCallback(bq_prefix, @ptrCast(&rq_sc), onRabitqMatch);
 
@@ -574,9 +602,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
                     }
                     return emitJson(ctx, final_heap.sortedDesc());
                 }
-                // Fall through (empty namespace → brute-force, which
-                // will produce no results but maintains consistent
-                // behavior with the no-params path).
+                // Fall through (empty namespace → brute-force).
             }
         }
 

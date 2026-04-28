@@ -92,6 +92,27 @@ pub fn encodedSize(dim: usize) usize {
     return ((dim + 7) / 8) + 8;
 }
 
+/// L2-normalize `in` into `out`. Both slices have the same length.
+/// Returns true if normalization succeeded; false if `in` was the zero
+/// vector (in which case `out` is left as a copy of `in`).
+///
+/// Used by the cosine path: we pre-normalize at both encode and query
+/// time so the estimator's L2² output maps to cosine via
+/// `cos = 1 − L²/2` on the unit sphere. Idempotent on already-unit
+/// inputs (round-trip error < 1e-7).
+pub fn normalizeInto(in: []align(1) const f32, out: []f32) bool {
+    std.debug.assert(in.len == out.len);
+    var sum_sq: f32 = 0.0;
+    for (in) |x| sum_sq += x * x;
+    if (sum_sq <= 1e-30) {
+        @memcpy(out, in);
+        return false;
+    }
+    const inv = 1.0 / @sqrt(sum_sq);
+    for (in, 0..) |x, i| out[i] = x * inv;
+    return true;
+}
+
 pub fn codeBytes(dim: usize) usize {
     return (dim + 7) / 8;
 }
@@ -739,6 +760,84 @@ test "rabitq: serialize / parse roundtrip" {
 test "rabitq: parse returns null for wrong size" {
     const buf = [_]u8{ 1, 2, 3, 4, 5, 6 };
     try testing.expect(parse(&buf, 32) == null); // would need 12 bytes
+}
+
+test "rabitq: normalizeInto produces unit norm" {
+    var in = [_]f32{ 3.0, 4.0, 0.0, 0.0 };
+    var out: [4]f32 = undefined;
+    const in_align: []align(1) const f32 = @ptrCast(&in);
+    try testing.expect(normalizeInto(in_align, &out));
+    var sq: f32 = 0;
+    for (out) |x| sq += x * x;
+    try testing.expectApproxEqAbs(@as(f32, 1.0), @sqrt(sq), 1e-6);
+}
+
+test "rabitq: normalizeInto returns false on zero vector" {
+    var in = [_]f32{ 0.0, 0.0, 0.0, 0.0 };
+    var out: [4]f32 = undefined;
+    const in_align: []align(1) const f32 = @ptrCast(&in);
+    try testing.expect(!normalizeInto(in_align, &out));
+}
+
+test "rabitq: cosine path — d² estimator on unit sphere converts to cosine" {
+    // Build a small unit-vector corpus and check that the L2² estimator's
+    // mapping `cos = 1 - d²/2` gives sane cosine values.
+    const alloc = testing.allocator;
+    const dim: usize = 32;
+
+    var prng = std.Random.DefaultPrng.init(0xC05);
+    const rand = prng.random();
+
+    var v: [32]f32 = undefined;
+    for (&v) |*x| x.* = rand.floatNorm(f32);
+    var v_unit: [32]f32 = undefined;
+    const v_align: []align(1) const f32 = @ptrCast(&v);
+    try testing.expect(normalizeInto(v_align, &v_unit));
+
+    // Centroid = zero (typical for cosine on Gaussian-distributed
+    // unit vectors — mean is near origin).
+    var params = RabitqParams{
+        .allocator = alloc,
+        .centroid = try alloc.alloc(f32, dim),
+        .rotation = try generateRotation(alloc, dim, 0xC05),
+        .dim = @intCast(dim),
+        .seed = 0xC05,
+    };
+    defer params.deinit();
+    @memset(params.centroid, 0);
+
+    // Encode v_unit.
+    var residual: [32]f32 = undefined;
+    var rotated: [32]f32 = undefined;
+    var code: [4]u8 = undefined;
+    const v_unit_align: []align(1) const f32 = @ptrCast(&v_unit);
+    const enc = encode(v_unit_align, &params, &residual, &rotated, &code);
+
+    // Query equal to v: estimator should return ~0 d² → cos ≈ 1.
+    var q_residual: [32]f32 = undefined;
+    var q_rot: [32]f32 = undefined;
+    const q_l2 = prepareQuery(v_unit_align, &params, &q_residual, &q_rot);
+    const d2 = estimateL2Sq(&q_rot, q_l2, &code, enc.l2_norm, enc.corr);
+    const cos_est = 1.0 - d2 * 0.5;
+    try testing.expect(cos_est > 0.5); // identical input → strong agreement
+
+    // Query orthogonal to v: cosine should be near 0 (within estimator noise).
+    var q_orth: [32]f32 = .{0} ** 32;
+    q_orth[0] = -v_unit[1];
+    q_orth[1] = v_unit[0];
+    // Normalize q_orth (won't be quite unit since we're in 32-D and
+    // only first two components are set against v's spread).
+    var q_orth_unit: [32]f32 = undefined;
+    const q_orth_align: []align(1) const f32 = @ptrCast(&q_orth);
+    _ = normalizeInto(q_orth_align, &q_orth_unit);
+    const q_orth_unit_align: []align(1) const f32 = @ptrCast(&q_orth_unit);
+    var q_residual2: [32]f32 = undefined;
+    var q_rot2: [32]f32 = undefined;
+    const q_l2_2 = prepareQuery(q_orth_unit_align, &params, &q_residual2, &q_rot2);
+    const d2_orth = estimateL2Sq(&q_rot2, q_l2_2, &code, enc.l2_norm, enc.corr);
+    const cos_orth = 1.0 - d2_orth * 0.5;
+    // Orthogonal-ish — cos should be much lower than self-match.
+    try testing.expect(cos_orth < cos_est);
 }
 
 test "rabitq: kNN recall on synthetic Gaussian corpus" {

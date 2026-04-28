@@ -55,6 +55,13 @@ const SumCtx = struct {
     count: usize,
     expected_dim: usize, // 0 = not yet captured
     mismatches: usize,
+    /// True iff the namespace metric is cosine — sum is taken over
+    /// L2-normalized vectors so the resulting centroid matches how
+    /// `requantizeOne` and the query path pre-normalize their inputs.
+    normalize: bool,
+    /// Reusable scratch for the normalization pass (length = dim).
+    /// Only filled when `normalize` is true.
+    norm_scratch: []f32,
 };
 
 fn accumulateVector(
@@ -78,7 +85,15 @@ fn accumulateVector(
         return .cont;
     }
 
-    for (vec, 0..) |v, i| sc.sum[i] += v;
+    if (sc.normalize) {
+        // Cosine path: project onto the unit sphere before summing.
+        // Vectors with norm ≈ 0 are skipped (they'd contribute noise to
+        // the centroid).
+        if (!rabitq.normalizeInto(vec, sc.norm_scratch[0..vec.len])) return .cont;
+        for (sc.norm_scratch[0..vec.len], 0..) |v, i| sc.sum[i] += v;
+    } else {
+        for (vec, 0..) |v, i| sc.sum[i] += v;
+    }
     sc.count += 1;
     return .cont;
 }
@@ -92,6 +107,13 @@ const RequantCtx = struct {
     rotated: []f32,
     bq_buf: []u8,
     requantized: usize,
+    /// Cosine path: pre-normalize each vector before encoding so the
+    /// stored bit pattern lives in unit-sphere space (matching the
+    /// centroid that was averaged from normalized vectors).
+    normalize: bool,
+    /// Reusable scratch for the normalization pass; only filled when
+    /// `normalize` is true.
+    norm_scratch: []f32,
 };
 
 fn requantizeOne(
@@ -107,8 +129,16 @@ fn requantizeOne(
     const vec = distance.bytesToF32(value) orelse return .cont;
     if (vec.len != rc.params.dim) return .cont;
 
+    const encode_input: []align(1) const f32 = blk: {
+        if (rc.normalize) {
+            if (!rabitq.normalizeInto(vec, rc.norm_scratch[0..vec.len])) return .cont;
+            break :blk @ptrCast(rc.norm_scratch[0..vec.len]);
+        }
+        break :blk vec;
+    };
+
     const code_slice = rc.bq_buf[0..rabitq.codeBytes(vec.len)];
-    const enc = rabitq.encode(vec, rc.params, rc.residual, rc.rotated, code_slice);
+    const enc = rabitq.encode(encode_input, rc.params, rc.residual, rc.rotated, code_slice);
     rabitq.serialize(enc, rc.bq_buf);
 
     const bq_key = std.fmt.allocPrint(rc.ctx.allocator, "bq:{s}", .{key}) catch return .cont;
@@ -147,11 +177,24 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     defer ctx.allocator.free(sum_buf);
     @memset(sum_buf, 0);
 
+    // Resolve the namespace's metric *before* the centroid scan so the
+    // accumulator knows whether to pre-normalize.
+    const registry = ctx.vector_registry orelse
+        return ctx.err("vrabitq: vector registry not available");
+    const ns_idx = registry.get(namespace) orelse
+        return ctx.err("vrabitq: namespace has no index (run VINSERT first)");
+    const normalize_for_metric = (ns_idx.metric == .cosine);
+
+    const norm_scratch = try ctx.allocator.alloc(f32, MAX_DIM);
+    defer ctx.allocator.free(norm_scratch);
+
     var sc = SumCtx{
         .sum = sum_buf,
         .count = 0,
         .expected_dim = 0,
         .mismatches = 0,
+        .normalize = normalize_for_metric,
+        .norm_scratch = norm_scratch,
     };
     ctx.scanCallback(namespace, @ptrCast(&sc), accumulateVector);
 
@@ -163,14 +206,6 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     }
 
     const dim = sc.expected_dim;
-
-    // ── Build RabitqParams on the namespace's allocator ─────────────
-    // The NamespaceIndex owns and frees these buffers when the index is
-    // destroyed, so they must be allocated from the matching allocator.
-    const registry = ctx.vector_registry orelse
-        return ctx.err("vrabitq: vector registry not available");
-    const ns_idx = registry.get(namespace) orelse
-        return ctx.err("vrabitq: namespace has no index (run VINSERT first)");
 
     const centroid = try ns_idx.allocator.alloc(f32, dim);
     errdefer ns_idx.allocator.free(centroid);
@@ -230,6 +265,8 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     defer ctx.allocator.free(rotated);
     const bq_buf = try ctx.allocator.alloc(u8, rabitq.encodedSize(dim));
     defer ctx.allocator.free(bq_buf);
+    const phase2_norm_scratch = try ctx.allocator.alloc(f32, dim);
+    defer ctx.allocator.free(phase2_norm_scratch);
 
     var rc = RequantCtx{
         .ctx = ctx,
@@ -238,6 +275,8 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
         .rotated = rotated,
         .bq_buf = bq_buf,
         .requantized = 0,
+        .normalize = normalize_for_metric,
+        .norm_scratch = phase2_norm_scratch,
     };
     ctx.scanCallback(namespace, @ptrCast(&rc), requantizeOne);
 

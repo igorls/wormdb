@@ -7,6 +7,7 @@ data/
 data-*/
 test_data/
 test_cluster/
+.wormdb-keys.json
 
 # Binary test outputs
 test_hash

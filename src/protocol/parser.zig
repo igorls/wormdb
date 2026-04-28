@@ -138,6 +138,11 @@ pub fn deinitCommand(allocator: std.mem.Allocator, cmd: Command) void {
             }
             allocator.free(params.items);
         },
+        .vrabitq_install => |params| {
+            allocator.free(params.namespace);
+            allocator.free(params.centroid);
+            allocator.free(params.rotation);
+        },
     }
 }
 

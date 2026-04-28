@@ -543,6 +543,32 @@ pub const Cluster = struct {
         }
     }
 
+    /// Replicate a RaBitQ params install (centroid + rotation) to all
+    /// alive peers. Issued by `EXEC vrabitq` *before* its re-encode pass
+    /// streams the per-vector bq:* SETs, so peers have the params in
+    /// hand when the encoded entries arrive on the same connection (TCP
+    /// preserves ordering per peer).
+    ///
+    /// The frame is large (d=128: 64 KiB; d=1536: ~9 MiB) but one-shot
+    /// per namespace per `vrabitq` invocation. The same anti-entropy
+    /// reconnect logic that other replicate paths rely on covers peers
+    /// that drop mid-broadcast — the next vrabitq run will resend.
+    pub fn replicateVrabitqInstall(
+        self: *Cluster,
+        params: Command.VrabitqInstallParams,
+    ) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.ensurePeersConnectedLocked();
+
+        var iter = self.peers.iterator();
+        while (iter.next()) |entry| {
+            var peer = entry.value_ptr;
+            _ = peer.sendCommand(.{ .vrabitq_install = params });
+        }
+    }
+
     /// Replicate a DEL to all alive peers via WormWire.
     pub fn replicateDelete(self: *Cluster, key: []const u8) !void {
         self.mutex.lock();

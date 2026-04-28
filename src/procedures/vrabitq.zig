@@ -202,6 +202,27 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
         ns_idx.setRabitqParams(params_ptr);
     }
 
+    // Broadcast the params to peers BEFORE the re-encode pass starts
+    // streaming bq:* SETs. TCP delivers in order on each peer
+    // connection, so peers will see the install frame first and have
+    // their RabitqParams in place by the time the encoded entries
+    // arrive. Without this step, peers would receive 24-byte bq entries
+    // they can't decode, silently degrading to brute-force on RaBitQ
+    // namespaces.
+    if (ctx.cluster) |c| {
+        const centroid_bytes = std.mem.sliceAsBytes(params_ptr.centroid);
+        const rotation_bytes = std.mem.sliceAsBytes(params_ptr.rotation);
+        c.replicateVrabitqInstall(.{
+            .namespace = namespace,
+            .dim = params_ptr.dim,
+            .seed = params_ptr.seed,
+            .centroid = centroid_bytes,
+            .rotation = rotation_bytes,
+        }) catch |e| {
+            std.log.warn("vrabitq: replicateVrabitqInstall failed: {s}", .{@errorName(e)});
+        };
+    }
+
     // ── Phase 2: re-encode every stored vector ─────────────────────
     const residual = try ctx.allocator.alloc(f32, dim);
     defer ctx.allocator.free(residual);

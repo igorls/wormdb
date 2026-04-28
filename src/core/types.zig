@@ -57,6 +57,7 @@ pub const Command = union(enum) {
     vinsert: VinsertParams, // VINSERT <key> <vec> <flags> <ns> <metric> <timestamp>
     vdelete: VdeleteParams, // VDELETE <key> <namespace>
     vbulkinsert: VbulkinsertParams, // VBULKINSERT <ns> <metric> <flags> <count> [<key> <vec> <ts>]×N
+    vrabitq_install: VrabitqInstallParams, // VRABITQ_INSTALL <ns> <dim> <seed> <centroid> <rotation> (peer replication)
 
     pub const SetParams = struct {
         key: []const u8,
@@ -96,6 +97,24 @@ pub const Command = union(enum) {
         namespace: []const u8,
     };
 
+    /// Parameters for VRABITQ_INSTALL — the cluster-only frame that
+    /// hands the leader's RaBitQ params (centroid + rotation matrix) to
+    /// every peer. Issued by `EXEC vrabitq` after it installs locally
+    /// and before it streams the per-vector re-encode SETs, so peers
+    /// have the params in hand by the time the bq:* writes start
+    /// arriving (assuming in-order delivery on each peer connection).
+    ///
+    /// `centroid` is `dim × 4` bytes (raw f32, host-endian round-trip
+    /// happens at the wire layer); `rotation` is `dim × dim × 4` bytes
+    /// (row-major). For d=128 that's 64 KiB; for d=1536 it's ~9 MiB.
+    pub const VrabitqInstallParams = struct {
+        namespace: []const u8,
+        dim: u32,
+        seed: u64,
+        centroid: []const u8,
+        rotation: []const u8,
+    };
+
     /// Parameters for VBULKINSERT. Shares namespace / metric / flags across
     /// all items to amortize per-frame wire + parse cost. The first item
     /// establishes the namespace's async mode (same rule as single VINSERT).
@@ -131,6 +150,7 @@ pub const CommandId = enum(u8) {
     vinsert = 0x0D,
     vdelete = 0x0E,
     vbulkinsert = 0x0F,
+    vrabitq_install = 0x10,
 };
 
 /// Maximum accepted binary payload length (16 MiB)

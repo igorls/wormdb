@@ -344,6 +344,61 @@ pub fn applyVbulkinsert(
     }
 }
 
+/// Apply a VRABITQ_INSTALL locally: build a `RabitqParams` from the
+/// wire payload (validated to match `dim`) and install it on the
+/// namespace's index. Used both by peer-side replication and by tests
+/// that want to seed a namespace without running the full vrabitq
+/// procedure end-to-end.
+///
+/// On success, the namespace's RaBitQ params slot is populated and any
+/// subsequent `applyVinsert` / `vsearch` will use the unbiased estimator
+/// path. On failure (registry missing, OOM, dim mismatch) the function
+/// returns an error and leaves the index untouched.
+pub fn applyVrabitqInstall(
+    registry: ?*NamespaceRegistry,
+    args: struct {
+        namespace: []const u8,
+        dim: u32,
+        seed: u64,
+        centroid_bytes: []const u8,
+        rotation_bytes: []const u8,
+        metric: Metric,
+    },
+) !void {
+    const reg = registry orelse return error.RegistryUnavailable;
+
+    const dim_usize: usize = @intCast(args.dim);
+    if (args.centroid_bytes.len != dim_usize * 4) return error.InvalidVectorBytes;
+    if (args.rotation_bytes.len != dim_usize * dim_usize * 4) return error.InvalidVectorBytes;
+
+    // We need the index allocator. getOrCreate so the params land on the
+    // correct namespace even if the peer hasn't seen any VINSERTs yet —
+    // the leader's re-encode SETs will arrive next and want this index.
+    const ns_idx = try reg.getOrCreate(args.namespace, args.metric);
+
+    const centroid = try ns_idx.allocator.alloc(f32, dim_usize);
+    errdefer ns_idx.allocator.free(centroid);
+    @memcpy(std.mem.sliceAsBytes(centroid), args.centroid_bytes);
+
+    const rotation = try ns_idx.allocator.alloc(f32, dim_usize * dim_usize);
+    errdefer ns_idx.allocator.free(rotation);
+    @memcpy(std.mem.sliceAsBytes(rotation), args.rotation_bytes);
+
+    const params_ptr = try ns_idx.allocator.create(rabitq.RabitqParams);
+    errdefer ns_idx.allocator.destroy(params_ptr);
+    params_ptr.* = .{
+        .allocator = ns_idx.allocator,
+        .centroid = centroid,
+        .rotation = rotation,
+        .dim = args.dim,
+        .seed = args.seed,
+    };
+
+    ns_idx.lock.lock();
+    defer ns_idx.lock.unlock();
+    ns_idx.setRabitqParams(params_ptr);
+}
+
 /// Apply a VDELETE locally: delete vec + BQ from the store, tombstone
 /// the HNSW node, emit event, optionally replicate. Returns
 /// `error.WormViolation` if the vec entry is WORM (store guard).

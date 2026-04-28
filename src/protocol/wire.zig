@@ -296,6 +296,40 @@ fn parseCommandPayload(cmd_id: CommandId, payload: []const u8, allocator: std.me
                 .items = items,
             } };
         },
+        .vrabitq_install => {
+            // [namespace][4B dim][8B seed][centroid][rotation]
+            const namespace = try readBytesField(payload, &pos, allocator);
+            errdefer allocator.free(namespace);
+
+            if (pos + 4 > payload.len) return error.Corruption;
+            const dim = std.mem.readInt(u32, payload[pos..][0..4], .big);
+            pos += 4;
+            if (pos + 8 > payload.len) return error.Corruption;
+            const seed = std.mem.readInt(u64, payload[pos..][0..8], .big);
+            pos += 8;
+
+            const centroid = try readBytesField(payload, &pos, allocator);
+            errdefer allocator.free(centroid);
+            const rotation = try readBytesField(payload, &pos, allocator);
+            errdefer allocator.free(rotation);
+
+            // Sanity-check sizes against dim — the applier will hard-fail
+            // on mismatch but failing earlier produces a cleaner error.
+            const expected_centroid: usize = @as(usize, dim) * 4;
+            const expected_rotation: usize = @as(usize, dim) * @as(usize, dim) * 4;
+            if (centroid.len != expected_centroid or rotation.len != expected_rotation) {
+                return error.Corruption;
+            }
+
+            if (pos != payload.len) return error.Corruption;
+            return .{ .vrabitq_install = .{
+                .namespace = namespace,
+                .dim = dim,
+                .seed = seed,
+                .centroid = centroid,
+                .rotation = rotation,
+            } };
+        },
     }
 }
 
@@ -437,6 +471,30 @@ pub fn parseCommandPayloadZeroCopy(cmd_id: CommandId, payload: []const u8, alloc
         .vbulkinsert => {
             // Variable-length items array needs allocation — delegate.
             return parseCommandPayload(cmd_id, payload, allocator);
+        },
+        .vrabitq_install => {
+            const namespace = try sliceBytesField(payload, &pos);
+            if (pos + 4 > payload.len) return error.Corruption;
+            const dim = std.mem.readInt(u32, payload[pos..][0..4], .big);
+            pos += 4;
+            if (pos + 8 > payload.len) return error.Corruption;
+            const seed = std.mem.readInt(u64, payload[pos..][0..8], .big);
+            pos += 8;
+            const centroid = try sliceBytesField(payload, &pos);
+            const rotation = try sliceBytesField(payload, &pos);
+            const expected_centroid: usize = @as(usize, dim) * 4;
+            const expected_rotation: usize = @as(usize, dim) * @as(usize, dim) * 4;
+            if (centroid.len != expected_centroid or rotation.len != expected_rotation) {
+                return error.Corruption;
+            }
+            if (pos != payload.len) return error.Corruption;
+            return .{ .vrabitq_install = .{
+                .namespace = @constCast(namespace),
+                .dim = dim,
+                .seed = seed,
+                .centroid = @constCast(centroid),
+                .rotation = @constCast(rotation),
+            } };
         },
     }
 }
@@ -633,6 +691,27 @@ pub fn writeCommand(writer: anytype, cmd: Command) !void {
                 try w.writeAll(&ts_buf);
             }
         },
+        .vrabitq_install => |params| {
+            // [namespace][4B dim][8B seed][centroid bytes][rotation bytes]
+            var payload_len: usize = 0;
+            payload_len += 4 + params.namespace.len;
+            payload_len += 4; // dim
+            payload_len += 8; // seed
+            payload_len += 4 + params.centroid.len;
+            payload_len += 4 + params.rotation.len;
+            if (payload_len > MAX_PAYLOAD_LENGTH) return error.PayloadTooLarge;
+
+            try writeHeader(w, @intFromEnum(CommandId.vrabitq_install), @intCast(payload_len));
+            try writeLenPrefixed(w, params.namespace);
+            var dim_buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, dim_buf[0..4], params.dim, .big);
+            try w.writeAll(&dim_buf);
+            var seed_buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, seed_buf[0..8], params.seed, .big);
+            try w.writeAll(&seed_buf);
+            try writeLenPrefixed(w, params.centroid);
+            try writeLenPrefixed(w, params.rotation);
+        },
     }
 }
 
@@ -780,4 +859,53 @@ test "wire roundtrip VDELETE" {
 
     try testing.expectEqualStrings("vec:articles:doc-1", parsed.vdelete.key);
     try testing.expectEqualStrings("vec:articles:", parsed.vdelete.namespace);
+}
+
+
+test "wire roundtrip VRABITQ_INSTALL" {
+    const testing = std.testing;
+
+    var bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer bytes.deinit(testing.allocator);
+
+    // d=4 to keep the test data small but exercise the centroid +
+    // rotation length-prefix paths.
+    const dim: u32 = 4;
+    const centroid_f32 = [_]f32{ 1.5, -2.25, 3.125, 0.0 };
+    const rotation_f32 = [_]f32{
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    };
+    const centroid_bytes_ptr: [*]const u8 = @ptrCast(&centroid_f32);
+    const rotation_bytes_ptr: [*]const u8 = @ptrCast(&rotation_f32);
+
+    const cmd = Command{ .vrabitq_install = .{
+        .namespace = "vec:roundtrip:",
+        .dim = dim,
+        .seed = 0xDEAD_BEEF_C0DE_F00D,
+        .centroid = centroid_bytes_ptr[0 .. dim * 4],
+        .rotation = rotation_bytes_ptr[0 .. dim * dim * 4],
+    } };
+
+    var writer = TestListWriter{ .list = &bytes, .allocator = testing.allocator };
+    try writeCommand(&writer, cmd);
+
+    var reader = TestSliceReader{ .buffer = bytes.items };
+    const parsed = try readFrameAlloc(&reader, testing.allocator);
+    defer switch (parsed) {
+        .vrabitq_install => |p| {
+            testing.allocator.free(p.namespace);
+            testing.allocator.free(p.centroid);
+            testing.allocator.free(p.rotation);
+        },
+        else => {},
+    };
+
+    try testing.expectEqualStrings("vec:roundtrip:", parsed.vrabitq_install.namespace);
+    try testing.expectEqual(@as(u32, 4), parsed.vrabitq_install.dim);
+    try testing.expectEqual(@as(u64, 0xDEAD_BEEF_C0DE_F00D), parsed.vrabitq_install.seed);
+    try testing.expectEqualSlices(u8, centroid_bytes_ptr[0 .. dim * 4], parsed.vrabitq_install.centroid);
+    try testing.expectEqualSlices(u8, rotation_bytes_ptr[0 .. dim * dim * 4], parsed.vrabitq_install.rotation);
 }

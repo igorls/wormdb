@@ -246,5 +246,28 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
             };
             break :blk .ok;
         },
+        .vrabitq_install => |params| blk: {
+            // Peer-side install. The leader's `EXEC vrabitq` is the only
+            // path that emits this frame, and it has already validated
+            // the dim / namespace lifecycle. A peer applying it picks
+            // up the metric from the namespace's existing index, or
+            // defaults to L2 if the namespace hasn't been touched yet
+            // (the only case RaBitQ is meaningful for today).
+            const inferred_metric: Metric = if (ctx.vector_registry) |reg|
+                if (reg.get(params.namespace)) |idx| idx.metric else Metric.l2
+            else
+                Metric.l2;
+            vector_ops.applyVrabitqInstall(ctx.vector_registry, .{
+                .namespace = params.namespace,
+                .dim = params.dim,
+                .seed = params.seed,
+                .centroid_bytes = params.centroid,
+                .rotation_bytes = params.rotation,
+                .metric = inferred_metric,
+            }) catch |err| {
+                break :blk Response{ .err = try ctx.allocator.dupe(u8, @errorName(err)) };
+            };
+            break :blk .ok;
+        },
     };
 }

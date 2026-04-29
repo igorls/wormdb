@@ -894,12 +894,15 @@ pub fn memResetIndex(ctx: *Ctx) anyerror!Ctx.Result {
     const bq_prefix = try std.fmt.allocPrint(ctx.allocator, "bq:vec:mem:{s}:", .{ns});
     defer ctx.allocator.free(bq_prefix);
 
-    // ── Drop the HNSW index ─────────────────────────────────────
-    if (ctx.vector_registry) |reg| {
-        if (reg.get(vec_prefix) != null) reg.remove(vec_prefix);
-    }
-
-    // ── Delete vec:* and bq:* keys; preserve mem:<ns>:* (doc + meta).
+    // ── Delete vec:* and bq:* keys first; only after all succeed do
+    //    we drop HNSW state and rewrite the config. The all-or-nothing
+    //    discipline matters: if any vec key survives a half-applied
+    //    reset (most commonly a WORM-protected key), the namespace
+    //    would end up with old vectors under a new embedder_id —
+    //    silent mixed-embedder corruption, the exact failure this
+    //    proc exists to prevent. On any failure we leave HNSW intact
+    //    and config untouched so the caller can inspect, then
+    //    `mem_drop` if they need a clean slate.
     var vectors_dropped: usize = 0;
     var skipped_worm: usize = 0;
     var errors: usize = 0;
@@ -936,6 +939,28 @@ pub fn memResetIndex(ctx: *Ctx) anyerror!Ctx.Result {
         }
     }
 
+    // ── Abort if any deletion failed — config and HNSW must stay in
+    //    their pre-reset state so the namespace remains coherent.
+    if (skipped_worm > 0 or errors > 0) {
+        return ctx.err(ctx.fmt(
+            "mem_reset_index: aborted; {d} vec/bq key(s) blocked by WORM and {d} other error(s) — config and HNSW left intact. Use mem_drop if you need a hard reset.",
+            .{ skipped_worm, errors },
+        ));
+    }
+
+    // ── Clear the HNSW index in-place. Using clearLocked rather than
+    //    NamespaceRegistry.remove avoids a use-after-free against any
+    //    concurrent caller that resolved the namespace pointer before
+    //    we ran (e.g. mem_query holding ns_idx through stage-2 refine).
+    //    The pointer stays valid; the caller observes an empty index.
+    if (ctx.vector_registry) |reg| {
+        if (reg.get(vec_prefix)) |ns_idx| {
+            ns_idx.lock.lock();
+            defer ns_idx.lock.unlock();
+            ns_idx.clearLocked();
+        }
+    }
+
     // ── Rewrite config with new embedder_id, preserving metric ──
     var cfg: std.ArrayListUnmanaged(u8) = .empty;
     defer cfg.deinit(ctx.allocator);
@@ -959,10 +984,6 @@ pub fn memResetIndex(ctx: *Ctx) anyerror!Ctx.Result {
     try json.appendSlice(ctx.allocator, metric.name());
     try json.appendSlice(ctx.allocator, "\",\"vectors_to_reingest\":");
     try writeUsize(&json, ctx.allocator, vectors_dropped);
-    try json.appendSlice(ctx.allocator, ",\"skipped_worm\":");
-    try writeUsize(&json, ctx.allocator, skipped_worm);
-    try json.appendSlice(ctx.allocator, ",\"errors\":");
-    try writeUsize(&json, ctx.allocator, errors);
     try json.append(ctx.allocator, '}');
     return ctx.value(try json.toOwnedSlice(ctx.allocator));
 }
@@ -1256,8 +1277,10 @@ test "mem_reset_index: drops vectors, preserves docs, rewrites config" {
     try testing.expect(fx.store.get("mem:demo:doc-1") != null);
     try testing.expect(fx.store.get("mem:demo:doc-2") != null);
     try testing.expect(fx.store.get("mem:demo:doc-1:meta") != null);
-    // … config rewritten with the new embedder.
-    const cfg = fx.store.get("__meta:mem:demo:config").?.value;
+    // … config rewritten with the new embedder. Use getValueDupe to
+    // copy under the shard lock — a raw Entry pointer would be unsafe
+    // if anything ever ran concurrently against this store.
+    const cfg = (try fx.store.getValueDupe("__meta:mem:demo:config", arena)).?;
     try testing.expect(std.mem.indexOf(u8, cfg, "text-embedding-3-large") != null);
     try testing.expect(std.mem.indexOf(u8, cfg, "bge-m3") == null);
 
@@ -1296,4 +1319,37 @@ test "mem_reset_index: rejects when namespace has no config" {
     );
     try testing.expect(result == .err);
     try testing.expect(std.mem.indexOf(u8, result.err, "no config") != null);
+}
+
+test "mem_reset_index: aborts cleanly when WORM blocks vec deletion" {
+    // Default mem_add writes vec keys with WORM=true — the typical
+    // production setup. mem_reset_index must refuse to half-apply: no
+    // config rewrite, no HNSW clear, no silent mixed-embedder state.
+    var fx = try TestStoreFixture.init("memreset_worm");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena);
+
+    // Default args → is_worm = true, so vec:mem:demo:doc-1 is WORM.
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    _ = try runProc(&fx.store, memAdd, &.{ "demo", "doc-1", "first", emb }, arena);
+
+    const result = try runProc(
+        &fx.store,
+        memResetIndex,
+        &.{ "demo", "text-embedding-3-large" },
+        arena,
+    );
+    try testing.expect(result == .err);
+    try testing.expect(std.mem.indexOf(u8, result.err, "WORM") != null);
+
+    // Original vector + config must both still be in place.
+    try testing.expect(fx.store.get("vec:mem:demo:doc-1") != null);
+    const cfg = (try fx.store.getValueDupe("__meta:mem:demo:config", arena)).?;
+    try testing.expect(std.mem.indexOf(u8, cfg, "bge-m3") != null);
+    try testing.expect(std.mem.indexOf(u8, cfg, "text-embedding-3-large") == null);
 }

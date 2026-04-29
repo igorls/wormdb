@@ -23,6 +23,7 @@ goes through the same WAL + replication path the rest of the server uses.
 | `mem_query`        | HNSW → brute-force fallback, joined with doc + metadata        |
 | `mem_stats`        | Counts, dim, HNSW state, config                                 |
 | `mem_drop`         | Scan-delete everything under a namespace (doc, meta, vec, BQ)   |
+| `mem_reset_index`  | Drop vec/BQ/HNSW for a namespace and switch its embedder id     |
 | `mem_capabilities` | Self-describing capability block for adapter discovery         |
 
 ## Key layout
@@ -209,11 +210,14 @@ in the contract itself.
   means the common failure case (dim mismatch) fails cleanly before any
   write, but vector-lands-then-doc-fails leaves an orphan. `mem_drop`
   is the recovery.
-- **No embedder enforcement.** `mem_init` pins the embedder id for
-  reporting but doesn't reject subsequent `mem_add` calls that happen
-  to use a different embedder at the same dim. Strict enforcement would
-  take an optional `embedder_id` arg on `mem_add`; easy to add if the
-  discipline cost proves real.
+- **Embedder enforcement is opt-in per call.** `mem_init` pins the
+  embedder id; `mem_add` will reject a mismatch *only when the caller
+  passes the optional 7th arg* (the asserted `embedder_id`). Callers
+  that don't assert keep the old behavior — same-dim model swaps go
+  through unchallenged. To switch a namespace to a new embedder, run
+  `mem_reset_index <ns> <new_embedder_id>` — drops vec/BQ/HNSW state,
+  rewrites the config, and preserves `mem:<ns>:*` doc bodies so the
+  client can re-embed and `mem_add` with new vectors.
 - **Privacy tiers are not modeled.** Namespace isolation is the only
   access boundary. Cross-namespace ACLs or per-doc privacy tiers are
   out of scope for v1 — they need a primitive design that doesn't

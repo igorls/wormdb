@@ -316,10 +316,16 @@ Default client port is `6389` (avoids Redis `6379` collision). Override with `--
 - [x] WormWire binary protocol (v1)
 - [x] Pub/Sub event bus
 - [x] Bun reference client + admin UI
-- [x] QUIC/WebTransport gateway
+- [x] WebSocket gateway (browser-direct WormWire over WS)
+- [x] QUIC/WebTransport gateway (libwtf + MsQuic, compile-time gated)
+- [x] io_uring event loop + epoll fallback
+- [x] Auth system (Ed25519 SCT tokens, per-gateway enforcement)
 - [x] Docker containerization
 - [x] meshguard cluster integration (SWIM + encrypted replication)
 - [x] Stored procedures (`EXEC`) with replication + event-bus from the procedure context
+- [x] KV procedures (`kv_put`, `kv_get`, `kv_stats`, `scan`, `transfer`, `increment`)
+- [x] Chat procedures (`chat_send`, `chat_history`)
+- [x] Memory procedures (`mem_init`, `mem_add`, `mem_get`, `mem_query`, `mem_stats`, `mem_drop`, `mem_capabilities`)
 - [x] Vector search — SIMD distances, BQ prefilter, HNSW graph index, per-namespace metric
 - [x] `vreindex` bulk rebuild for HNSW
 - [x] Native vector wire commands (`VINSERT`, `VDELETE`, `VBULKINSERT`) with replication-aware apply paths
@@ -329,10 +335,9 @@ Default client port is `6389` (avoids Redis `6379` collision). Override with `--
 
 ### 🚧 In Progress
 
-- [ ] Formal review/acceptance for WP-009 meshguard cluster integration
+- [ ] WormDB-side org-trust configuration for meshguard certificates
 - [ ] Protocol-level integration tests for pipelined commands with interleaved `EVENT` frames
 - [ ] Live server integration tests for native vector wire commands and cluster anti-echo
-- [ ] WormDB-side org-trust configuration for meshguard certificates
 
 ### 📋 Planned
 

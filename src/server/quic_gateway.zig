@@ -156,7 +156,9 @@ pub const QuicGateway = struct {
 
         // Block this thread until shutdown
         while (self.running.load(.acquire)) {
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            // 100ms poll — use libc nanosleep (std.time.sleep removed in Zig 0.16)
+            const req = std.c.timespec{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&req, null);
         }
     }
 
@@ -215,7 +217,7 @@ pub const QuicGateway = struct {
                 };
                 stream_ctx.* = StreamContext{
                     .session_ctx = session_ctx,
-                    .recv_buf = .{},
+                    .recv_buf = .{ .items = &.{}, .capacity = 0 },
                 };
 
                 wtf.wtf_stream_set_callback(stream, streamCallback);
@@ -397,18 +399,16 @@ pub const QuicGateway = struct {
         //     then free(send_ctx->buffers) and free(send_ctx)
         //   - All allocations must use C malloc/free (not Zig allocator)
         var tmp_buf: [65536]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&tmp_buf);
-        wire.writeResponse(fbs.writer(), resp) catch {
+        var fbw = wire.FixedBufWriter.init(&tmp_buf);
+        wire.writeResponse(&fbw, resp) catch {
             // Fallback: send a small error response
             var err_tmp: [256]u8 = undefined;
-            var err_fbs = std.io.fixedBufferStream(&err_tmp);
-            wire.writeResponse(err_fbs.writer(), Response{ .err = "response too large" }) catch return;
-            const err_data = err_fbs.getWritten();
-            sendRawResponse(stream, err_data);
+            var err_fbw = wire.FixedBufWriter.init(&err_tmp);
+            wire.writeResponse(&err_fbw, Response{ .err = "response too large" }) catch return;
+            sendRawResponse(stream, err_fbw.getWritten());
             return;
         };
-        const written = fbs.getWritten();
-        sendRawResponse(stream, written);
+        sendRawResponse(stream, fbw.getWritten());
     }
 
     fn sendRawResponse(stream: ?*wtf.wtf_stream_t, data: []const u8) void {

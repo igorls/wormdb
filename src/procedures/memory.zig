@@ -15,11 +15,12 @@
 //!
 //! ── Procedure surface ───────────────────────────────────────────────
 //!   mem_init         <ns> <embedder_id> <metric>
-//!   mem_add          <ns> <doc_id> <text> <embedding> [<meta_json>] [<worm>]
+//!   mem_add          <ns> <doc_id> <text> <embedding> [<meta_json>] [<worm>] [<embedder_id>]
 //!   mem_get          <ns> <doc_id>
 //!   mem_query        <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>]
 //!   mem_stats        <ns>
 //!   mem_drop         <ns>
+//!   mem_reset_index  <ns> <new_embedder_id>
 //!   mem_capabilities
 //!
 //! ── Design notes ────────────────────────────────────────────────────
@@ -27,9 +28,13 @@
 //!   that think in sessions call `mem_add` N times with derived ids.
 //! * `mem_init` is optional/lazy: the metric defaults to cosine on first
 //!   add. Calling mem_init up front lets you pre-declare for fail-fast.
-//! * Embedder identity is captured in config for reporting. Mixed-embedder
-//!   inserts are prevented operationally (by the client) + by dim-freeze
-//!   on the vector layer when models have different dims.
+//! * Embedder identity is captured in config for reporting and (when the
+//!   caller passes the optional `embedder_id` arg to `mem_add`) enforced
+//!   server-side: a mismatch between asserted and configured embedder
+//!   rejects the call before any state changes. Same-dim model swaps —
+//!   the failure mode dim-freeze can't catch — are caught here when the
+//!   client asserts. Use `mem_reset_index` to switch a namespace to a
+//!   new embedder; it drops vec/BQ/HNSW state but preserves doc bodies.
 //! * mem_query skips the BQ prefilter — HNSW is eagerly created by
 //!   mem_init, so cold-start (post-restart until vreindex) is the only
 //!   HNSW-absent case, and brute-force is the simpler fallback there.
@@ -253,30 +258,57 @@ pub fn memInit(ctx: *Ctx) anyerror!Ctx.Result {
 // ╚═══════════════════════════════════════════════════╝
 
 pub fn memAdd(ctx: *Ctx) anyerror!Ctx.Result {
-    const ns = ctx.arg(0) orelse
-        return ctx.err("mem_add requires: <ns> <doc_id> <text> <embedding> [<meta_json>] [<worm>]");
-    const doc_id = ctx.arg(1) orelse
-        return ctx.err("mem_add requires: <ns> <doc_id> <text> <embedding> [<meta_json>] [<worm>]");
-    const text = ctx.arg(2) orelse
-        return ctx.err("mem_add requires: <ns> <doc_id> <text> <embedding> [<meta_json>] [<worm>]");
-    const embedding = ctx.arg(3) orelse
-        return ctx.err("mem_add requires: <ns> <doc_id> <text> <embedding> [<meta_json>] [<worm>]");
+    const usage = "mem_add requires: <ns> <doc_id> <text> <embedding> [<meta_json>] [<worm>] [<embedder_id>]";
+    const ns = ctx.arg(0) orelse return ctx.err(usage);
+    const doc_id = ctx.arg(1) orelse return ctx.err(usage);
+    const text = ctx.arg(2) orelse return ctx.err(usage);
+    const embedding = ctx.arg(3) orelse return ctx.err(usage);
     const meta_json: []const u8 = ctx.arg(4) orelse "";
     const is_worm = if (ctx.arg(5)) |w| !std.mem.eql(u8, w, "0") else true;
+    const embedder_id_arg: ?[]const u8 = ctx.arg(6);
 
     if (!validateNs(ns))
         return ctx.err("mem_add: invalid ns");
     if (!validateDocId(doc_id))
         return ctx.err("mem_add: invalid doc_id");
+    if (embedder_id_arg) |req_emb| {
+        if (!validateEmbedderId(req_emb))
+            return ctx.err("mem_add: invalid embedder_id");
+    }
 
-    // ── Pick metric from config (default cosine if no init) ─────
-    const metric: Metric = blk: {
+    // ── Pick metric from config (default cosine if no init) and
+    //    optionally enforce embedder match. Read config once.
+    const cfg_bytes: ?[]const u8 = blk: {
         const cfg_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
         defer ctx.allocator.free(cfg_key);
-        const cfg = (try ctx.getCopy(cfg_key)) orelse break :blk .cosine;
-        const m_str = extractConfigField(cfg, "metric") orelse break :blk .cosine;
-        break :blk Metric.fromStr(m_str) orelse .cosine;
+        break :blk try ctx.getCopy(cfg_key);
     };
+
+    const metric: Metric = blk: {
+        if (cfg_bytes) |cfg| {
+            if (extractConfigField(cfg, "metric")) |m_str| {
+                if (Metric.fromStr(m_str)) |m| break :blk m;
+            }
+        }
+        break :blk .cosine;
+    };
+
+    // Embedder enforcement: only when caller asserts an id AND the
+    // namespace has an existing config. Lazy-init namespaces (no
+    // config yet) accept the add — first mem_init declares the
+    // embedder, and future asserted adds will be checked.
+    if (embedder_id_arg) |req_emb| {
+        if (cfg_bytes) |cfg| {
+            if (extractConfigField(cfg, "embedder_id")) |cfg_emb| {
+                if (!std.mem.eql(u8, cfg_emb, req_emb)) {
+                    return ctx.err(ctx.fmt(
+                        "mem_add: embedder mismatch (config={s}, requested={s})",
+                        .{ cfg_emb, req_emb },
+                    ));
+                }
+            }
+        }
+    }
 
     // ── Build derived keys ──────────────────────────────────────
     const doc_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}", .{ ns, doc_id });
@@ -825,6 +857,137 @@ pub fn memDrop(ctx: *Ctx) anyerror!Ctx.Result {
     return ctx.value(try json.toOwnedSlice(ctx.allocator));
 }
 
+// ╔═══════════════════════════════════════════════════╗
+// ║  mem_reset_index                                   ║
+// ╚═══════════════════════════════════════════════════╝
+
+/// Drop the HNSW + BQ + raw-vector state for a namespace and rewrite
+/// the config with a new embedder_id. Preserves `mem:<ns>:<id>` doc
+/// bodies and `:meta` blobs — BentoKit-style sidecar callers hold the
+/// canonical row in SQLite, re-embed against the new model, and call
+/// `mem_add` again to repopulate.
+///
+/// The metric is preserved from the existing config: changing metric
+/// requires `mem_drop` + fresh `mem_init`.
+pub fn memResetIndex(ctx: *Ctx) anyerror!Ctx.Result {
+    const ns = ctx.arg(0) orelse
+        return ctx.err("mem_reset_index requires: <ns> <new_embedder_id>");
+    const new_embedder_id = ctx.arg(1) orelse
+        return ctx.err("mem_reset_index requires: <ns> <new_embedder_id>");
+
+    if (!validateNs(ns)) return ctx.err("mem_reset_index: invalid ns");
+    if (!validateEmbedderId(new_embedder_id))
+        return ctx.err("mem_reset_index: invalid embedder_id");
+
+    const config_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
+    defer ctx.allocator.free(config_key);
+
+    const existing = (try ctx.getCopy(config_key)) orelse
+        return ctx.err("mem_reset_index: namespace has no config — call mem_init first");
+    const cfg_metric_str = extractConfigField(existing, "metric") orelse
+        return ctx.err("mem_reset_index: existing config missing metric field");
+    const metric = Metric.fromStr(cfg_metric_str) orelse
+        return ctx.err("mem_reset_index: existing config has unknown metric");
+
+    const vec_prefix = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
+    defer ctx.allocator.free(vec_prefix);
+    const bq_prefix = try std.fmt.allocPrint(ctx.allocator, "bq:vec:mem:{s}:", .{ns});
+    defer ctx.allocator.free(bq_prefix);
+
+    // ── Delete vec:* and bq:* keys first; only after all succeed do
+    //    we drop HNSW state and rewrite the config. The all-or-nothing
+    //    discipline matters: if any vec key survives a half-applied
+    //    reset (most commonly a WORM-protected key), the namespace
+    //    would end up with old vectors under a new embedder_id —
+    //    silent mixed-embedder corruption, the exact failure this
+    //    proc exists to prevent. On any failure we leave HNSW intact
+    //    and config untouched so the caller can inspect, then
+    //    `mem_drop` if they need a clean slate.
+    var vectors_dropped: usize = 0;
+    var skipped_worm: usize = 0;
+    var errors: usize = 0;
+
+    const prefixes = [_][]const u8{ vec_prefix, bq_prefix };
+    for (prefixes, 0..) |prefix, prefix_idx| {
+        var collector = DropCtx{
+            .keys = .empty,
+            .allocator = ctx.allocator,
+            .oom = false,
+        };
+        defer {
+            for (collector.keys.items) |k| collector.allocator.free(k);
+            collector.keys.deinit(collector.allocator);
+        }
+        ctx.scanCallback(prefix, @ptrCast(&collector), collectDropKey);
+        if (collector.oom)
+            return ctx.err("mem_reset_index: out of memory collecting keys");
+
+        for (collector.keys.items) |k| {
+            ctx.deleteDurable(k) catch |e| switch (e) {
+                error.WormViolation => {
+                    skipped_worm += 1;
+                    continue;
+                },
+                else => {
+                    errors += 1;
+                    continue;
+                },
+            };
+            // Only count the vec:* prefix (prefix_idx 0) toward the
+            // "needs re-ingest" tally — bq:* are derivatives.
+            if (prefix_idx == 0) vectors_dropped += 1;
+        }
+    }
+
+    // ── Abort if any deletion failed — config and HNSW must stay in
+    //    their pre-reset state so the namespace remains coherent.
+    if (skipped_worm > 0 or errors > 0) {
+        return ctx.err(ctx.fmt(
+            "mem_reset_index: aborted; {d} vec/bq key(s) blocked by WORM and {d} other error(s) — config and HNSW left intact. Use mem_drop if you need a hard reset.",
+            .{ skipped_worm, errors },
+        ));
+    }
+
+    // ── Clear the HNSW index in-place. Using clearLocked rather than
+    //    NamespaceRegistry.remove avoids a use-after-free against any
+    //    concurrent caller that resolved the namespace pointer before
+    //    we ran (e.g. mem_query holding ns_idx through stage-2 refine).
+    //    The pointer stays valid; the caller observes an empty index.
+    if (ctx.vector_registry) |reg| {
+        if (reg.get(vec_prefix)) |ns_idx| {
+            ns_idx.lock.lock();
+            defer ns_idx.lock.unlock();
+            ns_idx.clearLocked();
+        }
+    }
+
+    // ── Rewrite config with new embedder_id, preserving metric ──
+    var cfg: std.ArrayListUnmanaged(u8) = .empty;
+    defer cfg.deinit(ctx.allocator);
+    try cfg.appendSlice(ctx.allocator, "{\"embedder_id\":\"");
+    try cfg.appendSlice(ctx.allocator, new_embedder_id);
+    try cfg.appendSlice(ctx.allocator, "\",\"metric\":\"");
+    try cfg.appendSlice(ctx.allocator, metric.name());
+    try cfg.appendSlice(ctx.allocator, "\",\"created_at\":");
+    try writeU64(&cfg, ctx.allocator, ctx.timestamp());
+    try cfg.append(ctx.allocator, '}');
+    try ctx.setDurable(config_key, cfg.items);
+
+    // ── Response ────────────────────────────────────────────────
+    var json: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer json.deinit(ctx.allocator);
+    try json.appendSlice(ctx.allocator, "{\"namespace\":\"");
+    try appendJsonEscaped(&json, ctx.allocator, ns);
+    try json.appendSlice(ctx.allocator, "\",\"embedder_id\":\"");
+    try appendJsonEscaped(&json, ctx.allocator, new_embedder_id);
+    try json.appendSlice(ctx.allocator, "\",\"metric\":\"");
+    try json.appendSlice(ctx.allocator, metric.name());
+    try json.appendSlice(ctx.allocator, "\",\"vectors_to_reingest\":");
+    try writeUsize(&json, ctx.allocator, vectors_dropped);
+    try json.append(ctx.allocator, '}');
+    return ctx.value(try json.toOwnedSlice(ctx.allocator));
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
@@ -901,4 +1064,292 @@ test "applyDecay: lambda=1 returns pure recency in [0,1]" {
     const one_tau_ms: u64 = 168 * 3_600_000;
     const s_tau = applyDecay(0.5, 0, 1.0, one_tau_ms);
     try testing.expectApproxEqAbs(@as(f32, 0.3679), s_tau, 0.001);
+}
+
+// ╔═══════════════════════════════════════════════════╗
+// ║  Tests — embedder enforcement & mem_reset_index    ║
+// ╚═══════════════════════════════════════════════════╝
+//
+// These tests build a real Store + Ctx so the WAL + locking + setDurable
+// paths get exercised. They are slower than the helper tests above but
+// catch the actual integration: do mem_add and mem_reset_index leave the
+// store in the expected state?
+
+const compat = @import("../core/compat.zig");
+const StoreModule = @import("../storage/store.zig");
+
+/// Pack a slice of f32s as little-endian bytes — what mem_add expects on
+/// the wire. Lifetime: caller owns the returned slice.
+fn packF32(allocator: std.mem.Allocator, vals: []const f32) ![]u8 {
+    const buf = try allocator.alloc(u8, vals.len * 4);
+    for (vals, 0..) |v, i| {
+        const bits: u32 = @bitCast(v);
+        std.mem.writeInt(u32, buf[i * 4 ..][0..4], bits, .little);
+    }
+    return buf;
+}
+
+/// Spin up a fresh Store backed by a tmp WAL + snapshot. Caller is
+/// responsible for `store.deinit()` and `tmp.cleanup()` in that order.
+const TestStoreFixture = struct {
+    tmp: std.testing.TmpDir,
+    store: StoreModule.Store,
+    wal_path: []u8,
+    snapshot_path: []u8,
+
+    fn init(name: []const u8) !TestStoreFixture {
+        const alloc = testing.allocator;
+        var tmp = testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+
+        const tmp_path = try compat.Dir.realPathAlloc(tmp.dir, alloc, ".");
+        defer alloc.free(tmp_path);
+
+        const wal_path = try std.fmt.allocPrint(alloc, "{s}/{s}.wal", .{ tmp_path, name });
+        errdefer alloc.free(wal_path);
+        const snap_path = try std.fmt.allocPrint(alloc, "{s}/{s}.snap", .{ tmp_path, name });
+        errdefer alloc.free(snap_path);
+
+        const wal_file = try std.fmt.allocPrint(alloc, "{s}.wal", .{name});
+        defer alloc.free(wal_file);
+        const f = try compat.Dir.createFile(tmp.dir, wal_file, .{});
+        compat.File.close(f);
+
+        const store = try StoreModule.Store.init(alloc, .{
+            .wal_path = wal_path,
+            .snapshot_path = snap_path,
+            .sync_writes = false,
+        });
+
+        return .{ .tmp = tmp, .store = store, .wal_path = wal_path, .snapshot_path = snap_path };
+    }
+
+    fn deinit(self: *TestStoreFixture) void {
+        self.store.deinit();
+        testing.allocator.free(self.wal_path);
+        testing.allocator.free(self.snapshot_path);
+        self.tmp.cleanup();
+    }
+};
+
+/// Run a procedure with `args` against `store`, return the Response.
+/// Caller is responsible for any inspection of `.value` / `.err` payloads
+/// — they are arena-owned and live for the lifetime of `arena`.
+fn runProc(
+    store: *StoreModule.Store,
+    proc: *const fn (ctx: *Ctx) anyerror!Ctx.Result,
+    args: []const []const u8,
+    arena: std.mem.Allocator,
+) !Ctx.Result {
+    var ctx = Ctx.init(store, args, arena, null, null, null, null);
+    defer ctx.deinit();
+    return try proc(&ctx);
+}
+
+test "mem_add: accepts call without embedder_id arg (backward compat)" {
+    var fx = try TestStoreFixture.init("memadd_compat");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena);
+
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const result = try runProc(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-1", "hello", emb },
+        arena,
+    );
+    try testing.expect(result == .ok);
+}
+
+test "mem_add: rejects mismatched embedder_id" {
+    var fx = try TestStoreFixture.init("memadd_mismatch");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena);
+
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const result = try runProc(
+        &fx.store,
+        memAdd,
+        // 5th arg = meta_json, 6th = worm, 7th = embedder_id (the assert)
+        &.{ "demo", "doc-1", "hello", emb, "", "1", "text-embedding-3-large" },
+        arena,
+    );
+    try testing.expect(result == .err);
+    try testing.expect(std.mem.indexOf(u8, result.err, "embedder mismatch") != null);
+
+    // Side-effect check: the rejected add must not have written the doc.
+    try testing.expect(fx.store.get("mem:demo:doc-1") == null);
+}
+
+test "mem_add: accepts matching embedder_id" {
+    var fx = try TestStoreFixture.init("memadd_match");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena);
+
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const result = try runProc(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-1", "hello", emb, "", "1", "bge-m3" },
+        arena,
+    );
+    try testing.expect(result == .ok);
+    try testing.expect(fx.store.get("mem:demo:doc-1") != null);
+}
+
+test "mem_add: invalid embedder_id arg rejected before state changes" {
+    var fx = try TestStoreFixture.init("memadd_invalid");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena);
+
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const result = try runProc(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-1", "hello", emb, "", "1", "has:colon" },
+        arena,
+    );
+    try testing.expect(result == .err);
+    try testing.expect(fx.store.get("mem:demo:doc-1") == null);
+    try testing.expect(fx.store.get("vec:mem:demo:doc-1") == null);
+}
+
+test "mem_reset_index: drops vectors, preserves docs, rewrites config" {
+    var fx = try TestStoreFixture.init("memreset");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena);
+
+    // Two docs; one with metadata, one without — reset must preserve both.
+    // is_worm = "0" so reset's deleteDurable can succeed on the vec keys.
+    const emb1 = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const emb2 = try packF32(arena, &[_]f32{ 0.0, 1.0, 0.0, 0.0 });
+    _ = try runProc(&fx.store, memAdd, &.{ "demo", "doc-1", "first", emb1, "{\"k\":1}", "0" }, arena);
+    _ = try runProc(&fx.store, memAdd, &.{ "demo", "doc-2", "second", emb2, "", "0" }, arena);
+
+    // Sanity: vectors and docs both present pre-reset.
+    try testing.expect(fx.store.get("vec:mem:demo:doc-1") != null);
+    try testing.expect(fx.store.get("vec:mem:demo:doc-2") != null);
+    try testing.expect(fx.store.get("mem:demo:doc-1") != null);
+    try testing.expect(fx.store.get("mem:demo:doc-2") != null);
+
+    const result = try runProc(
+        &fx.store,
+        memResetIndex,
+        &.{ "demo", "text-embedding-3-large" },
+        arena,
+    );
+    try testing.expect(result == .value);
+
+    // The response JSON should report 2 vectors-to-reingest.
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"vectors_to_reingest\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"embedder_id\":\"text-embedding-3-large\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"metric\":\"cosine\"") != null);
+
+    // Vectors gone …
+    try testing.expect(fx.store.get("vec:mem:demo:doc-1") == null);
+    try testing.expect(fx.store.get("vec:mem:demo:doc-2") == null);
+    // … docs preserved (sidecar-pattern guarantee) …
+    try testing.expect(fx.store.get("mem:demo:doc-1") != null);
+    try testing.expect(fx.store.get("mem:demo:doc-2") != null);
+    try testing.expect(fx.store.get("mem:demo:doc-1:meta") != null);
+    // … config rewritten with the new embedder. Use getValueDupe to
+    // copy under the shard lock — a raw Entry pointer would be unsafe
+    // if anything ever ran concurrently against this store.
+    const cfg = (try fx.store.getValueDupe("__meta:mem:demo:config", arena)).?;
+    try testing.expect(std.mem.indexOf(u8, cfg, "text-embedding-3-large") != null);
+    try testing.expect(std.mem.indexOf(u8, cfg, "bge-m3") == null);
+
+    // Subsequent mem_add must now require the new embedder.
+    const emb3 = try packF32(arena, &[_]f32{ 0.0, 0.0, 1.0, 0.0 });
+    const stale_assert = try runProc(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-3", "third", emb3, "", "0", "bge-m3" },
+        arena,
+    );
+    try testing.expect(stale_assert == .err);
+
+    const fresh_assert = try runProc(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-3", "third", emb3, "", "0", "text-embedding-3-large" },
+        arena,
+    );
+    try testing.expect(fresh_assert == .ok);
+}
+
+test "mem_reset_index: rejects when namespace has no config" {
+    var fx = try TestStoreFixture.init("memreset_noconfig");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const result = try runProc(
+        &fx.store,
+        memResetIndex,
+        &.{ "ghost", "bge-m3" },
+        arena,
+    );
+    try testing.expect(result == .err);
+    try testing.expect(std.mem.indexOf(u8, result.err, "no config") != null);
+}
+
+test "mem_reset_index: aborts cleanly when WORM blocks vec deletion" {
+    // Default mem_add writes vec keys with WORM=true — the typical
+    // production setup. mem_reset_index must refuse to half-apply: no
+    // config rewrite, no HNSW clear, no silent mixed-embedder state.
+    var fx = try TestStoreFixture.init("memreset_worm");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena);
+
+    // Default args → is_worm = true, so vec:mem:demo:doc-1 is WORM.
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    _ = try runProc(&fx.store, memAdd, &.{ "demo", "doc-1", "first", emb }, arena);
+
+    const result = try runProc(
+        &fx.store,
+        memResetIndex,
+        &.{ "demo", "text-embedding-3-large" },
+        arena,
+    );
+    try testing.expect(result == .err);
+    try testing.expect(std.mem.indexOf(u8, result.err, "WORM") != null);
+
+    // Original vector + config must both still be in place.
+    try testing.expect(fx.store.get("vec:mem:demo:doc-1") != null);
+    const cfg = (try fx.store.getValueDupe("__meta:mem:demo:config", arena)).?;
+    try testing.expect(std.mem.indexOf(u8, cfg, "bge-m3") != null);
+    try testing.expect(std.mem.indexOf(u8, cfg, "text-embedding-3-large") == null);
 }

@@ -12,8 +12,8 @@ const wormdb = @import("lib.zig");
 const Store = wormdb.storage.Store;
 const EventBus = wormdb.event.EventBus;
 const Server = wormdb.server.Server;
-const UringServer = wormdb.server.uring.UringServer;
-const EpollServer = wormdb.server.epoll.EpollServer;
+// io_uring / epoll backends are Linux-only; referenced through
+// `wormdb.server.uring`/`.epoll` inside comptime-gated blocks below.
 const Gateway = wormdb.server.Gateway;
 const build_options = @import("build_options");
 const QuicGateway = wormdb.server.QuicGateway;
@@ -210,26 +210,32 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
     var event_bus = EventBus.init(allocator);
     defer event_bus.deinit();
 
-    // Initialize cluster if enabled
+    // Initialize cluster if enabled. Clustering depends on meshguard's
+    // WireGuard/netlink layer, which is Linux-only; on other platforms we log
+    // and run single-node. (See docs/WINDOWS.md and the meshguard port notes.)
     var cluster: ?Cluster = null;
     if (cfg.cluster.name != null) {
-        std.log.info("Initializing cluster: {s}", .{cfg.cluster.name.?});
-        // Pass seed as a single-element slice if provided
-        var seed_slice: [1][]const u8 = undefined;
-        const seeds: []const []const u8 = if (cfg.cluster.seed) |seed| blk: {
-            seed_slice[0] = seed;
-            break :blk seed_slice[0..1];
-        } else &.{};
+        if (comptime wormdb.server.is_linux) {
+            std.log.info("Initializing cluster: {s}", .{cfg.cluster.name.?});
+            // Pass seed as a single-element slice if provided
+            var seed_slice: [1][]const u8 = undefined;
+            const seeds: []const []const u8 = if (cfg.cluster.seed) |seed| blk: {
+                seed_slice[0] = seed;
+                break :blk seed_slice[0..1];
+            } else &.{};
 
-        cluster = Cluster.init(allocator, &store, &event_bus, .{
-            .seed_addrs = seeds,
-            .replication_factor = cfg.cluster.replication_factor,
-            .peer_port = port,
-            .config_dir = data_dir,
-            .gossip_port = cfg.cluster.gossip_port,
-            .wg_port = cfg.cluster.wg_port,
-        });
-        cluster.?.attachVectorRegistry(&vector_registry);
+            cluster = Cluster.init(allocator, &store, &event_bus, .{
+                .seed_addrs = seeds,
+                .replication_factor = cfg.cluster.replication_factor,
+                .peer_port = port,
+                .config_dir = data_dir,
+                .gossip_port = cfg.cluster.gossip_port,
+                .wg_port = cfg.cluster.wg_port,
+            });
+            cluster.?.attachVectorRegistry(&vector_registry);
+        } else {
+            std.log.warn("cluster '{s}' requested, but clustering is Linux-only — running single-node", .{cfg.cluster.name.?});
+        }
     }
     defer if (cluster != null) {
         cluster.?.deinit();
@@ -364,47 +370,59 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
         }
     }
 
-    // Run server — selected backend
-    const backend = cfg.server.backend;
+    // Run server — selected backend. io_uring and epoll are Linux-only; on
+    // other platforms the request transparently falls back to the thread pool.
+    const backend = blk: {
+        const requested = cfg.server.backend;
+        if (!wormdb.server.is_linux and requested != .threadpool) {
+            std.log.warn("backend '{s}' is Linux-only; using thread pool on this platform", .{@tagName(requested)});
+            break :blk .threadpool;
+        }
+        break :blk requested;
+    };
     std.log.info("Backend: {s}", .{@tagName(backend)});
     switch (backend) {
         .uring => {
-            var uring_server = UringServer.init(
-                allocator,
-                &store,
-                &event_bus,
-                if (cluster) |*c| c else null,
-                "0.0.0.0",
-                port,
-            ) catch |err| {
-                std.log.err("io_uring init failed: {}, falling back to thread pool", .{err});
-                try server.run();
-                return;
-            };
-            defer uring_server.deinit();
-            uring_server.run() catch |err| {
-                logStartupFailure(err, port, data_dir);
-                return err;
-            };
+            if (comptime wormdb.server.is_linux) {
+                var uring_server = wormdb.server.uring.UringServer.init(
+                    allocator,
+                    &store,
+                    &event_bus,
+                    if (cluster) |*c| c else null,
+                    "0.0.0.0",
+                    port,
+                ) catch |err| {
+                    std.log.err("io_uring init failed: {}, falling back to thread pool", .{err});
+                    try server.run();
+                    return;
+                };
+                defer uring_server.deinit();
+                uring_server.run() catch |err| {
+                    logStartupFailure(err, port, data_dir);
+                    return err;
+                };
+            } else unreachable;
         },
         .epoll => {
-            var epoll_server = EpollServer.init(
-                allocator,
-                &store,
-                &event_bus,
-                if (cluster) |*c| c else null,
-                "0.0.0.0",
-                port,
-            ) catch |err| {
-                std.log.err("epoll init failed: {}, falling back to thread pool", .{err});
-                try server.run();
-                return;
-            };
-            defer epoll_server.deinit();
-            epoll_server.run() catch |err| {
-                logStartupFailure(err, port, data_dir);
-                return err;
-            };
+            if (comptime wormdb.server.is_linux) {
+                var epoll_server = wormdb.server.epoll.EpollServer.init(
+                    allocator,
+                    &store,
+                    &event_bus,
+                    if (cluster) |*c| c else null,
+                    "0.0.0.0",
+                    port,
+                ) catch |err| {
+                    std.log.err("epoll init failed: {}, falling back to thread pool", .{err});
+                    try server.run();
+                    return;
+                };
+                defer epoll_server.deinit();
+                epoll_server.run() catch |err| {
+                    logStartupFailure(err, port, data_dir);
+                    return err;
+                };
+            } else unreachable;
         },
         .threadpool => {
             server.run() catch |err| {

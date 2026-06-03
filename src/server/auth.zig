@@ -19,9 +19,28 @@
 
 const std = @import("std");
 const compat = @import("../core/compat.zig");
-const c = @cImport({
-    @cInclude("sodium.h");
-});
+
+/// libsodium bindings via `extern "c"` declarations rather than `@cImport`,
+/// so the build needs only the link library — no system `sodium.h` header.
+/// (Headers are not vendored for the Windows MinGW build.) Mirrors the binding
+/// style meshguard uses in its crypto module.
+const c = struct {
+    extern "c" fn sodium_init() c_int;
+    extern "c" fn crypto_sign_ed25519_verify_detached(
+        sig: [*c]const u8,
+        m: [*c]const u8,
+        mlen: c_ulonglong,
+        pk: [*c]const u8,
+    ) c_int;
+    extern "c" fn crypto_sign_ed25519_detached(
+        sig: [*c]u8,
+        siglen_p: [*c]c_ulonglong,
+        m: [*c]const u8,
+        mlen: c_ulonglong,
+        sk: [*c]const u8,
+    ) c_int;
+    extern "c" fn crypto_sign_ed25519_keypair(pk: [*c]u8, sk: [*c]u8) c_int;
+};
 
 /// Operation types that can be authorized by a capability.
 pub const Operation = enum(u8) {

@@ -300,8 +300,7 @@ pub const Server = struct {
 
         // Disable Nagle's algorithm — critical for low-latency request/response.
         // Without this, small response packets get buffered for up to 40ms.
-        const fd = stream.getHandle();
-        std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+        core.compat.setNoDelay(stream.getHandle());
         var conn_ctx = ConnectionContext.init(self.allocator, self.event_bus, &stream);
         defer conn_ctx.deinit();
         defer conn.stream.close();

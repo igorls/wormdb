@@ -1,8 +1,28 @@
 const std = @import("std");
 
+/// Link libsodium into a module, branching on target OS.
+///
+/// Linux uses the vendored shared `deps/lib/libsodium.so`. Windows (gnu/MinGW
+/// ABI) links the vendored static `deps/lib/windows-x86_64/libsodium.a` and the
+/// system libraries libsodium's Windows backend needs (advapi32/bcrypt for the
+/// CSPRNG) plus ws2_32 for Winsock, which the threadpool server and gateway use.
+fn linkSodium(b: *std.Build, mod: *std.Build.Module, is_windows: bool) void {
+    if (is_windows) {
+        mod.addLibraryPath(b.path("deps/lib/windows-x86_64"));
+        mod.linkSystemLibrary("sodium", .{ .preferred_link_mode = .static });
+        mod.linkSystemLibrary("advapi32", .{});
+        mod.linkSystemLibrary("bcrypt", .{});
+        mod.linkSystemLibrary("ws2_32", .{});
+    } else {
+        mod.addLibraryPath(b.path("deps/lib"));
+        mod.linkSystemLibrary("sodium", .{});
+    }
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const is_windows = target.result.os.tag == .windows;
 
     // --- Build options (exposed to source via @import("build_options")) ---
     const enable_quic = b.option(bool, "quic", "Enable QUIC/WebTransport gateway (requires MsQuic)") orelse false;
@@ -44,8 +64,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // In Zig 0.16, link* / addInclude / addCSource are on Module, not Step.Compile
-    exe_mod.addLibraryPath(b.path("deps/lib"));
-    exe_mod.linkSystemLibrary("sodium", .{});
+    linkSodium(b, exe_mod, is_windows);
 
     const exe = b.addExecutable(.{
         .name = "wormdb",
@@ -113,8 +132,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    test_mod.addLibraryPath(b.path("deps/lib"));
-    test_mod.linkSystemLibrary("sodium", .{});
+    linkSodium(b, test_mod, is_windows);
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,

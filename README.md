@@ -26,6 +26,8 @@ zig build test
 ./zig-out/bin/wormdb --port 6389 --data ./data
 ```
 
+> **Platforms:** Linux is the primary target (full feature set, including clustering and the io_uring/epoll backends). WormDB also builds and runs natively on **Windows** for single-node use (threadpool backend; clustering is Linux-only) — see [docs/WINDOWS.md](docs/WINDOWS.md).
+
 ### Connect with the Bun Client
 
 ```bash

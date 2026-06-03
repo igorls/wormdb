@@ -4,6 +4,7 @@
 //! code churn across the codebase.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// A convenience Mutex wrapper using the global single-threaded Io instance.
 /// In 0.16, std.Io.Mutex.lock/unlock require an Io parameter.
@@ -155,22 +156,18 @@ pub const Dir = struct {
 };
 
 /// Current timestamp in milliseconds since UNIX epoch.
-/// Replaces removed `std.time.milliTimestamp`.
+/// Replaces removed `std.time.milliTimestamp`. Uses the 0.16 `std.Io` clock
+/// vtable so it works on every platform (the old `std.c.clock_gettime` path
+/// did not compile for the Windows ABI).
 pub fn nowMs() i64 {
-    var ts: std.posix.timespec = undefined;
-    _ = std.c.clock_gettime(.REALTIME, &ts);
-    const sec_ms: i64 = @as(i64, @intCast(ts.sec)) * std.time.ms_per_s;
-    const nsec_ms: i64 = @divFloor(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
-    return sec_ms + nsec_ms;
+    return std.Io.Timestamp.now(io(), .real).toMilliseconds();
 }
 
 /// Current monotonic timestamp in nanoseconds.
-/// Replaces removed `std.time.nanoTimestamp`.
+/// Replaces removed `std.time.nanoTimestamp`. `.awake` is the monotonic clock
+/// (CLOCK_MONOTONIC on Linux), matching the previous implementation.
 pub fn nowNs() i128 {
-    var ts: std.posix.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(i128, @intCast(ts.sec)) * std.time.ns_per_s +
-        @as(i128, @intCast(ts.nsec));
+    return @intCast(std.Io.Timestamp.now(io(), .awake).toNanoseconds());
 }
 
 /// Fill `buf` with cryptographically secure random bytes.
@@ -216,6 +213,32 @@ pub fn accept4(listener_fd: std.posix.fd_t, flags: u32) !std.posix.fd_t {
 /// Raw libc close() wrapper. `posix.close` was removed in Zig 0.16.
 pub fn close(fd: std.posix.fd_t) void {
     _ = std.c.close(fd);
+}
+
+/// Disable Nagle's algorithm (TCP_NODELAY) on a connected socket — critical
+/// for low-latency request/response. Best-effort: failures are ignored.
+///
+/// `std.posix.setsockopt` is a hard `@compileError` on Windows, so the Windows
+/// path calls Winsock's `setsockopt` directly. The Io.net socket handle is a
+/// `HANDLE` wrapping the underlying `SOCKET`, recovered here via `@intFromPtr`.
+pub fn setNoDelay(handle: std.posix.fd_t) void {
+    if (builtin.os.tag == .windows) {
+        const setsockopt = @extern(
+            *const fn (usize, c_int, c_int, [*]const u8, c_int) callconv(.c) c_int,
+            .{ .name = "setsockopt", .library_name = "ws2_32" },
+        );
+        const IPPROTO_TCP: c_int = 6;
+        const TCP_NODELAY: c_int = 1;
+        const one: c_int = 1;
+        _ = setsockopt(@intFromPtr(handle), IPPROTO_TCP, TCP_NODELAY, @ptrCast(&one), @sizeOf(c_int));
+    } else {
+        std.posix.setsockopt(
+            handle,
+            std.posix.IPPROTO.TCP,
+            std.posix.TCP.NODELAY,
+            &std.mem.toBytes(@as(c_int, 1)),
+        ) catch {};
+    }
 }
 
 /// Networking compatibility layer.
@@ -270,18 +293,38 @@ pub const net = struct {
         inner: std.Io.net.Stream,
 
         pub fn read(self: *Stream, buf: []u8) !usize {
-            const zio = io();
-            const result = self.inner.socket.handle;
-            // Use low-level posix read since Io.net.Stream uses Reader interface
-            const n = std.posix.read(result, buf) catch |err| {
-                return err;
-            };
-            _ = zio;
-            return n;
+            const handle = self.inner.socket.handle;
+            if (builtin.os.tag == .windows) {
+                // Winsock SOCKETs are not CRT file descriptors, so the POSIX
+                // read(2) path below is invalid on Windows. Route through the
+                // Io net vtable (Winsock recv under the hood).
+                const zio = io();
+                var iov = [_][]u8{buf};
+                return zio.vtable.netRead(zio.userdata, handle, &iov);
+            }
+            // POSIX: raw read(2) on the socket fd.
+            return std.posix.read(handle, buf);
         }
 
         pub fn writeAll(self: *Stream, data: []const u8) !void {
             const handle = self.inner.socket.handle;
+            if (builtin.os.tag == .windows) {
+                // Winsock send via the Io net vtable; loop on partial writes.
+                // netWrite treats `data[data.len-1]` as the splat pattern, so
+                // `data` must be non-empty: pass the payload as a one-element
+                // vector with splat=1 and an empty header (an empty `data`
+                // slice underflows `data.len - 1` inside the vtable).
+                const zio = io();
+                const empty_header: []const u8 = "";
+                var written: usize = 0;
+                while (written < data.len) {
+                    const chunk = [_][]const u8{data[written..]};
+                    const n = try zio.vtable.netWrite(zio.userdata, handle, empty_header, &chunk, 1);
+                    if (n == 0) return error.BrokenPipe;
+                    written += n;
+                }
+                return;
+            }
             var written: usize = 0;
             while (written < data.len) {
                 const rc = std.c.write(handle, data[written..].ptr, data.len - written);

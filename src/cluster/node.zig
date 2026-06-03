@@ -7,6 +7,7 @@
 //!   - WormWire replication over mesh tunnels
 
 const std = @import("std");
+const builtin = @import("builtin");
 const meshguard = @import("meshguard");
 const storage = @import("../storage/mod.zig");
 const event = @import("../event/mod.zig");
@@ -100,8 +101,12 @@ const PeerConnection = struct {
 
         // Set send timeout so writeAll to dead peers times out in 2s
         // instead of blocking for 30+ seconds (Linux TCP keepalive default).
-        const timeval = std.posix.timeval{ .sec = 2, .usec = 0 };
-        std.posix.setsockopt(stream.getHandle(), std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeval)) catch {};
+        // POSIX-only (std.posix.setsockopt is a compile-error on Windows); the
+        // cluster path only runs on Linux, so this is gated rather than ported.
+        if (comptime builtin.os.tag == .linux) {
+            const timeval = std.posix.timeval{ .sec = 2, .usec = 0 };
+            std.posix.setsockopt(stream.getHandle(), std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeval)) catch {};
+        }
 
         var stream_mut = stream;
         stream_mut.writeAll(&.{ 0x57, 0x52 }) catch {
@@ -247,14 +252,21 @@ pub const Cluster = struct {
             return;
         };
 
-        // Setup WireGuard kernel interface
-        WgConfig.setup(.{
-            .private_key = wg_private,
-            .listen_port = self.config.wg_port,
-            .mesh_ip = self.mesh_ip,
-        }) catch |err| {
-            std.log.warn("cluster: WG interface setup failed: {s} (continuing without WG)", .{@errorName(err)});
-        };
+        // Setup WireGuard kernel interface (Linux-only: meshguard manages the
+        // interface via netlink, which has no Windows/macOS equivalent here).
+        // Off Linux the mesh runs over real peer addresses (same fallback used
+        // when WG tunnels are unavailable, e.g. Docker).
+        if (comptime builtin.os.tag == .linux) {
+            WgConfig.setup(.{
+                .private_key = wg_private,
+                .listen_port = self.config.wg_port,
+                .mesh_ip = self.mesh_ip,
+            }) catch |err| {
+                std.log.warn("cluster: WG interface setup failed: {s} (continuing without WG)", .{@errorName(err)});
+            };
+        } else {
+            std.log.warn("cluster: WireGuard interface management is Linux-only; running mesh over real peer addresses", .{});
+        }
 
         // Initialize SWIM protocol
         self.swim = Swim.SwimProtocol.init(
@@ -316,8 +328,10 @@ pub const Cluster = struct {
             self.discovery_thread = null;
         }
 
-        // Teardown WireGuard interface
-        WgConfig.teardown(WgConfig.DEFAULT_IFNAME) catch {};
+        // Teardown WireGuard interface (Linux-only; see start()).
+        if (comptime builtin.os.tag == .linux) {
+            WgConfig.teardown(WgConfig.DEFAULT_IFNAME) catch {};
+        }
     }
 
     /// Reconcile the peer map from SWIM membership, then for every peer
@@ -781,36 +795,42 @@ fn resolveSeedEndpoint(seed_str: []const u8) ?messages.Endpoint {
         return .{ .addr = addr, .port = port };
     }
 
-    // Hostname: resolve via libc getaddrinfo (works with Docker DNS)
-    const c = @cImport({
-        @cInclude("netdb.h");
-        @cInclude("arpa/inet.h");
-    });
+    // Hostname: resolve via libc getaddrinfo (works with Docker DNS). The
+    // @cImport of netdb.h/arpa/inet.h is POSIX-only; clustering is disabled off
+    // Linux, so an unresolved hostname seed simply fails there.
+    if (comptime builtin.os.tag == .linux) {
+        const c = @cImport({
+            @cInclude("netdb.h");
+            @cInclude("arpa/inet.h");
+        });
 
-    // Null-terminate the hostname for C
-    var host_buf: [256]u8 = undefined;
-    if (host.len >= host_buf.len) return null;
-    @memcpy(host_buf[0..host.len], host);
-    host_buf[host.len] = 0;
+        // Null-terminate the hostname for C
+        var host_buf: [256]u8 = undefined;
+        if (host.len >= host_buf.len) return null;
+        @memcpy(host_buf[0..host.len], host);
+        host_buf[host.len] = 0;
 
-    var hints: c.struct_addrinfo = std.mem.zeroes(c.struct_addrinfo);
-    hints.ai_family = c.AF_INET; // IPv4 only
-    hints.ai_socktype = c.SOCK_DGRAM;
+        var hints: c.struct_addrinfo = std.mem.zeroes(c.struct_addrinfo);
+        hints.ai_family = c.AF_INET; // IPv4 only
+        hints.ai_socktype = c.SOCK_DGRAM;
 
-    var result: ?*c.struct_addrinfo = null;
-    const rc = c.getaddrinfo(&host_buf, null, &hints, &result);
-    if (rc != 0 or result == null) return null;
-    defer c.freeaddrinfo(result.?);
+        var result: ?*c.struct_addrinfo = null;
+        const rc = c.getaddrinfo(&host_buf, null, &hints, &result);
+        if (rc != 0 or result == null) return null;
+        defer c.freeaddrinfo(result.?);
 
-    // Extract IPv4 address from the first result
-    const sa: *const c.struct_sockaddr_in = @ptrCast(@alignCast(result.?.ai_addr));
-    const addr_bytes: [4]u8 = @bitCast(sa.sin_addr.s_addr);
+        // Extract IPv4 address from the first result
+        const sa: *const c.struct_sockaddr_in = @ptrCast(@alignCast(result.?.ai_addr));
+        const addr_bytes: [4]u8 = @bitCast(sa.sin_addr.s_addr);
 
-    var ip_buf: [15]u8 = undefined;
-    const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3] }) catch return null;
-    std.log.info("cluster: resolved seed '{s}' → {s}:{d}", .{ host, ip_str, port });
+        var ip_buf: [15]u8 = undefined;
+        const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3] }) catch return null;
+        std.log.info("cluster: resolved seed '{s}' → {s}:{d}", .{ host, ip_str, port });
 
-    return .{ .addr = addr_bytes, .port = port };
+        return .{ .addr = addr_bytes, .port = port };
+    }
+
+    return null;
 }
 
 fn parseIpv4(ip_str: []const u8) ?[4]u8 {

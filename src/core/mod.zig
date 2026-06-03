@@ -11,8 +11,6 @@ const std = @import("std");
 pub const types = @import("types.zig");
 pub const config = @import("config.zig");
 pub const compat = @import("compat.zig");
-pub const name = @import("name.zig");
-pub const keyenc = @import("keyenc.zig");
 
 // Re-export commonly used types
 pub const Entry = types.Entry;

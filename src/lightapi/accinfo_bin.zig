@@ -1,11 +1,11 @@
 //! Render a binary accinfo record (see hyperion-tools wseg-build `binfmt.rs`) to the cc32d9 accinfo
 //! JSON fragment — byte-identical to the JSON the builder used to pre-render. Keys are stored as the
 //! 33-byte point + two 4-byte base58check checksums; this re-encodes `EOS…`/`PUB_K1_…` at request
-//! time via `core/keyenc.zig` (base58), so the segment holds ~43 B/key instead of ~150 B of strings.
+//! time via `lightapi/keyenc.zig` (base58), so the segment holds ~43 B/key instead of ~150 B of strings.
 
 const std = @import("std");
-const name = @import("../core/name.zig");
-const keyenc = @import("../core/keyenc.zig");
+const name = @import("name.zig");
+const keyenc = @import("keyenc.zig");
 
 const MARKER: u8 = 0x00;
 const FLAG_RESOURCES: u8 = 0x01;

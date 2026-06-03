@@ -3,7 +3,7 @@
 //! (rex-enabled chains would add the computed `rex` block — not needed for the Libre matrix.)
 
 const std = @import("std");
-const Ctx = @import("context.zig").Ctx;
+const Ctx = @import("../procedures/context.zig").Ctx;
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const chain = ctx.arg(0) orelse return ctx.err("need <chain> <account>");

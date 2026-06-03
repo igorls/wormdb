@@ -2,8 +2,9 @@
 //! the raw row data the WS notifications stream; the gateway wraps them in the JSON-RPC envelope.
 
 const std = @import("std");
-const Ctx = @import("context.zig").Ctx;
-const name = @import("../core/name.zig");
+const Ctx = @import("../procedures/context.zig").Ctx;
+const name = @import("name.zig");
+const tables = @import("tables.zig");
 const balances = @import("lightapi_balances.zig");
 const topholders = @import("lightapi_topholders.zig");
 
@@ -57,7 +58,7 @@ pub fn holderRows(ctx: *Ctx) anyerror!Ctx.Result {
 /// The gateway streams one {account_name, perm, weight, pubkey} notification per line.
 pub fn keyRows(ctx: *Ctx) anyerror!Ctx.Result {
     const pubkey = ctx.arg(0) orelse return ctx.err("need <pubkey>");
-    const seg = ctx.store.lightapi_segment orelse return ctx.value("");
-    const blob = seg.lookup(.pub_keys, name.keyHash(pubkey)) orelse return ctx.value("");
+    const seg = ctx.store.frozen_segment orelse return ctx.value("");
+    const blob = seg.lookup(tables.pub_keys, name.keyHash(pubkey)) orelse return ctx.value("");
     return ctx.value(blob);
 }

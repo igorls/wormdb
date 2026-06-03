@@ -3,8 +3,14 @@
 //! Maps procedure names to native Zig functions compiled into the server.
 //! Each procedure receives a Ctx and returns a Result — the Ctx handles
 //! locking, argument parsing, and response building automatically.
+//!
+//! The table is generic. Application-specific procedures are contributed by
+//! optional modules and appended here behind a build flag — e.g. the Antelope
+//! Light-API procedures are pulled from `src/lightapi/mod.zig` only when
+//! `-Dlightapi=true`, so the default build names no blockchain code.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const Ctx = @import("context.zig").Ctx;
 
 pub const transfer = @import("transfer.zig");
@@ -24,28 +30,16 @@ pub const vrabitq = @import("vrabitq.zig");
 pub const vdelete = @import("vdelete.zig");
 pub const vnsdrop = @import("vnsdrop.zig");
 pub const memory = @import("memory.zig");
-pub const lightapi_balances = @import("lightapi_balances.zig");
-pub const lightapi_account = @import("lightapi_account.zig");
-pub const lightapi_accinfo = @import("lightapi_accinfo.zig");
-pub const lightapi_tokenbalance = @import("lightapi_tokenbalance.zig");
-pub const lightapi_get = @import("lightapi_get.zig");
-pub const lightapi_topholders = @import("lightapi_topholders.zig");
-pub const lightapi_holdercount = @import("lightapi_holdercount.zig");
-pub const lightapi_topn = @import("lightapi_topn.zig");
-pub const lightapi_sync = @import("lightapi_sync.zig");
-pub const lightapi_status = @import("lightapi_status.zig");
-pub const lightapi_ws = @import("lightapi_ws.zig");
-pub const lightapi_rexbalance = @import("lightapi_rexbalance.zig");
 
 pub const ProcedureFn = *const fn (ctx: *Ctx) anyerror!Ctx.Result;
 
-const Entry = struct {
+pub const Entry = struct {
     name: []const u8,
     func: ProcedureFn,
 };
 
-/// Comptime-generated procedure table.
-const PROCEDURES = [_]Entry{
+/// The generic, application-agnostic procedures — always compiled in.
+const GENERIC_PROCEDURES = [_]Entry{
     .{ .name = "transfer", .func = transfer.execute },
     .{ .name = "increment", .func = increment.execute },
     .{ .name = "kv_put", .func = kv_put.execute },
@@ -70,21 +64,18 @@ const PROCEDURES = [_]Entry{
     .{ .name = "mem_drop", .func = memory.memDrop },
     .{ .name = "mem_reset_index", .func = memory.memResetIndex },
     .{ .name = "mem_capabilities", .func = memory.memCapabilities },
-    .{ .name = "lightapi_balances", .func = lightapi_balances.execute },
-    .{ .name = "lightapi_account", .func = lightapi_account.execute },
-    .{ .name = "lightapi_accinfo", .func = lightapi_accinfo.execute },
-    .{ .name = "lightapi_tokenbalance", .func = lightapi_tokenbalance.execute },
-    .{ .name = "lightapi_get", .func = lightapi_get.execute },
-    .{ .name = "lightapi_topholders", .func = lightapi_topholders.execute },
-    .{ .name = "lightapi_holdercount", .func = lightapi_holdercount.execute },
-    .{ .name = "lightapi_topn", .func = lightapi_topn.execute },
-    .{ .name = "lightapi_sync", .func = lightapi_sync.execute },
-    .{ .name = "lightapi_status", .func = lightapi_status.execute },
-    .{ .name = "lightapi_ws_balances", .func = lightapi_ws.balancesRow },
-    .{ .name = "lightapi_ws_holders", .func = lightapi_ws.holderRows },
-    .{ .name = "lightapi_ws_keyrows", .func = lightapi_ws.keyRows },
-    .{ .name = "lightapi_rexbalance", .func = lightapi_rexbalance.execute },
 };
+
+/// Application procedures contributed by optional, build-flag-gated modules.
+/// When `-Dlightapi=true`, the Antelope Light-API procedures are appended; with
+/// the flag off this is empty and no `src/lightapi/` code is referenced.
+const APP_PROCEDURES = if (build_options.lightapi)
+    @import("../lightapi/mod.zig").procedures
+else
+    [_]Entry{};
+
+/// Comptime-generated procedure table: generic core + any enabled app modules.
+const PROCEDURES = GENERIC_PROCEDURES ++ APP_PROCEDURES;
 
 /// Look up a procedure by name. O(n) scan — n is tiny at comptime-known size.
 pub fn lookup(name: []const u8) ?ProcedureFn {

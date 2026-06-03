@@ -9,7 +9,7 @@
 //! N must be in [10,1000] (else the cc32d9 plain-text "Invalid count: N"). O(N) slice.
 
 const std = @import("std");
-const Ctx = @import("context.zig").Ctx;
+const Ctx = @import("../procedures/context.zig").Ctx;
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const key = ctx.arg(0) orelse return ctx.err("lightapi_topn requires <key> <N> [fmt]");

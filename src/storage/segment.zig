@@ -28,6 +28,11 @@
 //!   Index region (per table): key_count × 20 B, sorted by key asc:
 //!     key u64 | off u64 (into table's blob) | len u32
 //!   Blob region (per table): concatenated payloads.
+//!
+//! The segment core is **application-agnostic**: a table is identified by a plain
+//! `u32` id and looked up by a `u64` key. The meaning of those ids/keys is owned
+//! by the application that built the segment (e.g. the optional Light-API module
+//! defines named table constants and a name→u64 key codec).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -39,20 +44,11 @@ pub const VERSION: u32 = 1;
 const HEADER_FIXED: usize = 40; // up to and including meta_off/meta_len
 const DIR_ENTRY: usize = 48;
 const INDEX_ENTRY: usize = 20; // key u64 | off u64 | len u32
-const MAX_TABLES: usize = 16;
 
-/// Stable table identifiers. The builder and reader must agree on these.
-pub const TableId = enum(u32) {
-    balances = 0, // holder name -> packed "<contract>\t<symbol>\t<dec>\t<amount>\n..."
-    resources = 1, // (reserved) account -> binary resources
-    perms = 2, // (reserved) account -> binary permission list
-    delband_from = 3, // (reserved) `from` -> delegations made
-    delband_to = 4, // (reserved) `to` -> delegations received
-    accinfo = 5, // account name -> cc32d9 accinfo fragment ("resources":…,"linkauth":[…][,"code":…]})
-    token_holders = 6, // tokenKey(contract,symbol) -> [u16 hdr]["contract:symbol"] + "acct\tamount\n"… (amount-desc)
-    pub_keys = 7, // fnv1a64(pubkey EOS|PUB_K1) -> "account\tperm\tweight\n"… (holders of that key)
-    _,
-};
+/// Maximum number of distinct tables a segment may declare. Table ids are dense
+/// `u32`s in `[0, MAX_TABLES)`; ids at or beyond this bound are ignored at open
+/// time so a newer builder can add tables an older reader silently skips.
+pub const MAX_TABLES: usize = 16;
 
 pub const SegmentError = error{
     SegmentTooSmall,
@@ -134,21 +130,27 @@ pub const Segment = struct {
         self.tables = [_]?Table{null} ** MAX_TABLES;
     }
 
-    pub fn has(self: *const Segment, table: TableId) bool {
-        return self.tables[@intFromEnum(table)] != null;
+    /// Whether `table` (a dense u32 id) is present. Ids >= MAX_TABLES are never
+    /// present.
+    pub fn has(self: *const Segment, table: u32) bool {
+        return table < MAX_TABLES and self.tables[table] != null;
     }
 
-    /// Number of keys in a table (0 if absent). `accinfo` key count = the account universe (every
-    /// account has ≥1 permission) = cc32d9 `usercount`.
-    pub fn keyCount(self: *const Segment, table: TableId) u64 {
-        return if (self.tables[@intFromEnum(table)]) |t| t.key_count else 0;
+    /// Number of keys in a table (0 if absent or out of range). For the Light-API
+    /// `accinfo` table this equals the account universe (every account has ≥1
+    /// permission) = cc32d9 `usercount`.
+    pub fn keyCount(self: *const Segment, table: u32) u64 {
+        if (table >= MAX_TABLES) return 0;
+        return if (self.tables[table]) |t| t.key_count else 0;
     }
 
     /// Binary-search a table for `key`. Returns the borrowed blob slice (valid
     /// for the segment's lifetime — the mapping is never unmapped while
-    /// serving) or null if the key (or table) is absent.
-    pub fn lookup(self: *const Segment, table: TableId, key: u64) ?[]const u8 {
-        const t = self.tables[@intFromEnum(table)] orelse return null;
+    /// serving) or null if the key (or table) is absent. `table` is a dense u32
+    /// id; out-of-range ids return null.
+    pub fn lookup(self: *const Segment, table: u32, key: u64) ?[]const u8 {
+        if (table >= MAX_TABLES) return null;
+        const t = self.tables[table] orelse return null;
         var lo: usize = 0;
         var hi: usize = @intCast(t.key_count);
         while (lo < hi) {
@@ -293,14 +295,18 @@ fn buildOneTableSegment(
 
 test "segment round-trip via temp file" {
     const testing = std.testing;
-    const name = @import("../core/name.zig");
 
-    // Build a balances segment with keys that exercise the sorted-index search.
+    // Application-agnostic: a table is a u32 id, keys are arbitrary u64s. (The
+    // Light-API module maps account names to these u64s, but the segment core
+    // knows nothing about that — these are hand-picked keys that exercise the
+    // sorted-index binary search across the full u64 range.)
+    const TABLE: u32 = 0;
+    const OTHER_TABLE: u32 = 1;
     var entries = [_]TestEntry{
-        .{ .key = name.encode("a"), .val = "tok\tA\t4\t1.0000" },
-        .{ .key = name.encode("eosio"), .val = "eosio.token\tWAX\t8\t10.00000000" },
-        .{ .key = name.encode("waxupbitcold"), .val = "eosio.token\tWAX\t8\t999.99999999" },
-        .{ .key = name.encode("zzz"), .val = "x\tY\t0\t7" },
+        .{ .key = 1, .val = "tok\tA\t4\t1.0000" },
+        .{ .key = 0x5530ea0000000000, .val = "eosio.token\tWAX\t8\t10.00000000" },
+        .{ .key = 0xfedcba9876543210, .val = "eosio.token\tWAX\t8\t999.99999999" },
+        .{ .key = std.math.maxInt(u64), .val = "x\tY\t0\t7" },
     };
     // Index must be sorted by key ascending.
     std.sort.pdq(TestEntry, &entries, {}, struct {
@@ -309,7 +315,7 @@ test "segment round-trip via temp file" {
         }
     }.lt);
 
-    const bytes = try buildOneTableSegment(testing.allocator, @intFromEnum(TableId.balances), &entries);
+    const bytes = try buildOneTableSegment(testing.allocator, TABLE, &entries);
     defer testing.allocator.free(bytes);
 
     var tmp = testing.tmpDir(.{});
@@ -326,16 +332,20 @@ test "segment round-trip via temp file" {
     var seg = try Segment.open(testing.allocator, seg_path);
     defer seg.close(testing.allocator);
 
-    try testing.expect(seg.has(.balances));
-    try testing.expect(!seg.has(.perms));
+    try testing.expect(seg.has(TABLE));
+    try testing.expect(!seg.has(OTHER_TABLE));
+    try testing.expectEqual(@as(u64, 4), seg.keyCount(TABLE));
     try testing.expectEqualStrings(
         "eosio.token\tWAX\t8\t999.99999999",
-        seg.lookup(.balances, name.encode("waxupbitcold")).?,
+        seg.lookup(TABLE, 0xfedcba9876543210).?,
     );
-    try testing.expectEqualStrings("tok\tA\t4\t1.0000", seg.lookup(.balances, name.encode("a")).?);
-    try testing.expectEqualStrings("x\tY\t0\t7", seg.lookup(.balances, name.encode("zzz")).?);
-    try testing.expect(seg.lookup(.balances, name.encode("missing")) == null);
-    try testing.expect(seg.lookup(.resources, name.encode("a")) == null);
+    try testing.expectEqualStrings("tok\tA\t4\t1.0000", seg.lookup(TABLE, 1).?);
+    try testing.expectEqualStrings("x\tY\t0\t7", seg.lookup(TABLE, std.math.maxInt(u64)).?);
+    try testing.expect(seg.lookup(TABLE, 12345) == null);
+    try testing.expect(seg.lookup(OTHER_TABLE, 1) == null);
+    // Out-of-range table ids never resolve.
+    try testing.expect(!seg.has(MAX_TABLES));
+    try testing.expect(seg.lookup(MAX_TABLES, 1) == null);
 }
 
 test "rejects a bad-magic file" {

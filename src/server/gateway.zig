@@ -10,6 +10,7 @@
 //! identical code path as TCP connections.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const core = @import("../core/mod.zig");
 const storage = @import("../storage/mod.zig");
 const protocol = @import("../protocol/mod.zig");
@@ -19,6 +20,16 @@ const cluster_mod = @import("../cluster/mod.zig");
 const executor = @import("executor.zig");
 
 const auth = @import("auth.zig");
+
+/// Optional application request-handler module. The generic gateway (handshake,
+/// framing, keep-alive HTTP, the binary WormWire path) is app-agnostic; an app
+/// module supplies the HTTP `/...` route table and the WS text (JSON-RPC) dialect.
+/// Gated exactly like `quic_gateway` in server/mod.zig — with the flag off this
+/// is an empty struct and the gateway serves only the binary protocol + 404s HTTP.
+const app = if (build_options.lightapi) @import("../lightapi/mod.zig") else struct {};
+
+/// True when an app module is wired in to handle HTTP/WS-text requests.
+const has_app = @hasDecl(app, "routeHttp");
 
 const Store = storage.Store;
 const EventBus = event_mod.EventBus;
@@ -169,10 +180,13 @@ pub const Gateway = struct {
                 0x0A => continue, // Pong — ignore
                 0x02 => {}, // Binary — process below
                 0x01 => {
-                    // Text frame — the cc32d9 Light-API WebSocket dialect (JSON-RPC 2.0). Reuses the
-                    // same store/segment; streams notifications back as text frames.
-                    _ = cmd_arena.reset(.retain_capacity);
-                    self.handleJsonRpc(&stream, cmd_arena.allocator(), ws_frame.payload);
+                    // Text frame — handed to the app module's text dialect (the cc32d9 Light-API
+                    // WebSocket JSON-RPC 2.0 API), which streams notifications back as text frames
+                    // through a gateway-provided sink. No app module → text frames are ignored.
+                    if (has_app) {
+                        _ = cmd_arena.reset(.retain_capacity);
+                        self.handleAppText(&stream, cmd_arena.allocator(), ws_frame.payload);
+                    }
                     continue;
                 },
                 else => {
@@ -320,11 +334,13 @@ pub const Gateway = struct {
         }
     }
 
-    // --- Plain HTTP (Light-API drop-in) ---
+    // --- Plain HTTP request handling ---
     //
-    // Answers `GET /api/...` directly over HTTP/1.1 by routing to an EXEC procedure and returning its
-    // JSON value — the SAME executor pipeline as WormWire/WS clients, no application tier. Keep-alive
-    // loop so HTTP clients (and reverse proxies) get connection reuse. The DB *is* the API server.
+    // The generic gateway answers HTTP/1.1 GETs over a keep-alive loop (so HTTP clients and reverse
+    // proxies get connection reuse) but owns no routes. When an app module is wired in (e.g. the
+    // Light-API `/api/...` drop-in), each path is handed to `app.routeHttp`, which maps it to an EXEC
+    // procedure via the SAME executor pipeline as WormWire/WS clients — no application tier. With no
+    // app module, every path 404s.
 
     fn serveHttp(self: *Gateway, stream: *core.compat.net.Stream, request_buf: *[4096]u8, first: []const u8) void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -349,130 +365,19 @@ pub const Gateway = struct {
         var path = after[0..sp];
         if (std.mem.indexOfScalar(u8, path, '?')) |q| path = path[0..q]; // drop query string
 
-        if (self.route(alloc, path)) |r| {
-            const ct: []const u8 = if (r.json) "application/json" else "text/plain; charset=utf-8";
-            return writeHttp(stream, r.status, ct, r.body);
+        if (has_app) {
+            if (app.routeHttp(self.appExecCtx(), alloc, path)) |r| {
+                const ct: []const u8 = if (r.json) "application/json" else "text/plain; charset=utf-8";
+                return writeHttp(stream, r.status, ct, r.body);
+            }
         }
         return writeHttp(stream, 404, "text/plain", "not found");
     }
 
-    const RouteResult = struct { body: []const u8, json: bool, status: u16 = 200 };
-
-    /// Map a `/api/...` path to an EXEC. Returns the body + whether it is JSON, or null → 404.
-    fn route(self: *Gateway, alloc: std.mem.Allocator, path: []const u8) ?RouteResult {
-        var it = std.mem.tokenizeScalar(u8, path, '/');
-        if (!std.mem.eql(u8, it.next() orelse return null, "api")) return null;
-        const ep = it.next() orelse return null;
-        const eql = std.mem.eql;
-
-        if (eql(u8, ep, "balances")) {
-            const chain = it.next() orelse return null;
-            const acct = it.next() orelse return null;
-            if (it.next() != null) return null;
-            return jsonRoute(self.execProc(alloc, "lightapi_balances", &.{ chain, acct }));
-        }
-        if (eql(u8, ep, "account")) {
-            const chain = it.next() orelse return null;
-            const acct = it.next() orelse return null;
-            if (it.next() != null) return null;
-            return jsonRoute(self.execProc(alloc, "lightapi_account", &.{ chain, acct }));
-        }
-        if (eql(u8, ep, "accinfo")) {
-            const chain = it.next() orelse return null;
-            const acct = it.next() orelse return null;
-            if (it.next() != null) return null;
-            return jsonRoute(self.execProc(alloc, "lightapi_accinfo", &.{ chain, acct }));
-        }
-        if (eql(u8, ep, "tokenbalance")) {
-            const chain = it.next() orelse return null;
-            const acct = it.next() orelse return null;
-            const contract = it.next() orelse return null;
-            const symbol = it.next() orelse return null;
-            return textRoute(self.execProc(alloc, "lightapi_tokenbalance", &.{ chain, acct, contract, symbol }));
-        }
-        if (eql(u8, ep, "usercount")) {
-            const chain = it.next() orelse return null;
-            const key = std.fmt.allocPrint(alloc, "uc:{s}", .{chain}) catch return null;
-            return textRoute(self.execProc(alloc, "lightapi_get", &.{ key, "0" }));
-        }
-        if (eql(u8, ep, "holdercount")) {
-            const chain = it.next() orelse return null;
-            const contract = it.next() orelse return null;
-            const symbol = it.next() orelse return null;
-            return textRoute(self.execProc(alloc, "lightapi_holdercount", &.{ chain, contract, symbol }));
-        }
-        if (eql(u8, ep, "networks")) {
-            return jsonRoute(self.execProc(alloc, "lightapi_get", &.{ "lanet", "[]" }));
-        }
-        if (eql(u8, ep, "codehash")) {
-            const hash = it.next() orelse return null;
-            const key = std.fmt.allocPrint(alloc, "chh:{s}", .{hash}) catch return null;
-            return jsonRoute(self.execProc(alloc, "lightapi_get", &.{ key, "{}" }));
-        }
-        if (eql(u8, ep, "key")) {
-            const pubkey = it.next() orelse return null;
-            const key = std.fmt.allocPrint(alloc, "pk:{s}", .{pubkey}) catch return null;
-            return jsonRoute(self.execProc(alloc, "lightapi_get", &.{ key, "{}" }));
-        }
-        if (eql(u8, ep, "topholders")) {
-            const chain = it.next() orelse return null;
-            const contract = it.next() orelse return null;
-            const symbol = it.next() orelse return null;
-            const n = it.next() orelse return null;
-            return jsonRoute(self.execProc(alloc, "lightapi_topholders", &.{ chain, contract, symbol, n }));
-        }
-        if (eql(u8, ep, "topram") or eql(u8, ep, "topstake")) {
-            const chain = it.next() orelse return null;
-            const n = it.next() orelse return null;
-            // key = "topram:<chain>" / "topstake:<chain>" (materialized at load time).
-            // topram rows are [acct,ram] (1 int); topstake rows are [acct,cpu,net] (2 ints).
-            const key = std.fmt.allocPrint(alloc, "{s}:{s}", .{ ep, chain }) catch return null;
-            const fmt: []const u8 = if (eql(u8, ep, "topstake")) "nn" else "n";
-            return jsonRoute(self.execProc(alloc, "lightapi_topn", &.{ key, n, fmt }));
-        }
-        if (eql(u8, ep, "rexbalance")) {
-            const chain = it.next() orelse return null;
-            const acct = it.next() orelse return null;
-            return jsonRoute(self.execProc(alloc, "lightapi_rexbalance", &.{ chain, acct }));
-        }
-        if (eql(u8, ep, "rexraw")) {
-            const chain = it.next() orelse return null;
-            const key = std.fmt.allocPrint(alloc, "rexraw:{s}", .{chain}) catch return null;
-            return textRoute(self.execProc(alloc, "lightapi_get", &.{ key, "REX is not enabled" }));
-        }
-        if (eql(u8, ep, "sync")) {
-            const chain = it.next() orelse return null;
-            return textRoute(self.execProc(alloc, "lightapi_sync", &.{chain}));
-        }
-        if (eql(u8, ep, "status")) {
-            const body = self.execProc(alloc, "lightapi_status", &.{}) orelse return null;
-            // cc32d9 returns HTTP 503 when any network is out of sync (body starts "OUT_OF_SYNC").
-            const status: u16 = if (std.mem.startsWith(u8, body, "OUT_OF_SYNC")) 503 else 200;
-            return .{ .body = body, .json = false, .status = status };
-        }
-        return null;
-    }
-
-    fn jsonRoute(body: ?[]const u8) ?RouteResult {
-        return .{ .body = body orelse return null, .json = true };
-    }
-    fn textRoute(body: ?[]const u8) ?RouteResult {
-        return .{ .body = body orelse return null, .json = false };
-    }
-
-    /// Run a procedure through the shared executor; return its `value` payload (or null on error).
-    fn execProc(self: *Gateway, alloc: std.mem.Allocator, proc: []const u8, args: []const []const u8) ?[]const u8 {
-        const resp = executor.execute(.{
-            .allocator = alloc,
-            .store = self.store,
-            .event_bus = self.event_bus,
-            .cluster = self.cluster,
-            .identity = null,
-        }, .{ .exec = .{ .procedure = proc, .args = args } }) catch return null;
-        return switch (resp) {
-            .value => |v| v orelse "null",
-            else => null,
-        };
+    /// Build the neutral execution context the app request handlers operate on
+    /// (store/bus/cluster — the inputs the executor needs, no socket state).
+    fn appExecCtx(self: *Gateway) app.ExecCtx {
+        return .{ .store = self.store, .event_bus = self.event_bus, .cluster = self.cluster };
     }
 
     fn writeHttp(stream: *core.compat.net.Stream, status: u16, content_type: []const u8, body: []const u8) bool {
@@ -494,151 +399,24 @@ pub const Gateway = struct {
         return true;
     }
 
-    // --- cc32d9 WebSocket JSON-RPC API (jsonrpc2-ws dialect) ---
+    // --- App WebSocket text dialect (hook) ---
     //
-    // A text WS frame carries a JSON-RPC 2.0 request {method, params:{reqid, …}}. We stream results
-    // back as `reqdata` notifications — one per row `{method, reqid, data}` — terminated by
-    // `{method, reqid, end:true, status:200, error:null}`. Mirrors cc32d9's wsapi/lightapi_wsapi.js.
+    // A text WS frame is handed to the app module (when wired in). The app parses it and streams
+    // replies as text frames through a `Sink` we provide — a thin wrapper that wraps each chunk in a
+    // 0x01 WebSocket frame on this connection's stream. The gateway stays free of any app dialect (the
+    // Light-API cc32d9 JSON-RPC handlers live in src/lightapi/routes.zig).
 
-    fn handleJsonRpc(self: *Gateway, stream: *core.compat.net.Stream, a: std.mem.Allocator, text: []const u8) void {
-        const parsed = std.json.parseFromSlice(std.json.Value, a, text, .{}) catch return;
-        defer parsed.deinit();
-        if (parsed.value != .object) return;
-        const root = parsed.value.object;
-        const method = root.get("method") orelse return;
-        if (method != .string) return;
-        const m = method.string;
-        const params: ?std.json.ObjectMap = if (root.get("params")) |p| (if (p == .object) p.object else null) else null;
-
-        var reqid_buf: [80]u8 = undefined;
-        const reqid = reqidStr(params, &reqid_buf);
-
-        if (std.mem.eql(u8, m, "get_networks")) {
-            const lanet = self.execProc(a, "lightapi_get", &.{ "lanet", "[]" }) orelse "[]";
-            self.wsData(stream, a, "get_networks", reqid, lanet);
-            self.wsEnd(stream, a, "get_networks", reqid);
-        } else if (std.mem.eql(u8, m, "get_balances")) {
-            self.wsBalances(stream, a, params, reqid);
-        } else if (std.mem.eql(u8, m, "get_token_holders")) {
-            self.wsTokenHolders(stream, a, params, reqid);
-        } else if (std.mem.eql(u8, m, "get_accounts_from_keys")) {
-            self.wsAccountsFromKeys(stream, a, params, reqid);
-        } else {
-            self.wsErr(stream, a, m, reqid, "unknown method");
-        }
+    fn handleAppText(self: *Gateway, stream: *core.compat.net.Stream, a: std.mem.Allocator, text: []const u8) void {
+        const sink: app.Sink = .{ .ptr = stream, .writeText = sendWsTextFrame };
+        app.handleWsText(self.appExecCtx(), sink, a, text);
     }
 
-    /// reqid re-emitted verbatim (number or JSON string); defaults to null.
-    fn reqidStr(params: ?std.json.ObjectMap, buf: []u8) []const u8 {
-        const p = params orelse return "null";
-        const v = p.get("reqid") orelse return "null";
-        return switch (v) {
-            .integer => |i| std.fmt.bufPrint(buf, "{d}", .{i}) catch "null",
-            .string => |s| std.fmt.bufPrint(buf, "\"{s}\"", .{s}) catch "null",
-            else => "null",
-        };
-    }
-
-    fn wsData(_: *Gateway, stream: *core.compat.net.Stream, a: std.mem.Allocator, method: []const u8, reqid: []const u8, data_json: []const u8) void {
-        var buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer buf.deinit(a);
-        buf.appendSlice(a, "{\"jsonrpc\":\"2.0\",\"method\":\"reqdata\",\"params\":{\"method\":\"") catch return;
-        buf.appendSlice(a, method) catch return;
-        buf.appendSlice(a, "\",\"reqid\":") catch return;
-        buf.appendSlice(a, reqid) catch return;
-        buf.appendSlice(a, ",\"data\":") catch return;
-        buf.appendSlice(a, data_json) catch return;
-        buf.appendSlice(a, "}}") catch return;
-        sendWsFrame(stream, 0x01, buf.items) catch {};
-    }
-
-    fn wsEnd(_: *Gateway, stream: *core.compat.net.Stream, a: std.mem.Allocator, method: []const u8, reqid: []const u8) void {
-        var buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer buf.deinit(a);
-        buf.appendSlice(a, "{\"jsonrpc\":\"2.0\",\"method\":\"reqdata\",\"params\":{\"method\":\"") catch return;
-        buf.appendSlice(a, method) catch return;
-        buf.appendSlice(a, "\",\"reqid\":") catch return;
-        buf.appendSlice(a, reqid) catch return;
-        buf.appendSlice(a, ",\"end\":true,\"status\":200,\"error\":null}}") catch return;
-        sendWsFrame(stream, 0x01, buf.items) catch {};
-    }
-
-    fn wsErr(_: *Gateway, stream: *core.compat.net.Stream, a: std.mem.Allocator, method: []const u8, reqid: []const u8, msg: []const u8) void {
-        var buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer buf.deinit(a);
-        buf.appendSlice(a, "{\"jsonrpc\":\"2.0\",\"method\":\"reqdata\",\"params\":{\"method\":\"") catch return;
-        buf.appendSlice(a, method) catch return;
-        buf.appendSlice(a, "\",\"reqid\":") catch return;
-        buf.appendSlice(a, reqid) catch return;
-        buf.appendSlice(a, ",\"end\":true,\"status\":500,\"error\":\"") catch return;
-        buf.appendSlice(a, msg) catch return;
-        buf.appendSlice(a, "\"}}") catch return;
-        sendWsFrame(stream, 0x01, buf.items) catch {};
-    }
-
-    fn paramStr(params: ?std.json.ObjectMap, field: []const u8) ?[]const u8 {
-        const p = params orelse return null;
-        const v = p.get(field) orelse return null;
-        return if (v == .string) v.string else null;
-    }
-
-    fn wsBalances(self: *Gateway, stream: *core.compat.net.Stream, a: std.mem.Allocator, params: ?std.json.ObjectMap, reqid: []const u8) void {
-        const network = paramStr(params, "network") orelse "";
-        const accounts = if (params) |p| p.get("accounts") else null;
-        if (accounts == null or accounts.? != .array) {
-            self.wsErr(stream, a, "get_balances", reqid, "accounts required");
-            return;
-        }
-        var n: usize = 0;
-        for (accounts.?.array.items) |acc| {
-            if (acc != .string or n >= 100) break;
-            n += 1;
-            if (self.execProc(a, "lightapi_ws_balances", &.{ network, acc.string })) |row| {
-                self.wsData(stream, a, "get_balances", reqid, row);
-            }
-        }
-        self.wsEnd(stream, a, "get_balances", reqid);
-    }
-
-    fn wsTokenHolders(self: *Gateway, stream: *core.compat.net.Stream, a: std.mem.Allocator, params: ?std.json.ObjectMap, reqid: []const u8) void {
-        const contract = paramStr(params, "contract") orelse "";
-        const currency = paramStr(params, "currency") orelse "";
-        const lines = self.execProc(a, "lightapi_ws_holders", &.{ contract, currency }) orelse "";
-        var it = std.mem.splitScalar(u8, lines, '\n');
-        while (it.next()) |line| {
-            if (line.len == 0) continue;
-            var f = std.mem.splitScalar(u8, line, '\t');
-            const acct = f.next() orelse continue;
-            const amount = f.next() orelse continue;
-            const data = std.fmt.allocPrint(a, "{{\"account\":\"{s}\",\"amount\":\"{s}\"}}", .{ acct, amount }) catch continue;
-            self.wsData(stream, a, "get_token_holders", reqid, data);
-        }
-        self.wsEnd(stream, a, "get_token_holders", reqid);
-    }
-
-    fn wsAccountsFromKeys(self: *Gateway, stream: *core.compat.net.Stream, a: std.mem.Allocator, params: ?std.json.ObjectMap, reqid: []const u8) void {
-        const keys = if (params) |p| p.get("keys") else null;
-        if (keys == null or keys.? != .array) {
-            self.wsErr(stream, a, "get_accounts_from_keys", reqid, "keys required");
-            return;
-        }
-        var n: usize = 0;
-        for (keys.?.array.items) |k| {
-            if (k != .string or n >= 100) break;
-            n += 1;
-            const rows = self.execProc(a, "lightapi_ws_keyrows", &.{k.string}) orelse "";
-            var it = std.mem.splitScalar(u8, rows, '\n');
-            while (it.next()) |line| {
-                if (line.len == 0) continue;
-                var f = std.mem.splitScalar(u8, line, '\t');
-                const acct = f.next() orelse continue;
-                const perm = f.next() orelse continue;
-                const weight = f.next() orelse continue;
-                const data = std.fmt.allocPrint(a, "{{\"account_name\":\"{s}\",\"perm\":\"{s}\",\"weight\":{s},\"pubkey\":\"{s}\"}}", .{ acct, perm, weight, k.string }) catch continue;
-                self.wsData(stream, a, "get_accounts_from_keys", reqid, data);
-            }
-        }
-        self.wsEnd(stream, a, "get_accounts_from_keys", reqid);
+    /// `Sink.writeText` impl: send `text` as a single WebSocket text frame. `ptr`
+    /// is the connection's `*core.compat.net.Stream`. Errors are swallowed (the
+    /// peer hanging up just ends the stream of notifications).
+    fn sendWsTextFrame(ptr: *anyopaque, text: []const u8) void {
+        const stream: *core.compat.net.Stream = @ptrCast(@alignCast(ptr));
+        sendWsFrame(stream, 0x01, text) catch {};
     }
 
     // --- WebSocket Protocol Implementation ---

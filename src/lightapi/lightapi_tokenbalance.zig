@@ -2,7 +2,7 @@
 //! packed per-account balance list. EXEC lightapi_tokenbalance <chain> <account> <contract> <symbol>
 
 const std = @import("std");
-const Ctx = @import("context.zig").Ctx;
+const Ctx = @import("../procedures/context.zig").Ctx;
 const balances = @import("lightapi_balances.zig");
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {

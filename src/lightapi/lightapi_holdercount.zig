@@ -5,7 +5,7 @@
 //! e.g. from a precompute/feed) wins if present, for forward-compat.
 
 const std = @import("std");
-const Ctx = @import("context.zig").Ctx;
+const Ctx = @import("../procedures/context.zig").Ctx;
 const topholders = @import("lightapi_topholders.zig");
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {

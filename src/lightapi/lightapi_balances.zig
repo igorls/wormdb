@@ -12,8 +12,9 @@
 //!   lacfg:<chain>           -> the `chain{}` JSON block (static per chain)
 
 const std = @import("std");
-const Ctx = @import("context.zig").Ctx;
-const name = @import("../core/name.zig");
+const Ctx = @import("../procedures/context.zig").Ctx;
+const name = @import("name.zig");
+const tables = @import("tables.zig");
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const chain = ctx.arg(0) orelse return ctx.err("lightapi_balances requires <chain> <account>");
@@ -47,7 +48,7 @@ pub fn packedBalances(ctx: *Ctx, chain: []const u8, account: []const u8) !?[]con
     // even empty (a balance that went to zero) — is authoritative; only an absent key falls through
     // to the segment. This is how a feed keeps the snapshot-built segment current per account.
     if (try ctx.getCopy(ctx.fmt("bal:{s}:{s}", .{ chain, account }))) |override| return override;
-    if (ctx.store.lightapi_segment) |s| return s.lookup(.balances, name.encode(account));
+    if (ctx.store.frozen_segment) |s| return s.lookup(tables.balances, name.encode(account));
     return null;
 }
 

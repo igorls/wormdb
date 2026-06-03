@@ -7,9 +7,10 @@
 //! per account.
 
 const std = @import("std");
-const Ctx = @import("context.zig").Ctx;
+const Ctx = @import("../procedures/context.zig").Ctx;
 const balances = @import("lightapi_balances.zig");
-const name = @import("../core/name.zig");
+const name = @import("name.zig");
+const tables = @import("tables.zig");
 const accinfo_bin = @import("accinfo_bin.zig");
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
@@ -21,7 +22,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     // Live overlay (KV `acci:<chain>:<acct>`) shadows the frozen segment baseline.
     const frag: ?[]const u8 = blk: {
         if (try ctx.getCopy(ctx.fmt("acci:{s}:{s}", .{ chain, account }))) |o| break :blk o;
-        if (ctx.store.lightapi_segment) |s| break :blk s.lookup(.accinfo, name.encode(account));
+        if (ctx.store.frozen_segment) |s| break :blk s.lookup(tables.accinfo, name.encode(account));
         break :blk null;
     };
     const pb = try balances.packedBalances(ctx, chain, account);

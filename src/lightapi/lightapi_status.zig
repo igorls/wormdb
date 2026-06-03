@@ -4,7 +4,7 @@
 //! surfaces here too.
 
 const std = @import("std");
-const Ctx = @import("context.zig").Ctx;
+const Ctx = @import("../procedures/context.zig").Ctx;
 const sync = @import("lightapi_sync.zig");
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {

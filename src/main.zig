@@ -26,6 +26,14 @@ const Backend = wormdb.core.config.Backend;
 const WormDBConfig = wormdb.core.config.WormDBConfig;
 const loadFromFile = wormdb.core.config.loadFromFile;
 
+/// Optional Antelope Light-API module — compiled in only with `-Dlightapi=true`
+/// (same comptime-gating pattern as `quic_gateway`). Reached through the wormdb
+/// library so it is the single instantiation the gateway/registry also use. With
+/// the flag off this is an empty struct and `startServer` calls none of its
+/// hooks, so the binary carries zero blockchain code.
+const lightapi = wormdb.lightapi;
+const has_lightapi = @hasDecl(lightapi, "onStart");
+
 // Zig 0.16: "Juicy Main" — accept std.process.Init for pre-initialized
 // allocator, Io, args, and environment.
 pub fn main(init: std.process.Init) !void {
@@ -129,13 +137,14 @@ pub fn main(init: std.process.Init) !void {
                 std.log.err("Invalid persistence mode: {s} (expected: full, snapshot, none)", .{args[i]});
                 return error.InvalidArgs;
             }
-        } else if (std.mem.eql(u8, args[i], "--lightapi-segment")) {
+        } else if (std.mem.eql(u8, args[i], "--segment") or std.mem.eql(u8, args[i], "--lightapi-segment")) {
+            // --segment is the generic flag; --lightapi-segment is a back-compat alias.
             i += 1;
             if (i >= args.len) {
-                std.log.err("--lightapi-segment requires an argument", .{});
+                std.log.err("--segment requires an argument", .{});
                 return error.InvalidArgs;
             }
-            cfg.lightapi_segment = args[i];
+            cfg.segment = args[i];
         } else if (std.mem.eql(u8, args[i], "--gateway-port")) {
             i += 1;
             if (i >= args.len) {
@@ -174,10 +183,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // --- Step 4: Start WormDB with resolved config ---
-    try startServer(allocator, &cfg);
+    try startServer(allocator, &cfg, config_path);
 }
 
-fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
+fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig, config_path: []const u8) !void {
     const port = cfg.server.port;
     const data_dir = cfg.data;
     const persistence = cfg.store.persistence;
@@ -221,28 +230,31 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
         };
     }
 
-    // Attach the frozen Light-API segment if configured: a read-only mmap of
-    // the large per-account tables. Procedures read these by Antelope name u64;
-    // small/aggregate values still come from the KV store. Stays mapped for the
-    // process lifetime (closed on shutdown).
-    var lightapi_seg: ?wormdb.storage.Segment = null;
-    defer if (lightapi_seg) |*s| s.close(allocator);
-    if (cfg.lightapi_segment) |seg_path| {
-        lightapi_seg = wormdb.storage.Segment.open(allocator, seg_path) catch |err| blk: {
-            std.log.err("Failed to open Light-API segment '{s}': {}", .{ seg_path, err });
+    // Attach the frozen segment if configured: a read-only mmap of large static
+    // tables, keyed by u64 (table id u32). Procedures may read from it instead of
+    // the KV store; small/aggregate values still come from KV. What its tables
+    // mean is app-defined. Stays mapped for the process lifetime (closed on
+    // shutdown).
+    var frozen_seg: ?wormdb.storage.Segment = null;
+    defer if (frozen_seg) |*s| s.close(allocator);
+    if (cfg.segment) |seg_path| {
+        frozen_seg = wormdb.storage.Segment.open(allocator, seg_path) catch |err| blk: {
+            std.log.err("Failed to open segment '{s}': {}", .{ seg_path, err });
             break :blk null;
         };
-        if (lightapi_seg) |*s| {
-            store.attachLightApiSegment(s);
-            std.log.info("Light-API segment: {s} ({d} bytes, {s}-backed)", .{ seg_path, s.bytes.len, @tagName(s.backing) });
+        if (frozen_seg) |*s| {
+            store.attachFrozenSegment(s);
+            std.log.info("Frozen segment: {s} ({d} bytes, {s}-backed)", .{ seg_path, s.bytes.len, @tagName(s.backing) });
         }
     }
 
-    // Seed the Light-API chain metadata (lacfg:<chain> + lanet) from config, so serving a snapshot
-    // segment needs no external loader. The live feed overwrites block_num/sync later.
-    seedLightApi(&store, allocator, cfg) catch |err| {
-        std.log.warn("Light-API metadata seed failed: {s}", .{@errorName(err)});
-    };
+    // App startup hook (only when an optional app module is wired in). The
+    // Antelope Light-API module uses this to seed chain metadata (lacfg:<chain> +
+    // lanet) from its config block — so serving a snapshot segment needs no
+    // external loader. With no app module this is a no-op.
+    if (has_lightapi) {
+        lightapi.onStart(&store, allocator, config_path);
+    }
 
     // Initialize event bus
     var event_bus = EventBus.init(allocator);
@@ -471,57 +483,6 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
     }
 }
 
-/// Build the cc32d9 `chain{}` block for one configured network into `out`.
-fn buildChainBlock(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, n: anytype) !void {
-    const net = n.network orelse n.chain;
-    var buf: [512]u8 = undefined;
-    const s = try std.fmt.bufPrint(
-        &buf,
-        "{{\"network\":\"{s}\",\"sync\":0,\"decimals\":{d},\"systoken\":\"{s}\",\"chainid\":\"{s}\",\"production\":{d},\"block_num\":{d},\"block_time\":\"\",\"description\":\"{s}\",\"rex_enabled\":{d}}}",
-        .{ net, n.decimals, n.systoken, n.chainid, @as(u8, if (n.production) 1 else 0), n.block_num, n.description, @as(u8, if (n.rex_enabled) 1 else 0) },
-    );
-    try out.appendSlice(a, s);
-}
-
-/// Seed `lacfg:<chain>` (per network) + `lanet` (the /networks array) into KV from config.
-fn seedLightApi(store: *Store, allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
-    const nets = cfg.lightapi.networks;
-    if (nets.len == 0) return;
-
-    var lanet: std.ArrayListUnmanaged(u8) = .empty;
-    defer lanet.deinit(allocator);
-    try lanet.append(allocator, '[');
-
-    for (nets, 0..) |n, i| {
-        var block: std.ArrayListUnmanaged(u8) = .empty;
-        defer block.deinit(allocator);
-        try buildChainBlock(&block, allocator, n);
-
-        const key = try std.fmt.allocPrint(allocator, "lacfg:{s}", .{n.chain});
-        defer allocator.free(key);
-        try store.set(key, block.items, false);
-
-        if (i > 0) try lanet.append(allocator, ',');
-        try lanet.appendSlice(allocator, block.items);
-
-        // usercount is free from the segment: the accinfo table's key count is the account universe
-        // (every account has ≥1 permission). Seed `uc:<chain>` so /usercount serves a real number
-        // without a precompute pass or the live feed.
-        if (store.lightapi_segment) |s| {
-            const uc = s.keyCount(.accinfo);
-            if (uc > 0) {
-                const uk = try std.fmt.allocPrint(allocator, "uc:{s}", .{n.chain});
-                defer allocator.free(uk);
-                var ub: [24]u8 = undefined;
-                try store.set(uk, try std.fmt.bufPrint(&ub, "{d}", .{uc}), false);
-            }
-        }
-        std.log.info("Light-API chain seeded: {s} ({s}, {d} decimals)", .{ n.chain, n.systoken, n.decimals });
-    }
-    try lanet.append(allocator, ']');
-    try store.set("lanet", lanet.items, false);
-}
-
 fn logStartupFailure(err: anyerror, port: u16, data_dir: []const u8) void {
     std.log.err("WormDB startup failed: {}", .{err});
 
@@ -567,7 +528,7 @@ fn printHelp(io: std.Io) !void {
         \\  --wg-port <port>           WireGuard listen port (default: 51830)
         \\  --no-sync                  Disable fsync per write (faster, less durable)
         \\  --persistence <mode>       Persistence mode: full (default), snapshot, none
-        \\  --lightapi-segment <path>  Frozen Light-API segment (.wseg) to mmap at startup
+        \\  --segment <path>           Frozen segment (.wseg) to mmap read-only at startup
         \\  --gateway-port <port>      Enable the HTTP/WebSocket gateway on <port>
         \\  --help, -h                 Show this help
         \\

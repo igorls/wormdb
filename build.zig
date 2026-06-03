@@ -26,9 +26,13 @@ pub fn build(b: *std.Build) void {
 
     // --- Build options (exposed to source via @import("build_options")) ---
     const enable_quic = b.option(bool, "quic", "Enable QUIC/WebTransport gateway (requires MsQuic)") orelse false;
+    // Opt-in Antelope Light-API feature. Default false → the generic core
+    // compiles with ZERO blockchain code (nothing in src/lightapi/ is reached).
+    const enable_lightapi = b.option(bool, "lightapi", "Enable the Antelope Light-API module (procedures, /api routes, [lightapi] config)") orelse false;
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "quic", enable_quic);
+    build_options.addOption(bool, "lightapi", enable_lightapi);
 
     // MeshGuard library module (embedded mesh networking)
     const meshguard_mod = b.createModule(.{

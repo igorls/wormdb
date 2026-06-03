@@ -6,7 +6,7 @@
 //! static delay could not). Threshold (in-sync cutoff, seconds) is `syncthr:<chain>` (default 30).
 
 const std = @import("std");
-const Ctx = @import("context.zig").Ctx;
+const Ctx = @import("../procedures/context.zig").Ctx;
 
 /// Seconds since the feed's last applied block, or null if never synced.
 pub fn delaySecs(ctx: *Ctx, chain: []const u8) ?i64 {

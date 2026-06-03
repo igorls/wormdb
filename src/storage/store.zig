@@ -60,12 +60,13 @@ pub const Store = struct {
     /// Optional HNSW registry back-reference. Attached by main.zig after
     /// both objects exist; snapshot write/load use it when present.
     vector_registry: ?*NamespaceRegistry = null,
-    /// Optional frozen Light-API segment (read-only, mmap'd). Attached by
-    /// main.zig after construction. When present, procedures read the large
-    /// per-account tables (balances, resources, perms, …) from it by Antelope
-    /// `name` u64 instead of the KV shards — collapsing per-entry overhead and
-    /// letting the OS page in only the working set. Null = serve from KV only.
-    lightapi_segment: ?*const Segment = null,
+    /// Optional frozen segment (read-only, mmap'd). Attached by main.zig after
+    /// construction via `--segment <path>`. When present, procedures may read
+    /// large *static* tables from it (keyed by u64, table id u32) instead of the
+    /// KV shards — collapsing per-entry overhead and letting the OS page in only
+    /// the working set. What the tables/keys mean is app-defined (e.g. the
+    /// Light-API module). Null = serve from KV only.
+    frozen_segment: ?*const Segment = null,
 
     /// Attach the per-namespace HNSW registry to this store so snapshots
     /// persist and restore graph state alongside KV data. Call after both
@@ -74,10 +75,10 @@ pub const Store = struct {
         self.vector_registry = registry;
     }
 
-    /// Attach a frozen Light-API segment (read-only). Call after the store is
-    /// constructed and the segment is mapped; the segment must outlive the store.
-    pub fn attachLightApiSegment(self: *Store, seg: *const Segment) void {
-        self.lightapi_segment = seg;
+    /// Attach a frozen segment (read-only). Call after the store is constructed
+    /// and the segment is mapped; the segment must outlive the store.
+    pub fn attachFrozenSegment(self: *Store, seg: *const Segment) void {
+        self.frozen_segment = seg;
     }
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Store {

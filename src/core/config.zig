@@ -122,6 +122,27 @@ pub const AuthConfig = struct {
     token_max_age_s: u64 = 3600,
 };
 
+/// One Light-API network's static metadata (the `chain{}` block). WormDB builds the cc32d9 chain
+/// block from this at startup and seeds `lacfg:<chain>` + `lanet` into KV — so serving a snapshot
+/// segment needs no external loader. `chainid`/`decimals`/`systoken` come from the chain; `block_num`
+/// is the segment's snapshot block (the live feed updates it thereafter).
+pub const LightApiNetwork = struct {
+    chain: []const u8,
+    network: ?[]const u8 = null, // defaults to `chain`
+    systoken: []const u8 = "",
+    decimals: u8 = 4,
+    chainid: []const u8 = "",
+    description: []const u8 = "",
+    rex_enabled: bool = false,
+    production: bool = true,
+    block_num: u64 = 0,
+};
+
+/// Light-API serving metadata (seeded into KV at startup).
+pub const LightApiConfig = struct {
+    networks: []const LightApiNetwork = &.{},
+};
+
 /// Top-level WormDB configuration.
 /// Maps directly to the JSON config file structure.
 pub const WormDBConfig = struct {
@@ -132,6 +153,9 @@ pub const WormDBConfig = struct {
     /// mmaps it at startup and serves the large per-account Light-API tables
     /// from it. Null = no segment (serve everything from the KV store).
     lightapi_segment: ?[]const u8 = null,
+
+    /// Light-API network metadata — WormDB seeds the chain block(s) into KV at startup.
+    lightapi: LightApiConfig = .{},
 
     /// Store / persistence settings
     store: Config = .{},

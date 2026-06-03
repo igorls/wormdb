@@ -437,11 +437,10 @@ pub const Gateway = struct {
         }
         if (eql(u8, ep, "sync")) {
             const chain = it.next() orelse return null;
-            const key = std.fmt.allocPrint(alloc, "sync:{s}", .{chain}) catch return null;
-            return textRoute(self.execProc(alloc, "lightapi_get", &.{ key, "0 OUT_OF_SYNC" }));
+            return textRoute(self.execProc(alloc, "lightapi_sync", &.{chain}));
         }
         if (eql(u8, ep, "status")) {
-            return textRoute(self.execProc(alloc, "lightapi_get", &.{ "lastatus", "OK" }));
+            return textRoute(self.execProc(alloc, "lightapi_status", &.{}));
         }
         return null;
     }

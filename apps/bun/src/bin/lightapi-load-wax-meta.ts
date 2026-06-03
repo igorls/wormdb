@@ -46,6 +46,8 @@ const packTop = (j: string) => {
 };
 
 await set("lacfg:wax", chainJson);
+// The segment's snapshot block — the watermark the live feed resumes from (and a rebase re-stamps).
+await set("segblock:wax", "437909753");
 await set("uc:wax", await get("/api/usercount/wax"));
 await set("hc:wax:eosio.token:WAX", await get("/api/holdercount/wax/eosio.token/WAX"));
 await set("lanet", await get("/api/networks"));

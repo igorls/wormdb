@@ -10,6 +10,7 @@
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
 const name = @import("../core/name.zig");
+const accinfo_bin = @import("accinfo_bin.zig");
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const chain = ctx.arg(0) orelse return ctx.err("lightapi_accinfo requires <chain> <account>");
@@ -30,9 +31,13 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     try json.appendSlice(a, "\",\"chain\":");
     try json.appendSlice(a, chain_json);
     if (frag) |f| {
-        // f = `"resources":…,"linkauth":[…][,"code":…]}` — splice straight in after the chain block.
         try json.append(a, ',');
-        try json.appendSlice(a, f);
+        // Binary segment record → render; JSON overlay/legacy fragment → splice straight in.
+        if (accinfo_bin.isBinary(f)) {
+            accinfo_bin.render(&json, a, f) catch return ctx.err("corrupt accinfo record");
+        } else {
+            try json.appendSlice(a, f);
+        }
     } else {
         // No accinfo row for this account — minimal empty shape.
         try json.appendSlice(a, ",\"resources\":null,\"permissions\":[],\"delegated_to\":[],\"delegated_from\":[],\"linkauth\":[]}");

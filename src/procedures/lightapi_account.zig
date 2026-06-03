@@ -10,6 +10,7 @@ const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
 const balances = @import("lightapi_balances.zig");
 const name = @import("../core/name.zig");
+const accinfo_bin = @import("accinfo_bin.zig");
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const chain = ctx.arg(0) orelse return ctx.err("lightapi_account requires <chain> <account>");
@@ -31,15 +32,24 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     try json.appendSlice(a, "\",\"chain\":");
     try json.appendSlice(a, chain_json);
 
-    if (frag) |f| if (f.len > 0 and f[f.len - 1] == '}') {
-        // Splice `,"balances":[…]` before the fragment's closing brace (balances last).
-        try json.append(a, ',');
-        try json.appendSlice(a, f[0 .. f.len - 1]);
-        try json.appendSlice(a, ",\"balances\":");
-        try balances.appendBalancesArray(&json, a, pb);
-        try json.append(a, '}');
-        return ctx.value(try json.toOwnedSlice(a));
-    };
+    if (frag) |f| {
+        // Get the accinfo fragment as JSON: render the binary record, or use the JSON directly.
+        var rendered: std.ArrayListUnmanaged(u8) = .empty;
+        defer rendered.deinit(a);
+        const body: []const u8 = if (accinfo_bin.isBinary(f)) blk: {
+            accinfo_bin.render(&rendered, a, f) catch break :blk f; // on corruption fall through
+            break :blk rendered.items;
+        } else f;
+        if (body.len > 0 and body[body.len - 1] == '}') {
+            // Splice `,"balances":[…]` before the fragment's closing brace (balances last).
+            try json.append(a, ',');
+            try json.appendSlice(a, body[0 .. body.len - 1]);
+            try json.appendSlice(a, ",\"balances\":");
+            try balances.appendBalancesArray(&json, a, pb);
+            try json.append(a, '}');
+            return ctx.value(try json.toOwnedSlice(a));
+        }
+    }
 
     // Fallback (no accinfo fragment): minimal empty accinfo shape + balances.
     try json.appendSlice(a, ",\"resources\":null,\"permissions\":[],\"delegated_to\":[],\"delegated_from\":[],\"linkauth\":[],\"balances\":");

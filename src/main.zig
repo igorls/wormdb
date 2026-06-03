@@ -503,6 +503,19 @@ fn seedLightApi(store: *Store, allocator: std.mem.Allocator, cfg: *const WormDBC
 
         if (i > 0) try lanet.append(allocator, ',');
         try lanet.appendSlice(allocator, block.items);
+
+        // usercount is free from the segment: the accinfo table's key count is the account universe
+        // (every account has ≥1 permission). Seed `uc:<chain>` so /usercount serves a real number
+        // without a precompute pass or the live feed.
+        if (store.lightapi_segment) |s| {
+            const uc = s.keyCount(.accinfo);
+            if (uc > 0) {
+                const uk = try std.fmt.allocPrint(allocator, "uc:{s}", .{n.chain});
+                defer allocator.free(uk);
+                var ub: [24]u8 = undefined;
+                try store.set(uk, try std.fmt.bufPrint(&ub, "{d}", .{uc}), false);
+            }
+        }
         std.log.info("Light-API chain seeded: {s} ({s}, {d} decimals)", .{ n.chain, n.systoken, n.decimals });
     }
     try lanet.append(allocator, ']');

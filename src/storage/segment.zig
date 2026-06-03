@@ -136,6 +136,12 @@ pub const Segment = struct {
         return self.tables[@intFromEnum(table)] != null;
     }
 
+    /// Number of keys in a table (0 if absent). `accinfo` key count = the account universe (every
+    /// account has ≥1 permission) = cc32d9 `usercount`.
+    pub fn keyCount(self: *const Segment, table: TableId) u64 {
+        return if (self.tables[@intFromEnum(table)]) |t| t.key_count else 0;
+    }
+
     /// Binary-search a table for `key`. Returns the borrowed blob slice (valid
     /// for the segment's lifetime — the mapping is never unmapped while
     /// serving) or null if the key (or table) is absent.

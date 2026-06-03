@@ -13,16 +13,10 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const contract = ctx.arg(1) orelse return ctx.err("need <chain> <contract> <symbol>");
     const symbol = ctx.arg(2) orelse return ctx.err("need <chain> <contract> <symbol>");
 
-    // KV override first (precompute/feed), else count the segment token_holders lines.
+    // KV override first (precompute/feed), else the O(1) count from the token_holders blob header.
     if (try ctx.getCopy(ctx.fmt("hc:{s}:{s}:{s}", .{ chain, contract, symbol }))) |v| {
         return ctx.value(v);
     }
-    var count: usize = 0;
-    if (topholders.holderLines(ctx, contract, symbol)) |lines| {
-        var it = std.mem.splitScalar(u8, lines, '\n');
-        while (it.next()) |line| {
-            if (line.len != 0) count += 1;
-        }
-    }
+    const count = topholders.holderCount(ctx, contract, symbol) orelse 0;
     return ctx.value(ctx.fmt("{d}", .{count}));
 }

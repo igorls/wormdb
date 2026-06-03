@@ -9,22 +9,36 @@ const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
 const name = @import("../core/name.zig");
 
-/// Return the holder lines ("acct\tamount\n"…, amount-desc) for a token from the segment's
-/// token_holders table, or null if the token/table is absent. The blob is `[u16 hdr_len][hdr]` then
-/// the lines; `hdr` = "contract:symbol" guards against the (astronomically rare) hash collision.
-pub fn holderLines(ctx: *Ctx, contract: []const u8, symbol: []const u8) ?[]const u8 {
+/// Locate a token's token_holders blob and return `.{ count, lines }` — the holder count (u32 in the
+/// blob header, so /holdercount is O(1)) and the amount-desc holder lines ("acct\tamount\n"…). Returns
+/// null if the token/table is absent. Blob = `[u16 hdr_len][hdr]["contract:symbol" collision guard]
+/// [u32 count][lines]`.
+const TokenHolders = struct { count: u32, lines: []const u8 };
+fn lookupToken(ctx: *Ctx, contract: []const u8, symbol: []const u8) ?TokenHolders {
     const seg = ctx.store.lightapi_segment orelse return null;
     const blob = seg.lookup(.token_holders, name.tokenKey(contract, symbol)) orelse return null;
     if (blob.len < 2) return null;
     const hdr_len = std.mem.readInt(u16, blob[0..2], .little);
-    if (2 + @as(usize, hdr_len) > blob.len) return null;
-    const hdr = blob[2 .. 2 + hdr_len];
+    const after_hdr = 2 + @as(usize, hdr_len);
+    if (after_hdr + 4 > blob.len) return null;
+    const hdr = blob[2..after_hdr];
     // verify "contract:symbol" (collision guard)
     const ok = hdr.len == contract.len + 1 + symbol.len and
         std.mem.startsWith(u8, hdr, contract) and hdr[contract.len] == ':' and
         std.mem.endsWith(u8, hdr, symbol);
     if (!ok) return null;
-    return blob[2 + hdr_len ..];
+    const count = std.mem.readInt(u32, blob[after_hdr..][0..4], .little);
+    return .{ .count = count, .lines = blob[after_hdr + 4 ..] };
+}
+
+/// The amount-desc holder lines for a token, or null. (topholders / WS get_token_holders.)
+pub fn holderLines(ctx: *Ctx, contract: []const u8, symbol: []const u8) ?[]const u8 {
+    return if (lookupToken(ctx, contract, symbol)) |t| t.lines else null;
+}
+
+/// The holder count for a token — O(1) from the blob header. (holdercount.)
+pub fn holderCount(ctx: *Ctx, contract: []const u8, symbol: []const u8) ?u32 {
+    return if (lookupToken(ctx, contract, symbol)) |t| t.count else null;
 }
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {

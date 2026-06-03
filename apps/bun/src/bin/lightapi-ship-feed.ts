@@ -23,6 +23,9 @@ function decode(abi: ABI, type: string, data: Uint8Array): any {
 const SHIP = Bun.env.SHIP ?? "ws://127.0.0.1:18080/";
 const CHAIN_API = Bun.env.CHAIN_API ?? "http://127.0.0.1:18888"; // nodeos http
 const CHAIN = Bun.env.CHAIN ?? "libre";
+// PORT is the WormWire port the OVERLAY is written to. When running this feed inside Docker against a
+// host-published WormDB, use the *published host port* (e.g. 16589), NOT the container-internal 6389 —
+// host.docker.internal:6389 would hit the host's 6389, not the 16589->6389 mapping.
 const PORT = Number(Bun.env.PORT ?? 16589);
 const SYSTOKEN = Bun.env.SYSTOKEN ?? "LIBRE";
 const SYSCONTRACT = Bun.env.SYSCONTRACT ?? "eosio.token";

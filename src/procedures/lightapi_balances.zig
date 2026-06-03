@@ -43,10 +43,12 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
 /// is attached, otherwise from the KV store (arena-owned copy). Shared by
 /// lightapi_tokenbalance and lightapi_account.
 pub fn packedBalances(ctx: *Ctx, chain: []const u8, account: []const u8) !?[]const u8 {
-    if (ctx.store.lightapi_segment) |s| {
-        return s.lookup(.balances, name.encode(account));
-    }
-    return ctx.getCopy(ctx.fmt("bal:{s}:{s}", .{ chain, account }));
+    // Live overlay (KV) shadows the frozen segment baseline: a present `bal:<chain>:<acct>` key —
+    // even empty (a balance that went to zero) — is authoritative; only an absent key falls through
+    // to the segment. This is how a feed keeps the snapshot-built segment current per account.
+    if (try ctx.getCopy(ctx.fmt("bal:{s}:{s}", .{ chain, account }))) |override| return override;
+    if (ctx.store.lightapi_segment) |s| return s.lookup(.balances, name.encode(account));
+    return null;
 }
 
 /// Append the cc32d9 balances `[...]` array (built from the packed per-account list) to `json`.

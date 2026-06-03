@@ -17,7 +17,12 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const a = ctx.allocator;
 
     const chain_json = (try ctx.getCopy(ctx.fmt("lacfg:{s}", .{chain}))) orelse "{}";
-    const frag: ?[]const u8 = if (ctx.store.lightapi_segment) |s| s.lookup(.accinfo, name.encode(account)) else null;
+    // Live overlay (KV `acci:<chain>:<acct>`) shadows the frozen segment baseline.
+    const frag: ?[]const u8 = blk: {
+        if (try ctx.getCopy(ctx.fmt("acci:{s}:{s}", .{ chain, account }))) |o| break :blk o;
+        if (ctx.store.lightapi_segment) |s| break :blk s.lookup(.accinfo, name.encode(account));
+        break :blk null;
+    };
 
     var json: std.ArrayListUnmanaged(u8) = .empty;
     try json.appendSlice(a, "{\"account_name\":\"");

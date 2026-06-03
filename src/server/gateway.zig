@@ -106,20 +106,16 @@ pub const Gateway = struct {
         defer stream.close();
 
         // Disable Nagle for low-latency request/response
-        std.posix.setsockopt(
-            stream.getHandle(),
-            std.posix.IPPROTO.TCP,
-            std.posix.TCP.NODELAY,
-            &std.mem.toBytes(@as(c_int, 1)),
-        ) catch {};
+        core.compat.setNoDelay(stream.getHandle());
 
         // Step 1: WebSocket handshake
         var request_buf: [4096]u8 = undefined;
         const request = readHttpRequest(&stream, &request_buf) orelse return;
 
         const ws_key = extractWebSocketKey(request) orelse {
-            const reject = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-            stream.writeAll(reject) catch {};
+            // Not a WebSocket upgrade — serve the plain-HTTP Light-API drop-in (GET /api/...),
+            // so HTTP clients consume the same contract as cc32d9 / Hyperion with no app tier.
+            self.serveHttp(&stream, &request_buf, request);
             return;
         };
 
@@ -315,6 +311,173 @@ pub const Gateway = struct {
             };
             sendWsFrame(&stream, 0x02, fbw.getWritten()) catch return;
         }
+    }
+
+    // --- Plain HTTP (Light-API drop-in) ---
+    //
+    // Answers `GET /api/...` directly over HTTP/1.1 by routing to an EXEC procedure and returning its
+    // JSON value — the SAME executor pipeline as WormWire/WS clients, no application tier. Keep-alive
+    // loop so HTTP clients (and reverse proxies) get connection reuse. The DB *is* the API server.
+
+    fn serveHttp(self: *Gateway, stream: *core.compat.net.Stream, request_buf: *[4096]u8, first: []const u8) void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        var current = first;
+        while (self.running.load(.acquire)) {
+            _ = arena.reset(.retain_capacity);
+            if (!self.handleHttpRequest(stream, arena.allocator(), current)) return;
+            current = readHttpRequest(stream, request_buf) orelse return;
+        }
+    }
+
+    /// Handle one HTTP request. Returns true to keep the connection alive.
+    fn handleHttpRequest(self: *Gateway, stream: *core.compat.net.Stream, alloc: std.mem.Allocator, request: []const u8) bool {
+        const line_end = std.mem.indexOf(u8, request, "\r\n") orelse return false;
+        const line = request[0..line_end];
+        if (!std.mem.startsWith(u8, line, "GET ")) {
+            return writeHttp(stream, 405, "text/plain", "method not allowed");
+        }
+        const after = line[4..];
+        const sp = std.mem.indexOfScalar(u8, after, ' ') orelse return false;
+        var path = after[0..sp];
+        if (std.mem.indexOfScalar(u8, path, '?')) |q| path = path[0..q]; // drop query string
+
+        if (self.route(alloc, path)) |r| {
+            const ct: []const u8 = if (r.json) "application/json" else "text/plain; charset=utf-8";
+            return writeHttp(stream, 200, ct, r.body);
+        }
+        return writeHttp(stream, 404, "text/plain", "not found");
+    }
+
+    const RouteResult = struct { body: []const u8, json: bool };
+
+    /// Map a `/api/...` path to an EXEC. Returns the body + whether it is JSON, or null → 404.
+    fn route(self: *Gateway, alloc: std.mem.Allocator, path: []const u8) ?RouteResult {
+        var it = std.mem.tokenizeScalar(u8, path, '/');
+        if (!std.mem.eql(u8, it.next() orelse return null, "api")) return null;
+        const ep = it.next() orelse return null;
+        const eql = std.mem.eql;
+
+        if (eql(u8, ep, "balances")) {
+            const chain = it.next() orelse return null;
+            const acct = it.next() orelse return null;
+            if (it.next() != null) return null;
+            return jsonRoute(self.execProc(alloc, "lightapi_balances", &.{ chain, acct }));
+        }
+        if (eql(u8, ep, "account")) {
+            const chain = it.next() orelse return null;
+            const acct = it.next() orelse return null;
+            if (it.next() != null) return null;
+            return jsonRoute(self.execProc(alloc, "lightapi_account", &.{ chain, acct }));
+        }
+        if (eql(u8, ep, "accinfo")) {
+            const chain = it.next() orelse return null;
+            const acct = it.next() orelse return null;
+            if (it.next() != null) return null;
+            const key = std.fmt.allocPrint(alloc, "acci:{s}:{s}", .{ chain, acct }) catch return null;
+            return jsonRoute(self.execProc(alloc, "lightapi_get", &.{ key, "{}" }));
+        }
+        if (eql(u8, ep, "tokenbalance")) {
+            const chain = it.next() orelse return null;
+            const acct = it.next() orelse return null;
+            const contract = it.next() orelse return null;
+            const symbol = it.next() orelse return null;
+            return textRoute(self.execProc(alloc, "lightapi_tokenbalance", &.{ chain, acct, contract, symbol }));
+        }
+        if (eql(u8, ep, "usercount")) {
+            const chain = it.next() orelse return null;
+            const key = std.fmt.allocPrint(alloc, "uc:{s}", .{chain}) catch return null;
+            return textRoute(self.execProc(alloc, "lightapi_get", &.{ key, "0" }));
+        }
+        if (eql(u8, ep, "holdercount")) {
+            const chain = it.next() orelse return null;
+            const contract = it.next() orelse return null;
+            const symbol = it.next() orelse return null;
+            const key = std.fmt.allocPrint(alloc, "hc:{s}:{s}:{s}", .{ chain, contract, symbol }) catch return null;
+            return textRoute(self.execProc(alloc, "lightapi_get", &.{ key, "0" }));
+        }
+        if (eql(u8, ep, "networks")) {
+            return jsonRoute(self.execProc(alloc, "lightapi_get", &.{ "lanet", "[]" }));
+        }
+        if (eql(u8, ep, "codehash")) {
+            const hash = it.next() orelse return null;
+            const key = std.fmt.allocPrint(alloc, "chh:{s}", .{hash}) catch return null;
+            return jsonRoute(self.execProc(alloc, "lightapi_get", &.{ key, "{}" }));
+        }
+        if (eql(u8, ep, "key")) {
+            const pubkey = it.next() orelse return null;
+            const key = std.fmt.allocPrint(alloc, "pk:{s}", .{pubkey}) catch return null;
+            return jsonRoute(self.execProc(alloc, "lightapi_get", &.{ key, "{}" }));
+        }
+        if (eql(u8, ep, "topholders")) {
+            const chain = it.next() orelse return null;
+            const contract = it.next() orelse return null;
+            const symbol = it.next() orelse return null;
+            const n = it.next() orelse return null;
+            return jsonRoute(self.execProc(alloc, "lightapi_topholders", &.{ chain, contract, symbol, n }));
+        }
+        if (eql(u8, ep, "topram") or eql(u8, ep, "topstake")) {
+            return jsonRoute(self.execProc(alloc, "lightapi_get", &.{ "__empty_arr", "[]" }));
+        }
+        if (eql(u8, ep, "rexbalance")) {
+            const chain = it.next() orelse return null;
+            const acct = it.next() orelse return null;
+            return jsonRoute(self.execProc(alloc, "lightapi_rexbalance", &.{ chain, acct }));
+        }
+        if (eql(u8, ep, "rexraw")) {
+            const chain = it.next() orelse return null;
+            const key = std.fmt.allocPrint(alloc, "rexraw:{s}", .{chain}) catch return null;
+            return textRoute(self.execProc(alloc, "lightapi_get", &.{ key, "REX is not enabled" }));
+        }
+        if (eql(u8, ep, "sync")) {
+            const chain = it.next() orelse return null;
+            const key = std.fmt.allocPrint(alloc, "sync:{s}", .{chain}) catch return null;
+            return textRoute(self.execProc(alloc, "lightapi_get", &.{ key, "0 OUT_OF_SYNC" }));
+        }
+        if (eql(u8, ep, "status")) {
+            return textRoute(self.execProc(alloc, "lightapi_get", &.{ "lastatus", "OK" }));
+        }
+        return null;
+    }
+
+    fn jsonRoute(body: ?[]const u8) ?RouteResult {
+        return .{ .body = body orelse return null, .json = true };
+    }
+    fn textRoute(body: ?[]const u8) ?RouteResult {
+        return .{ .body = body orelse return null, .json = false };
+    }
+
+    /// Run a procedure through the shared executor; return its `value` payload (or null on error).
+    fn execProc(self: *Gateway, alloc: std.mem.Allocator, proc: []const u8, args: []const []const u8) ?[]const u8 {
+        const resp = executor.execute(.{
+            .allocator = alloc,
+            .store = self.store,
+            .event_bus = self.event_bus,
+            .cluster = self.cluster,
+            .identity = null,
+        }, .{ .exec = .{ .procedure = proc, .args = args } }) catch return null;
+        return switch (resp) {
+            .value => |v| v orelse "null",
+            else => null,
+        };
+    }
+
+    fn writeHttp(stream: *core.compat.net.Stream, status: u16, content_type: []const u8, body: []const u8) bool {
+        const reason: []const u8 = switch (status) {
+            200 => "OK",
+            404 => "Not Found",
+            405 => "Method Not Allowed",
+            else => "OK",
+        };
+        var hdr: [256]u8 = undefined;
+        const h = std.fmt.bufPrint(
+            &hdr,
+            "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
+            .{ status, reason, content_type, body.len },
+        ) catch return false;
+        stream.writeAll(h) catch return false;
+        stream.writeAll(body) catch return false;
+        return true;
     }
 
     // --- WebSocket Protocol Implementation ---

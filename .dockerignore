@@ -1,0 +1,13 @@
+.git
+.zig-cache
+zig-out
+node_modules
+**/node_modules
+protodata
+protodb
+deps/meshguard
+deps/msquic
+deps/libwtf
+.playwright-mcp
+*.pdb
+*.exe

@@ -24,6 +24,12 @@ pub const vrabitq = @import("vrabitq.zig");
 pub const vdelete = @import("vdelete.zig");
 pub const vnsdrop = @import("vnsdrop.zig");
 pub const memory = @import("memory.zig");
+pub const lightapi_balances = @import("lightapi_balances.zig");
+pub const lightapi_account = @import("lightapi_account.zig");
+pub const lightapi_tokenbalance = @import("lightapi_tokenbalance.zig");
+pub const lightapi_get = @import("lightapi_get.zig");
+pub const lightapi_topholders = @import("lightapi_topholders.zig");
+pub const lightapi_rexbalance = @import("lightapi_rexbalance.zig");
 
 pub const ProcedureFn = *const fn (ctx: *Ctx) anyerror!Ctx.Result;
 
@@ -58,6 +64,12 @@ const PROCEDURES = [_]Entry{
     .{ .name = "mem_drop", .func = memory.memDrop },
     .{ .name = "mem_reset_index", .func = memory.memResetIndex },
     .{ .name = "mem_capabilities", .func = memory.memCapabilities },
+    .{ .name = "lightapi_balances", .func = lightapi_balances.execute },
+    .{ .name = "lightapi_account", .func = lightapi_account.execute },
+    .{ .name = "lightapi_tokenbalance", .func = lightapi_tokenbalance.execute },
+    .{ .name = "lightapi_get", .func = lightapi_get.execute },
+    .{ .name = "lightapi_topholders", .func = lightapi_topholders.execute },
+    .{ .name = "lightapi_rexbalance", .func = lightapi_rexbalance.execute },
 };
 
 /// Look up a procedure by name. O(n) scan — n is tiny at comptime-known size.

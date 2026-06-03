@@ -7,6 +7,8 @@ data/
 data-*/
 test_data/
 test_cluster/
+protodata/
+protodb/
 .wormdb-keys.json
 
 # Binary test outputs

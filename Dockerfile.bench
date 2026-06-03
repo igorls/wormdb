@@ -1,0 +1,31 @@
+# Self-building Linux container for the Light-API benchmark matrix.
+# Builds wormdb from source (zig 0.16 + libsodium + meshguard) into a slim runtime — so every stack
+# in the comparison runs containerized with its full dependency set, benchmarked from outside.
+FROM debian:bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl xz-utils git ca-certificates libsodium-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Zig 0.16.0 (matches the host toolchain).
+RUN curl -fL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | tar -xJ -C /opt \
+    && ln -s /opt/zig-x86_64-linux-0.16.0/zig /usr/local/bin/zig
+
+WORKDIR /build
+COPY . /build
+
+# meshguard (its remote HEAD is the host's working commit); point the vendored libsodium at the system lib.
+RUN git clone --depth 1 https://github.com/igorls/meshguard.git deps/meshguard \
+    && rm -f deps/lib/libsodium.so \
+    && ln -s /usr/lib/x86_64-linux-gnu/libsodium.so deps/lib/libsodium.so
+
+RUN zig build -Doptimize=ReleaseSmall
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libsodium23 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/zig-out/bin/wormdb /usr/bin/wormdb
+RUN mkdir -p /data
+EXPOSE 6389 6390
+ENTRYPOINT ["/usr/bin/wormdb"]
+CMD ["--port", "6389", "--data", "/data"]

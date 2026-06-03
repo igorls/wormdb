@@ -56,6 +56,45 @@ pub fn decode(value: u64, buf: []u8) []const u8 {
     return buf[0..end];
 }
 
+/// FNV1a-64 of a byte string. Matches the Rust `wseg-build` `fnv1a64`.
+pub fn fnv1a64(s: []const u8) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for (s) |b| {
+        h ^= b;
+        h = h *% 0x100000001b3;
+    }
+    return h;
+}
+
+/// Stable key for a (contract, symbol) token: FNV1a-64 of "contract:symbol". Must match the Rust
+/// `wseg-build` `token_key` so segment lookups line up.
+pub fn tokenKey(contract: []const u8, symbol: []const u8) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    const mix = struct {
+        fn f(hash: *u64, bytes: []const u8) void {
+            for (bytes) |b| {
+                hash.* ^= b;
+                hash.* = hash.* *% 0x100000001b3;
+            }
+        }
+    }.f;
+    mix(&h, contract);
+    mix(&h, ":");
+    mix(&h, symbol);
+    return h;
+}
+
+/// Segment key for a public key string (EOS… or PUB_K1_…). Matches Rust `key_hash`.
+pub fn keyHash(pubkey: []const u8) u64 {
+    return fnv1a64(pubkey);
+}
+
+test "tokenKey matches the Rust FNV1a recipe" {
+    // FNV1a-64 of "eosio.token:WAX" — cross-checked against the Rust token_key.
+    try std.testing.expectEqual(@as(u64, 13053440730298864435), tokenKey("eosio.token", "WAX"));
+    try std.testing.expect(tokenKey("eosio.token", "WAX") != tokenKey("eosio.token", "EOS"));
+}
+
 test "encode canonical eosio vector" {
     // name("eosio") is the well-known constant 6138663577826885632.
     try std.testing.expectEqual(@as(u64, 6138663577826885632), encode("eosio"));

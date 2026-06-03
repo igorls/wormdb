@@ -30,9 +30,11 @@ pub const lightapi_accinfo = @import("lightapi_accinfo.zig");
 pub const lightapi_tokenbalance = @import("lightapi_tokenbalance.zig");
 pub const lightapi_get = @import("lightapi_get.zig");
 pub const lightapi_topholders = @import("lightapi_topholders.zig");
+pub const lightapi_holdercount = @import("lightapi_holdercount.zig");
 pub const lightapi_topn = @import("lightapi_topn.zig");
 pub const lightapi_sync = @import("lightapi_sync.zig");
 pub const lightapi_status = @import("lightapi_status.zig");
+pub const lightapi_ws = @import("lightapi_ws.zig");
 pub const lightapi_rexbalance = @import("lightapi_rexbalance.zig");
 
 pub const ProcedureFn = *const fn (ctx: *Ctx) anyerror!Ctx.Result;
@@ -74,9 +76,13 @@ const PROCEDURES = [_]Entry{
     .{ .name = "lightapi_tokenbalance", .func = lightapi_tokenbalance.execute },
     .{ .name = "lightapi_get", .func = lightapi_get.execute },
     .{ .name = "lightapi_topholders", .func = lightapi_topholders.execute },
+    .{ .name = "lightapi_holdercount", .func = lightapi_holdercount.execute },
     .{ .name = "lightapi_topn", .func = lightapi_topn.execute },
     .{ .name = "lightapi_sync", .func = lightapi_sync.execute },
     .{ .name = "lightapi_status", .func = lightapi_status.execute },
+    .{ .name = "lightapi_ws_balances", .func = lightapi_ws.balancesRow },
+    .{ .name = "lightapi_ws_holders", .func = lightapi_ws.holderRows },
+    .{ .name = "lightapi_ws_keyrows", .func = lightapi_ws.keyRows },
     .{ .name = "lightapi_rexbalance", .func = lightapi_rexbalance.execute },
 };
 

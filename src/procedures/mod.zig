@@ -24,9 +24,11 @@ pub const lightapi_accinfo = @import("lightapi_accinfo.zig");
 pub const lightapi_tokenbalance = @import("lightapi_tokenbalance.zig");
 pub const lightapi_get = @import("lightapi_get.zig");
 pub const lightapi_topholders = @import("lightapi_topholders.zig");
+pub const lightapi_holdercount = @import("lightapi_holdercount.zig");
 pub const lightapi_topn = @import("lightapi_topn.zig");
 pub const lightapi_sync = @import("lightapi_sync.zig");
 pub const lightapi_status = @import("lightapi_status.zig");
+pub const lightapi_ws = @import("lightapi_ws.zig");
 pub const lightapi_rexbalance = @import("lightapi_rexbalance.zig");
 
 test {

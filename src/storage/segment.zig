@@ -49,6 +49,8 @@ pub const TableId = enum(u32) {
     delband_from = 3, // (reserved) `from` -> delegations made
     delband_to = 4, // (reserved) `to` -> delegations received
     accinfo = 5, // account name -> cc32d9 accinfo fragment ("resources":…,"linkauth":[…][,"code":…]})
+    token_holders = 6, // tokenKey(contract,symbol) -> [u16 hdr]["contract:symbol"] + "acct\tamount\n"… (amount-desc)
+    pub_keys = 7, // fnv1a64(pubkey EOS|PUB_K1) -> "account\tperm\tweight\n"… (holders of that key)
     _,
 };
 

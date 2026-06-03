@@ -374,8 +374,7 @@ pub const Gateway = struct {
             const chain = it.next() orelse return null;
             const acct = it.next() orelse return null;
             if (it.next() != null) return null;
-            const key = std.fmt.allocPrint(alloc, "acci:{s}:{s}", .{ chain, acct }) catch return null;
-            return jsonRoute(self.execProc(alloc, "lightapi_get", &.{ key, "{}" }));
+            return jsonRoute(self.execProc(alloc, "lightapi_accinfo", &.{ chain, acct }));
         }
         if (eql(u8, ep, "tokenbalance")) {
             const chain = it.next() orelse return null;
@@ -414,10 +413,17 @@ pub const Gateway = struct {
             const contract = it.next() orelse return null;
             const symbol = it.next() orelse return null;
             const n = it.next() orelse return null;
-            return jsonRoute(self.execProc(alloc, "lightapi_topholders", &.{ chain, contract, symbol, n }));
+            const key = std.fmt.allocPrint(alloc, "th:{s}:{s}:{s}", .{ chain, contract, symbol }) catch return null;
+            return jsonRoute(self.execProc(alloc, "lightapi_topn", &.{ key, n, "s" }));
         }
         if (eql(u8, ep, "topram") or eql(u8, ep, "topstake")) {
-            return jsonRoute(self.execProc(alloc, "lightapi_get", &.{ "__empty_arr", "[]" }));
+            const chain = it.next() orelse return null;
+            const n = it.next() orelse return null;
+            // key = "topram:<chain>" / "topstake:<chain>" (materialized at load time).
+            // topram rows are [acct,ram] (1 int); topstake rows are [acct,cpu,net] (2 ints).
+            const key = std.fmt.allocPrint(alloc, "{s}:{s}", .{ ep, chain }) catch return null;
+            const fmt: []const u8 = if (eql(u8, ep, "topstake")) "nn" else "n";
+            return jsonRoute(self.execProc(alloc, "lightapi_topn", &.{ key, n, fmt }));
         }
         if (eql(u8, ep, "rexbalance")) {
             const chain = it.next() orelse return null;

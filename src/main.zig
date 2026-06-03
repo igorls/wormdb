@@ -129,6 +129,21 @@ pub fn main(init: std.process.Init) !void {
                 std.log.err("Invalid persistence mode: {s} (expected: full, snapshot, none)", .{args[i]});
                 return error.InvalidArgs;
             }
+        } else if (std.mem.eql(u8, args[i], "--lightapi-segment")) {
+            i += 1;
+            if (i >= args.len) {
+                std.log.err("--lightapi-segment requires an argument", .{});
+                return error.InvalidArgs;
+            }
+            cfg.lightapi_segment = args[i];
+        } else if (std.mem.eql(u8, args[i], "--gateway-port")) {
+            i += 1;
+            if (i >= args.len) {
+                std.log.err("--gateway-port requires an argument", .{});
+                return error.InvalidArgs;
+            }
+            cfg.gateway.enabled = true;
+            cfg.gateway.port = try std.fmt.parseInt(u16, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--io-uring")) {
             cfg.server.backend = .uring;
         } else if (std.mem.eql(u8, args[i], "--backend")) {
@@ -204,6 +219,23 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
             logStartupFailure(err, port, data_dir);
             return err;
         };
+    }
+
+    // Attach the frozen Light-API segment if configured: a read-only mmap of
+    // the large per-account tables. Procedures read these by Antelope name u64;
+    // small/aggregate values still come from the KV store. Stays mapped for the
+    // process lifetime (closed on shutdown).
+    var lightapi_seg: ?wormdb.storage.Segment = null;
+    defer if (lightapi_seg) |*s| s.close(allocator);
+    if (cfg.lightapi_segment) |seg_path| {
+        lightapi_seg = wormdb.storage.Segment.open(allocator, seg_path) catch |err| blk: {
+            std.log.err("Failed to open Light-API segment '{s}': {}", .{ seg_path, err });
+            break :blk null;
+        };
+        if (lightapi_seg) |*s| {
+            store.attachLightApiSegment(s);
+            std.log.info("Light-API segment: {s} ({d} bytes, {s}-backed)", .{ seg_path, s.bytes.len, @tagName(s.backing) });
+        }
     }
 
     // Initialize event bus
@@ -478,6 +510,8 @@ fn printHelp(io: std.Io) !void {
         \\  --wg-port <port>           WireGuard listen port (default: 51830)
         \\  --no-sync                  Disable fsync per write (faster, less durable)
         \\  --persistence <mode>       Persistence mode: full (default), snapshot, none
+        \\  --lightapi-segment <path>  Frozen Light-API segment (.wseg) to mmap at startup
+        \\  --gateway-port <port>      Enable the HTTP/WebSocket gateway on <port>
         \\  --help, -h                 Show this help
         \\
         \\Config File:

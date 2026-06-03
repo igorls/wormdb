@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
+const name = @import("../core/name.zig");
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const chain = ctx.arg(0) orelse return ctx.err("lightapi_balances requires <chain> <account>");
@@ -20,9 +21,11 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
 
     const a = ctx.allocator;
 
-    // Chain block + packed balances, both O(1) GETs (getCopy locks/copies → arena-owned, lock-free here).
+    // Chain block: a small per-chain value, kept in KV (getCopy → arena-owned).
     const chain_json = (try ctx.getCopy(ctx.fmt("lacfg:{s}", .{chain}))) orelse "{}";
-    const packed_bals = try ctx.getCopy(ctx.fmt("bal:{s}:{s}", .{ chain, account }));
+    // Packed balances: from the frozen segment (O(log n) binary search by name
+    // u64, slice borrowed from the mmap) when attached, else the KV store.
+    const packed_bals = try packedBalances(ctx, chain, account);
 
     var json: std.ArrayListUnmanaged(u8) = .empty;
     try json.appendSlice(a, "{\"account_name\":\"");
@@ -33,6 +36,17 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     try appendBalancesArray(&json, a, packed_bals);
     try json.append(a, '}');
     return ctx.value(try json.toOwnedSlice(a));
+}
+
+/// Fetch an account's packed balance list — from the frozen Light-API segment
+/// (binary search by Antelope `name` u64, slice borrowed from the mmap) when one
+/// is attached, otherwise from the KV store (arena-owned copy). Shared by
+/// lightapi_tokenbalance and lightapi_account.
+pub fn packedBalances(ctx: *Ctx, chain: []const u8, account: []const u8) !?[]const u8 {
+    if (ctx.store.lightapi_segment) |s| {
+        return s.lookup(.balances, name.encode(account));
+    }
+    return ctx.getCopy(ctx.fmt("bal:{s}:{s}", .{ chain, account }));
 }
 
 /// Append the cc32d9 balances `[...]` array (built from the packed per-account list) to `json`.

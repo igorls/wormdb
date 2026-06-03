@@ -128,6 +128,11 @@ pub const WormDBConfig = struct {
     /// Data directory for WAL and snapshots
     data: []const u8 = "./data",
 
+    /// Optional path to a frozen Light-API segment (.wseg). When set, WormDB
+    /// mmaps it at startup and serves the large per-account Light-API tables
+    /// from it. Null = no segment (serve everything from the KV store).
+    lightapi_segment: ?[]const u8 = null,
+
     /// Store / persistence settings
     store: Config = .{},
 

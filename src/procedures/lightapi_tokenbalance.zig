@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
+const balances = @import("lightapi_balances.zig");
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const chain = ctx.arg(0) orelse return ctx.err("need <chain> <account> <contract> <symbol>");
@@ -10,7 +11,8 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const contract = ctx.arg(2) orelse return ctx.err("need <chain> <account> <contract> <symbol>");
     const symbol = ctx.arg(3) orelse return ctx.err("need <chain> <account> <contract> <symbol>");
 
-    const pb = try ctx.getCopy(ctx.fmt("bal:{s}:{s}", .{ chain, account }));
+    // Segment (by name u64) when attached, else KV — same source as /balances.
+    const pb = try balances.packedBalances(ctx, chain, account);
     if (pb) |packed_list| {
         var lines = std.mem.splitScalar(u8, packed_list, '\n');
         while (lines.next()) |line| {

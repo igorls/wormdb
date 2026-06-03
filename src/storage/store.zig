@@ -12,6 +12,7 @@ const PersistenceMode = core.config.PersistenceMode;
 const Wal = wal_mod.Wal;
 const compat = core.compat;
 const WalRecord = wal_mod.WalRecord;
+const Segment = @import("segment.zig").Segment;
 
 // Snapshot format:
 //   v1 → WDBSNAP1: KV entries only (legacy, still loadable).
@@ -59,12 +60,24 @@ pub const Store = struct {
     /// Optional HNSW registry back-reference. Attached by main.zig after
     /// both objects exist; snapshot write/load use it when present.
     vector_registry: ?*NamespaceRegistry = null,
+    /// Optional frozen Light-API segment (read-only, mmap'd). Attached by
+    /// main.zig after construction. When present, procedures read the large
+    /// per-account tables (balances, resources, perms, …) from it by Antelope
+    /// `name` u64 instead of the KV shards — collapsing per-entry overhead and
+    /// letting the OS page in only the working set. Null = serve from KV only.
+    lightapi_segment: ?*const Segment = null,
 
     /// Attach the per-namespace HNSW registry to this store so snapshots
     /// persist and restore graph state alongside KV data. Call after both
     /// the store and the registry have been constructed (see main.zig).
     pub fn attachVectorRegistry(self: *Store, registry: *NamespaceRegistry) void {
         self.vector_registry = registry;
+    }
+
+    /// Attach a frozen Light-API segment (read-only). Call after the store is
+    /// constructed and the segment is mapped; the segment must outlive the store.
+    pub fn attachLightApiSegment(self: *Store, seg: *const Segment) void {
+        self.lightapi_segment = seg;
     }
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Store {

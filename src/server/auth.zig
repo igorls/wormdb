@@ -316,7 +316,11 @@ pub fn commandToOperation(cmd_id: u8) ?Operation {
         0x07 => .subscribe, // UNSUB uses same permission as SUB
         0x08 => .publish,
         0x09 => .exec,
-        else => null, // STATUS, CLUSTER_STATUS, etc. — always permitted
+        0x0D => .set, // VINSERT mutates vector keys
+        0x0E => .delete, // VDELETE mutates vector keys
+        0x0F => .set, // VBULKINSERT mutates vector keys under its namespace
+        0x10 => .set, // VRABITQ_INSTALL mutates vector namespace state
+        else => null, // STATUS, CLUSTER_STATUS, SAVE, AUTH, etc. — transport-handled or always permitted
     };
 }
 
@@ -330,6 +334,10 @@ pub fn commandTarget(cmd: @import("../core/types.zig").Command) ?[]const u8 {
         .unsubscribe => |ch| ch,
         .publish => |p| p.channel,
         .exec => |p| p.procedure,
+        .vinsert => |p| p.key,
+        .vdelete => |p| p.key,
+        .vbulkinsert => |p| p.namespace,
+        .vrabitq_install => |p| p.namespace,
         else => null,
     };
 }
@@ -337,6 +345,40 @@ pub fn commandTarget(cmd: @import("../core/types.zig").Command) ?[]const u8 {
 // ╔═══════════════════════════════════════════════╗
 // ║  Tests                                         ║
 // ╚═══════════════════════════════════════════════╝
+
+test "command-level auth maps vector mutations" {
+    const testing = std.testing;
+    const Command = @import("../core/types.zig").Command;
+
+    try testing.expectEqual(@as(?Operation, .set), commandToOperation(0x0D));
+    try testing.expectEqual(@as(?Operation, .delete), commandToOperation(0x0E));
+    try testing.expectEqual(@as(?Operation, .set), commandToOperation(0x0F));
+    try testing.expectEqual(@as(?Operation, .set), commandToOperation(0x10));
+
+    try testing.expectEqualStrings("vec:docs:1", commandTarget(Command{ .vinsert = .{
+        .key = "vec:docs:1",
+        .vector = "\x00\x00\x00\x00",
+        .namespace = "vec:docs:",
+        .metric = "cosine",
+        .timestamp = 1,
+    } }).?);
+    try testing.expectEqualStrings("vec:docs:1", commandTarget(Command{ .vdelete = .{
+        .key = "vec:docs:1",
+        .namespace = "vec:docs:",
+    } }).?);
+    try testing.expectEqualStrings("vec:docs:", commandTarget(Command{ .vbulkinsert = .{
+        .namespace = "vec:docs:",
+        .metric = "cosine",
+        .items = &.{},
+    } }).?);
+    try testing.expectEqualStrings("vec:docs:", commandTarget(Command{ .vrabitq_install = .{
+        .namespace = "vec:docs:",
+        .dim = 1,
+        .seed = 1,
+        .centroid = "\x00\x00\x00\x00",
+        .rotation = "\x00\x00\x00\x00",
+    } }).?);
+}
 
 test "encode, verify, and parse roundtrip" {
     const testing = std.testing;

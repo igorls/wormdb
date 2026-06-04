@@ -11,13 +11,15 @@ const Ctx = @import("context.zig").Ctx;
 const balances = @import("lightapi_balances.zig");
 const name = @import("../core/name.zig");
 const accinfo_bin = @import("accinfo_bin.zig");
+const chainmod = @import("lightapi_chain.zig");
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const chain = ctx.arg(0) orelse return ctx.err("lightapi_account requires <chain> <account>");
     const account = ctx.arg(1) orelse return ctx.err("lightapi_account requires <chain> <account>");
     const a = ctx.allocator;
 
-    const chain_json = (try ctx.getCopy(ctx.fmt("lacfg:{s}", .{chain}))) orelse "{}";
+    // Live chain block (block_num/block_time/sync from the feed); null → unknown chain → 404.
+    const chain_json = (try chainmod.block(ctx, a, chain)) orelse return ctx.err("unknown chain");
     // Live overlay (KV `acci:<chain>:<acct>`) shadows the frozen segment baseline.
     const frag: ?[]const u8 = blk: {
         if (try ctx.getCopy(ctx.fmt("acci:{s}:{s}", .{ chain, account }))) |o| break :blk o;

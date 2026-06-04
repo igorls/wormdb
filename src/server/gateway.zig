@@ -402,17 +402,15 @@ pub const Gateway = struct {
             return textRoute(self.execProc(alloc, "lightapi_holdercount", &.{ chain, contract, symbol }));
         }
         if (eql(u8, ep, "networks")) {
-            return jsonRoute(self.execProc(alloc, "lightapi_get", &.{ "lanet", "[]" }));
+            return jsonRoute(self.execProc(alloc, "lightapi_networks", &.{}));
         }
         if (eql(u8, ep, "codehash")) {
             const hash = it.next() orelse return null;
-            const key = std.fmt.allocPrint(alloc, "chh:{s}", .{hash}) catch return null;
-            return jsonRoute(self.execProc(alloc, "lightapi_get", &.{ key, "{}" }));
+            return jsonRoute(self.execProc(alloc, "lightapi_codehash", &.{hash}));
         }
         if (eql(u8, ep, "key")) {
             const pubkey = it.next() orelse return null;
-            const key = std.fmt.allocPrint(alloc, "pk:{s}", .{pubkey}) catch return null;
-            return jsonRoute(self.execProc(alloc, "lightapi_get", &.{ key, "{}" }));
+            return jsonRoute(self.execProc(alloc, "lightapi_key", &.{pubkey}));
         }
         if (eql(u8, ep, "topholders")) {
             const chain = it.next() orelse return null;
@@ -421,14 +419,15 @@ pub const Gateway = struct {
             const n = it.next() orelse return null;
             return jsonRoute(self.execProc(alloc, "lightapi_topholders", &.{ chain, contract, symbol, n }));
         }
-        if (eql(u8, ep, "topram") or eql(u8, ep, "topstake")) {
+        if (eql(u8, ep, "topram")) {
             const chain = it.next() orelse return null;
             const n = it.next() orelse return null;
-            // key = "topram:<chain>" / "topstake:<chain>" (materialized at load time).
-            // topram rows are [acct,ram] (1 int); topstake rows are [acct,cpu,net] (2 ints).
-            const key = std.fmt.allocPrint(alloc, "{s}:{s}", .{ ep, chain }) catch return null;
-            const fmt: []const u8 = if (eql(u8, ep, "topstake")) "nn" else "n";
-            return jsonRoute(self.execProc(alloc, "lightapi_topn", &.{ key, n, fmt }));
+            return jsonRoute(self.execProc(alloc, "lightapi_topram", &.{ chain, n }));
+        }
+        if (eql(u8, ep, "topstake")) {
+            const chain = it.next() orelse return null;
+            const n = it.next() orelse return null;
+            return jsonRoute(self.execProc(alloc, "lightapi_topstake", &.{ chain, n }));
         }
         if (eql(u8, ep, "rexbalance")) {
             const chain = it.next() orelse return null;

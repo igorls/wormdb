@@ -4,13 +4,15 @@
 
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
+const chainmod = @import("lightapi_chain.zig");
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const chain = ctx.arg(0) orelse return ctx.err("need <chain> <account>");
     const account = ctx.arg(1) orelse return ctx.err("need <chain> <account>");
     const a = ctx.allocator;
 
-    const chain_json = (try ctx.getCopy(ctx.fmt("lacfg:{s}", .{chain}))) orelse "{}";
+    // Live chain block (block_num/block_time/sync from the feed); null → unknown chain → 404.
+    const chain_json = (try chainmod.block(ctx, a, chain)) orelse return ctx.err("unknown chain");
     var json: std.ArrayListUnmanaged(u8) = .empty;
     try json.appendSlice(a, "{\"account_name\":\"");
     try json.appendSlice(a, account);

@@ -175,6 +175,7 @@ async function applyBlock(blk: any, ws: WebSocket) {
     const headMs = Date.parse(headInfo.head_block_time + "Z");
     const ms = headMs - (Number(headInfo.head_block_num) - bnum) * 500;
     await set(`synctime:${CHAIN}`, String(ms));
+    await set(`syncblock:${CHAIN}`, String(bnum));
     await set("syncchains", CHAIN);
     // Tolerate the LIB lag: in-sync if within (lag + 30s). cc32d9/light-api use a similar threshold.
     if (firstSync) { await set(`syncthr:${CHAIN}`, "240"); firstSync = false; }

@@ -51,6 +51,9 @@ pub const TableId = enum(u32) {
     accinfo = 5, // account name -> cc32d9 accinfo fragment ("resources":…,"linkauth":[…][,"code":…]})
     token_holders = 6, // tokenKey(contract,symbol) -> [u16 hdr]["contract:symbol"] + "acct\tamount\n"… (amount-desc)
     pub_keys = 7, // fnv1a64(pubkey EOS|PUB_K1) -> "account\tperm\tweight\n"… (holders of that key)
+    top_ram = 8, // sentinel key 0 -> [u32 count]["owner\tram_bytes\n"…] (ram-desc, capped)
+    top_stake = 9, // sentinel key 0 -> [u32 count]["owner\tstake\n"…] (cpu+net-desc, capped)
+    codehash = 10, // fnv1a64(code_hash hex) -> [u16 hdr][hash hex] + "account\n"… (accounts with that code)
     _,
 };
 

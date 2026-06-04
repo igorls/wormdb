@@ -14,6 +14,7 @@
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
 const name = @import("../core/name.zig");
+const chainmod = @import("lightapi_chain.zig");
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const chain = ctx.arg(0) orelse return ctx.err("lightapi_balances requires <chain> <account>");
@@ -21,8 +22,8 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
 
     const a = ctx.allocator;
 
-    // Chain block: a small per-chain value, kept in KV (getCopy → arena-owned).
-    const chain_json = (try ctx.getCopy(ctx.fmt("lacfg:{s}", .{chain}))) orelse "{}";
+    // Live chain block (block_num/block_time/sync from the feed); null → unknown chain → 404.
+    const chain_json = (try chainmod.block(ctx, a, chain)) orelse return ctx.err("unknown chain");
     // Packed balances: from the frozen segment (O(log n) binary search by name
     // u64, slice borrowed from the mmap) when attached, else the KV store.
     const packed_bals = try packedBalances(ctx, chain, account);

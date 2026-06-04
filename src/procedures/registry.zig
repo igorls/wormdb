@@ -36,6 +36,10 @@ pub const lightapi_sync = @import("lightapi_sync.zig");
 pub const lightapi_status = @import("lightapi_status.zig");
 pub const lightapi_ws = @import("lightapi_ws.zig");
 pub const lightapi_rexbalance = @import("lightapi_rexbalance.zig");
+pub const lightapi_topram = @import("lightapi_topram.zig");
+pub const lightapi_codehash = @import("lightapi_codehash.zig");
+pub const lightapi_key = @import("lightapi_key.zig");
+pub const lightapi_networks = @import("lightapi_networks.zig");
 
 pub const ProcedureFn = *const fn (ctx: *Ctx) anyerror!Ctx.Result;
 
@@ -84,6 +88,11 @@ const PROCEDURES = [_]Entry{
     .{ .name = "lightapi_ws_holders", .func = lightapi_ws.holderRows },
     .{ .name = "lightapi_ws_keyrows", .func = lightapi_ws.keyRows },
     .{ .name = "lightapi_rexbalance", .func = lightapi_rexbalance.execute },
+    .{ .name = "lightapi_topram", .func = lightapi_topram.executeRam },
+    .{ .name = "lightapi_topstake", .func = lightapi_topram.executeStake },
+    .{ .name = "lightapi_codehash", .func = lightapi_codehash.execute },
+    .{ .name = "lightapi_key", .func = lightapi_key.execute },
+    .{ .name = "lightapi_networks", .func = lightapi_networks.execute },
 };
 
 /// Look up a procedure by name. O(n) scan — n is tiny at comptime-known size.

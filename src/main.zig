@@ -483,26 +483,32 @@ fn buildChainBlock(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, n: an
     try out.appendSlice(a, s);
 }
 
-/// Seed `lacfg:<chain>` (per network) + `lanet` (the /networks array) into KV from config.
+/// Seed `lacfgs:<chain>` (static chain fields, tab-separated) + `lachains` (the chain list) into KV
+/// from config. The cc32d9 chain block is then assembled at REQUEST time by lightapi_chain.zig, which
+/// overlays live block_num/block_time/sync from the feed — so /networks and every embedded `chain{}`
+/// report real freshness instead of the static snapshot block.
 fn seedLightApi(store: *Store, allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
     const nets = cfg.lightapi.networks;
     if (nets.len == 0) return;
 
-    var lanet: std.ArrayListUnmanaged(u8) = .empty;
-    defer lanet.deinit(allocator);
-    try lanet.append(allocator, '[');
+    var lachains: std.ArrayListUnmanaged(u8) = .empty;
+    defer lachains.deinit(allocator);
 
     for (nets, 0..) |n, i| {
-        var block: std.ArrayListUnmanaged(u8) = .empty;
-        defer block.deinit(allocator);
-        try buildChainBlock(&block, allocator, n);
-
-        const key = try std.fmt.allocPrint(allocator, "lacfg:{s}", .{n.chain});
+        const net = n.network orelse n.chain;
+        // net \t decimals \t systoken \t chainid \t production \t description \t rex_enabled \t snap_block
+        const cfgs = try std.fmt.allocPrint(allocator, "{s}\t{d}\t{s}\t{s}\t{d}\t{s}\t{d}\t{d}", .{
+            net,                                    n.decimals, n.systoken, n.chainid,
+            @as(u8, if (n.production) 1 else 0),    n.description,
+            @as(u8, if (n.rex_enabled) 1 else 0),   n.block_num,
+        });
+        defer allocator.free(cfgs);
+        const key = try std.fmt.allocPrint(allocator, "lacfgs:{s}", .{n.chain});
         defer allocator.free(key);
-        try store.set(key, block.items, false);
+        try store.set(key, cfgs, false);
 
-        if (i > 0) try lanet.append(allocator, ',');
-        try lanet.appendSlice(allocator, block.items);
+        if (i > 0) try lachains.append(allocator, ',');
+        try lachains.appendSlice(allocator, n.chain);
 
         // usercount is free from the segment: the accinfo table's key count is the account universe
         // (every account has ≥1 permission). Seed `uc:<chain>` so /usercount serves a real number
@@ -518,8 +524,7 @@ fn seedLightApi(store: *Store, allocator: std.mem.Allocator, cfg: *const WormDBC
         }
         std.log.info("Light-API chain seeded: {s} ({s}, {d} decimals)", .{ n.chain, n.systoken, n.decimals });
     }
-    try lanet.append(allocator, ']');
-    try store.set("lanet", lanet.items, false);
+    try store.set("lachains", lachains.items, false);
 }
 
 fn logStartupFailure(err: anyerror, port: u16, data_dir: []const u8) void {

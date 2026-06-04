@@ -315,7 +315,11 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
             cfg.gateway.port,
         );
 
-        // Wire auth config into gateway
+        // Wire auth config into gateway. Apply require_auth even when no valid
+        // public keys are configured so missing/invalid keys fail closed.
+        gw.auth_required = cfg.auth.require_auth;
+        gw.max_token_age = cfg.auth.token_max_age_s;
+
         if (cfg.auth.public_keys.len > 0) {
             var pks = allocator.alloc(auth.PublicKey, cfg.auth.public_keys.len) catch {
                 std.log.err("Failed to allocate auth public keys", .{});
@@ -332,10 +336,12 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
             }
             if (valid_count > 0) {
                 gw.public_keys = pks[0..valid_count];
-                gw.auth_required = cfg.auth.require_auth;
-                gw.max_token_age = cfg.auth.token_max_age_s;
                 std.log.info("Auth: {d} public key(s) loaded, require_auth={}", .{ valid_count, cfg.auth.require_auth });
+            } else if (cfg.auth.require_auth) {
+                std.log.err("Auth: require_auth=true but no valid public keys were loaded; gateway commands will require auth and reject AUTH", .{});
             }
+        } else if (cfg.auth.require_auth) {
+            std.log.err("Auth: require_auth=true but no public keys are configured; gateway commands will require auth and reject AUTH", .{});
         }
 
         _ = gw.start() catch |err| {
@@ -377,7 +383,11 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
                 key_path,
             );
 
-            // Wire auth config (same keys as WebSocket gateway)
+            // Wire auth config (same keys as WebSocket gateway). Apply require_auth
+            // even when no valid public keys are configured so missing/invalid keys fail closed.
+            quic_gw.auth_required = cfg.auth.require_auth;
+            quic_gw.max_token_age = cfg.auth.token_max_age_s;
+
             if (cfg.auth.public_keys.len > 0) {
                 var pks = allocator.alloc(auth.PublicKey, cfg.auth.public_keys.len) catch {
                     std.log.err("QUIC Gateway: failed to allocate auth public keys", .{});
@@ -394,9 +404,11 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
                 }
                 if (valid_count > 0) {
                     quic_gw.public_keys = pks[0..valid_count];
-                    quic_gw.auth_required = cfg.auth.require_auth;
-                    quic_gw.max_token_age = cfg.auth.token_max_age_s;
+                } else if (cfg.auth.require_auth) {
+                    std.log.err("Auth: require_auth=true but no valid public keys were loaded; QUIC gateway commands will require auth and reject AUTH", .{});
                 }
+            } else if (cfg.auth.require_auth) {
+                std.log.err("Auth: require_auth=true but no public keys are configured; QUIC gateway commands will require auth and reject AUTH", .{});
             }
 
             // Register as global for session callbacks

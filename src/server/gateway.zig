@@ -35,7 +35,8 @@ pub const Gateway = struct {
     cluster: ?*Cluster,
     port: u16,
     running: std.atomic.Value(bool),
-    /// Ed25519 public keys for SCT verification. Empty = auth disabled (all commands permitted).
+    /// Ed25519 public keys for SCT verification. Empty means AUTH cannot succeed;
+    /// commands are still rejected when auth_required is true.
     public_keys: []const auth.PublicKey,
     /// Maximum token lifetime in seconds (0 = no limit).
     max_token_age: u64,

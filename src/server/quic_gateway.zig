@@ -354,14 +354,8 @@ pub const QuicGateway = struct {
                 // Capability enforcement
                 if (gw.auth_required) {
                     if (session_ctx.auth_state) |*state| {
-                        const op = auth.commandToOperation(cmd_id_raw);
-                        const target = auth.commandTarget(cmd);
-                        if (op) |o| {
-                            if (target) |t| {
-                                if (!state.permits(o, t)) {
-                                    break :blk Response{ .err = "permission denied" };
-                                }
-                            }
+                        if (!auth.commandPermitted(state, cmd_id_raw, cmd)) {
+                            break :blk Response{ .err = "permission denied" };
                         }
                     } else {
                         break :blk Response{ .err = "auth required" };

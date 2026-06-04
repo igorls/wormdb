@@ -316,12 +316,17 @@ pub fn commandToOperation(cmd_id: u8) ?Operation {
         0x07 => .subscribe, // UNSUB uses same permission as SUB
         0x08 => .publish,
         0x09 => .exec,
-        else => null, // STATUS, CLUSTER_STATUS, etc. — always permitted
+        0x0D => .set, // VINSERT writes a vector key.
+        0x0E => .delete, // VDELETE deletes a vector key.
+        0x0F => .set, // VBULKINSERT writes every item key.
+        else => null, // STATUS, CLUSTER_STATUS, SAVE, AUTH, etc. — always permitted
     };
 }
 
+const Command = @import("../core/types.zig").Command;
+
 /// Extract the target key/channel/procedure from a command for capability checking.
-pub fn commandTarget(cmd: @import("../core/types.zig").Command) ?[]const u8 {
+pub fn commandTarget(cmd: Command) ?[]const u8 {
     return switch (cmd) {
         .get => |key| key,
         .set => |p| p.key,
@@ -330,8 +335,34 @@ pub fn commandTarget(cmd: @import("../core/types.zig").Command) ?[]const u8 {
         .unsubscribe => |ch| ch,
         .publish => |p| p.channel,
         .exec => |p| p.procedure,
+        .vinsert => |p| p.key,
+        .vdelete => |p| p.key,
+        .vbulkinsert => null, // Multi-target; use commandPermitted.
         else => null,
     };
+}
+
+/// Check whether a parsed command is permitted by the token's capabilities.
+///
+/// Single-target commands use `commandTarget`; VBULKINSERT must authorize every
+/// item key because the frame can write many arbitrary keys. Commands that map
+/// to no protected operation are public. Commands that map to an operation but
+/// do not expose a target are denied by default.
+pub fn commandPermitted(state: *const TokenState, cmd_id: u8, cmd: Command) bool {
+    const op = commandToOperation(cmd_id) orelse return true;
+
+    switch (cmd) {
+        .vbulkinsert => |params| {
+            for (params.items) |item| {
+                if (!state.permits(op, item.key)) return false;
+            }
+            return true;
+        },
+        else => {
+            const target = commandTarget(cmd) orelse return false;
+            return state.permits(op, target);
+        },
+    }
 }
 
 // ╔═══════════════════════════════════════════════╗
@@ -427,6 +458,72 @@ test "capability enforcement: prefix matching" {
     try testing.expect(!state.permits(.get, "user:bob:profile")); // wrong prefix
     try testing.expect(!state.permits(.set, "user:alice:profile")); // wrong op
     try testing.expect(!state.permits(.exec, "transfer")); // wrong proc
+}
+
+test "command authorization covers vector writes" {
+    const testing = std.testing;
+    const Types = @import("../core/types.zig");
+
+    const state = TokenState{
+        .subject = "writer",
+        .iat = 0,
+        .exp = 0,
+        .jti = 0,
+        .capabilities = &[_]Capability{
+            .{ .op = .set, .match_type = .prefix, .pattern = "vec:allowed:" },
+            .{ .op = .delete, .match_type = .prefix, .pattern = "vec:allowed:" },
+        },
+    };
+
+    try testing.expectEqual(Operation.set, commandToOperation(0x0D).?);
+    try testing.expectEqual(Operation.delete, commandToOperation(0x0E).?);
+    try testing.expectEqual(Operation.set, commandToOperation(0x0F).?);
+
+    const vinsert = Types.Command{ .vinsert = .{
+        .key = "vec:allowed:1",
+        .vector = "\x00\x00\x00\x00",
+        .namespace = "allowed",
+        .metric = "l2",
+        .timestamp = 0,
+    } };
+    try testing.expect(commandPermitted(&state, 0x0D, vinsert));
+
+    const denied_vinsert = Types.Command{ .vinsert = .{
+        .key = "vec:denied:1",
+        .vector = "\x00\x00\x00\x00",
+        .namespace = "denied",
+        .metric = "l2",
+        .timestamp = 0,
+    } };
+    try testing.expect(!commandPermitted(&state, 0x0D, denied_vinsert));
+
+    const vdelete = Types.Command{ .vdelete = .{
+        .key = "vec:allowed:1",
+        .namespace = "allowed",
+    } };
+    try testing.expect(commandPermitted(&state, 0x0E, vdelete));
+
+    const allowed_items = [_]Types.Command.VbulkinsertParams.BulkItem{
+        .{ .key = "vec:allowed:1", .vector = "\x00\x00\x00\x00", .timestamp = 0 },
+        .{ .key = "vec:allowed:2", .vector = "\x00\x00\x00\x00", .timestamp = 0 },
+    };
+    const allowed_bulk = Types.Command{ .vbulkinsert = .{
+        .namespace = "allowed",
+        .metric = "l2",
+        .items = &allowed_items,
+    } };
+    try testing.expect(commandPermitted(&state, 0x0F, allowed_bulk));
+
+    const mixed_items = [_]Types.Command.VbulkinsertParams.BulkItem{
+        .{ .key = "vec:allowed:1", .vector = "\x00\x00\x00\x00", .timestamp = 0 },
+        .{ .key = "vec:denied:2", .vector = "\x00\x00\x00\x00", .timestamp = 0 },
+    };
+    const mixed_bulk = Types.Command{ .vbulkinsert = .{
+        .namespace = "allowed",
+        .metric = "l2",
+        .items = &mixed_items,
+    } };
+    try testing.expect(!commandPermitted(&state, 0x0F, mixed_bulk));
 }
 
 test {

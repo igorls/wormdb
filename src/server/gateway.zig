@@ -270,20 +270,13 @@ pub const Gateway = struct {
                     // Step 5: Capability enforcement
                     if (self.auth_required) {
                         if (auth_state) |*state| {
-                            const op = auth.commandToOperation(cmd_id_raw);
-                            const target = auth.commandTarget(cmd);
-                            if (op) |o| {
-                                if (target) |t| {
-                                    if (!state.permits(o, t)) {
-                                        break :blk Response{ .err = "permission denied" };
-                                    }
-                                }
+                            if (!auth.commandPermitted(state, cmd_id_raw, cmd)) {
+                                break :blk Response{ .err = "permission denied" };
                             }
                         } else {
-                            // No STATUS/CLUSTER_STATUS without auth if auth_required
-                            // (those ops return null from commandToOperation, so they pass through)
-                            const op = auth.commandToOperation(cmd_id_raw);
-                            if (op != null) {
+                            // Commands mapped to an Operation require authentication;
+                            // public commands such as STATUS still pass through.
+                            if (auth.commandToOperation(cmd_id_raw) != null) {
                                 break :blk Response{ .err = "auth required" };
                             }
                         }

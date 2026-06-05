@@ -18,7 +18,7 @@ WormDB enforces immutability at the storage layer. When a key is written with th
 Setting a WORM key looks like a normal `SET` with an added flag:
 
 ```bash
-bun run apps/bun/src/bin/client.ts SET audit:tx-001 "debit 500 acct:alice" WORM
+bun run apps/bun/src/bin/client.ts SET audit:tx-001 "debit 500 acct:alice" --worm
 # → OK
 ```
 
@@ -69,8 +69,8 @@ WORM is irreversible and there is no administrative override. Once a key is seal
 
 ```bash
 # Each entry is a unique, immutable event
-bun run apps/bun/src/bin/client.ts SET audit:2026-03-02:001 '{"action":"login","user":"alice"}' WORM
-bun run apps/bun/src/bin/client.ts SET audit:2026-03-02:002 '{"action":"transfer","amount":500}' WORM
+bun run apps/bun/src/bin/client.ts SET audit:2026-03-02:001 '{"action":"login","user":"alice"}' --worm
+bun run apps/bun/src/bin/client.ts SET audit:2026-03-02:002 '{"action":"transfer","amount":500}' --worm
 ```
 
 ### Financial Transaction Ledger
@@ -79,7 +79,11 @@ Pair WORM records with the `transfer` procedure — the procedure atomically upd
 
 ```bash
 # Record the transfer as immutable history
-bun run apps/bun/src/bin/client.ts SET txn:00042 "alice→bob:200" WORM
+bun run apps/bun/src/bin/client.ts SET txn:00042 "alice→bob:200" --worm
 # Execute the actual balance transfer (mutable keys)
 bun run apps/bun/src/bin/client.ts EXEC transfer acct:alice acct:bob 200
 ```
+
+## Vectors And Memory
+
+WORM also applies to vector and memory records. Native vector inserts and `mem_add` default to immutable vector/doc records unless the caller opts out. This is useful for agent memory and embedding provenance: old memories can stay searchable without being silently rewritten by a later ingestion run.

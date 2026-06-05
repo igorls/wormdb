@@ -29,10 +29,10 @@ bun run apps/bun/src/bin/client.ts SET mykey "hello world"
 # → OK
 ```
 
-Add the `WORM` flag to make the key permanently immutable:
+Add `--worm` to make the key permanently immutable. The CLI translates this to the WORM bit in the `SET` frame:
 
 ```bash
-bun run apps/bun/src/bin/client.ts SET audit "record-001" WORM
+bun run apps/bun/src/bin/client.ts SET audit "record-001" --worm
 # → OK
 ```
 
@@ -112,6 +112,34 @@ bun run apps/bun/src/bin/client.ts EXEC transfer acct:alice acct:bob 999999
 ```
 
 See [Stored Procedures](/architecture/procedures) for the full procedure model and how to write your own.
+
+## Vector Procedures
+
+Vector operations can be called through `EXEC` procedures or through native vector wire commands in custom clients.
+
+```bash
+# Inspect namespace state
+bun run apps/bun/src/bin/client.ts EXEC vstats vec:
+
+# Rebuild HNSW after raw SET ingest or recovery from an old snapshot
+bun run apps/bun/src/bin/client.ts EXEC vreindex vec:
+
+# Install RaBitQ parameters and re-encode bq:* companions
+bun run apps/bun/src/bin/client.ts EXEC vrabitq vec:
+```
+
+For inserts/searches, procedure arguments carry raw `f32` bytes; on supported little-endian targets, pack embeddings as little-endian `f32` values. The Bun library also exposes native helpers such as `vinsertNative()` and `vbulkinsertNative()` for binary clients. See [Vector Search](/architecture/vector-search).
+
+## Agent Memory Procedures
+
+The `mem_*` procedures compose durable document storage, metadata, embeddings, HNSW search, and pub/sub.
+
+```bash
+bun run apps/bun/src/bin/client.ts EXEC mem_capabilities
+bun run apps/bun/src/bin/client.ts EXEC mem_init notes openai/text-embedding-3-small cosine
+```
+
+`mem_add` and `mem_query` expect raw embedding bytes. See [Agent Memory](/architecture/agent-memory) for key layout, embedder enforcement, and reset behavior.
 
 ## Cluster & Status Commands
 

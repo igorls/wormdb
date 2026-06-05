@@ -66,6 +66,22 @@ The payload exceeded WormDB's **16 MiB** frame limit. If you're storing large va
 
 The procedure name passed to `EXEC` doesn't exist in the registry. Check the available built-ins in [Stored Procedures](/architecture/procedures).
 
+### `AUTH must be sent over gateway`
+
+`AUTH` reached the generic command executor instead of being intercepted by a gateway connection. Use the WebSocket or QUIC gateway for SCT authentication; raw TCP WormWire clients should not send `AUTH` unless their transport implements connection-level auth handling.
+
+### `vinsert: invalid vector bytes`
+
+The vector payload is empty or its byte length is not a multiple of four. Vector bytes are raw `f32` values, not JSON arrays or text numbers; on supported little-endian targets, pack them as little-endian `f32`.
+
+### `vsearch: query key not found`
+
+`vsearch` takes a key containing the query vector, not an inline vector. Insert or set the query vector first, then call `EXEC vsearch <query_key> ...`.
+
+### `mem_add: embedder mismatch`
+
+The memory namespace has a configured `embedder_id`, and the caller asserted a different embedder in the optional final `mem_add` argument. Re-embed with the configured model. If you intentionally rotate, note that `EXEC mem_reset_index <ns> <new_embedder_id>` aborts when default WORM vector keys would be left behind; use non-WORM vectors for planned rotation or run `mem_drop` for a hard reset that reports skipped WORM keys.
+
 ### `replication failed after local commit`
 
 The write succeeded on the local node but could not be replicated to one or more peers. The data exists locally but other nodes may not have it. Check:
@@ -99,6 +115,20 @@ If the node is responsive to direct commands but shows as suspected, there may b
 ### `wormwire=disconnected` for a peer
 
 The TCP replication channel isn't established. The node may be alive at the gossip layer but unreachable on the WormWire port. Check that the `--port` used for WormWire is accessible from other nodes.
+
+## Gateway Issues
+
+### HTTP `/api/...` returns 404
+
+The request is not on a known Light-API route, or the gateway is not enabled. Start WormDB with `--gateway-port <port>` or set `gateway.enabled=true` in config, then request the route from the gateway port, not the primary WormWire TCP port.
+
+### `/api/status` returns 503
+
+For the Light-API drop-in, `/api/status` intentionally returns HTTP 503 when the body starts with `OUT_OF_SYNC`. Check the live feed, segment watermark, and chain metadata.
+
+### WebSocket command returns `auth required`
+
+The gateway has `auth.require_auth=true` and the connection has not authenticated with a valid SCT token. Configure `auth.public_keys`, mint a token from an auth provider, and send `AUTH` before protected commands.
 
 ## Diagnostic Commands
 

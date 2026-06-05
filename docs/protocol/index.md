@@ -2,6 +2,8 @@
 
 WormWire is a purpose-built binary protocol for WormDB. Rather than repurposing an existing text protocol like Redis RESP, WormDB uses a compact binary framing format that eliminates text parsing overhead, removes delimiter ambiguity, and encodes commands as typed IDs rather than string names.
 
+The same command model is used by the TCP server, the browser WebSocket gateway, the QUIC/WebTransport gateway, and peer replication. Raw TCP uses the `WW`/`WR` preface described below; browser gateways carry framed commands inside WebSocket or WebTransport streams. Some command IDs are public client commands; `WR` replication links also use peer-only frames such as `VRABITQ_INSTALL`.
+
 ## Connection Handshake
 
 Every TCP connection begins with a 2-byte magic preface that identifies the connection type:
@@ -69,3 +71,7 @@ If you're writing a WormWire client library, here's the minimal flow:
 4. Handle the response code to determine success, error, or event
 
 See [Command Reference](/protocol/commands) for the exact command IDs and payload layouts for each command.
+
+## Browser Gateways
+
+Browser clients do not open raw TCP sockets and do not send the TCP `WW` preface. Use the gateway port for WormWire frames over WebSocket or QUIC/WebTransport. The gateway can also enforce SCT auth before forwarding commands to the executor. See [Gateways & Light-API](/operations/gateways).

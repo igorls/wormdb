@@ -528,7 +528,8 @@ multi-tenant isolation via explicit namespaces.
 
 ### Vector Format
 
-Vectors are stored as **raw little-endian f32 byte arrays**. A 1536-dimensional
+Vectors are stored as **raw f32 byte arrays**. On supported little-endian targets,
+clients should pack them as little-endian `f32` values. A 1536-dimensional
 embedding is exactly 6,144 bytes. No header, no metadata, no framing — just the
 float values packed contiguously. This is the same format used by every major
 embedding API (OpenAI, Cohere, Voyage, etc.) when exporting raw bytes.

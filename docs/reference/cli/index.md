@@ -8,20 +8,23 @@ Command-line options for the `wormdb` binary.
 
 ## Options
 
-| Flag                   | Type    | Default      | Description                                            |
-| ---------------------- | ------- | ------------ | ------------------------------------------------------ |
-| `--port <n>`           | integer | `6389`       | TCP listen port for client and peer connections        |
-| `--data <path>`        | path    | `./data`     | Directory for WAL, snapshots, and node identity        |
-| `--persistence <mode>` | enum    | `full`       | Durability mode: `full`, `snapshot`, or `none`         |
-| `--backend <type>`     | enum    | `threadpool` | IO backend: `threadpool`, `epoll`, or `uring`          |
-| `--no-sync`            | flag    | off          | Disable synchronous WAL writes (faster, less durable)  |
-| `--cluster <name>`     | string  | disabled     | Enable cluster mode with the given cluster name        |
-| `--seed <host:port>`   | address | none         | Gossip endpoint of an existing node to join            |
-| `--replicas <n>`       | integer | `0`          | Replication factor hint (`0` = replicate to all peers) |
-| `--gossip-port <n>`    | integer | `51821`      | UDP port for SWIM gossip                               |
-| `--wg-port <n>`        | integer | `51830`      | WireGuard listen port used by meshguard                |
-| `--io-uring`           | flag    | off          | Legacy shortcut for `--backend uring`                  |
-| `--help`, `-h`         | flag    | —            | Show help text                                         |
+| Flag | Type | Default | Description |
+| ---- | ---- | ------- | ----------- |
+| `--config <path>` | path | `./wormdb.json` if present | JSON config file |
+| `--port <n>` | integer | `6389` | TCP listen port for client and peer connections |
+| `--data <path>` | path | `./data` | Directory for WAL, snapshots, node identity, and vector snapshots |
+| `--persistence <mode>` | enum | `full` | Durability mode: `full`, `snapshot`, or `none` |
+| `--backend <type>` | enum | `threadpool` | IO backend: `threadpool`, `epoll`, or `uring` |
+| `--no-sync` | flag | off | Disable synchronous WAL writes (faster, less durable) |
+| `--cluster <name>` | string | disabled | Enable cluster mode with the given cluster name |
+| `--seed <host:port>` | address | none | Gossip endpoint of an existing node to join |
+| `--replicas <n>` | integer | `0` | Replication factor hint (`0` = replicate to all peers) |
+| `--gossip-port <n>` | integer | `51821` | UDP port for SWIM gossip |
+| `--wg-port <n>` | integer | `51830` | WireGuard listen port used by meshguard |
+| `--lightapi-segment <path>` | path | none | mmap a frozen Light-API segment at startup |
+| `--gateway-port <n>` | integer | disabled | Enable the HTTP/WebSocket gateway on this port |
+| `--io-uring` | flag | off | Legacy shortcut for `--backend uring` |
+| `--help`, `-h` | flag | — | Show help text |
 
 ## Examples
 
@@ -56,3 +59,43 @@ Joins an existing cluster named `myapp` via the seed node's gossip endpoint.
 ```
 
 Requires Linux kernel 5.6+. See [Server Backends](/architecture/server-backends) for tradeoffs.
+
+### Gateway And Light-API Segment
+
+```bash
+./zig-out/bin/wormdb --port 6389 --gateway-port 6390 --lightapi-segment ./lightapi.wseg
+```
+
+Enables the HTTP/WebSocket gateway and serves large Light-API tables from a frozen segment. See [Gateways & Light-API](/operations/gateways).
+
+## JSON Config
+
+CLI flags override the JSON config. Fields not present in the file use defaults, and unknown fields are ignored for forward compatibility.
+
+```json
+{
+  "data": "./data",
+  "server": { "port": 6389, "backend": "threadpool" },
+  "gateway": {
+    "enabled": true,
+    "port": 6390,
+    "quic_enabled": false
+  },
+  "auth": {
+    "public_keys": [],
+    "require_auth": true,
+    "token_max_age_s": 3600
+  },
+  "lightapi_segment": "./lightapi.wseg",
+  "lightapi": {
+    "networks": [
+      {
+        "chain": "wax",
+        "systoken": "WAX",
+        "decimals": 8,
+        "chainid": "..."
+      }
+    ]
+  }
+}
+```

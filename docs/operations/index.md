@@ -1,6 +1,6 @@
 # Operations
 
-This section covers everything you need to run WormDB in practice — from choosing a durability mode to deploying a multi-node cluster and diagnosing failures.
+This section covers everything you need to run WormDB in practice — from choosing a durability mode to deploying a multi-node cluster, exposing browser/Light-API gateways, maintaining vector indexes, and diagnosing failures.
 
 ## Before You Deploy
 
@@ -38,6 +38,14 @@ bun run apps/bun/src/bin/client.ts SAVE
 # → OK
 ```
 
+**5. For vector-heavy deployments, inspect namespace health**:
+
+```bash
+bun run apps/bun/src/bin/client.ts EXEC vstats vec:
+```
+
+Run `EXEC vreindex <namespace>` after raw vector ingest or recovery from an old snapshot when HNSW needs to be immediately current.
+
 ## Admin UI
 
 For visual inspection, launch the admin dashboard:
@@ -52,4 +60,5 @@ Then open [http://localhost:8099](http://localhost:8099). The UI shows key count
 
 - [Persistence Modes](/operations/persistence) — WAL, snapshot, and in-memory tradeoffs
 - [Clustering](/operations/clustering) — forming a mesh, replication, and verifying health
+- [Gateways & Light-API](/operations/gateways) — WebSocket, QUIC/WebTransport, SCT auth, and plain HTTP Light-API routes
 - [Troubleshooting](/operations/troubleshooting) — common failures, error messages, and diagnostics

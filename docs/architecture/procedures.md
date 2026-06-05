@@ -50,10 +50,14 @@ All locks are automatically released when the procedure returns — you never ne
 | ------------------------ | -------------------------------------------------- |
 | `ctx.get(key)`           | Raw value bytes (caller must hold shard lock)      |
 | `ctx.getInt(T, key)`     | Parse stored value as integer type `T`             |
-| `ctx.set(key, value)`    | Write raw bytes                                    |
-| `ctx.setInt(key, value)` | Write integer as string                            |
+| `ctx.set(key, value)`    | Write raw bytes through the unsafe in-memory path  |
+| `ctx.setDurable(key, value)` | Write through WAL and replicate to peers      |
+| `ctx.setDurableWorm(key, value)` | Durable write with the WORM bit set       |
+| `ctx.setInt(key, value)` | Write integer as string through `ctx.set`          |
 | `ctx.exists(key)`        | Check if key exists                                |
-| `ctx.del(key)`           | Delete key (bypasses WORM for internal procedures) |
+| `ctx.del(key)`           | Delete key through the unsafe in-memory path       |
+| `ctx.deleteDurable(key)` | Delete through WAL, WORM check, and replication    |
+| `ctx.getCopy(key)`       | Lock, copy, and unlock a value for long-lived reads |
 
 ### Responses
 
@@ -68,10 +72,29 @@ All locks are automatically released when the procedure returns — you never ne
 
 | Method             | Description                             |
 | ------------------ | --------------------------------------- |
-| `ctx.eql(a, b)`    | Compare two byte slices                 |
-| `ctx.randomHex(n)` | Generate random hex string of `n` bytes |
+| `ctx.eql(a, b)`        | Compare two byte slices                         |
+| `ctx.randomHex(n)`     | Generate random hex string of `n` bytes         |
+| `ctx.timestamp()`      | Current server timestamp in milliseconds        |
+| `ctx.identity()`       | Authenticated SCT subject, if present           |
+| `ctx.publish(c, msg)`  | Best-effort pub/sub event from inside a procedure |
+
+::: warning
+`ctx.set()`, `ctx.setInt()`, and `ctx.del()` bypass the WAL, WORM checks, and replication. Use `ctx.setDurable*()` and `ctx.deleteDurable()` when procedure-written data must survive crashes and replicate like normal client writes.
+:::
+
+Durable writes temporarily release held shard locks before the store write and cluster replication call, then re-acquire them in sorted order. This avoids deadlocks with anti-entropy scans that may need to lock every shard.
 
 ## Built-In Procedures
+
+The registry currently includes several procedure families:
+
+| Family | Procedures |
+| ------ | ---------- |
+| Atomic KV | `increment`, `transfer`, `kv_put`, `kv_get`, `kv_stats`, `scan` |
+| Collaboration demos | `chat_send`, `chat_history` |
+| Vector search | `vinsert`, `vsearch`, `vsim`, `vstats`, `vreindex`, `vrabitq`, `vdelete`, `vnsdrop` |
+| Agent memory | `mem_init`, `mem_add`, `mem_get`, `mem_query`, `mem_stats`, `mem_drop`, `mem_reset_index`, `mem_capabilities` |
+| Light-API | `lightapi_*` procedures served through the gateway's HTTP and JSON-RPC routes |
 
 ### `increment`
 
@@ -115,6 +138,23 @@ bun run apps/bun/src/bin/client.ts EXEC transfer acct:a acct:b 200
 ```
 
 **Source**: `src/procedures/transfer.zig` — 20 lines of procedure logic.
+
+### Vector Procedures
+
+See [Vector Search](/architecture/vector-search) for the full vector procedure surface. The important operational procedures are:
+
+- `vstats` — inspect namespace dimensions, HNSW state, tombstones, and RaBitQ params.
+- `vreindex` — rebuild HNSW from durable `vec:*` keys.
+- `vrabitq` — install RaBitQ params and re-encode `bq:*` companions.
+- `vdelete` / `vnsdrop` — tombstone or drop vector namespaces.
+
+### Agent Memory Procedures
+
+See [Agent Memory](/architecture/agent-memory) for the `mem_*` surface. These procedures compose WORM docs, metadata, vector inserts, pub/sub, and embedder-id enforcement for AI memory stores.
+
+### Light-API Procedures
+
+The `lightapi_*` procedures are compiled into the same registry and can be called through `EXEC`, but most users reach them through the gateway's `/api/...` routes. See [Gateways & Light-API](/operations/gateways).
 
 ## Anatomy of a Procedure
 

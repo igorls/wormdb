@@ -3,33 +3,30 @@ layout: home
 
 hero:
   name: "WormDB"
-  text: "Data That Can't Be Rewritten"
-  tagline: "A distributed key-value store built in Zig with write-once immutability, embedded stored procedures, a binary wire protocol, and mesh-based clustering."
-  image:
-    src: /logo.svg
-    alt: WormDB
+  text: "Immutable KV, procedures, streams, and vector search in one Zig binary"
+  tagline: "A WormWire-native data server for audit-safe records, atomic server-side workflows, pub/sub event streams, local ANN indexes, and optional mesh replication."
   actions:
     - theme: brand
+      text: Start in 5 Minutes
+      link: /getting-started/quick-start
+    - theme: alt
       text: What is WormDB?
       link: /getting-started/
     - theme: alt
-      text: Quick Start
-      link: /getting-started/quick-start
-    - theme: alt
-      text: Architecture
-      link: /architecture/
+      text: Command Reference
+      link: /protocol/commands
 
 features:
-  - title: 🔒 Write-Once Immutability
-    details: WORM keys are permanently sealed on first write — no overwrites, no deletes. Built for audit logs, compliance records, and financial ledgers where history must never change.
-  - title: ⚡ Binary Wire Protocol
-    details: WormWire v1 uses strict framed binary encoding with explicit command IDs, big-endian lengths, and a 16 MiB payload limit. No text parsing overhead.
-  - title: 🧩 Embedded Procedures
-    details: Execute compiled Zig procedures server-side with automatic shard locking. Atomic multi-key operations like transfers and counters, without round-trip latency.
-  - title: 🔧 Pluggable IO Backends
-    details: Choose threadpool for compatibility, epoll for event-driven workloads, or io_uring for maximum throughput on modern Linux kernels.
-  - title: 🌐 Mesh Clustering
-    details: Nodes discover each other via SWIM gossip and replicate writes over persistent WormWire peer channels. No external coordination service required.
-  - title: 📊 Built-In Observability
-    details: STATUS, CLUSTER STATUS, and CLUSTER PEERS return structured key=value output designed for scripting, monitoring dashboards, and automation pipelines.
+  - title: WORM as a Storage Invariant
+    details: Mark a key as write-once and the storage layer rejects every later overwrite or delete. Use it for ledgers, audit trails, compliance records, and provenance logs.
+  - title: WormWire Binary Protocol
+    details: Client and replication links use explicit WW/WR handshakes, 1-byte command IDs, 4-byte big-endian payload lengths, and a strict 16 MiB frame limit.
+  - title: Compiled Zig Procedures
+    details: EXEC handlers run inside the server with shard locking, so counters, transfers, vector workflows, and domain procedures finish in one round-trip.
+  - title: Co-Located Vector Search
+    details: Store embeddings through the same durable path, then query local HNSW, RaBitQ/BQ, or brute-force search with cosine, dot, or L2 metrics per namespace.
+  - title: Mesh Replication on Linux
+    details: Cluster mode uses meshguard for SWIM gossip, node identity, WireGuard tunnel setup, and persistent WormWire peer replication without an external coordinator.
+  - title: Operator-Friendly Persistence
+    details: WAL records include CRC32 protection, snapshots persist KV state and vector indexes, and STATUS/CLUSTER output stays machine-readable for scripts.
 ---

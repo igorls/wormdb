@@ -21,6 +21,7 @@ Every WormDB command has a 1-byte integer ID and a defined payload layout. All v
 | `0x0D` | `VINSERT`        | Native vector insert                    |
 | `0x0E` | `VDELETE`        | Native vector delete/tombstone          |
 | `0x0F` | `VBULKINSERT`    | Native bulk vector insert               |
+| `0x10` | `VRABITQ_INSTALL` | Peer-only RaBitQ parameter replication |
 
 ## Payload Layouts
 
@@ -85,7 +86,7 @@ where each arg = [4B arg_len][arg bytes]
 [key][vector][1B flags][namespace][metric][8B timestamp]
 ```
 
-`key`, `vector`, `namespace`, and `metric` are length-prefixed fields. `vector` is raw little-endian `f32` bytes. `metric` is the UTF-8 string `cosine`, `dot`, or `l2`.
+`key`, `vector`, `namespace`, and `metric` are length-prefixed fields. `vector` is raw `f32` bytes interpreted directly by the server; on supported little-endian targets, clients should pack little-endian `f32` values. `metric` is the UTF-8 string `cosine`, `dot`, or `l2`.
 
 **Flags byte**:
 
@@ -111,6 +112,14 @@ for each item: [key][vector][8B timestamp]
 ```
 
 `namespace`, `metric`, `key`, and `vector` are length-prefixed fields. The flags byte uses the same bits as `VINSERT`, but applies to every item in the batch. The bulk command amortizes frame parsing and namespace locking across many vector inserts.
+
+### VRABITQ_INSTALL
+
+```text
+[namespace][4B dim][8B seed][centroid][rotation]
+```
+
+This is an internal replication frame emitted by `EXEC vrabitq`. It installs the leader's RaBitQ centroid and rotation matrix on peers before the re-encoded `bq:*` writes arrive. Normal client libraries should not expose this as an application command.
 
 ### No-Payload Commands — `STATUS`, `CLUSTER STATUS`, `CLUSTER PEERS`, `SAVE`
 

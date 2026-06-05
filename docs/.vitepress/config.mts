@@ -1,11 +1,12 @@
 import { defineConfig } from 'vitepress'
 
 export default defineConfig({
+  base: '/wormdb/',
   title: "WormDB",
   description: "Distributed key-value store in Zig with WORM semantics, procedure execution, and mesh clustering.",
   ignoreDeadLinks: true,
   head: [
-    ['link', { rel: 'icon', href: '/logo.svg' }]
+    ['link', { rel: 'icon', href: '/wormdb/logo.svg' }]
   ],
   themeConfig: {
     logo: '/logo.svg',
@@ -36,6 +37,7 @@ export default defineConfig({
             { text: 'Overview', link: '/operations/' },
             { text: 'Persistence Modes', link: '/operations/persistence' },
             { text: 'Clustering', link: '/operations/clustering' },
+            { text: 'Gateways & Light-API', link: '/operations/gateways' },
             { text: 'Troubleshooting', link: '/operations/troubleshooting' },
           ]
         }
@@ -48,6 +50,8 @@ export default defineConfig({
             { text: 'WORM Semantics', link: '/architecture/worm-semantics' },
             { text: 'Server Backends', link: '/architecture/server-backends' },
             { text: 'Stored Procedures', link: '/architecture/procedures' },
+            { text: 'Vector Search', link: '/architecture/vector-search' },
+            { text: 'Agent Memory', link: '/architecture/agent-memory' },
             { text: 'Pub/Sub', link: '/architecture/pubsub' },
             { text: 'Benchmarks', link: '/architecture/benchmarks' },
           ]
@@ -74,7 +78,7 @@ export default defineConfig({
     },
 
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/WormDB/wormdb' } // Placeholder
+      { icon: 'github', link: 'https://github.com/igorls/wormdb' }
     ]
   }
 })

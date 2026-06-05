@@ -4,6 +4,12 @@ This walkthrough gets a local WormDB instance running and verified in under five
 
 ## 1. Build the Binary
 
+Fetch the in-tree dependencies first. `deps/meshguard` is required for the normal build.
+
+```bash
+git submodule update --init --recursive
+```
+
 ```bash
 zig build -Doptimize=ReleaseSmall
 ```
@@ -45,7 +51,7 @@ bun run apps/bun/src/bin/client.ts GET hello
 WORM (Write Once, Read Many) is the defining capability. Set a key with the WORM flag:
 
 ```bash
-bun run apps/bun/src/bin/client.ts SET audit "entry-001" WORM
+bun run apps/bun/src/bin/client.ts SET audit "entry-001" --worm
 # → OK
 ```
 
@@ -95,7 +101,18 @@ bun run apps/bun/src/bin/client.ts EXEC increment counter 5
 
 See [Stored Procedures](/architecture/procedures) for the full procedure model.
 
-## 7. Start the Admin UI (Optional)
+## 7. Check Recent Procedure Families
+
+WormDB also ships procedure surfaces for vector search and agent memory:
+
+```bash
+bun run apps/bun/src/bin/client.ts EXEC vstats vec:
+bun run apps/bun/src/bin/client.ts EXEC mem_capabilities
+```
+
+See [Vector Search](/architecture/vector-search) and [Agent Memory](/architecture/agent-memory) for the current command surface.
+
+## 8. Start the Admin UI (Optional)
 
 ```bash
 UI_PORT=8099 WORMDB_PORT=6389 bun run apps/bun/src/bin/ui.ts
@@ -108,3 +125,4 @@ Open [http://localhost:8099](http://localhost:8099) for a visual dashboard showi
 - **Use the client in detail** → [Clients & Commands](/getting-started/clients)
 - **Understand the internals** → [Architecture](/architecture/)
 - **Deploy with persistence and clustering** → [Operations](/operations/)
+- **Expose browser and Light-API routes** → [Gateways & Light-API](/operations/gateways)

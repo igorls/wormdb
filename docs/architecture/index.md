@@ -13,12 +13,16 @@ flowchart TB
 	store["Store<br/>256 hash-sharded buckets"]
 	wal["WAL / Snapshot<br/>CRC32-protected records"]
 	bus["Event Bus<br/>pub/sub fanout"]
+	vector["Vector Registry<br/>HNSW + BQ/RaBitQ"]
+	procs["Procedures<br/>EXEC registry"]
 	cluster["Cluster<br/>SWIM gossip + peer replication"]
 
 	client --> transport --> wire --> exec
 	exec --> store
 	store --> wal
 	exec --> bus
+	exec --> vector
+	exec --> procs
 	exec --> cluster
 ```
 
@@ -29,6 +33,8 @@ flowchart TB
 | **Executor**  | `src/server/executor.zig`          | Dispatch commands to store, event bus, cluster, or procedures |
 | **Storage**   | `src/storage/store.zig`, `wal.zig` | Sharded in-memory HashMap, WAL append, snapshot load/save     |
 | **Events**    | `src/event/bus.zig`                | Channel subscriptions, publish fanout to connected clients    |
+| **Vector**    | `src/vector/`, `src/procedures/vector_ops.zig` | HNSW/BQ/RaBitQ serving index over durable `vec:*` entries |
+| **Procedures** | `src/procedures/registry.zig`     | Compiled `EXEC` handlers for atomic workflows and app surfaces |
 | **Cluster**   | `src/cluster/node.zig`             | SWIM membership, peer liveness, write replication             |
 
 ## Command Execution Flow
@@ -49,7 +55,7 @@ sequenceDiagram
 	W->>E: typed Command union
 	E->>T: apply read/write
 	alt mutation with cluster enabled
-		E->>CL: replicate SET/DEL
+		E->>CL: replicate SET/DEL/vector frame
 	end
 	E-->>S: typed Response union
 	S-->>C: encoded response frame
@@ -79,14 +85,14 @@ WormDB offers three persistence modes via `--persistence`:
 | `snapshot` | None                         | Last snapshot only    |
 | `none`     | None                         | Data lost on exit     |
 
-See [Persistence Modes](/operations/persistence) for operational guidance on choosing between them.
+Snapshots can also persist the vector serving index. Snapshot v2 appends an `WDBHNSW2` trailer with HNSW graph state, tombstones, timestamps, and RaBitQ parameters. See [Persistence Modes](/operations/persistence) for operational guidance on choosing between modes and [Vector Search](/architecture/vector-search) for rebuild behavior.
 
 ## Cluster Model
 
 Clustering is optional and enabled with `--cluster <name>`:
 
 - **Discovery**: SWIM gossip protocol over UDP
-- **Replication**: mutating commands (`SET`, `DEL`) replicate to peers over persistent WormWire TCP connections after local commit
+- **Replication**: mutating commands (`SET`, `DEL`, native vector frames, and durable procedure writes) replicate to peers over persistent WormWire TCP connections after local commit
 - **No external coordinator** — no ZooKeeper, no etcd, no Raft leader election
 
 See [Clustering](/operations/clustering) for deployment patterns.
@@ -96,4 +102,6 @@ See [Clustering](/operations/clustering) for deployment patterns.
 - [WORM Semantics](/architecture/worm-semantics) — how immutability works and when to use it
 - [Server Backends](/architecture/server-backends) — threadpool vs. epoll vs. io_uring tradeoffs
 - [Stored Procedures](/architecture/procedures) — the embedded procedure execution model
+- [Vector Search](/architecture/vector-search) — HNSW, RaBitQ, native vector frames, and rebuild paths
+- [Agent Memory](/architecture/agent-memory) — the `mem_*` procedure surface for AI memory
 - [Pub/Sub](/architecture/pubsub) — real-time event distribution

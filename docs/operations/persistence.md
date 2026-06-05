@@ -83,6 +83,8 @@ No disk IO at all. No snapshot, no WAL. Data exists only in process memory and i
 - Records are protected with CRC32 checksums to detect corruption during replay.
 - WAL truncation happens only in `full` mode, after a successful snapshot write.
 - The `wal_size` field in `STATUS` output tracks the current WAL file size in bytes — use this for monitoring growth.
+- Snapshot v2 persists HNSW graphs, tombstones, timestamps, and RaBitQ parameters in an `WDBHNSW2` trailer after the KV snapshot.
+- WAL replay restores durable vector keys after the latest snapshot, but does not replay every vector-index mutation. Run `EXEC vreindex <namespace>` after raw `SET` ingest, recovery from an old snapshot, or any WAL-only catch-up where HNSW must be immediately current.
 
 ```bash
 bun run apps/bun/src/bin/client.ts STATUS
@@ -95,3 +97,7 @@ cluster_enabled=0
 ```
 
 If `wal_size` grows continuously, consider scheduling periodic `SAVE` commands to trigger snapshot + truncation.
+
+## Procedure Durability
+
+Stored procedures have both unsafe and durable Ctx helpers. `ctx.set()` and `ctx.del()` mutate in-memory state directly and are durable only after the next snapshot. Procedures that must behave like normal client writes should use `ctx.setDurable()`, `ctx.setDurableWorm()`, or `ctx.deleteDurable()`, which go through the WAL and cluster replication path.

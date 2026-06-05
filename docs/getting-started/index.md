@@ -6,13 +6,19 @@ Financial ledgers, audit trails, compliance records, sensor logs — in all of t
 
 ## Why Zig?
 
-Zig gives WormDB explicit control over memory allocation, no hidden allocators, no garbage collection pauses, and no runtime surprises. Every allocation is visible, every error is handled, and the compiled binary is a single ~2 MB static executable with zero dependencies beyond `libsodium` for cluster identity.
+Zig gives WormDB explicit control over memory allocation, no hidden allocators, no garbage collection pauses, and no runtime surprises. Every allocation is visible, every error is handled, and the server ships as a small static binary with `libsodium` linked for crypto, auth, and cluster identity.
 
 ## Key Capabilities
 
 **Embedded Procedures** — Instead of round-tripping commands over the network for multi-key operations, WormDB compiles Zig procedures directly into the server binary. Procedures like `increment` and `transfer` acquire shard locks, read/write multiple keys atomically, and return results — all in a single network call.
 
 **Binary Protocol** — WormWire v1 is a purpose-built binary protocol. Every frame carries a 1-byte command ID, a 4-byte big-endian length, and the payload. No text parsing, no ambiguity about delimiters, no wasted bytes.
+
+**Vector Search** — Embeddings live beside KV records as durable `vec:*` keys. HNSW, BQ/RaBitQ, tombstones, and namespace stats are maintained by the server and exposed through native vector wire commands plus `EXEC` procedures.
+
+**Agent Memory** — The `mem_*` procedure family stores document chunks, metadata, embeddings, and pub/sub notifications in one round-trip, with optional embedder-id enforcement for model swaps.
+
+**Browser Gateways** — The optional gateway exposes WormWire over WebSocket and plain HTTP Light-API routes backed by compiled procedures. QUIC/WebTransport is available only in binaries built with `-Dquic=true` and configured with TLS material.
 
 **Mesh Clustering** — Nodes find each other through SWIM gossip over UDP and replicate writes over persistent TCP connections using the same WormWire framing. No external coordinator (ZooKeeper, etcd) is needed.
 
@@ -27,10 +33,13 @@ Zig gives WormDB explicit control over memory allocation, no hidden allocators, 
 | [Architecture](/architecture/)                 | Runtime layers, data model, and design rationale                   |
 | [Operations](/operations/)                     | Persistence modes, cluster deployment, troubleshooting             |
 | [Protocol](/protocol/)                         | WormWire v1 frame format and command reference                     |
+| [Vector Search](/architecture/vector-search)   | Native vector commands, HNSW, RaBitQ, and rebuild behavior         |
+| [Agent Memory](/architecture/agent-memory)     | `mem_*` procedures for AI-agent memory stores                      |
 | [Reference](/reference/cli/)                   | CLI flags and status field definitions                             |
 
 ## Prerequisites
 
-- **Zig 0.15+** — the build toolchain
-- **libsodium** — used for cluster node identity generation
-- **Bun** — runs the reference client and admin UI
+- **Zig 0.16+** — the build toolchain
+- **libsodium** — used for crypto, auth, and cluster identity
+- **Bun** — runs the reference client, admin UI, browser demo tooling, and docs site
+- **Git submodules** — `deps/meshguard` is required; QUIC builds also need `deps/msquic` and `deps/libwtf`

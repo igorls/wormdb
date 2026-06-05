@@ -18,4 +18,5 @@
 | A-006 | P2 | Handle oversized single-line commands safely | Done | [WP-006](./work-packages/WP-006-oversized-line-safety.md) | Approved in REVIEW-006 |
 | A-007 | P2 | Improve startup failure diagnostics | Done | [WP-007](./work-packages/WP-007-startup-and-connectivity-diagnostics.md) | Approved in REVIEW-007 |
 | A-008 | P1 | Binary protocol framing over TCP (WormWire v1) | Done | [WP-008](./work-packages/WP-008-binary-protocol-framing.md) | Approved in REVIEW-008 |
-| A-010 | P1 | AtomicAssets serving — read AA segment + first faceted endpoint | In Progress | [WP-010](./work-packages/WP-010-atomicassets-serving.md) | Mirrors the Light-API serving model; production path for one WormDB serving LA+AA+chain-v1 |
+| A-010 | P1 | AtomicAssets serving — read AA segment + first faceted endpoint | Done | [WP-010](./work-packages/WP-010-atomicassets-serving.md) | Approved in REVIEW-010 — serves GET /atomicassets/v1/assets?owner from the frozen segment, validated on the 88.8M-asset WAX-testnet segment |
+| A-011 | P1 | AtomicAssets faceted live overlay (port aa_live.rs into the engine) | Draft | TBD | roaring add/rem + tombstones + two-phase apply; the freshness layer over the AA segment |

@@ -40,6 +40,7 @@ pub const lightapi_topram = @import("lightapi_topram.zig");
 pub const lightapi_codehash = @import("lightapi_codehash.zig");
 pub const lightapi_key = @import("lightapi_key.zig");
 pub const lightapi_networks = @import("lightapi_networks.zig");
+pub const atomicassets_assets = @import("atomicassets_assets.zig");
 
 pub const ProcedureFn = *const fn (ctx: *Ctx) anyerror!Ctx.Result;
 
@@ -93,6 +94,7 @@ const PROCEDURES = [_]Entry{
     .{ .name = "lightapi_codehash", .func = lightapi_codehash.execute },
     .{ .name = "lightapi_key", .func = lightapi_key.execute },
     .{ .name = "lightapi_networks", .func = lightapi_networks.execute },
+    .{ .name = "atomicassets_assets_by_owner", .func = atomicassets_assets.byOwner },
 };
 
 /// Look up a procedure by name. O(n) scan — n is tiny at comptime-known size.

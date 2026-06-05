@@ -67,6 +67,15 @@ pub const Store = struct {
     /// letting the OS page in only the working set. Null = serve from KV only.
     lightapi_segment: ?*const Segment = null,
 
+    /// Optional frozen AtomicAssets segment (read-only, mmap'd). Same `.wseg`
+    /// format and attach lifecycle as `lightapi_segment`, but a distinct domain
+    /// (table ids 11..=21: forward asset store + per-dimension posting lists +
+    /// presorted orderings). Procedures read faceted AtomicAssets state from it.
+    /// Null = no AtomicAssets segment attached.
+    /// (A unified multi-segment registry replacing both typed slots is a planned
+    /// follow-up; this keeps the two domains independent for now.)
+    atomicassets_segment: ?*const Segment = null,
+
     /// Attach the per-namespace HNSW registry to this store so snapshots
     /// persist and restore graph state alongside KV data. Call after both
     /// the store and the registry have been constructed (see main.zig).
@@ -78,6 +87,12 @@ pub const Store = struct {
     /// constructed and the segment is mapped; the segment must outlive the store.
     pub fn attachLightApiSegment(self: *Store, seg: *const Segment) void {
         self.lightapi_segment = seg;
+    }
+
+    /// Attach a frozen AtomicAssets segment (read-only). Call after the store is
+    /// constructed and the segment is mapped; the segment must outlive the store.
+    pub fn attachAtomicAssetsSegment(self: *Store, seg: *const Segment) void {
+        self.atomicassets_segment = seg;
     }
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Store {

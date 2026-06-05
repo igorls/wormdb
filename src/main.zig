@@ -136,6 +136,13 @@ pub fn main(init: std.process.Init) !void {
                 return error.InvalidArgs;
             }
             cfg.lightapi_segment = args[i];
+        } else if (std.mem.eql(u8, args[i], "--atomicassets-segment")) {
+            i += 1;
+            if (i >= args.len) {
+                std.log.err("--atomicassets-segment requires an argument", .{});
+                return error.InvalidArgs;
+            }
+            cfg.atomicassets_segment = args[i];
         } else if (std.mem.eql(u8, args[i], "--gateway-port")) {
             i += 1;
             if (i >= args.len) {
@@ -235,6 +242,27 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
         if (lightapi_seg) |*s| {
             store.attachLightApiSegment(s);
             std.log.info("Light-API segment: {s} ({d} bytes, {s}-backed)", .{ seg_path, s.bytes.len, @tagName(s.backing) });
+        }
+    }
+
+    // Frozen AtomicAssets segment (table ids 11..=21: forward asset store + per-dimension posting lists +
+    // presorted orderings). Same lifecycle as the Light-API segment; a distinct domain.
+    var aa_seg: ?wormdb.storage.Segment = null;
+    defer if (aa_seg) |*s| s.close(allocator);
+    if (cfg.atomicassets_segment) |seg_path| {
+        aa_seg = wormdb.storage.Segment.open(allocator, seg_path) catch |err| blk: {
+            std.log.err("Failed to open AtomicAssets segment '{s}': {}", .{ seg_path, err });
+            break :blk null;
+        };
+        if (aa_seg) |*s| {
+            store.attachAtomicAssetsSegment(s);
+            const fwd = s.keyCount(@enumFromInt(11)); // FWD: asset_id -> asset record
+            const by_owner = s.keyCount(@enumFromInt(12)); // BY_OWNER posting
+            const by_coll = s.keyCount(@enumFromInt(13)); // BY_COLL posting
+            std.log.info(
+                "AtomicAssets segment: {s} ({d} bytes, {s}-backed) — assets={d} owners={d} collections={d}",
+                .{ seg_path, s.bytes.len, @tagName(s.backing), fwd, by_owner, by_coll },
+            );
         }
     }
 
@@ -573,6 +601,7 @@ fn printHelp(io: std.Io) !void {
         \\  --no-sync                  Disable fsync per write (faster, less durable)
         \\  --persistence <mode>       Persistence mode: full (default), snapshot, none
         \\  --lightapi-segment <path>  Frozen Light-API segment (.wseg) to mmap at startup
+        \\  --atomicassets-segment <path>  Frozen AtomicAssets segment (.wseg) to mmap at startup
         \\  --gateway-port <port>      Enable the HTTP/WebSocket gateway on <port>
         \\  --help, -h                 Show this help
         \\

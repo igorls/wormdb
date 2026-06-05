@@ -39,7 +39,11 @@ pub const VERSION: u32 = 1;
 const HEADER_FIXED: usize = 40; // up to and including meta_off/meta_len
 const DIR_ENTRY: usize = 48;
 const INDEX_ENTRY: usize = 20; // key u64 | off u64 | len u32
-const MAX_TABLES: usize = 16;
+// A segment can hold tables for multiple API domains in one disjoint table-id namespace:
+// Light-API uses 0..=10, AtomicAssets uses 11..=21, chain-v1/AtomicMarket reserved above. The `tables`
+// array is indexed by table_id, so this is the highest addressable id + 1. 32 gives headroom for all
+// three domains at a cost of a few hundred bytes of optional slots per attached segment.
+const MAX_TABLES: usize = 32;
 
 /// Stable table identifiers. The builder and reader must agree on these.
 pub const TableId = enum(u32) {
@@ -339,6 +343,49 @@ test "segment round-trip via temp file" {
     try testing.expectEqualStrings("x\tY\t0\t7", seg.lookup(.balances, name.encode("zzz")).?);
     try testing.expect(seg.lookup(.balances, name.encode("missing")) == null);
     try testing.expect(seg.lookup(.resources, name.encode("a")) == null);
+}
+
+test "high table-id (AtomicAssets range) is addressable" {
+    // Regression for the MAX_TABLES=16 showstopper: the AtomicAssets builder uses table ids 11..=21
+    // (SORTED_TMPL=21). Before MAX_TABLES was raised, `open` dropped any id >= 16, so these tables were
+    // silently unreadable. Build a segment with table id 21 and confirm it round-trips.
+    const testing = std.testing;
+    const name = @import("../core/name.zig");
+    const AA_SORTED_TMPL: u32 = 21;
+
+    var entries = [_]TestEntry{
+        .{ .key = 0, .val = "sentinel-blob" }, // SORTED_TMPL uses the sentinel key 0
+        .{ .key = name.encode("alice"), .val = "owned-by-alice" },
+        .{ .key = name.encode("zzz"), .val = "z" },
+    };
+    std.sort.pdq(TestEntry, &entries, {}, struct {
+        fn lt(_: void, x: TestEntry, y: TestEntry) bool {
+            return x.key < y.key;
+        }
+    }.lt);
+
+    const bytes = try buildOneTableSegment(testing.allocator, AA_SORTED_TMPL, &entries);
+    defer testing.allocator.free(bytes);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try compat.Dir.realPathAlloc(tmp.dir, testing.allocator, ".");
+    defer testing.allocator.free(dir_path);
+    const seg_path = try std.fmt.allocPrint(testing.allocator, "{s}/aa.wseg", .{dir_path});
+    defer testing.allocator.free(seg_path);
+    const f = try compat.Dir.createFile(tmp.dir, "aa.wseg", .{});
+    try compat.File.writeAll(f, bytes);
+    compat.File.close(f);
+
+    var seg = try Segment.open(testing.allocator, seg_path);
+    defer seg.close(testing.allocator);
+
+    const tid: TableId = @enumFromInt(AA_SORTED_TMPL);
+    try testing.expect(seg.has(tid));
+    try testing.expectEqual(@as(u64, 3), seg.keyCount(tid));
+    try testing.expectEqualStrings("sentinel-blob", seg.lookup(tid, 0).?);
+    try testing.expectEqualStrings("owned-by-alice", seg.lookup(tid, name.encode("alice")).?);
+    try testing.expect(seg.lookup(tid, name.encode("missing")) == null);
 }
 
 test "rejects a bad-magic file" {

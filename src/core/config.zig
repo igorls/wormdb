@@ -154,6 +154,11 @@ pub const WormDBConfig = struct {
     /// from it. Null = no segment (serve everything from the KV store).
     lightapi_segment: ?[]const u8 = null,
 
+    /// Optional path to a frozen AtomicAssets segment (.wseg). When set, WormDB
+    /// mmaps it at startup and serves faceted AtomicAssets state from it (table
+    /// ids 11..=21). Null = no AtomicAssets segment.
+    atomicassets_segment: ?[]const u8 = null,
+
     /// Light-API network metadata — WormDB seeds the chain block(s) into KV at startup.
     lightapi: LightApiConfig = .{},
 

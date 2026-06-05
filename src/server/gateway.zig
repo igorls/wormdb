@@ -347,9 +347,13 @@ pub const Gateway = struct {
         const after = line[4..];
         const sp = std.mem.indexOfScalar(u8, after, ' ') orelse return false;
         var path = after[0..sp];
-        if (std.mem.indexOfScalar(u8, path, '?')) |q| path = path[0..q]; // drop query string
+        var query: []const u8 = "";
+        if (std.mem.indexOfScalar(u8, path, '?')) |q| {
+            query = path[q + 1 ..]; // AtomicAssets endpoints take filter/sort/page params here
+            path = path[0..q];
+        }
 
-        if (self.route(alloc, path)) |r| {
+        if (self.route(alloc, path, query)) |r| {
             const ct: []const u8 = if (r.json) "application/json" else "text/plain; charset=utf-8";
             return writeHttp(stream, r.status, ct, r.body);
         }
@@ -359,11 +363,28 @@ pub const Gateway = struct {
     const RouteResult = struct { body: []const u8, json: bool, status: u16 = 200 };
 
     /// Map a `/api/...` path to an EXEC. Returns the body + whether it is JSON, or null → 404.
-    fn route(self: *Gateway, alloc: std.mem.Allocator, path: []const u8) ?RouteResult {
-        var it = std.mem.tokenizeScalar(u8, path, '/');
-        if (!std.mem.eql(u8, it.next() orelse return null, "api")) return null;
-        const ep = it.next() orelse return null;
+    fn route(self: *Gateway, alloc: std.mem.Allocator, path: []const u8, query: []const u8) ?RouteResult {
         const eql = std.mem.eql;
+        var it = std.mem.tokenizeScalar(u8, path, '/');
+        const first = it.next() orelse return null;
+
+        // AtomicAssets API: /atomicassets/v1/<endpoint>?<params>
+        if (eql(u8, first, "atomicassets")) {
+            const ver = it.next() orelse return null;
+            if (!eql(u8, ver, "v1")) return null;
+            const aep = it.next() orelse return null;
+            if (eql(u8, aep, "assets")) {
+                // first slice: assets owned by an account, newest-first (page-1 from the frozen segment).
+                const owner = queryParam(query, "owner") orelse return null;
+                const limit = queryParam(query, "limit") orelse "100";
+                return jsonRoute(self.execProc(alloc, "atomicassets_assets_by_owner", &.{ owner, limit }));
+            }
+            return null;
+        }
+
+        // Light-API drop-in: /api/<endpoint>/...
+        if (!eql(u8, first, "api")) return null;
+        const ep = it.next() orelse return null;
 
         if (eql(u8, ep, "balances")) {
             const chain = it.next() orelse return null;
@@ -448,6 +469,18 @@ pub const Gateway = struct {
             // cc32d9 returns HTTP 503 when any network is out of sync (body starts "OUT_OF_SYNC").
             const status: u16 = if (std.mem.startsWith(u8, body, "OUT_OF_SYNC")) 503 else 200;
             return .{ .body = body, .json = false, .status = status };
+        }
+        return null;
+    }
+
+    /// Find a query-string parameter value (`key=value`, '&'-separated). No URL-decoding — AtomicAssets
+    /// names (charset .12345a-z) and numeric limits don't need it; a percent-decode step can be added
+    /// when string filter values arrive.
+    fn queryParam(query: []const u8, key: []const u8) ?[]const u8 {
+        var it = std.mem.tokenizeScalar(u8, query, '&');
+        while (it.next()) |pair| {
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+            if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
         }
         return null;
     }

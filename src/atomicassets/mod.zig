@@ -6,6 +6,7 @@
 //! live under `src/procedures/atomicassets_*`. The live faceted overlay is a later package.
 
 pub const binfmt = @import("binfmt.zig");
+pub const overlay = @import("overlay.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

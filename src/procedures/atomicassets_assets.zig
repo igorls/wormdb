@@ -13,10 +13,15 @@ const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
 const name = @import("../core/name.zig");
 const aa = @import("../atomicassets/binfmt.zig");
+const ov = @import("../atomicassets/overlay.zig");
 
 const MAX_LIMIT: usize = 100;
 
 /// EXEC atomicassets_assets_by_owner <owner> [limit]
+/// Page-1 (newest-first) of an owner's CURRENT assets: the base BY_OWNER posting head merged with the live
+/// overlay (per-owner add-set), each candidate validated against the current forward record (overlay
+/// override → base) — the re-validation spine, so a transferred-out/burned asset drops out without any
+/// posting surgery.
 pub fn byOwner(ctx: *Ctx) anyerror!Ctx.Result {
     const owner = ctx.arg(0) orelse
         return ctx.err("atomicassets_assets_by_owner requires <owner> [limit]");
@@ -26,40 +31,61 @@ pub fn byOwner(ctx: *Ctx) anyerror!Ctx.Result {
     const seg = ctx.store.atomicassets_segment orelse
         return ctx.err("no atomicassets segment attached");
     const a = ctx.allocator;
+    const target = name.encode(owner);
+
+    // Candidate asset_ids (newest-first): the base posting head (fetch the full head for over-scan
+    // headroom past stale candidates) ∪ the overlay add-set (mints + transfer-ins since the base).
+    var cand: std.ArrayListUnmanaged(u64) = .empty;
+    defer cand.deinit(a);
+    if (seg.lookup(@enumFromInt(aa.TableId.by_owner), target)) |posting| {
+        var head: [MAX_LIMIT]u64 = undefined;
+        const n = aa.postingHead(posting, head[0..]);
+        try cand.appendSlice(a, head[0..n]);
+    }
+    if (try ctx.getCopy(try ov.ownerKey(a, owner))) |add| {
+        var i: usize = 0;
+        while (i < ov.addCount(add)) : (i += 1) try cand.append(a, ov.addId(add, i));
+    }
+    std.mem.sort(u64, cand.items, {}, std.sort.desc(u64));
 
     var json: std.ArrayListUnmanaged(u8) = .empty;
     try json.appendSlice(a, "{\"success\":true,\"data\":[");
+    var nbuf: [13]u8 = undefined;
+    var first = true;
+    var emitted: usize = 0;
+    var prev: u64 = 0;
+    var has_prev = false;
+    for (cand.items) |asset_id| {
+        if (has_prev and asset_id == prev) continue; // dedup (the list is sorted)
+        has_prev = true;
+        prev = asset_id;
+        if (emitted >= limit) break;
 
-    if (seg.lookup(@enumFromInt(aa.TableId.by_owner), name.encode(owner))) |posting| {
-        var ids: [MAX_LIMIT]u64 = undefined;
-        const n = aa.postingHead(posting, ids[0..limit]);
-        var nbuf: [13]u8 = undefined;
-        var first = true;
-        for (ids[0..n]) |asset_id| {
-            const fwd = seg.lookup(@enumFromInt(aa.TableId.fwd), asset_id) orelse continue;
-            const asset = aa.decodeAsset(fwd) orelse continue;
+        // Resolve current state (overlay override → base) and validate ownership.
+        const blob = (try ov.currentAsset(ctx.store, a, asset_id)) orelse continue; // tombstoned / unknown
+        const asset = aa.decodeAsset(blob) orelse continue;
+        if (asset.owner != target) continue; // transferred away → drop the stale base candidate
 
-            if (!first) try json.append(a, ',');
-            first = false;
-
-            try json.appendSlice(a, "{\"asset_id\":\"");
-            try appendU64(&json, a, asset_id);
-            try json.appendSlice(a, "\",\"owner\":\"");
-            try json.appendSlice(a, name.decode(asset.owner, &nbuf));
-            try json.appendSlice(a, "\",\"collection_name\":\"");
-            try json.appendSlice(a, name.decode(asset.collection, &nbuf));
-            try json.appendSlice(a, "\",\"schema_name\":\"");
-            try json.appendSlice(a, name.decode(asset.schema, &nbuf));
-            try json.appendSlice(a, "\",\"template_id\":");
-            if (asset.template_id < 0) {
-                try json.appendSlice(a, "null");
-            } else {
-                try appendI64(&json, a, asset.template_id);
-            }
-            try json.appendSlice(a, ",\"template_mint\":");
-            try appendU64(&json, a, asset.template_mint);
-            try json.append(a, '}');
+        emitted += 1;
+        if (!first) try json.append(a, ',');
+        first = false;
+        try json.appendSlice(a, "{\"asset_id\":\"");
+        try appendU64(&json, a, asset_id);
+        try json.appendSlice(a, "\",\"owner\":\"");
+        try json.appendSlice(a, name.decode(asset.owner, &nbuf));
+        try json.appendSlice(a, "\",\"collection_name\":\"");
+        try json.appendSlice(a, name.decode(asset.collection, &nbuf));
+        try json.appendSlice(a, "\",\"schema_name\":\"");
+        try json.appendSlice(a, name.decode(asset.schema, &nbuf));
+        try json.appendSlice(a, "\",\"template_id\":");
+        if (asset.template_id < 0) {
+            try json.appendSlice(a, "null");
+        } else {
+            try appendI64(&json, a, asset.template_id);
         }
+        try json.appendSlice(a, ",\"template_mint\":");
+        try appendU64(&json, a, asset.template_mint);
+        try json.append(a, '}');
     }
 
     try json.appendSlice(a, "]}");
@@ -221,6 +247,116 @@ test "atomicassets_assets_by_owner serves an owner's newest assets from the segm
     var ctx2 = Ctx.init(&store, &args2, arena.allocator(), null, null, null, null);
     defer ctx2.deinit();
     try testing.expectEqualStrings("{\"success\":true,\"data\":[]}", (try byOwner(&ctx2)).value.?);
+}
+
+test "byOwner reflects live mint/transfer/burn via the overlay" {
+    const a = testing.allocator;
+    const apply = @import("atomicassets_apply.zig");
+
+    // segment baseline: alice owns 1000,1001; bob owns 2000.
+    const a1000 = try makeAsset(a, "alice", "mycol", "mysch", 7, 100, 1);
+    defer a.free(a1000);
+    const a1001 = try makeAsset(a, "alice", "mycol", "mysch", 7, 100, 2);
+    defer a.free(a1001);
+    const a2000 = try makeAsset(a, "bob", "mycol", "mysch", 7, 100, 5);
+    defer a.free(a2000);
+    var p_alice: [21]u8 = undefined; // RAW posting [0][u32 2][1000][1001]
+    p_alice[0] = 0;
+    std.mem.writeInt(u32, p_alice[1..5], 2, .little);
+    std.mem.writeInt(u64, p_alice[5..13], 1000, .little);
+    std.mem.writeInt(u64, p_alice[13..21], 1001, .little);
+    var p_bob: [13]u8 = undefined; // [0][u32 1][2000]
+    p_bob[0] = 0;
+    std.mem.writeInt(u32, p_bob[1..5], 1, .little);
+    std.mem.writeInt(u64, p_bob[5..13], 2000, .little);
+
+    const fwd_entries = [_]SegEntry{
+        .{ .key = 1000, .val = a1000 },
+        .{ .key = 1001, .val = a1001 },
+        .{ .key = 2000, .val = a2000 },
+    };
+    var owner_entries = [_]SegEntry{
+        .{ .key = name.encode("alice"), .val = &p_alice },
+        .{ .key = name.encode("bob"), .val = &p_bob },
+    };
+    std.sort.pdq(SegEntry, &owner_entries, {}, struct {
+        fn lt(_: void, x: SegEntry, y: SegEntry) bool {
+            return x.key < y.key;
+        }
+    }.lt);
+    const tables = [_]SegTable{
+        .{ .id = aa.TableId.fwd, .entries = &fwd_entries },
+        .{ .id = aa.TableId.by_owner, .entries = &owner_entries },
+    };
+    const seg_bytes = try buildSeg(a, &tables);
+    defer a.free(seg_bytes);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try compat.Dir.realPathAlloc(tmp.dir, a, ".");
+    defer a.free(dir_path);
+    const seg_path = try std.fmt.allocPrint(a, "{s}/aa.wseg", .{dir_path});
+    defer a.free(seg_path);
+    const sf = try compat.Dir.createFile(tmp.dir, "aa.wseg", .{});
+    try compat.File.writeAll(sf, seg_bytes);
+    compat.File.close(sf);
+    var seg = try Segment.open(a, seg_path);
+    defer seg.close(a);
+
+    const wal_path = try std.fmt.allocPrint(a, "{s}/t.wal", .{dir_path});
+    defer a.free(wal_path);
+    const snap_path = try std.fmt.allocPrint(a, "{s}/t.snap", .{dir_path});
+    defer a.free(snap_path);
+    const wf = try compat.Dir.createFile(tmp.dir, "t.wal", .{});
+    compat.File.close(wf);
+    var store = try Store.init(a, .{ .wal_path = wal_path, .snapshot_path = snap_path, .sync_writes = false });
+    defer store.deinit();
+    store.attachAtomicAssetsSegment(&seg);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const Run = struct {
+        fn run(s: *Store, ara: std.mem.Allocator, proc: *const fn (*Ctx) anyerror!Ctx.Result, args: []const []const u8) ![]const u8 {
+            var c = Ctx.init(s, args, ara, null, null, null, null);
+            defer c.deinit();
+            return switch (try proc(&c)) {
+                .value => |v| v orelse "",
+                .err => |e| {
+                    std.debug.print("proc err: {s}\n", .{e});
+                    return error.ProcErr;
+                },
+                else => "",
+            };
+        }
+    };
+    const has = struct {
+        fn f(j: []const u8, id: []const u8) bool {
+            return std.mem.indexOf(u8, j, id) != null;
+        }
+    }.f;
+
+    // baseline
+    const j0 = try Run.run(&store, ar, byOwner, &.{"alice"});
+    try testing.expect(has(j0, "\"asset_id\":\"1001\"") and has(j0, "\"asset_id\":\"1000\""));
+
+    // transfer 1000 alice -> bob
+    _ = try Run.run(&store, ar, apply.transfer, &.{ "1000", "bob" });
+    const ja = try Run.run(&store, ar, byOwner, &.{"alice"});
+    try testing.expect(!has(ja, "\"asset_id\":\"1000\"") and has(ja, "\"asset_id\":\"1001\"")); // moved off alice
+    const jb = try Run.run(&store, ar, byOwner, &.{"bob"});
+    try testing.expect(has(jb, "\"asset_id\":\"2000\"") and has(jb, "\"asset_id\":\"1000\"")); // now under bob
+    try testing.expect(std.mem.indexOf(u8, jb, "\"2000\"").? < std.mem.indexOf(u8, jb, "\"1000\"").?); // newest-first
+
+    // burn 1001 -> alice empties (1000 already moved, 1001 burned)
+    _ = try Run.run(&store, ar, apply.burn, &.{"1001"});
+    try testing.expectEqualStrings("{\"success\":true,\"data\":[]}", try Run.run(&store, ar, byOwner, &.{"alice"}));
+
+    // mint 3000 to alice -> appears newest-first with the minted fields
+    _ = try Run.run(&store, ar, apply.mint, &.{ "3000", "alice", "newcol", "newsch", "9", "200", "1" });
+    const jm = try Run.run(&store, ar, byOwner, &.{"alice"});
+    try testing.expect(has(jm, "\"asset_id\":\"3000\"") and has(jm, "\"collection_name\":\"newcol\""));
 }
 
 test {

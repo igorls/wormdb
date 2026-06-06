@@ -5,7 +5,7 @@
 //! locking, argument parsing, and response building automatically.
 
 const std = @import("std");
-const Ctx = @import("context.zig").Ctx;
+const domain = @import("domain.zig");
 
 pub const transfer = @import("transfer.zig");
 pub const increment = @import("increment.zig");
@@ -40,15 +40,24 @@ pub const lightapi_topram = @import("lightapi_topram.zig");
 pub const lightapi_codehash = @import("lightapi_codehash.zig");
 pub const lightapi_key = @import("lightapi_key.zig");
 pub const lightapi_networks = @import("lightapi_networks.zig");
-pub const atomicassets_assets = @import("atomicassets_assets.zig");
-pub const atomicassets_apply = @import("atomicassets_apply.zig");
+// AtomicAssets procedures are NOT imported here — they live in their own package
+// (wormdb-domain-atomicassets) and are registered at startup via registerDomains().
 
-pub const ProcedureFn = *const fn (ctx: *Ctx) anyerror!Ctx.Result;
+pub const ProcedureFn = domain.ProcFn;
 
-const Entry = struct {
-    name: []const u8,
-    func: ProcedureFn,
-};
+const Entry = domain.Entry;
+
+/// Domain procedures contributed by external domain packages, set ONCE at startup by the
+/// composition root (main.zig) from each domain's manifest. Kept separate from the comptime
+/// PROCEDURES so the engine core imports no domain code — this is the seam that lets a domain
+/// live in its own package/repository. Written before serving begins; read-only thereafter.
+var domain_procedures: []const Entry = &.{};
+
+/// Register a domain package's procedures into the EXEC registry. Call at startup, before
+/// serving. Names must not collide with the built-ins or each other (composition-root concern).
+pub fn registerDomains(procs: []const Entry) void {
+    domain_procedures = procs;
+}
 
 /// Comptime-generated procedure table.
 const PROCEDURES = [_]Entry{
@@ -95,18 +104,16 @@ const PROCEDURES = [_]Entry{
     .{ .name = "lightapi_codehash", .func = lightapi_codehash.execute },
     .{ .name = "lightapi_key", .func = lightapi_key.execute },
     .{ .name = "lightapi_networks", .func = lightapi_networks.execute },
-    .{ .name = "atomicassets_assets_by_owner", .func = atomicassets_assets.byOwner },
-    .{ .name = "aa_mint", .func = atomicassets_apply.mint },
-    .{ .name = "aa_transfer", .func = atomicassets_apply.transfer },
-    .{ .name = "aa_burn", .func = atomicassets_apply.burn },
 };
 
 /// Look up a procedure by name. O(n) scan — n is tiny at comptime-known size.
 pub fn lookup(name: []const u8) ?ProcedureFn {
     for (&PROCEDURES) |*entry| {
-        if (std.mem.eql(u8, entry.name, name)) {
-            return entry.func;
-        }
+        if (std.mem.eql(u8, entry.name, name)) return entry.func;
+    }
+    // External domain procedures (registered at startup from package manifests).
+    for (domain_procedures) |entry| {
+        if (std.mem.eql(u8, entry.name, name)) return entry.func;
     }
     return null;
 }

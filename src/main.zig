@@ -7,7 +7,16 @@
 //! CLI flags override any values from the config file.
 
 const std = @import("std");
-const wormdb = @import("lib.zig");
+// Import the engine via the named module (not @import("lib.zig")) so main and the domain
+// packages share ONE wormdb module instance — otherwise a file-import copy and the named-module
+// copy are distinct modules and their types (Domain/Entry/Ctx) don't match.
+const wormdb = @import("wormdb");
+// AtomicAssets domain package — its own repo, wired in at src/atomicassets (a symlink to the
+// package's src/, like deps/meshguard). Imported as a plain file into the exe module so it
+// shares this binary's `wormdb` import (same engine module instance → its manifest types match
+// the engine exactly). Composed in via registerDomains() at startup; the engine core (lib.zig)
+// imports none of it.
+const atomicassets = @import("atomicassets/mod.zig");
 
 const Store = wormdb.storage.Store;
 const EventBus = wormdb.event.EventBus;
@@ -261,6 +270,17 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig, la_networ
             return err;
         };
     }
+
+    // Compose domain packages: register their EXEC procedures into the engine registry.
+    // The domains live in their own repos (e.g. wormdb-domain-atomicassets); the engine core
+    // imports none of them — main is the composition root that wires their manifests in.
+    wormdb.procedures.registry.registerDomains(atomicassets.manifest.procedures);
+    std.log.info("Composed domain '{s}': {d} procedures, table ids {d}..={d}", .{
+        atomicassets.manifest.name,
+        atomicassets.manifest.procedures.len,
+        atomicassets.manifest.table_id_lo,
+        atomicassets.manifest.table_id_hi,
+    });
 
     // Attach the configured frozen segments: each a read-only mmap addressed by an
     // opaque name a serving layer looks up. The engine assigns the name no meaning;

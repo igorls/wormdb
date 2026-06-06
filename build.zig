@@ -29,6 +29,10 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "quic", enable_quic);
+    // Create the build_options module ONCE and share it across all modules below. Creating it
+    // per-module would yield distinct module instances that conflict once they're composed
+    // together (e.g. main importing the engine via the named `wormdb` module).
+    const build_options_mod = build_options.createModule();
 
     // MeshGuard library module (embedded mesh networking). Use b.path (relative to THIS
     // package's root) not .cwd_relative, so wormdb resolves correctly when consumed as a
@@ -51,12 +55,16 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = &.{
             .{ .name = "meshguard", .module = meshguard_mod },
-            .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "build_options", .module = build_options_mod },
         },
     });
     linkSodium(b, wormdb_mod, is_windows);
 
-    // Main executable
+    // Main executable. Domain packages live in their own repos and are wired in at src/<name>
+    // (a symlink to the package's src/, like deps/meshguard). main.zig imports the domain's
+    // manifest as a plain file within this module, so the domain shares the exe's `wormdb`
+    // import (the same engine module instance — its manifest types match exactly). main.zig
+    // registers each manifest's procedures at startup.
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -65,7 +73,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "wormdb", .module = wormdb_mod },
             .{ .name = "meshguard", .module = meshguard_mod },
-            .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "build_options", .module = build_options_mod },
         },
     });
 
@@ -134,7 +142,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = &.{
             .{ .name = "meshguard", .module = meshguard_mod },
-            .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "build_options", .module = build_options_mod },
         },
     });
 

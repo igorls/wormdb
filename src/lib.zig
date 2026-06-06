@@ -17,6 +17,10 @@ pub const cluster = @import("cluster/mod.zig");
 pub const procedures = @import("procedures/mod.zig");
 pub const vector = @import("vector/mod.zig");
 
+// The compile-time build options (e.g. `quic`). Exposed so the composition root (the server exe)
+// reads the SAME instance the engine compiled against — a second build_options module would conflict.
+pub const build_options = @import("build_options");
+
 // Antelope codecs — a shared leaf library used by the domain packages (Light-API, AtomicAssets).
 // Not a serving domain itself; the engine exposes it so domains import it via @import("wormdb").
 // (Light-API + AtomicAssets each now live in their own package, composed into the binary at build

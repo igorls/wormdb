@@ -158,6 +158,10 @@ pub fn collectWsMethods(comptime manifests: anytype) []const WsMethod {
 pub fn validate(comptime manifests: anytype, comptime builtin_proc_names: []const []const u8) void {
     @setEvalBranchQuota(100_000);
     comptime {
+        // NB: the `manifests` loops below use a plain `for`, not `inline for`, on purpose. Inside this
+        // `comptime` block the tuple is already iterated at comptime; Zig 0.16 rejects `inline for` here
+        // with "redundant inline keyword in comptime scope". (The collect* helpers above are NOT in a
+        // comptime block, so they must spell `inline for` — the asymmetry is required, not an oversight.)
         // (1) procedure names — unique across domains and disjoint from the engine builtins.
         var procs: []const []const u8 = builtin_proc_names;
         for (manifests) |m| {

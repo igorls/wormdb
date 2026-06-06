@@ -60,12 +60,15 @@ pub const Store = struct {
     /// Optional HNSW registry back-reference. Attached by main.zig after
     /// both objects exist; snapshot write/load use it when present.
     vector_registry: ?*NamespaceRegistry = null,
-    /// Optional frozen Light-API segment (read-only, mmap'd). Attached by
-    /// main.zig after construction. When present, procedures read the large
-    /// per-account tables (balances, resources, perms, …) from it by Antelope
-    /// `name` u64 instead of the KV shards — collapsing per-entry overhead and
-    /// letting the OS page in only the working set. Null = serve from KV only.
-    lightapi_segment: ?*const Segment = null,
+    /// Registry of frozen read-only segments (mmap'd `.wseg`), addressed by an
+    /// opaque caller-chosen name. The engine is domain-agnostic: a serving layer
+    /// attaches and looks up "its" segment by a string it owns (e.g. "lightapi",
+    /// "atomicassets"), so no blockchain/domain identity lives in the store.
+    /// Attached by the composition root (`main.zig`) after construction; each
+    /// segment (and its name) must outlive the store. Small fixed capacity —
+    /// there are only a handful of serving domains.
+    segments_buf: [MAX_SEGMENTS]NamedSegment = undefined,
+    segment_count: usize = 0,
 
     /// Attach the per-namespace HNSW registry to this store so snapshots
     /// persist and restore graph state alongside KV data. Call after both
@@ -74,10 +77,33 @@ pub const Store = struct {
         self.vector_registry = registry;
     }
 
-    /// Attach a frozen Light-API segment (read-only). Call after the store is
-    /// constructed and the segment is mapped; the segment must outlive the store.
-    pub fn attachLightApiSegment(self: *Store, seg: *const Segment) void {
-        self.lightapi_segment = seg;
+    const MAX_SEGMENTS: usize = 8;
+    const NamedSegment = struct { name: []const u8, seg: *const Segment };
+
+    /// Attach a frozen read-only segment under `name`. Re-attaching the same name
+    /// replaces it. Call after the store is constructed and the segment is mapped;
+    /// the segment (and `name`) must outlive the store.
+    pub fn attachSegment(self: *Store, name: []const u8, seg: *const Segment) void {
+        for (self.segments_buf[0..self.segment_count]) |*ns| {
+            if (std.mem.eql(u8, ns.name, name)) {
+                ns.seg = seg;
+                return;
+            }
+        }
+        if (self.segment_count >= MAX_SEGMENTS) {
+            std.log.warn("segment registry full ({d}); dropping '{s}'", .{ MAX_SEGMENTS, name });
+            return;
+        }
+        self.segments_buf[self.segment_count] = .{ .name = name, .seg = seg };
+        self.segment_count += 1;
+    }
+
+    /// Look up a frozen segment by the name it was attached under. Null if none.
+    pub fn segment(self: *const Store, name: []const u8) ?*const Segment {
+        for (self.segments_buf[0..self.segment_count]) |ns| {
+            if (std.mem.eql(u8, ns.name, name)) return ns.seg;
+        }
+        return null;
     }
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Store {

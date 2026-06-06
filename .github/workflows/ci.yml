@@ -1,0 +1,33 @@
+# Lean engine CI — compile + run the unit test suite (includes the segment
+# fail-closed table-id gate and the .wseg format invariants). Typical run is a
+# minute or two: no QUIC. The MsQuic CMake build adds several minutes and is
+# Linux/-Dquic-only, so it is deliberately excluded from the fast path here.
+name: CI
+
+on:
+  push:
+    branches: [main, master, "feat/**", "fix/**", "refactor/**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false # skip the heavy QUIC submodules (msquic / libwtf)
+
+      - name: Fetch the meshguard submodule only
+        run: git submodule update --init --depth 1 deps/meshguard
+
+      # Linux links the vendored deps/lib/libsodium.so; the system package resolves
+      # the same soname at test-runtime. (~seconds, mirrors the Docker build recipe.)
+      - name: Install libsodium
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libsodium-dev
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: zig build test
+        run: zig build test

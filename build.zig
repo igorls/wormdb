@@ -19,108 +19,96 @@ fn linkSodium(b: *std.Build, mod: *std.Build.Module, is_windows: bool) void {
     }
 }
 
+/// Link the QUIC/WebTransport C deps (MsQuic + libwtf) into a module so consumers inherit them, exactly
+/// like linkSodium. Uses b.path (relative to THIS package's root) so it resolves when wormdb is consumed
+/// as a dependency. Applied only when `-Dquic=true`. NOTE: Linux-oriented. Preconditions: `git submodule
+/// update --init` (deps/msquic, deps/libwtf) + a CMake build of MsQuic (which produces the SHARED
+/// `bin/Release/libmsquic.so`). The binary then needs libmsquic.so at runtime (set LD_LIBRARY_PATH or an
+/// rpath to deps/msquic/build/bin/Release). Build/verify on Linux (see docker/build-linux.sh).
+fn linkQuic(b: *std.Build, mod: *std.Build.Module) void {
+    // MsQuic's default build is a shared library — link libmsquic.so from its build output dir.
+    mod.addLibraryPath(b.path("deps/msquic/build/bin/Release"));
+    mod.linkSystemLibrary("msquic", .{});
+    mod.addIncludePath(b.path("deps/msquic/src/inc"));
+    mod.addIncludePath(b.path("deps/libwtf/include"));
+    mod.addIncludePath(b.path("deps/libwtf/build/include")); // cmake-generated wtf_version.h (run `cmake -B build` on libwtf)
+    mod.addIncludePath(b.path("deps/libwtf/src"));
+    mod.addIncludePath(b.path("deps/libwtf/deps/ls-qpack"));
+    mod.addIncludePath(b.path("deps/libwtf/deps/xxhash"));
+    mod.addIncludePath(b.path("deps/libwtf/deps/tinycthreads"));
+    mod.addIncludePath(b.path("deps/libwtf/deps/verstable"));
+    const libwtf_sources = [_][]const u8{
+        "deps/libwtf/src/conn.c",
+        "deps/libwtf/src/context.c",
+        "deps/libwtf/src/datagram.c",
+        "deps/libwtf/src/http3.c",
+        "deps/libwtf/src/log.c",
+        "deps/libwtf/src/qpack.c",
+        "deps/libwtf/src/server.c",
+        "deps/libwtf/src/session.c",
+        "deps/libwtf/src/settings.c",
+        "deps/libwtf/src/stream.c",
+        "deps/libwtf/src/utils.c",
+        "deps/libwtf/src/varint.c",
+        "deps/libwtf/deps/xxhash/xxhash.c",
+        "deps/libwtf/deps/tinycthreads/tinycthread.c",
+        "deps/libwtf/deps/ls-qpack/lsqpack.c",
+    };
+    for (libwtf_sources) |src| {
+        mod.addCSourceFile(.{
+            .file = b.path(src),
+            .flags = &.{ "-std=gnu11", "-DWTF_EXPORTS", "-fno-sanitize=alignment" },
+        });
+    }
+    // The shared libmsquic.so bundles its own TLS (quictls), so no external -lcrypto is needed (the
+    // static .a would have required it). libwtf's tinycthread wraps pthread on POSIX.
+    mod.linkSystemLibrary("pthread", .{});
+}
+
+// This package is the WormDB ENGINE LIBRARY only. It produces the `wormdb` module (consumed by the
+// server binary and the domain packages, each in their own repo) plus its unit tests — it does NOT
+// build the server exe. The exe is the composition root and lives in `wormdb-server`, which depends
+// on this engine + the domain packages. Splitting the exe out of the engine is what lets the domains
+// depend on `wormdb` via the package manager without a build-root self-diamond.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const is_windows = target.result.os.tag == .windows;
 
-    // --- Build options (exposed to source via @import("build_options")) ---
+    // Build option, exposed to source via @import("build_options"). QUIC's C deps (MsQuic/libwtf) are
+    // wired in the server build when enabled — see wormdb-server. The engine only carries the flag +
+    // the (comptime-gated) Zig code.
     const enable_quic = b.option(bool, "quic", "Enable QUIC/WebTransport gateway (requires MsQuic)") orelse false;
-
     const build_options = b.addOptions();
     build_options.addOption(bool, "quic", enable_quic);
+    const build_options_mod = build_options.createModule();
 
-    // MeshGuard library module (embedded mesh networking)
+    // MeshGuard library module (embedded mesh networking). b.path resolves against THIS package's root,
+    // so it works when wormdb is consumed as a dependency.
     const meshguard_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = "deps/meshguard/src/lib.zig" },
+        .root_source_file = b.path("deps/meshguard/src/lib.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
 
-    // WormDB library module
-    const wormdb_mod = b.createModule(.{
+    // The engine library module — exposed via addModule so the server exe + domain packages consume the
+    // real engine types (Store, Ctx, Segment, Domain, …) with `@import("wormdb")`. linkSodium is applied
+    // to the module so consumers inherit the libsodium link transitively.
+    const wormdb_mod = b.addModule("wormdb", .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{
             .{ .name = "meshguard", .module = meshguard_mod },
-            .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "build_options", .module = build_options_mod },
         },
     });
+    linkSodium(b, wormdb_mod, is_windows);
+    if (enable_quic) linkQuic(b, wormdb_mod); // QUIC C deps inherited by consumers (server exe)
 
-    // Main executable
-    const exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{
-            .{ .name = "wormdb", .module = wormdb_mod },
-            .{ .name = "meshguard", .module = meshguard_mod },
-            .{ .name = "build_options", .module = build_options.createModule() },
-        },
-    });
-
-    // In Zig 0.16, link* / addInclude / addCSource are on Module, not Step.Compile
-    linkSodium(b, exe_mod, is_windows);
-
-    const exe = b.addExecutable(.{
-        .name = "wormdb",
-        .root_module = exe_mod,
-    });
-
-    // --- QUIC / WebTransport support (opt-in via -Dquic=true) ---
-    if (enable_quic) {
-        // MsQuic static library (pre-built)
-        exe_mod.addObjectFile(.{ .cwd_relative = "deps/msquic/build/bin/Release/libmsquic.a" });
-
-        // MsQuic include path
-        exe_mod.addIncludePath(.{ .cwd_relative = "deps/msquic/src/inc" });
-
-        // libwtf include paths
-        exe_mod.addIncludePath(.{ .cwd_relative = "deps/libwtf/include" });
-        exe_mod.addIncludePath(.{ .cwd_relative = "deps/libwtf/src" });
-        exe_mod.addIncludePath(.{ .cwd_relative = "deps/libwtf/deps/ls-qpack" });
-        exe_mod.addIncludePath(.{ .cwd_relative = "deps/libwtf/deps/xxhash" });
-        exe_mod.addIncludePath(.{ .cwd_relative = "deps/libwtf/deps/tinycthreads" });
-        exe_mod.addIncludePath(.{ .cwd_relative = "deps/libwtf/deps/verstable" });
-
-        // libwtf C sources
-        const libwtf_sources = [_][]const u8{
-            "deps/libwtf/src/conn.c",
-            "deps/libwtf/src/context.c",
-            "deps/libwtf/src/datagram.c",
-            "deps/libwtf/src/http3.c",
-            "deps/libwtf/src/log.c",
-            "deps/libwtf/src/qpack.c",
-            "deps/libwtf/src/server.c",
-            "deps/libwtf/src/session.c",
-            "deps/libwtf/src/settings.c",
-            "deps/libwtf/src/stream.c",
-            "deps/libwtf/src/utils.c",
-            "deps/libwtf/src/varint.c",
-            // libwtf vendored deps
-            "deps/libwtf/deps/xxhash/xxhash.c",
-            "deps/libwtf/deps/tinycthreads/tinycthread.c",
-            "deps/libwtf/deps/ls-qpack/lsqpack.c",
-        };
-        for (libwtf_sources) |src| {
-            exe_mod.addCSourceFile(.{
-                .file = .{ .cwd_relative = src },
-                .flags = &.{ "-std=gnu11", "-DWTF_EXPORTS", "-fno-sanitize=alignment" },
-            });
-        }
-
-        // System libraries needed by MsQuic
-        exe_mod.linkSystemLibrary("crypto", .{});
-        exe_mod.linkSystemLibrary("pthread", .{});
-    }
-
-    b.installArtifact(exe);
-
-    // Tests
+    // Unit tests for the engine.
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
@@ -128,26 +116,14 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = &.{
             .{ .name = "meshguard", .module = meshguard_mod },
-            .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "build_options", .module = build_options_mod },
         },
     });
-
     linkSodium(b, test_mod, is_windows);
+    if (enable_quic) linkQuic(b, test_mod);
 
-    const unit_tests = b.addTest(.{
-        .root_module = test_mod,
-    });
-
+    const unit_tests = b.addTest(.{ .root_module = test_mod });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
-
-    // Run command
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
-    const run_step = b.step("run", "Run wormdb");
-    run_step.dependOn(&run_cmd.step);
 }

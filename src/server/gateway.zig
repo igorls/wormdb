@@ -17,6 +17,17 @@ const wire = protocol.wire;
 const event_mod = @import("../event/mod.zig");
 const cluster_mod = @import("../cluster/mod.zig");
 const executor = @import("executor.zig");
+const domain = @import("../procedures/domain.zig");
+
+/// Domain HTTP routes, registered at startup by the composition root from the domain manifests
+/// (each domain package contributes its routes). Read-only during serving; the gateway holds no
+/// domain URLs of its own.
+var domain_routes: []const domain.Route = &.{};
+
+/// Register the composed domains' HTTP routes. Call once at startup, before serving.
+pub fn registerRoutes(routes: []const domain.Route) void {
+    domain_routes = routes;
+}
 
 const auth = @import("auth.zig");
 
@@ -362,134 +373,37 @@ pub const Gateway = struct {
 
     const RouteResult = struct { body: []const u8, json: bool, status: u16 = 200 };
 
-    /// Map a `/api/...` path to an EXEC. Returns the body + whether it is JSON, or null → 404.
+    /// Match the request path against the registered domain routes (manifest-contributed). The first
+    /// route whose `prefix` segments match wins; its builder maps the remaining path segments + query
+    /// to an EXEC call. No domain URLs are hard-coded here — they live in each domain package's manifest.
     fn route(self: *Gateway, alloc: std.mem.Allocator, path: []const u8, query: []const u8) ?RouteResult {
-        const eql = std.mem.eql;
+        var segbuf: [16][]const u8 = undefined;
+        var n: usize = 0;
         var it = std.mem.tokenizeScalar(u8, path, '/');
-        const first = it.next() orelse return null;
+        while (it.next()) |s| {
+            if (n >= segbuf.len) return null;
+            segbuf[n] = s;
+            n += 1;
+        }
+        const segs = segbuf[0..n];
 
-        // AtomicAssets API: /atomicassets/v1/<endpoint>?<params>
-        if (eql(u8, first, "atomicassets")) {
-            const ver = it.next() orelse return null;
-            if (!eql(u8, ver, "v1")) return null;
-            const aep = it.next() orelse return null;
-            if (eql(u8, aep, "assets")) {
-                // first slice: assets owned by an account, newest-first (page-1 from the frozen segment).
-                const owner = queryParam(query, "owner") orelse return null;
-                const limit = queryParam(query, "limit") orelse "100";
-                return jsonRoute(self.execProc(alloc, "atomicassets_assets_by_owner", &.{ owner, limit }));
-            }
-            return null;
-        }
-
-        // Light-API drop-in: /api/<endpoint>/...
-        if (!eql(u8, first, "api")) return null;
-        const ep = it.next() orelse return null;
-
-        if (eql(u8, ep, "balances")) {
-            const chain = it.next() orelse return null;
-            const acct = it.next() orelse return null;
-            if (it.next() != null) return null;
-            return jsonRoute(self.execProc(alloc, "lightapi_balances", &.{ chain, acct }));
-        }
-        if (eql(u8, ep, "account")) {
-            const chain = it.next() orelse return null;
-            const acct = it.next() orelse return null;
-            if (it.next() != null) return null;
-            return jsonRoute(self.execProc(alloc, "lightapi_account", &.{ chain, acct }));
-        }
-        if (eql(u8, ep, "accinfo")) {
-            const chain = it.next() orelse return null;
-            const acct = it.next() orelse return null;
-            if (it.next() != null) return null;
-            return jsonRoute(self.execProc(alloc, "lightapi_accinfo", &.{ chain, acct }));
-        }
-        if (eql(u8, ep, "tokenbalance")) {
-            const chain = it.next() orelse return null;
-            const acct = it.next() orelse return null;
-            const contract = it.next() orelse return null;
-            const symbol = it.next() orelse return null;
-            return textRoute(self.execProc(alloc, "lightapi_tokenbalance", &.{ chain, acct, contract, symbol }));
-        }
-        if (eql(u8, ep, "usercount")) {
-            const chain = it.next() orelse return null;
-            const key = std.fmt.allocPrint(alloc, "uc:{s}", .{chain}) catch return null;
-            return textRoute(self.execProc(alloc, "lightapi_get", &.{ key, "0" }));
-        }
-        if (eql(u8, ep, "holdercount")) {
-            const chain = it.next() orelse return null;
-            const contract = it.next() orelse return null;
-            const symbol = it.next() orelse return null;
-            return textRoute(self.execProc(alloc, "lightapi_holdercount", &.{ chain, contract, symbol }));
-        }
-        if (eql(u8, ep, "networks")) {
-            return jsonRoute(self.execProc(alloc, "lightapi_networks", &.{}));
-        }
-        if (eql(u8, ep, "codehash")) {
-            const hash = it.next() orelse return null;
-            return jsonRoute(self.execProc(alloc, "lightapi_codehash", &.{hash}));
-        }
-        if (eql(u8, ep, "key")) {
-            const pubkey = it.next() orelse return null;
-            return jsonRoute(self.execProc(alloc, "lightapi_key", &.{pubkey}));
-        }
-        if (eql(u8, ep, "topholders")) {
-            const chain = it.next() orelse return null;
-            const contract = it.next() orelse return null;
-            const symbol = it.next() orelse return null;
-            const n = it.next() orelse return null;
-            return jsonRoute(self.execProc(alloc, "lightapi_topholders", &.{ chain, contract, symbol, n }));
-        }
-        if (eql(u8, ep, "topram")) {
-            const chain = it.next() orelse return null;
-            const n = it.next() orelse return null;
-            return jsonRoute(self.execProc(alloc, "lightapi_topram", &.{ chain, n }));
-        }
-        if (eql(u8, ep, "topstake")) {
-            const chain = it.next() orelse return null;
-            const n = it.next() orelse return null;
-            return jsonRoute(self.execProc(alloc, "lightapi_topstake", &.{ chain, n }));
-        }
-        if (eql(u8, ep, "rexbalance")) {
-            const chain = it.next() orelse return null;
-            const acct = it.next() orelse return null;
-            return jsonRoute(self.execProc(alloc, "lightapi_rexbalance", &.{ chain, acct }));
-        }
-        if (eql(u8, ep, "rexraw")) {
-            const chain = it.next() orelse return null;
-            const key = std.fmt.allocPrint(alloc, "rexraw:{s}", .{chain}) catch return null;
-            return textRoute(self.execProc(alloc, "lightapi_get", &.{ key, "REX is not enabled" }));
-        }
-        if (eql(u8, ep, "sync")) {
-            const chain = it.next() orelse return null;
-            return textRoute(self.execProc(alloc, "lightapi_sync", &.{chain}));
-        }
-        if (eql(u8, ep, "status")) {
-            const body = self.execProc(alloc, "lightapi_status", &.{}) orelse return null;
-            // cc32d9 returns HTTP 503 when any network is out of sync (body starts "OUT_OF_SYNC").
-            const status: u16 = if (std.mem.startsWith(u8, body, "OUT_OF_SYNC")) 503 else 200;
-            return .{ .body = body, .json = false, .status = status };
+        for (domain_routes) |r| {
+            if (r.prefix.len > segs.len) continue;
+            if (!segPrefixEql(r.prefix, segs[0..r.prefix.len])) continue;
+            const caps = domain.Captures{ .segs = segs[r.prefix.len..], .query = query };
+            const call = r.build(alloc, &caps) orelse return null;
+            const body = self.execProc(alloc, call.proc, call.args) orelse return null;
+            const status = if (call.status_from_body) |f| f(body) else call.status;
+            return .{ .body = body, .json = call.json, .status = status };
         }
         return null;
     }
 
-    /// Find a query-string parameter value (`key=value`, '&'-separated). No URL-decoding — AtomicAssets
-    /// names (charset .12345a-z) and numeric limits don't need it; a percent-decode step can be added
-    /// when string filter values arrive.
-    fn queryParam(query: []const u8, key: []const u8) ?[]const u8 {
-        var it = std.mem.tokenizeScalar(u8, query, '&');
-        while (it.next()) |pair| {
-            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-            if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
+    fn segPrefixEql(prefix: []const []const u8, segs: []const []const u8) bool {
+        for (prefix, segs) |pseg, s| {
+            if (!std.mem.eql(u8, pseg, s)) return false;
         }
-        return null;
-    }
-
-    fn jsonRoute(body: ?[]const u8) ?RouteResult {
-        return .{ .body = body orelse return null, .json = true };
-    }
-    fn textRoute(body: ?[]const u8) ?RouteResult {
-        return .{ .body = body orelse return null, .json = false };
+        return true;
     }
 
     /// Run a procedure through the shared executor; return its `value` payload (or null on error).

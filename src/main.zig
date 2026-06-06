@@ -278,6 +278,7 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig, la_networ
     // imports none of them — main is the composition root that wires their manifests in.
     const DOMAINS = .{ lightapi.manifest, atomicassets.manifest };
     wormdb.procedures.registry.registerDomains(comptime wormdb.procedures.domain.collectProcedures(DOMAINS));
+    wormdb.server.gateway.registerRoutes(comptime wormdb.procedures.domain.collectRoutes(DOMAINS));
     inline for (DOMAINS) |d| {
         std.log.info("Composed domain '{s}': {d} procedures, table ids {d}..={d}", .{
             d.name, d.procedures.len, d.table_id_lo, d.table_id_hi,

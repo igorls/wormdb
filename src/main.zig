@@ -24,7 +24,9 @@ const NamespaceRegistry = wormdb.vector.NamespaceRegistry;
 const PersistenceMode = wormdb.core.config.PersistenceMode;
 const Backend = wormdb.core.config.Backend;
 const WormDBConfig = wormdb.core.config.WormDBConfig;
+const SegmentMount = wormdb.core.config.SegmentMount;
 const loadFromFile = wormdb.core.config.loadFromFile;
+const LightApiNetwork = wormdb.lightapi.config.LightApiNetwork;
 
 // Zig 0.16: "Juicy Main" — accept std.process.Init for pre-initialized
 // allocator, Io, args, and environment.
@@ -60,6 +62,11 @@ pub fn main(init: std.process.Init) !void {
     };
 
     // --- Step 3: Apply CLI overrides ---
+    // Segment mounts named on the CLI (generic `--segment name=path`, plus the
+    // domain-named back-compat aliases) are collected here, then appended to the
+    // config-file `segments` after the loop.
+    var cli_segments: std.ArrayListUnmanaged(SegmentMount) = .empty;
+    defer cli_segments.deinit(allocator);
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--port")) {
@@ -129,20 +136,33 @@ pub fn main(init: std.process.Init) !void {
                 std.log.err("Invalid persistence mode: {s} (expected: full, snapshot, none)", .{args[i]});
                 return error.InvalidArgs;
             }
+        } else if (std.mem.eql(u8, args[i], "--segment")) {
+            i += 1;
+            if (i >= args.len) {
+                std.log.err("--segment requires an argument (name=path)", .{});
+                return error.InvalidArgs;
+            }
+            const eq = std.mem.indexOfScalar(u8, args[i], '=') orelse {
+                std.log.err("--segment expects name=path, got '{s}'", .{args[i]});
+                return error.InvalidArgs;
+            };
+            try cli_segments.append(allocator, .{ .name = args[i][0..eq], .path = args[i][eq + 1 ..] });
         } else if (std.mem.eql(u8, args[i], "--lightapi-segment")) {
+            // Deprecated alias for `--segment lightapi=<path>` (kept for existing deployments).
             i += 1;
             if (i >= args.len) {
                 std.log.err("--lightapi-segment requires an argument", .{});
                 return error.InvalidArgs;
             }
-            cfg.lightapi_segment = args[i];
+            try cli_segments.append(allocator, .{ .name = "lightapi", .path = args[i] });
         } else if (std.mem.eql(u8, args[i], "--atomicassets-segment")) {
+            // Deprecated alias for `--segment atomicassets=<path>`.
             i += 1;
             if (i >= args.len) {
                 std.log.err("--atomicassets-segment requires an argument", .{});
                 return error.InvalidArgs;
             }
-            cfg.atomicassets_segment = args[i];
+            try cli_segments.append(allocator, .{ .name = "atomicassets", .path = args[i] });
         } else if (std.mem.eql(u8, args[i], "--gateway-port")) {
             i += 1;
             if (i >= args.len) {
@@ -180,11 +200,25 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // Fold CLI-named segment mounts into the config-file list (CLI appended last).
+    if (cli_segments.items.len > 0) {
+        var all = try std.ArrayListUnmanaged(SegmentMount).initCapacity(allocator, cfg.segments.len + cli_segments.items.len);
+        all.appendSliceAssumeCapacity(cfg.segments);
+        all.appendSliceAssumeCapacity(cli_segments.items);
+        cfg.segments = try all.toOwnedSlice(allocator);
+    }
+
     // --- Step 4: Start WormDB with resolved config ---
-    try startServer(allocator, &cfg);
+    // Light-API networks are a domain config section parsed by the domain itself,
+    // so core stays domain-agnostic. Empty if the file or the section is absent.
+    const la_networks = wormdb.lightapi.config.loadNetworks(config_path, allocator) catch |err| blk: {
+        std.log.warn("Light-API config load failed: {s}", .{@errorName(err)});
+        break :blk &.{};
+    };
+    try startServer(allocator, &cfg, la_networks);
 }
 
-fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
+fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig, la_networks: []const LightApiNetwork) !void {
     const port = cfg.server.port;
     const data_dir = cfg.data;
     const persistence = cfg.store.persistence;
@@ -228,47 +262,32 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
         };
     }
 
-    // Attach the frozen Light-API segment if configured: a read-only mmap of
-    // the large per-account tables. Procedures read these by Antelope name u64;
-    // small/aggregate values still come from the KV store. Stays mapped for the
-    // process lifetime (closed on shutdown).
-    var lightapi_seg: ?wormdb.storage.Segment = null;
-    defer if (lightapi_seg) |*s| s.close(allocator);
-    if (cfg.lightapi_segment) |seg_path| {
-        lightapi_seg = wormdb.storage.Segment.open(allocator, seg_path) catch |err| blk: {
-            std.log.err("Failed to open Light-API segment '{s}': {}", .{ seg_path, err });
-            break :blk null;
-        };
-        if (lightapi_seg) |*s| {
-            store.attachLightApiSegment(s);
-            std.log.info("Light-API segment: {s} ({d} bytes, {s}-backed)", .{ seg_path, s.bytes.len, @tagName(s.backing) });
-        }
+    // Attach the configured frozen segments: each a read-only mmap addressed by an
+    // opaque name a serving layer looks up. The engine assigns the name no meaning;
+    // segments stay mapped for the process lifetime (closed on shutdown).
+    const opened_segs = try allocator.alloc(?wormdb.storage.Segment, cfg.segments.len);
+    defer {
+        for (opened_segs) |*os| if (os.*) |*s| s.close(allocator);
+        allocator.free(opened_segs);
     }
-
-    // Frozen AtomicAssets segment (table ids 11..=21: forward asset store + per-dimension posting lists +
-    // presorted orderings). Same lifecycle as the Light-API segment; a distinct domain.
-    var aa_seg: ?wormdb.storage.Segment = null;
-    defer if (aa_seg) |*s| s.close(allocator);
-    if (cfg.atomicassets_segment) |seg_path| {
-        aa_seg = wormdb.storage.Segment.open(allocator, seg_path) catch |err| blk: {
-            std.log.err("Failed to open AtomicAssets segment '{s}': {}", .{ seg_path, err });
+    for (cfg.segments, 0..) |mount, idx| {
+        opened_segs[idx] = wormdb.storage.Segment.open(allocator, mount.path) catch |err| blk: {
+            std.log.err("Failed to open segment '{s}' ({s}): {}", .{ mount.name, mount.path, err });
             break :blk null;
         };
-        if (aa_seg) |*s| {
-            store.attachAtomicAssetsSegment(s);
-            const fwd = s.keyCount(@enumFromInt(11)); // FWD: asset_id -> asset record
-            const by_owner = s.keyCount(@enumFromInt(12)); // BY_OWNER posting
-            const by_coll = s.keyCount(@enumFromInt(13)); // BY_COLL posting
+        if (opened_segs[idx]) |*s| {
+            store.attachSegment(mount.name, s);
             std.log.info(
-                "AtomicAssets segment: {s} ({d} bytes, {s}-backed) — assets={d} owners={d} collections={d}",
-                .{ seg_path, s.bytes.len, @tagName(s.backing), fwd, by_owner, by_coll },
+                "Segment '{s}': {s} ({d} bytes, {s}-backed, {d} tables)",
+                .{ mount.name, mount.path, s.bytes.len, @tagName(s.backing), s.tableCount() },
             );
         }
     }
 
-    // Seed the Light-API chain metadata (lacfg:<chain> + lanet) from config, so serving a snapshot
-    // segment needs no external loader. The live feed overwrites block_num/sync later.
-    seedLightApi(&store, allocator, cfg) catch |err| {
+    // Seed the Light-API chain metadata from the domain config (a no-op when no networks
+    // are configured), so serving a snapshot segment needs no external loader. The live
+    // feed overwrites block_num/sync later.
+    wormdb.lightapi.seed.run(&store, allocator, la_networks) catch |err| {
         std.log.warn("Light-API metadata seed failed: {s}", .{@errorName(err)});
     };
 
@@ -499,62 +518,6 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
     }
 }
 
-/// Build the cc32d9 `chain{}` block for one configured network into `out`.
-fn buildChainBlock(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, n: anytype) !void {
-    const net = n.network orelse n.chain;
-    var buf: [512]u8 = undefined;
-    const s = try std.fmt.bufPrint(
-        &buf,
-        "{{\"network\":\"{s}\",\"sync\":0,\"decimals\":{d},\"systoken\":\"{s}\",\"chainid\":\"{s}\",\"production\":{d},\"block_num\":{d},\"block_time\":\"\",\"description\":\"{s}\",\"rex_enabled\":{d}}}",
-        .{ net, n.decimals, n.systoken, n.chainid, @as(u8, if (n.production) 1 else 0), n.block_num, n.description, @as(u8, if (n.rex_enabled) 1 else 0) },
-    );
-    try out.appendSlice(a, s);
-}
-
-/// Seed `lacfgs:<chain>` (static chain fields, tab-separated) + `lachains` (the chain list) into KV
-/// from config. The cc32d9 chain block is then assembled at REQUEST time by lightapi_chain.zig, which
-/// overlays live block_num/block_time/sync from the feed — so /networks and every embedded `chain{}`
-/// report real freshness instead of the static snapshot block.
-fn seedLightApi(store: *Store, allocator: std.mem.Allocator, cfg: *const WormDBConfig) !void {
-    const nets = cfg.lightapi.networks;
-    if (nets.len == 0) return;
-
-    var lachains: std.ArrayListUnmanaged(u8) = .empty;
-    defer lachains.deinit(allocator);
-
-    for (nets, 0..) |n, i| {
-        const net = n.network orelse n.chain;
-        // net \t decimals \t systoken \t chainid \t production \t description \t rex_enabled \t snap_block
-        const cfgs = try std.fmt.allocPrint(allocator, "{s}\t{d}\t{s}\t{s}\t{d}\t{s}\t{d}\t{d}", .{
-            net,                                    n.decimals, n.systoken, n.chainid,
-            @as(u8, if (n.production) 1 else 0),    n.description,
-            @as(u8, if (n.rex_enabled) 1 else 0),   n.block_num,
-        });
-        defer allocator.free(cfgs);
-        const key = try std.fmt.allocPrint(allocator, "lacfgs:{s}", .{n.chain});
-        defer allocator.free(key);
-        try store.set(key, cfgs, false);
-
-        if (i > 0) try lachains.append(allocator, ',');
-        try lachains.appendSlice(allocator, n.chain);
-
-        // usercount is free from the segment: the accinfo table's key count is the account universe
-        // (every account has ≥1 permission). Seed `uc:<chain>` so /usercount serves a real number
-        // without a precompute pass or the live feed.
-        if (store.lightapi_segment) |s| {
-            const uc = s.keyCount(.accinfo);
-            if (uc > 0) {
-                const uk = try std.fmt.allocPrint(allocator, "uc:{s}", .{n.chain});
-                defer allocator.free(uk);
-                var ub: [24]u8 = undefined;
-                try store.set(uk, try std.fmt.bufPrint(&ub, "{d}", .{uc}), false);
-            }
-        }
-        std.log.info("Light-API chain seeded: {s} ({s}, {d} decimals)", .{ n.chain, n.systoken, n.decimals });
-    }
-    try store.set("lachains", lachains.items, false);
-}
-
 fn logStartupFailure(err: anyerror, port: u16, data_dir: []const u8) void {
     std.log.err("WormDB startup failed: {}", .{err});
 
@@ -600,8 +563,10 @@ fn printHelp(io: std.Io) !void {
         \\  --wg-port <port>           WireGuard listen port (default: 51830)
         \\  --no-sync                  Disable fsync per write (faster, less durable)
         \\  --persistence <mode>       Persistence mode: full (default), snapshot, none
-        \\  --lightapi-segment <path>  Frozen Light-API segment (.wseg) to mmap at startup
-        \\  --atomicassets-segment <path>  Frozen AtomicAssets segment (.wseg) to mmap at startup
+        \\  --segment <name=path>      Frozen segment (.wseg) to mmap at startup, attached under <name>
+        \\                             (repeatable; e.g. --segment lightapi=la.wseg --segment atomicassets=aa.wseg)
+        \\  --lightapi-segment <path>  Deprecated alias for --segment lightapi=<path>
+        \\  --atomicassets-segment <path>  Deprecated alias for --segment atomicassets=<path>
         \\  --gateway-port <port>      Enable the HTTP/WebSocket gateway on <port>
         \\  --help, -h                 Show this help
         \\

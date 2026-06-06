@@ -74,8 +74,8 @@ pub fn currentAsset(store: *Store, a: std.mem.Allocator, id: u64) !?[]const u8 {
         if (isTomb(override)) return null;
         return override;
     }
-    const seg = store.atomicassets_segment orelse return null;
-    return seg.lookup(@enumFromInt(binfmt.TableId.fwd), id);
+    const seg = store.segment("atomicassets") orelse return null;
+    return seg.lookup(binfmt.TableId.fwd, id);
 }
 
 // ── add-set (packed [u64 LE]) ──

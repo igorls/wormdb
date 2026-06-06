@@ -8,7 +8,7 @@
 
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
-const name = @import("../core/name.zig");
+const name = @import("../antelope/name.zig");
 const aa = @import("../atomicassets/binfmt.zig");
 const ov = @import("../atomicassets/overlay.zig");
 

@@ -9,7 +9,8 @@
 
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
-const name = @import("../core/name.zig");
+const name = @import("../antelope/name.zig");
+const la = @import("../lightapi/tables.zig");
 const accinfo_bin = @import("accinfo_bin.zig");
 const chainmod = @import("lightapi_chain.zig");
 
@@ -23,7 +24,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     // Live overlay (KV `acci:<chain>:<acct>`) shadows the frozen segment baseline.
     const frag: ?[]const u8 = blk: {
         if (try ctx.getCopy(ctx.fmt("acci:{s}:{s}", .{ chain, account }))) |o| break :blk o;
-        if (ctx.store.lightapi_segment) |s| break :blk s.lookup(.accinfo, name.encode(account));
+        if (ctx.store.segment("lightapi")) |s| break :blk s.lookup(la.TableId.accinfo, name.encode(account));
         break :blk null;
     };
 

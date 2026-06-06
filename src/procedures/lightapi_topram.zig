@@ -8,9 +8,9 @@
 
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
-const segment = @import("../storage/segment.zig");
+const la = @import("../lightapi/tables.zig");
 
-fn executeTop(ctx: *Ctx, table: segment.TableId) anyerror!Ctx.Result {
+fn executeTop(ctx: *Ctx, table: u32) anyerror!Ctx.Result {
     _ = ctx.arg(0) orelse return ctx.err("need <chain> <N>"); // chain (the segment is single-chain)
     const n_str = ctx.arg(1) orelse return ctx.err("need <chain> <N>");
     const a = ctx.allocator;
@@ -19,7 +19,7 @@ fn executeTop(ctx: *Ctx, table: segment.TableId) anyerror!Ctx.Result {
     if (n < 10 or n > 1000) return ctx.value(ctx.fmt("Invalid count: {s}", .{n_str}));
 
     const lines: []const u8 = blk: {
-        const seg = ctx.store.lightapi_segment orelse break :blk "";
+        const seg = ctx.store.segment("lightapi") orelse break :blk "";
         const blob = seg.lookup(table, 0) orelse break :blk "";
         break :blk if (blob.len >= 4) blob[4..] else ""; // skip the [u32 count] header
     };
@@ -49,11 +49,11 @@ fn executeTop(ctx: *Ctx, table: segment.TableId) anyerror!Ctx.Result {
 }
 
 pub fn executeRam(ctx: *Ctx) anyerror!Ctx.Result {
-    return executeTop(ctx, .top_ram);
+    return executeTop(ctx, la.TableId.top_ram);
 }
 
 pub fn executeStake(ctx: *Ctx) anyerror!Ctx.Result {
-    return executeTop(ctx, .top_stake);
+    return executeTop(ctx, la.TableId.top_stake);
 }
 
 test {

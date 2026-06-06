@@ -122,25 +122,13 @@ pub const AuthConfig = struct {
     token_max_age_s: u64 = 3600,
 };
 
-/// One Light-API network's static metadata (the `chain{}` block). WormDB builds the cc32d9 chain
-/// block from this at startup and seeds `lacfg:<chain>` + `lanet` into KV — so serving a snapshot
-/// segment needs no external loader. `chainid`/`decimals`/`systoken` come from the chain; `block_num`
-/// is the segment's snapshot block (the live feed updates it thereafter).
-pub const LightApiNetwork = struct {
-    chain: []const u8,
-    network: ?[]const u8 = null, // defaults to `chain`
-    systoken: []const u8 = "",
-    decimals: u8 = 4,
-    chainid: []const u8 = "",
-    description: []const u8 = "",
-    rex_enabled: bool = false,
-    production: bool = true,
-    block_num: u64 = 0,
-};
-
-/// Light-API serving metadata (seeded into KV at startup).
-pub const LightApiConfig = struct {
-    networks: []const LightApiNetwork = &.{},
+/// One frozen segment mount: a `.wseg` file mmap'd at startup and attached to the
+/// store under `name`. The engine is domain-agnostic — `name` is an opaque string
+/// a serving layer looks up (e.g. "lightapi", "atomicassets"); core assigns it no
+/// meaning.
+pub const SegmentMount = struct {
+    name: []const u8,
+    path: []const u8,
 };
 
 /// Top-level WormDB configuration.
@@ -149,18 +137,10 @@ pub const WormDBConfig = struct {
     /// Data directory for WAL and snapshots
     data: []const u8 = "./data",
 
-    /// Optional path to a frozen Light-API segment (.wseg). When set, WormDB
-    /// mmaps it at startup and serves the large per-account Light-API tables
-    /// from it. Null = no segment (serve everything from the KV store).
-    lightapi_segment: ?[]const u8 = null,
-
-    /// Optional path to a frozen AtomicAssets segment (.wseg). When set, WormDB
-    /// mmaps it at startup and serves faceted AtomicAssets state from it (table
-    /// ids 11..=21). Null = no AtomicAssets segment.
-    atomicassets_segment: ?[]const u8 = null,
-
-    /// Light-API network metadata — WormDB seeds the chain block(s) into KV at startup.
-    lightapi: LightApiConfig = .{},
+    /// Frozen read-only segments (.wseg) to mmap at startup. Each is attached to
+    /// the store under its opaque `name`; a serving layer looks it up by that name.
+    /// The engine assigns no domain meaning to the name.
+    segments: []const SegmentMount = &.{},
 
     /// Store / persistence settings
     store: Config = .{},
@@ -183,18 +163,25 @@ pub const WormDBConfig = struct {
 /// The file content is kept alive for the process lifetime since
 /// parsed string values reference the input buffer directly.
 pub fn loadFromFile(path: []const u8, allocator: std.mem.Allocator) !WormDBConfig {
-    // Zig 0.16: use global single-threaded Io for blocking file I/O
+    return loadTyped(WormDBConfig, path, allocator);
+}
+
+/// Load any config struct `T` from the JSON file at `path`, or `T{}` (all defaults)
+/// if the file is missing. Generic so a domain serving layer can parse its OWN config
+/// section from the same file without core knowing the domain type — keeping core free
+/// of any domain config struct. Content is NOT freed: parsed string slices point into
+/// it for the process lifetime, and `ignore_unknown_fields` lets each caller see only
+/// its own section.
+pub fn loadTyped(comptime T: type, path: []const u8, allocator: std.mem.Allocator) !T {
     const io = std.Io.Threaded.global_single_threaded.io();
     const cwd = std.Io.Dir.cwd();
-
-    // Content is intentionally NOT freed — string slices in the parsed
-    // config point into this buffer for the process lifetime.
     const content = cwd.readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| {
-        if (err == error.FileNotFound) return WormDBConfig{};
+        if (err == error.FileNotFound) return T{};
         return err;
     };
-
-    return loadFromJson(content, allocator);
+    return std.json.parseFromSliceLeaky(T, allocator, content, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.InvalidConfig;
 }
 
 /// Parse a WormDBConfig from a JSON string.

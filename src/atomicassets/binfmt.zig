@@ -157,7 +157,7 @@ test "postingHead ROARING reads the descending head" {
 
 test "decodeAsset reads the core fields at the right offsets" {
     const a = testing.allocator;
-    const name = @import("../core/name.zig");
+    const name = @import("../antelope/name.zig");
     var blob: std.ArrayListUnmanaged(u8) = .empty;
     defer blob.deinit(a);
     try blob.append(a, 1); // version

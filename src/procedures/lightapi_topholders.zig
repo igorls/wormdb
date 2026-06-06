@@ -7,7 +7,8 @@
 
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
-const name = @import("../core/name.zig");
+const name = @import("../antelope/name.zig");
+const la = @import("../lightapi/tables.zig");
 
 /// Locate a token's token_holders blob and return `.{ count, lines }` — the holder count (u32 in the
 /// blob header, so /holdercount is O(1)) and the amount-desc holder lines ("acct\tamount\n"…). Returns
@@ -15,8 +16,8 @@ const name = @import("../core/name.zig");
 /// [u32 count][lines]`.
 const TokenHolders = struct { count: u32, lines: []const u8 };
 fn lookupToken(ctx: *Ctx, contract: []const u8, symbol: []const u8) ?TokenHolders {
-    const seg = ctx.store.lightapi_segment orelse return null;
-    const blob = seg.lookup(.token_holders, name.tokenKey(contract, symbol)) orelse return null;
+    const seg = ctx.store.segment("lightapi") orelse return null;
+    const blob = seg.lookup(la.TableId.token_holders, name.tokenKey(contract, symbol)) orelse return null;
     if (blob.len < 2) return null;
     const hdr_len = std.mem.readInt(u16, blob[0..2], .little);
     const after_hdr = 2 + @as(usize, hdr_len);

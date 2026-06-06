@@ -1,5 +1,5 @@
 //! Frozen segment — a read-only, externally-built, memory-mapped columnar store
-//! for large *static* datasets (the Light-API-at-WAX tables).
+//! for large *static* datasets (e.g. an API's huge per-key tables).
 //!
 //! The generic `Store` (sharded `StringHashMap(*Entry)`) pays ~130–160 B of
 //! fixed overhead per key — an `Entry` struct, a duplicated key, a value
@@ -7,9 +7,8 @@
 //! (tens of millions of accounts) that overhead alone is many GB, and the
 //! pre-rendered-JSON values multiply it. A frozen segment sidesteps all of it:
 //!
-//!   * keys are the natural Antelope `name` u64 (no string keys, no hashing of
-//!     ASCII), held in one contiguous **sorted index** (16 B/entry) — binary
-//!     search, zero per-entry allocation;
+//!   * keys are u64 (no string keys, no hashing of ASCII), held in one contiguous
+//!     **sorted index** (16 B/entry) — binary search, zero per-entry allocation;
 //!   * values live back-to-back in a **blob arena**, referenced by (off,len);
 //!   * the whole file is **mmap'd** read-only, so resident memory is the working
 //!     set the OS pages in — not the entire dataset — and boot is just `mmap`.
@@ -39,27 +38,12 @@ pub const VERSION: u32 = 1;
 const HEADER_FIXED: usize = 40; // up to and including meta_off/meta_len
 const DIR_ENTRY: usize = 48;
 const INDEX_ENTRY: usize = 20; // key u64 | off u64 | len u32
-// A segment can hold tables for multiple API domains in one disjoint table-id namespace:
-// Light-API uses 0..=10, AtomicAssets uses 11..=21, chain-v1/AtomicMarket reserved above. The `tables`
-// array is indexed by table_id, so this is the highest addressable id + 1. 32 gives headroom for all
-// three domains at a cost of a few hundred bytes of optional slots per attached segment.
+// Tables are addressed by an opaque `u32` table id assigned by the segment builder; the engine attaches
+// no meaning to it. Serving layers own their own id namespaces in disjoint ranges of one shared segment
+// (e.g. Light-API in `lightapi/tables.zig`, AtomicAssets in `atomicassets/binfmt.zig`). The `tables` array
+// is indexed by table id, so MAX_TABLES is the highest addressable id + 1; 32 gives ample headroom at a
+// cost of a few hundred bytes of optional slots per attached segment.
 const MAX_TABLES: usize = 32;
-
-/// Stable table identifiers. The builder and reader must agree on these.
-pub const TableId = enum(u32) {
-    balances = 0, // holder name -> packed "<contract>\t<symbol>\t<dec>\t<amount>\n..."
-    resources = 1, // (reserved) account -> binary resources
-    perms = 2, // (reserved) account -> binary permission list
-    delband_from = 3, // (reserved) `from` -> delegations made
-    delband_to = 4, // (reserved) `to` -> delegations received
-    accinfo = 5, // account name -> cc32d9 accinfo fragment ("resources":…,"linkauth":[…][,"code":…]})
-    token_holders = 6, // tokenKey(contract,symbol) -> [u16 hdr]["contract:symbol"] + "acct\tamount\n"… (amount-desc)
-    pub_keys = 7, // fnv1a64(pubkey EOS|PUB_K1) -> "account\tperm\tweight\n"… (holders of that key)
-    top_ram = 8, // sentinel key 0 -> [u32 count]["owner\tram_bytes\n"…] (ram-desc, capped)
-    top_stake = 9, // sentinel key 0 -> [u32 count]["owner\tstake\n"…] (cpu+net-desc, capped)
-    codehash = 10, // fnv1a64(code_hash hex) -> [u16 hdr][hash hex] + "account\n"… (accounts with that code)
-    _,
-};
 
 pub const SegmentError = error{
     SegmentTooSmall,
@@ -141,21 +125,32 @@ pub const Segment = struct {
         self.tables = [_]?Table{null} ** MAX_TABLES;
     }
 
-    pub fn has(self: *const Segment, table: TableId) bool {
-        return self.tables[@intFromEnum(table)] != null;
+    pub fn has(self: *const Segment, table: u32) bool {
+        if (table >= MAX_TABLES) return false;
+        return self.tables[table] != null;
     }
 
-    /// Number of keys in a table (0 if absent). `accinfo` key count = the account universe (every
-    /// account has ≥1 permission) = cc32d9 `usercount`.
-    pub fn keyCount(self: *const Segment, table: TableId) u64 {
-        return if (self.tables[@intFromEnum(table)]) |t| t.key_count else 0;
+    /// Number of keys in a table (0 if absent or out of range).
+    pub fn keyCount(self: *const Segment, table: u32) u64 {
+        if (table >= MAX_TABLES) return 0;
+        return if (self.tables[table]) |t| t.key_count else 0;
+    }
+
+    /// Number of populated tables in this segment (domain-neutral; for startup logging).
+    pub fn tableCount(self: *const Segment) usize {
+        var n: usize = 0;
+        for (self.tables) |t| {
+            if (t != null) n += 1;
+        }
+        return n;
     }
 
     /// Binary-search a table for `key`. Returns the borrowed blob slice (valid
     /// for the segment's lifetime — the mapping is never unmapped while
     /// serving) or null if the key (or table) is absent.
-    pub fn lookup(self: *const Segment, table: TableId, key: u64) ?[]const u8 {
-        const t = self.tables[@intFromEnum(table)] orelse return null;
+    pub fn lookup(self: *const Segment, table: u32, key: u64) ?[]const u8 {
+        if (table >= MAX_TABLES) return null;
+        const t = self.tables[table] orelse return null;
         var lo: usize = 0;
         var hi: usize = @intCast(t.key_count);
         while (lo < hi) {
@@ -300,14 +295,17 @@ fn buildOneTableSegment(
 
 test "segment round-trip via temp file" {
     const testing = std.testing;
-    const name = @import("../core/name.zig");
 
-    // Build a balances segment with keys that exercise the sorted-index search.
+    // Build a one-table segment with u64 keys that exercise the sorted-index search.
+    const K_A: u64 = 100;
+    const K_EOSIO: u64 = 200;
+    const K_WAX: u64 = 300;
+    const K_ZZZ: u64 = 400;
     var entries = [_]TestEntry{
-        .{ .key = name.encode("a"), .val = "tok\tA\t4\t1.0000" },
-        .{ .key = name.encode("eosio"), .val = "eosio.token\tWAX\t8\t10.00000000" },
-        .{ .key = name.encode("waxupbitcold"), .val = "eosio.token\tWAX\t8\t999.99999999" },
-        .{ .key = name.encode("zzz"), .val = "x\tY\t0\t7" },
+        .{ .key = K_A, .val = "tok\tA\t4\t1.0000" },
+        .{ .key = K_EOSIO, .val = "eosio.token\tWAX\t8\t10.00000000" },
+        .{ .key = K_WAX, .val = "eosio.token\tWAX\t8\t999.99999999" },
+        .{ .key = K_ZZZ, .val = "x\tY\t0\t7" },
     };
     // Index must be sorted by key ascending.
     std.sort.pdq(TestEntry, &entries, {}, struct {
@@ -316,7 +314,7 @@ test "segment round-trip via temp file" {
         }
     }.lt);
 
-    const bytes = try buildOneTableSegment(testing.allocator, @intFromEnum(TableId.balances), &entries);
+    const bytes = try buildOneTableSegment(testing.allocator, 0, &entries);
     defer testing.allocator.free(bytes);
 
     var tmp = testing.tmpDir(.{});
@@ -333,16 +331,16 @@ test "segment round-trip via temp file" {
     var seg = try Segment.open(testing.allocator, seg_path);
     defer seg.close(testing.allocator);
 
-    try testing.expect(seg.has(.balances));
-    try testing.expect(!seg.has(.perms));
+    try testing.expect(seg.has(0));
+    try testing.expect(!seg.has(2));
     try testing.expectEqualStrings(
         "eosio.token\tWAX\t8\t999.99999999",
-        seg.lookup(.balances, name.encode("waxupbitcold")).?,
+        seg.lookup(0, K_WAX).?,
     );
-    try testing.expectEqualStrings("tok\tA\t4\t1.0000", seg.lookup(.balances, name.encode("a")).?);
-    try testing.expectEqualStrings("x\tY\t0\t7", seg.lookup(.balances, name.encode("zzz")).?);
-    try testing.expect(seg.lookup(.balances, name.encode("missing")) == null);
-    try testing.expect(seg.lookup(.resources, name.encode("a")) == null);
+    try testing.expectEqualStrings("tok\tA\t4\t1.0000", seg.lookup(0, K_A).?);
+    try testing.expectEqualStrings("x\tY\t0\t7", seg.lookup(0, K_ZZZ).?);
+    try testing.expect(seg.lookup(0, 999) == null);
+    try testing.expect(seg.lookup(1, K_A) == null);
 }
 
 test "high table-id (AtomicAssets range) is addressable" {
@@ -350,13 +348,14 @@ test "high table-id (AtomicAssets range) is addressable" {
     // (SORTED_TMPL=21). Before MAX_TABLES was raised, `open` dropped any id >= 16, so these tables were
     // silently unreadable. Build a segment with table id 21 and confirm it round-trips.
     const testing = std.testing;
-    const name = @import("../core/name.zig");
     const AA_SORTED_TMPL: u32 = 21;
+    const K_ALICE: u64 = 500;
+    const K_ZZZ: u64 = 600;
 
     var entries = [_]TestEntry{
         .{ .key = 0, .val = "sentinel-blob" }, // SORTED_TMPL uses the sentinel key 0
-        .{ .key = name.encode("alice"), .val = "owned-by-alice" },
-        .{ .key = name.encode("zzz"), .val = "z" },
+        .{ .key = K_ALICE, .val = "owned-by-alice" },
+        .{ .key = K_ZZZ, .val = "z" },
     };
     std.sort.pdq(TestEntry, &entries, {}, struct {
         fn lt(_: void, x: TestEntry, y: TestEntry) bool {
@@ -380,12 +379,11 @@ test "high table-id (AtomicAssets range) is addressable" {
     var seg = try Segment.open(testing.allocator, seg_path);
     defer seg.close(testing.allocator);
 
-    const tid: TableId = @enumFromInt(AA_SORTED_TMPL);
-    try testing.expect(seg.has(tid));
-    try testing.expectEqual(@as(u64, 3), seg.keyCount(tid));
-    try testing.expectEqualStrings("sentinel-blob", seg.lookup(tid, 0).?);
-    try testing.expectEqualStrings("owned-by-alice", seg.lookup(tid, name.encode("alice")).?);
-    try testing.expect(seg.lookup(tid, name.encode("missing")) == null);
+    try testing.expect(seg.has(AA_SORTED_TMPL));
+    try testing.expectEqual(@as(u64, 3), seg.keyCount(AA_SORTED_TMPL));
+    try testing.expectEqualStrings("sentinel-blob", seg.lookup(AA_SORTED_TMPL, 0).?);
+    try testing.expectEqualStrings("owned-by-alice", seg.lookup(AA_SORTED_TMPL, K_ALICE).?);
+    try testing.expect(seg.lookup(AA_SORTED_TMPL, 999) == null);
 }
 
 test "rejects a bad-magic file" {

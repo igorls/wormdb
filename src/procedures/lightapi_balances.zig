@@ -13,7 +13,8 @@
 
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
-const name = @import("../core/name.zig");
+const name = @import("../antelope/name.zig");
+const la = @import("../lightapi/tables.zig");
 const chainmod = @import("lightapi_chain.zig");
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
@@ -48,7 +49,7 @@ pub fn packedBalances(ctx: *Ctx, chain: []const u8, account: []const u8) !?[]con
     // even empty (a balance that went to zero) — is authoritative; only an absent key falls through
     // to the segment. This is how a feed keeps the snapshot-built segment current per account.
     if (try ctx.getCopy(ctx.fmt("bal:{s}:{s}", .{ chain, account }))) |override| return override;
-    if (ctx.store.lightapi_segment) |s| return s.lookup(.balances, name.encode(account));
+    if (ctx.store.segment("lightapi")) |s| return s.lookup(la.TableId.balances, name.encode(account));
     return null;
 }
 

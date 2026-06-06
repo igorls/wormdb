@@ -9,7 +9,8 @@
 
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
-const name = @import("../core/name.zig");
+const name = @import("../antelope/name.zig");
+const la = @import("../lightapi/tables.zig");
 const accinfo_bin = @import("accinfo_bin.zig");
 const chainmod = @import("lightapi_chain.zig");
 
@@ -47,8 +48,8 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const pubkey = ctx.arg(0) orelse return ctx.err("need <pubkey>");
     const a = ctx.allocator;
 
-    const seg = ctx.store.lightapi_segment orelse return ctx.value("{}");
-    const blob = seg.lookup(.pub_keys, name.keyHash(pubkey)) orelse return ctx.value("{}");
+    const seg = ctx.store.segment("lightapi") orelse return ctx.value("{}");
+    const blob = seg.lookup(la.TableId.pub_keys, name.keyHash(pubkey)) orelse return ctx.value("{}");
 
     // Unique matching accounts (a key can appear in several of an account's permissions).
     var accts: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -79,7 +80,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     for (accts.items, 0..) |acct, idx| {
         const frag: ?[]const u8 = blk: {
             if (try ctx.getCopy(ctx.fmt("acci:{s}:{s}", .{ chain_name, acct }))) |o| break :blk o;
-            break :blk seg.lookup(.accinfo, name.encode(acct));
+            break :blk seg.lookup(la.TableId.accinfo, name.encode(acct));
         };
         var perms: []const u8 = "[]";
         if (frag) |f| {

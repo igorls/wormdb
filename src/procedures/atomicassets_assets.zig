@@ -11,7 +11,7 @@
 
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
-const name = @import("../core/name.zig");
+const name = @import("../antelope/name.zig");
 const aa = @import("../atomicassets/binfmt.zig");
 const ov = @import("../atomicassets/overlay.zig");
 
@@ -28,7 +28,7 @@ pub fn byOwner(ctx: *Ctx) anyerror!Ctx.Result {
     var limit: usize = ctx.argInt(usize, 1) orelse MAX_LIMIT;
     if (limit == 0 or limit > MAX_LIMIT) limit = MAX_LIMIT;
 
-    const seg = ctx.store.atomicassets_segment orelse
+    const seg = ctx.store.segment("atomicassets") orelse
         return ctx.err("no atomicassets segment attached");
     const a = ctx.allocator;
     const target = name.encode(owner);
@@ -37,7 +37,7 @@ pub fn byOwner(ctx: *Ctx) anyerror!Ctx.Result {
     // headroom past stale candidates) ∪ the overlay add-set (mints + transfer-ins since the base).
     var cand: std.ArrayListUnmanaged(u64) = .empty;
     defer cand.deinit(a);
-    if (seg.lookup(@enumFromInt(aa.TableId.by_owner), target)) |posting| {
+    if (seg.lookup(aa.TableId.by_owner, target)) |posting| {
         var head: [MAX_LIMIT]u64 = undefined;
         const n = aa.postingHead(posting, head[0..]);
         try cand.appendSlice(a, head[0..n]);
@@ -222,7 +222,7 @@ test "atomicassets_assets_by_owner serves an owner's newest assets from the segm
     compat.File.close(wf);
     var store = try Store.init(a, .{ .wal_path = wal_path, .snapshot_path = snap_path, .sync_writes = false });
     defer store.deinit();
-    store.attachAtomicAssetsSegment(&seg);
+    store.attachSegment("atomicassets", &seg);
 
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -311,7 +311,7 @@ test "byOwner reflects live mint/transfer/burn via the overlay" {
     compat.File.close(wf);
     var store = try Store.init(a, .{ .wal_path = wal_path, .snapshot_path = snap_path, .sync_writes = false });
     defer store.deinit();
-    store.attachAtomicAssetsSegment(&seg);
+    store.attachSegment("atomicassets", &seg);
 
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();

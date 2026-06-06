@@ -3,7 +3,8 @@
 
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
-const name = @import("../core/name.zig");
+const name = @import("../antelope/name.zig");
+const la = @import("../lightapi/tables.zig");
 const balances = @import("lightapi_balances.zig");
 const topholders = @import("lightapi_topholders.zig");
 
@@ -57,7 +58,7 @@ pub fn holderRows(ctx: *Ctx) anyerror!Ctx.Result {
 /// The gateway streams one {account_name, perm, weight, pubkey} notification per line.
 pub fn keyRows(ctx: *Ctx) anyerror!Ctx.Result {
     const pubkey = ctx.arg(0) orelse return ctx.err("need <pubkey>");
-    const seg = ctx.store.lightapi_segment orelse return ctx.value("");
-    const blob = seg.lookup(.pub_keys, name.keyHash(pubkey)) orelse return ctx.value("");
+    const seg = ctx.store.segment("lightapi") orelse return ctx.value("");
+    const blob = seg.lookup(la.TableId.pub_keys, name.keyHash(pubkey)) orelse return ctx.value("");
     return ctx.value(blob);
 }

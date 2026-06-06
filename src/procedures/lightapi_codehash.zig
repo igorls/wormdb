@@ -7,7 +7,8 @@
 
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
-const name = @import("../core/name.zig");
+const name = @import("../antelope/name.zig");
+const la = @import("../lightapi/tables.zig");
 const chainmod = @import("lightapi_chain.zig");
 
 fn isHex64(s: []const u8) bool {
@@ -26,8 +27,8 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     for (raw, 0..) |c, i| hash[i] = std.ascii.toLower(c);
     if (!isHex64(hash)) return ctx.value("{}");
 
-    const seg = ctx.store.lightapi_segment orelse return ctx.value("{}");
-    const blob = seg.lookup(.codehash, name.keyHash(hash)) orelse return ctx.value("{}");
+    const seg = ctx.store.segment("lightapi") orelse return ctx.value("{}");
+    const blob = seg.lookup(la.TableId.codehash, name.keyHash(hash)) orelse return ctx.value("{}");
     if (blob.len < 2) return ctx.value("{}");
     const hdr_len = std.mem.readInt(u16, blob[0..2], .little);
     const after = 2 + @as(usize, hdr_len);

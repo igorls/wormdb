@@ -16,6 +16,11 @@ pub const event = @import("event/mod.zig");
 pub const cluster = @import("cluster/mod.zig");
 pub const procedures = @import("procedures/mod.zig");
 pub const vector = @import("vector/mod.zig");
+
+// Domain serving layers — these depend on the engine above; the engine never
+// depends on them. Blockchain/Antelope knowledge lives only here and in `procedures`.
+pub const antelope = @import("antelope/mod.zig");
+pub const lightapi = @import("lightapi/mod.zig");
 pub const atomicassets = @import("atomicassets/mod.zig");
 
 // Re-export commonly used types

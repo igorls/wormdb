@@ -56,11 +56,13 @@ pub const Gateway = struct {
     cluster: ?*Cluster,
     port: u16,
     running: std.atomic.Value(bool),
-    /// Ed25519 public keys for SCT verification. Empty = auth disabled (all commands permitted).
+    /// Ed25519 public keys for SCT verification. Empty means AUTH cannot succeed; it does NOT
+    /// disable auth — commands are still rejected when `auth_required` is true (fail closed).
     public_keys: []const auth.PublicKey,
     /// Maximum token lifetime in seconds (0 = no limit).
     max_token_age: u64,
-    /// Whether authentication is required (true = reject unauthenticated commands).
+    /// Whether this listener enforces auth (= `cfg.auth.require_auth && cfg.gateway.auth_enabled`).
+    /// True ⇒ executor rejects unauthenticated protected commands; false ⇒ listener opted out.
     auth_required: bool,
 
     pub fn init(
@@ -288,34 +290,18 @@ pub const Gateway = struct {
                     break :blk Response.ok;
                 },
                 else => blk: {
-                    // Step 5: Capability enforcement
-                    if (self.auth_required) {
-                        if (auth_state) |*state| {
-                            const op = auth.commandToOperation(cmd_id_raw);
-                            const target = auth.commandTarget(cmd);
-                            if (op) |o| {
-                                if (target) |t| {
-                                    if (!state.permits(o, t)) {
-                                        break :blk Response{ .err = "permission denied" };
-                                    }
-                                }
-                            }
-                        } else {
-                            // No STATUS/CLUSTER_STATUS without auth if auth_required
-                            // (those ops return null from commandToOperation, so they pass through)
-                            const op = auth.commandToOperation(cmd_id_raw);
-                            if (op != null) {
-                                break :blk Response{ .err = "auth required" };
-                            }
-                        }
-                    }
-
+                    // Authorization is enforced once, in executor.execute (the unified
+                    // chokepoint). This listener only supplies the decision: enforce with the
+                    // connection's token when auth is on for this listener, else .disabled.
                     break :blk executor.execute(.{
                         .allocator = arena_alloc,
                         .store = self.store,
                         .event_bus = self.event_bus,
                         .cluster = self.cluster,
-                        .identity = if (auth_state) |*s| s.subject else null,
+                        .auth = if (self.auth_required)
+                            .{ .enforce = if (auth_state) |*s| s else null }
+                        else
+                            .disabled,
                     }, cmd) catch |err| {
                         const err_msg: []const u8 = switch (err) {
                             error.WormViolation => "WORM violation",
@@ -417,13 +403,16 @@ pub const Gateway = struct {
     }
 
     /// Run a procedure through the shared executor; return its `value` payload (or null on error).
+    /// HTTP-GET and JSON-RPC EXEC reach here with no per-connection token (Phase 1), so when this
+    /// listener enforces auth the call passes `.enforce(null)` and the executor rejects it
+    /// (fail-closed). Disable auth on the WS listener to expose a public read-only HTTP/JSON-RPC API.
     fn execProc(self: *Gateway, alloc: std.mem.Allocator, proc: []const u8, args: []const []const u8) ?[]const u8 {
         const resp = executor.execute(.{
             .allocator = alloc,
             .store = self.store,
             .event_bus = self.event_bus,
             .cluster = self.cluster,
-            .identity = null,
+            .auth = if (self.auth_required) .{ .enforce = null } else .disabled,
         }, .{ .exec = .{ .procedure = proc, .args = args } }) catch return null;
         return switch (resp) {
             .value => |v| v orelse "null",

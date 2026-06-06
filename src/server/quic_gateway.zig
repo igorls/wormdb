@@ -229,7 +229,7 @@ pub const QuicGateway = struct {
                     const session_ctx: *SessionContext = @ptrCast(@alignCast(ptr));
                     const gw = session_ctx.gateway;
                     if (session_ctx.auth_state) |*state| {
-                        gw.allocator.free(state.capabilities);
+                        auth.freeTokenState(gw.allocator, state);
                     }
                     gw.allocator.destroy(session_ctx);
                 }
@@ -345,36 +345,22 @@ pub const QuicGateway = struct {
                     break :blk Response{ .err = "invalid token" };
                 };
                 if (session_ctx.auth_state) |*old| {
-                    gw.allocator.free(old.capabilities);
+                    auth.freeTokenState(gw.allocator, old);
                 }
                 session_ctx.auth_state = state;
                 break :blk Response.ok;
             },
             else => blk: {
-                // Capability enforcement
-                if (gw.auth_required) {
-                    if (session_ctx.auth_state) |*state| {
-                        const op = auth.commandToOperation(cmd_id_raw);
-                        const target = auth.commandTarget(cmd);
-                        if (op) |o| {
-                            if (target) |t| {
-                                if (!state.permits(o, t)) {
-                                    break :blk Response{ .err = "permission denied" };
-                                }
-                            }
-                        }
-                    } else {
-                        break :blk Response{ .err = "auth required" };
-                    }
-                }
-
-                // Execute
+                // Authorization is enforced once, in executor.execute (the unified chokepoint).
                 break :blk executor.execute(.{
                     .allocator = arena_alloc,
                     .store = gw.store,
                     .event_bus = gw.event_bus,
                     .cluster = gw.cluster,
-                    .identity = if (session_ctx.auth_state) |*s| s.subject else null,
+                    .auth = if (gw.auth_required)
+                        .{ .enforce = if (session_ctx.auth_state) |*s| s else null }
+                    else
+                        .disabled,
                 }, cmd) catch |err| {
                     const err_msg: []const u8 = switch (err) {
                         error.WormViolation => "WORM violation",

@@ -16,6 +16,7 @@ const Cluster = cluster_mod.Cluster;
 const NamespaceRegistry = @import("../vector/index.zig").NamespaceRegistry;
 const vector_ops = @import("../procedures/vector_ops.zig");
 const Metric = @import("../vector/metric.zig").Metric;
+const auth = @import("auth.zig");
 
 /// Execute context — bundles the dependencies needed for command execution.
 pub const ExecContext = struct {
@@ -26,13 +27,29 @@ pub const ExecContext = struct {
     /// Per-namespace HNSW index registry (optional). Procedures that do
     /// vector search consult this first; null → BQ or brute-force paths.
     vector_registry: ?*NamespaceRegistry = null,
-    /// Authenticated identity (from SCT subject). Null if unauthenticated.
-    identity: ?[]const u8 = null,
+    /// Authorization decision supplied by the calling transport. Defaults to `.trusted` so
+    /// internal/replicated callers and existing tests bypass checks; every CLIENT-facing
+    /// transport MUST set a non-trusted value (`.enforce`/`.disabled`) explicitly.
+    auth: auth.AuthContext = .trusted,
 };
 
 /// Execute a command, returning the response.
 /// Pure dispatch — no transport, no connection state.
 pub fn execute(ctx: ExecContext, cmd: Command) !Response {
+    // Unified authorization chokepoint — every transport funnels through here. `.trusted`
+    // (internal/replicated) and `.disabled` (explicit per-transport opt-out) bypass checks;
+    // `.enforce` runs the capability check for protected commands, while public commands
+    // (STATUS/CLUSTER_*/SAVE/AUTH → no operation) always pass.
+    switch (ctx.auth) {
+        .trusted, .disabled => {},
+        .enforce => |maybe_state| {
+            if (auth.operationForCommand(cmd) != null) {
+                const state = maybe_state orelse return Response{ .err = "auth required" };
+                if (!auth.commandPermittedUnion(state, cmd)) return Response{ .err = "permission denied" };
+            }
+        },
+    }
+
     return switch (cmd) {
         .get => |key| blk: {
             const value = ctx.store.getValueDupe(key, ctx.allocator) catch {
@@ -152,7 +169,7 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
                 ctx.store,
                 params.args,
                 ctx.allocator,
-                ctx.identity,
+                ctx.auth.identity(),
                 ctx.cluster,
                 ctx.event_bus,
                 ctx.vector_registry,
@@ -238,11 +255,13 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
                 params.items,
                 true, // client-originated → propagate
             ) catch |err| {
-                break :blk switch (err) {
-                    error.InvalidVectorBytes => Response{ .err = try ctx.allocator.dupe(u8, "vbulkinsert: invalid vector bytes (must be non-empty, len % 4 == 0)") },
-                    error.WormViolation => Response{ .err = try ctx.allocator.dupe(u8, "WORM violation: vector key is immutable") },
-                    else => Response{ .err = try ctx.allocator.dupe(u8, @errorName(err)) },
-                };
+                // applyVbulkinsert skips invalid/oversized items internally; the only error it
+                // surfaces is the namespace-confinement check (#15).
+                const msg: []const u8 = if (err == error.KeyMissingNamespace)
+                    "vbulkinsert: item key outside its declared namespace"
+                else
+                    @errorName(err);
+                break :blk Response{ .err = try ctx.allocator.dupe(u8, msg) };
             };
             break :blk .ok;
         },
@@ -270,4 +289,68 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
             break :blk .ok;
         },
     };
+}
+
+test "executor auth gate: enforce blocks unauthenticated writes, public passes, disabled/trusted bypass" {
+    const testing = std.testing;
+    var store = try Store.init(testing.allocator, .{ .persistence = .none });
+    defer store.deinit();
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    const base = ExecContext{
+        .allocator = testing.allocator,
+        .store = &store,
+        .event_bus = &bus,
+        .cluster = null,
+    };
+    const set_cmd = Command{ .set = .{ .key = "k", .value = "v" } };
+
+    // .enforce(null): protected SET rejected, nothing written.
+    {
+        var ctx = base;
+        ctx.auth = .{ .enforce = null };
+        const resp = try execute(ctx, set_cmd);
+        try testing.expect(resp == .err);
+        try testing.expectEqualStrings("auth required", resp.err);
+        try testing.expectEqual(@as(usize, 0), store.count());
+    }
+    // .enforce(null): public STATUS passes.
+    {
+        var ctx = base;
+        ctx.auth = .{ .enforce = null };
+        const resp = try execute(ctx, .status);
+        try testing.expect(resp == .value);
+        if (resp.value) |v| testing.allocator.free(v);
+    }
+    // .disabled bypass: SET applies.
+    {
+        var ctx = base;
+        ctx.auth = .disabled;
+        try testing.expect(try execute(ctx, set_cmd) == .ok);
+        try testing.expectEqual(@as(usize, 1), store.count());
+    }
+    // .trusted (the default) bypass: SET applies.
+    {
+        try testing.expect(try execute(base, Command{ .set = .{ .key = "k2", .value = "v2" } }) == .ok);
+        try testing.expectEqual(@as(usize, 2), store.count());
+    }
+    // .enforce(state): capability honored — outside prefix denied, inside allowed.
+    {
+        const state = auth.TokenState{
+            .subject = "u",
+            .iat = 0,
+            .exp = 0,
+            .jti = 0,
+            .capabilities = &[_]auth.Capability{
+                .{ .op = .set, .match_type = .prefix, .pattern = "ok:" },
+            },
+        };
+        var ctx = base;
+        ctx.auth = .{ .enforce = &state };
+        const denied = try execute(ctx, Command{ .set = .{ .key = "no:1", .value = "v" } });
+        try testing.expect(denied == .err);
+        try testing.expectEqualStrings("permission denied", denied.err);
+        try testing.expect(try execute(ctx, Command{ .set = .{ .key = "ok:1", .value = "v" } }) == .ok);
+    }
 }

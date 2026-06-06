@@ -85,6 +85,10 @@ pub const UringServer = struct {
         store: *Store,
         event_bus: *EventBus,
         cluster: ?*Cluster,
+        /// Whether this binary listener enforces auth (set by the composition root from
+        /// `cfg.auth.require_auth && cfg.server.auth_enabled`). Phase 1 has no AUTH-frame handling
+        /// here, so enforce ⇒ every protected command fails closed at the executor gate.
+        auth_enforce: bool,
         bind_address: []const u8,
         port: u16,
     ) !UringServer {
@@ -148,6 +152,7 @@ pub const UringServer = struct {
                 .store = store,
                 .event_bus = event_bus,
                 .cluster = cluster,
+                .auth = if (auth_enforce) .{ .enforce = null } else .disabled,
             },
             .running = false,
         };

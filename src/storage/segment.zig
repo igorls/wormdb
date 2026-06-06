@@ -43,7 +43,7 @@ const INDEX_ENTRY: usize = 20; // key u64 | off u64 | len u32
 // (e.g. Light-API in `lightapi/tables.zig`, AtomicAssets in `atomicassets/binfmt.zig`). The `tables` array
 // is indexed by table id, so MAX_TABLES is the highest addressable id + 1; 32 gives ample headroom at a
 // cost of a few hundred bytes of optional slots per attached segment.
-const MAX_TABLES: usize = 32;
+pub const MAX_TABLES: usize = 32;
 
 pub const SegmentError = error{
     SegmentTooSmall,
@@ -54,6 +54,7 @@ pub const SegmentError = error{
     SegmentBadIndex,
     SegmentShortRead,
     SegmentEmpty,
+    SegmentTableIdOutOfRange,
 };
 
 fn rd32(b: []const u8, off: usize) u32 {
@@ -108,7 +109,11 @@ pub const Segment = struct {
             if (index_off + index_len > bytes.len) return SegmentError.SegmentTruncated;
             if (blob_off + blob_len > bytes.len) return SegmentError.SegmentTruncated;
             if (index_len != key_count * INDEX_ENTRY) return SegmentError.SegmentBadIndex;
-            if (table_id >= MAX_TABLES) continue; // unknown table — ignore, stay forward-compatible
+            // A table id beyond MAX_TABLES means the builder wrote a table this engine can't address.
+            // Fail CLOSED (loud error) rather than silently dropping it — the MAX_TABLES=16 regression
+            // silently served empty data for AtomicAssets ids 11..=21. A larger namespace is a deliberate
+            // VERSION bump (rejected above), not an out-of-range id at the current version.
+            if (table_id >= MAX_TABLES) return SegmentError.SegmentTableIdOutOfRange;
 
             seg.tables[table_id] = .{
                 .key_count = key_count,

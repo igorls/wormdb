@@ -61,6 +61,52 @@ pub const Route = struct {
     build: *const fn (alloc: std.mem.Allocator, caps: *const Captures) ?ExecCall,
 };
 
+/// The streaming context a WebSocket JSON-RPC handler receives. The gateway owns the WS framing +
+/// the executor; the domain handler only emits data rows / end / err and runs procedures — so the
+/// cc32d9 (or any) WS dialect (method names, param shapes, row JSON) lives in the domain, not the
+/// engine. `impl` + the fn pointers are a small vtable the gateway fills in; handlers use the methods.
+pub const WsCtx = struct {
+    impl: *anyopaque,
+    allocator: std.mem.Allocator,
+    /// The JSON-RPC request's `params` object (or null). Handlers read arrays/fields directly.
+    params: ?std.json.ObjectMap,
+
+    emitFn: *const fn (impl: *anyopaque, data_json: []const u8) void,
+    endFn: *const fn (impl: *anyopaque) void,
+    errFn: *const fn (impl: *anyopaque, msg: []const u8) void,
+    execFn: *const fn (impl: *anyopaque, proc: []const u8, args: []const []const u8) ?[]const u8,
+
+    /// Stream one JSON data row to the client.
+    pub fn emit(self: *const WsCtx, data_json: []const u8) void {
+        self.emitFn(self.impl, data_json);
+    }
+    /// Terminate the request stream (status 200).
+    pub fn end(self: *const WsCtx) void {
+        self.endFn(self.impl);
+    }
+    /// Terminate the request stream with an error.
+    pub fn fail(self: *const WsCtx, msg: []const u8) void {
+        self.errFn(self.impl, msg);
+    }
+    /// Run an EXEC procedure through the engine; returns its value payload (or null).
+    pub fn exec(self: *const WsCtx, proc: []const u8, args: []const []const u8) ?[]const u8 {
+        return self.execFn(self.impl, proc, args);
+    }
+    /// A string `params` field, or null.
+    pub fn param(self: *const WsCtx, field: []const u8) ?[]const u8 {
+        const p = self.params orelse return null;
+        const v = p.get(field) orelse return null;
+        return if (v == .string) v.string else null;
+    }
+};
+
+/// One WebSocket JSON-RPC method a domain contributes. `name` is the method string; `handler`
+/// streams the response via the WsCtx.
+pub const WsMethod = struct {
+    name: []const u8,
+    handler: *const fn (ctx: *const WsCtx) void,
+};
+
 /// Everything a domain contributes to the engine. The engine assigns `name` and the
 /// table-id range no meaning beyond identity + cross-domain disjointness.
 pub const Domain = struct {
@@ -76,6 +122,8 @@ pub const Domain = struct {
     procedures: []const Entry = &.{},
     /// HTTP routes this domain contributes (path prefix -> proc-call builder).
     routes: []const Route = &.{},
+    /// WebSocket JSON-RPC methods this domain contributes (method name -> streaming handler).
+    ws_methods: []const WsMethod = &.{},
 };
 
 /// Flatten the procedures of several domain manifests into one slice at comptime — the composition
@@ -91,6 +139,13 @@ pub fn collectProcedures(comptime manifests: anytype) []const Entry {
 pub fn collectRoutes(comptime manifests: anytype) []const Route {
     var list: []const Route = &.{};
     inline for (manifests) |m| list = list ++ m.routes;
+    return list;
+}
+
+/// Flatten the WebSocket methods of several domain manifests into one slice at comptime.
+pub fn collectWsMethods(comptime manifests: anytype) []const WsMethod {
+    var list: []const WsMethod = &.{};
+    inline for (manifests) |m| list = list ++ m.ws_methods;
     return list;
 }
 

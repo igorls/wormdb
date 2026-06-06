@@ -29,6 +29,16 @@ pub fn registerRoutes(routes: []const domain.Route) void {
     domain_routes = routes;
 }
 
+/// Domain WebSocket JSON-RPC methods, registered at startup from the manifests. The gateway owns the
+/// WS framing + the executor; the cc32d9 dialect (method names, param shapes, row JSON) lives in the
+/// domains. Read-only during serving.
+var domain_ws_methods: []const domain.WsMethod = &.{};
+
+/// Register the composed domains' WS JSON-RPC methods. Call once at startup, before serving.
+pub fn registerWsMethods(methods: []const domain.WsMethod) void {
+    domain_ws_methods = methods;
+}
+
 const auth = @import("auth.zig");
 
 const Store = storage.Store;
@@ -446,6 +456,31 @@ pub const Gateway = struct {
     // back as `reqdata` notifications — one per row `{method, reqid, data}` — terminated by
     // `{method, reqid, end:true, status:200, error:null}`. Mirrors cc32d9's wsapi/lightapi_wsapi.js.
 
+    // Per-WS-request state the trampolines below dereference — the gateway side of the WsCtx vtable.
+    const WsImpl = struct {
+        gw: *Gateway,
+        stream: *core.compat.net.Stream,
+        a: std.mem.Allocator,
+        method: []const u8,
+        reqid: []const u8,
+    };
+    fn wsEmitTramp(impl: *anyopaque, data_json: []const u8) void {
+        const w: *WsImpl = @ptrCast(@alignCast(impl));
+        w.gw.wsData(w.stream, w.a, w.method, w.reqid, data_json);
+    }
+    fn wsEndTramp(impl: *anyopaque) void {
+        const w: *WsImpl = @ptrCast(@alignCast(impl));
+        w.gw.wsEnd(w.stream, w.a, w.method, w.reqid);
+    }
+    fn wsErrTramp(impl: *anyopaque, msg: []const u8) void {
+        const w: *WsImpl = @ptrCast(@alignCast(impl));
+        w.gw.wsErr(w.stream, w.a, w.method, w.reqid, msg);
+    }
+    fn wsExecTramp(impl: *anyopaque, proc: []const u8, args: []const []const u8) ?[]const u8 {
+        const w: *WsImpl = @ptrCast(@alignCast(impl));
+        return w.gw.execProc(w.a, proc, args);
+    }
+
     fn handleJsonRpc(self: *Gateway, stream: *core.compat.net.Stream, a: std.mem.Allocator, text: []const u8) void {
         const parsed = std.json.parseFromSlice(std.json.Value, a, text, .{}) catch return;
         defer parsed.deinit();
@@ -459,19 +494,24 @@ pub const Gateway = struct {
         var reqid_buf: [80]u8 = undefined;
         const reqid = reqidStr(params, &reqid_buf);
 
-        if (std.mem.eql(u8, m, "get_networks")) {
-            const lanet = self.execProc(a, "lightapi_get", &.{ "lanet", "[]" }) orelse "[]";
-            self.wsData(stream, a, "get_networks", reqid, lanet);
-            self.wsEnd(stream, a, "get_networks", reqid);
-        } else if (std.mem.eql(u8, m, "get_balances")) {
-            self.wsBalances(stream, a, params, reqid);
-        } else if (std.mem.eql(u8, m, "get_token_holders")) {
-            self.wsTokenHolders(stream, a, params, reqid);
-        } else if (std.mem.eql(u8, m, "get_accounts_from_keys")) {
-            self.wsAccountsFromKeys(stream, a, params, reqid);
-        } else {
-            self.wsErr(stream, a, m, reqid, "unknown method");
+        // Dispatch to the registered domain WS method; the handler streams via the WsCtx vtable.
+        for (domain_ws_methods) |wm| {
+            if (std.mem.eql(u8, wm.name, m)) {
+                var impl = WsImpl{ .gw = self, .stream = stream, .a = a, .method = m, .reqid = reqid };
+                const ctx = domain.WsCtx{
+                    .impl = &impl,
+                    .allocator = a,
+                    .params = params,
+                    .emitFn = wsEmitTramp,
+                    .endFn = wsEndTramp,
+                    .errFn = wsErrTramp,
+                    .execFn = wsExecTramp,
+                };
+                wm.handler(&ctx);
+                return;
+            }
         }
+        self.wsErr(stream, a, m, reqid, "unknown method");
     }
 
     /// reqid re-emitted verbatim (number or JSON string); defaults to null.
@@ -520,71 +560,6 @@ pub const Gateway = struct {
         buf.appendSlice(a, msg) catch return;
         buf.appendSlice(a, "\"}}") catch return;
         sendWsFrame(stream, 0x01, buf.items) catch {};
-    }
-
-    fn paramStr(params: ?std.json.ObjectMap, field: []const u8) ?[]const u8 {
-        const p = params orelse return null;
-        const v = p.get(field) orelse return null;
-        return if (v == .string) v.string else null;
-    }
-
-    fn wsBalances(self: *Gateway, stream: *core.compat.net.Stream, a: std.mem.Allocator, params: ?std.json.ObjectMap, reqid: []const u8) void {
-        const network = paramStr(params, "network") orelse "";
-        const accounts = if (params) |p| p.get("accounts") else null;
-        if (accounts == null or accounts.? != .array) {
-            self.wsErr(stream, a, "get_balances", reqid, "accounts required");
-            return;
-        }
-        var n: usize = 0;
-        for (accounts.?.array.items) |acc| {
-            if (acc != .string or n >= 100) break;
-            n += 1;
-            if (self.execProc(a, "lightapi_ws_balances", &.{ network, acc.string })) |row| {
-                self.wsData(stream, a, "get_balances", reqid, row);
-            }
-        }
-        self.wsEnd(stream, a, "get_balances", reqid);
-    }
-
-    fn wsTokenHolders(self: *Gateway, stream: *core.compat.net.Stream, a: std.mem.Allocator, params: ?std.json.ObjectMap, reqid: []const u8) void {
-        const contract = paramStr(params, "contract") orelse "";
-        const currency = paramStr(params, "currency") orelse "";
-        const lines = self.execProc(a, "lightapi_ws_holders", &.{ contract, currency }) orelse "";
-        var it = std.mem.splitScalar(u8, lines, '\n');
-        while (it.next()) |line| {
-            if (line.len == 0) continue;
-            var f = std.mem.splitScalar(u8, line, '\t');
-            const acct = f.next() orelse continue;
-            const amount = f.next() orelse continue;
-            const data = std.fmt.allocPrint(a, "{{\"account\":\"{s}\",\"amount\":\"{s}\"}}", .{ acct, amount }) catch continue;
-            self.wsData(stream, a, "get_token_holders", reqid, data);
-        }
-        self.wsEnd(stream, a, "get_token_holders", reqid);
-    }
-
-    fn wsAccountsFromKeys(self: *Gateway, stream: *core.compat.net.Stream, a: std.mem.Allocator, params: ?std.json.ObjectMap, reqid: []const u8) void {
-        const keys = if (params) |p| p.get("keys") else null;
-        if (keys == null or keys.? != .array) {
-            self.wsErr(stream, a, "get_accounts_from_keys", reqid, "keys required");
-            return;
-        }
-        var n: usize = 0;
-        for (keys.?.array.items) |k| {
-            if (k != .string or n >= 100) break;
-            n += 1;
-            const rows = self.execProc(a, "lightapi_ws_keyrows", &.{k.string}) orelse "";
-            var it = std.mem.splitScalar(u8, rows, '\n');
-            while (it.next()) |line| {
-                if (line.len == 0) continue;
-                var f = std.mem.splitScalar(u8, line, '\t');
-                const acct = f.next() orelse continue;
-                const perm = f.next() orelse continue;
-                const weight = f.next() orelse continue;
-                const data = std.fmt.allocPrint(a, "{{\"account_name\":\"{s}\",\"perm\":\"{s}\",\"weight\":{s},\"pubkey\":\"{s}\"}}", .{ acct, perm, weight, k.string }) catch continue;
-                self.wsData(stream, a, "get_accounts_from_keys", reqid, data);
-            }
-        }
-        self.wsEnd(stream, a, "get_accounts_from_keys", reqid);
     }
 
     // --- WebSocket Protocol Implementation ---

@@ -112,6 +112,13 @@ pub const VinsertArgs = struct {
     is_async: bool = false,
 };
 
+/// A wire vector key must live under its declared namespace. Enforced at the procedure
+/// boundary (independent of token capabilities) so a key can never be written/deleted outside
+/// its namespace — including on the peer-replicated path. Empty namespace ⇒ rejected.
+fn keyBelongsToNamespace(key: []const u8, namespace: []const u8) bool {
+    return namespace.len > 0 and std.mem.startsWith(u8, key, namespace);
+}
+
 /// Apply a VINSERT locally: write vec + BQ to the store, update HNSW,
 /// emit event, optionally replicate. Metric mismatches on the registry
 /// are logged and skipped (store + BQ still succeed — peers remain
@@ -127,6 +134,8 @@ pub fn applyVinsert(
     // ── Validate ─────────────────────────────────────────────────
     if (args.vector.len == 0 or args.vector.len % 4 != 0)
         return error.InvalidVectorBytes;
+    if (!keyBelongsToNamespace(args.key, args.namespace))
+        return error.KeyMissingNamespace;
 
     // ── Pre-check dim against the frozen namespace dimension ─────
     // Fails fast BEFORE any store write. Critical for WORM inserts:
@@ -268,6 +277,11 @@ pub fn applyVbulkinsert(
     replicate: bool,
 ) !void {
     if (items.len == 0) return;
+    // Validate ALL item keys before ANY write, so a namespace mismatch produces no partial batch.
+    for (items) |item| {
+        if (!keyBelongsToNamespace(item.key, namespace))
+            return error.KeyMissingNamespace;
+    }
 
     // ── Phase 1: store.set(vec) + store.set(bq) for each item ────
     // These use per-key shard locks; parallel shards don't block each
@@ -427,6 +441,9 @@ pub fn applyVdelete(
     namespace: []const u8,
     replicate: bool,
 ) !void {
+    if (!keyBelongsToNamespace(key, namespace))
+        return error.KeyMissingNamespace;
+
     // ── Delete vec entry (WAL + WORM check) ──────────────────────
     try store.delete(key);
 
@@ -466,6 +483,68 @@ pub fn applyVdelete(
             };
         }
     }
+}
+
+test "vector wire helpers reject keys outside namespace" {
+    const testing = std.testing;
+
+    var store = try Store.init(testing.allocator, .{ .persistence = .none });
+    defer store.deinit();
+
+    try testing.expectError(error.KeyMissingNamespace, applyVinsert(
+        &store,
+        null,
+        null,
+        null,
+        testing.allocator,
+        .{
+            .key = "admin/session",
+            .vector = "\x00\x00\x00\x00",
+            .worm = false,
+            .namespace = "vec:docs:",
+            .metric = .cosine,
+            .timestamp = 1,
+            .replicate = false,
+        },
+    ));
+
+    try testing.expectError(error.KeyMissingNamespace, applyVdelete(
+        &store,
+        null,
+        null,
+        null,
+        testing.allocator,
+        "admin/session",
+        "vec:docs:",
+        false,
+    ));
+}
+
+test "vector bulk insert rejects keys outside namespace before writing" {
+    const testing = std.testing;
+
+    var store = try Store.init(testing.allocator, .{ .persistence = .none });
+    defer store.deinit();
+
+    const items = &[_]Command.VbulkinsertParams.BulkItem{
+        .{ .key = "vec:docs:1", .vector = "\x00\x00\x00\x00", .timestamp = 1 },
+        .{ .key = "admin/session", .vector = "\x00\x00\x00\x00", .timestamp = 2 },
+    };
+
+    try testing.expectError(error.KeyMissingNamespace, applyVbulkinsert(
+        &store,
+        null,
+        null,
+        null,
+        testing.allocator,
+        "vec:docs:",
+        .cosine,
+        false,
+        false,
+        items,
+        false,
+    ));
+    try testing.expect(store.get("vec:docs:1") == null);
 }
 
 // Keep the Command union visible for callers that need to construct frames.

@@ -316,12 +316,20 @@ pub fn commandToOperation(cmd_id: u8) ?Operation {
         0x07 => .subscribe, // UNSUB uses same permission as SUB
         0x08 => .publish,
         0x09 => .exec,
-        else => null, // STATUS, CLUSTER_STATUS, etc. — always permitted
+        0x0D => .set, // VINSERT writes a vector key
+        0x0E => .delete, // VDELETE deletes a vector key
+        0x0F => .set, // VBULKINSERT writes every item key
+        0x10 => .set, // VRABITQ_INSTALL mutates vector namespace state
+        else => null, // STATUS, CLUSTER_STATUS, SAVE, AUTH, etc. — always permitted
     };
 }
 
+const Command = @import("../core/types.zig").Command;
+
 /// Extract the target key/channel/procedure from a command for capability checking.
-pub fn commandTarget(cmd: @import("../core/types.zig").Command) ?[]const u8 {
+/// VBULKINSERT is multi-target (returns null) and must be authorized per-item via
+/// `commandPermittedUnion`.
+pub fn commandTarget(cmd: Command) ?[]const u8 {
     return switch (cmd) {
         .get => |key| key,
         .set => |p| p.key,
@@ -330,8 +338,79 @@ pub fn commandTarget(cmd: @import("../core/types.zig").Command) ?[]const u8 {
         .unsubscribe => |ch| ch,
         .publish => |p| p.channel,
         .exec => |p| p.procedure,
+        .vinsert => |p| p.key,
+        .vdelete => |p| p.key,
+        .vbulkinsert => null, // multi-target; authorized per-item in commandPermittedUnion
+        .vrabitq_install => |p| p.namespace,
         else => null,
     };
+}
+
+/// Map a parsed `Command` (union tag) to its auth `Operation`. The executor's gate keys on
+/// this instead of the wire `cmd_id` byte (the executor only has the parsed command). `null`
+/// ⇒ a public command (STATUS / CLUSTER_STATUS / CLUSTER_PEERS / SAVE / AUTH).
+pub fn operationForCommand(cmd: Command) ?Operation {
+    return switch (cmd) {
+        .get => .get,
+        .set => .set,
+        .delete => .delete,
+        .subscribe, .unsubscribe => .subscribe,
+        .publish => .publish,
+        .exec => .exec,
+        .vinsert, .vbulkinsert, .vrabitq_install => .set,
+        .vdelete => .delete,
+        else => null, // status, cluster_status, cluster_peers, save, auth
+    };
+}
+
+/// Authorize a parsed command against a token's capabilities. VBULKINSERT authorizes EVERY
+/// item key (a bulk frame can write many arbitrary keys); a command that maps to an operation
+/// but exposes no target is denied by default. Public commands (no operation) are permitted.
+pub fn commandPermittedUnion(state: *const TokenState, cmd: Command) bool {
+    const op = operationForCommand(cmd) orelse return true; // public command
+    switch (cmd) {
+        .vbulkinsert => |p| {
+            for (p.items) |item| {
+                if (!state.permits(op, item.key)) return false;
+            }
+            return true;
+        },
+        else => {
+            const target = commandTarget(cmd) orelse return false; // op-mapped, no target ⇒ deny
+            return state.permits(op, target);
+        },
+    }
+}
+
+/// The authorization decision a transport hands to `executor.execute`. Secure by default: a
+/// client transport that cannot authenticate passes `.enforce(null)`, which rejects every
+/// protected command. `.disabled` is an explicit per-transport opt-out (trusted network /
+/// max performance); `.trusted` is for internal / replicated / maintenance callers and is the
+/// `ExecContext` default so internal callers and existing tests are unaffected.
+pub const AuthContext = union(enum) {
+    /// Internal / replicated / maintenance caller — skip all capability checks.
+    trusted,
+    /// Auth explicitly disabled for this listener (logged loudly at startup).
+    disabled,
+    /// Client call. `null` token ⇒ unauthenticated (only public commands pass).
+    enforce: ?*const TokenState,
+
+    /// The authenticated subject, if any (passed to procedures as the identity).
+    pub fn identity(self: AuthContext) ?[]const u8 {
+        return switch (self) {
+            .trusted, .disabled => null,
+            .enforce => |ts| if (ts) |s| s.subject else null,
+        };
+    }
+};
+
+/// Free a `TokenState`'s heap allocations (subject + each capability pattern + the slice).
+/// Used by every transport that owns a per-connection token (replaces the partial frees that
+/// leaked `subject`/`cap.pattern` on the QUIC path).
+pub fn freeTokenState(allocator: std.mem.Allocator, state: *const TokenState) void {
+    allocator.free(state.subject);
+    for (state.capabilities) |cap| allocator.free(cap.pattern);
+    allocator.free(state.capabilities);
 }
 
 // ╔═══════════════════════════════════════════════╗
@@ -427,6 +506,67 @@ test "capability enforcement: prefix matching" {
     try testing.expect(!state.permits(.get, "user:bob:profile")); // wrong prefix
     try testing.expect(!state.permits(.set, "user:alice:profile")); // wrong op
     try testing.expect(!state.permits(.exec, "transfer")); // wrong proc
+}
+
+test "operationForCommand agrees with commandToOperation for every Command id" {
+    const testing = std.testing;
+    const T = @import("../core/types.zig");
+    const cases = .{
+        .{ T.Command{ .get = "k" }, T.CommandId.get },
+        .{ T.Command{ .set = .{ .key = "k", .value = "v" } }, T.CommandId.set },
+        .{ T.Command{ .delete = "k" }, T.CommandId.delete },
+        .{ T.Command{ .subscribe = "c" }, T.CommandId.subscribe },
+        .{ T.Command{ .unsubscribe = "c" }, T.CommandId.unsubscribe },
+        .{ T.Command{ .publish = .{ .channel = "c", .message = "m" } }, T.CommandId.publish },
+        .{ T.Command{ .exec = .{ .procedure = "p", .args = &.{} } }, T.CommandId.exec },
+        .{ T.Command{ .vinsert = .{ .key = "vec:n:1", .vector = "\x00\x00\x00\x00", .namespace = "vec:n:", .metric = "l2", .timestamp = 0 } }, T.CommandId.vinsert },
+        .{ T.Command{ .vdelete = .{ .key = "vec:n:1", .namespace = "vec:n:" } }, T.CommandId.vdelete },
+        .{ T.Command{ .vbulkinsert = .{ .namespace = "vec:n:", .metric = "l2", .items = &.{} } }, T.CommandId.vbulkinsert },
+        .{ T.Command{ .vrabitq_install = .{ .namespace = "vec:n:", .dim = 1, .seed = 0, .centroid = "\x00\x00\x00\x00", .rotation = "\x00\x00\x00\x00" } }, T.CommandId.vrabitq_install },
+    };
+    inline for (cases) |tc| {
+        try testing.expectEqual(commandToOperation(@intFromEnum(tc[1])), operationForCommand(tc[0]));
+    }
+    // Public commands map to no operation on both keyings.
+    try testing.expectEqual(@as(?Operation, null), operationForCommand(.status));
+    try testing.expectEqual(@as(?Operation, null), operationForCommand(.save));
+    try testing.expectEqual(@as(?Operation, null), operationForCommand(.{ .auth = "x" }));
+}
+
+test "commandPermittedUnion: per-item bulk, targetless deny, public pass" {
+    const testing = std.testing;
+    const T = @import("../core/types.zig");
+    const state = TokenState{
+        .subject = "writer",
+        .iat = 0,
+        .exp = 0,
+        .jti = 0,
+        .capabilities = &[_]Capability{
+            .{ .op = .set, .match_type = .prefix, .pattern = "vec:ok:" },
+        },
+    };
+
+    // Public command — always permitted.
+    try testing.expect(commandPermittedUnion(&state, .status));
+
+    // Single vector write: in-prefix allowed, out-of-prefix denied.
+    try testing.expect(commandPermittedUnion(&state, .{ .vinsert = .{ .key = "vec:ok:1", .vector = "\x00\x00\x00\x00", .namespace = "vec:ok:", .metric = "l2", .timestamp = 0 } }));
+    try testing.expect(!commandPermittedUnion(&state, .{ .vinsert = .{ .key = "vec:no:1", .vector = "\x00\x00\x00\x00", .namespace = "vec:no:", .metric = "l2", .timestamp = 0 } }));
+
+    // Bulk: every item must pass; one stray key denies the whole frame.
+    const ok_items = [_]T.Command.VbulkinsertParams.BulkItem{
+        .{ .key = "vec:ok:1", .vector = "\x00\x00\x00\x00", .timestamp = 0 },
+        .{ .key = "vec:ok:2", .vector = "\x00\x00\x00\x00", .timestamp = 0 },
+    };
+    try testing.expect(commandPermittedUnion(&state, .{ .vbulkinsert = .{ .namespace = "vec:ok:", .metric = "l2", .items = &ok_items } }));
+    const mixed_items = [_]T.Command.VbulkinsertParams.BulkItem{
+        .{ .key = "vec:ok:1", .vector = "\x00\x00\x00\x00", .timestamp = 0 },
+        .{ .key = "vec:no:2", .vector = "\x00\x00\x00\x00", .timestamp = 0 },
+    };
+    try testing.expect(!commandPermittedUnion(&state, .{ .vbulkinsert = .{ .namespace = "vec:ok:", .metric = "l2", .items = &mixed_items } }));
+
+    // Op-mapped command whose target the token lacks — denied.
+    try testing.expect(!commandPermittedUnion(&state, .{ .set = .{ .key = "other:1", .value = "v" } }));
 }
 
 test {

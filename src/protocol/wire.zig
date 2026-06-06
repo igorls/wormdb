@@ -261,6 +261,12 @@ fn parseCommandPayload(cmd_id: CommandId, payload: []const u8, allocator: std.me
             pos += 4;
             const count: usize = @intCast(count_u32);
 
+            // Each item needs at least an empty key field (4B), an empty vector field (4B), and
+            // an 8B timestamp. Reject impossible counts BEFORE allocating the items array so a tiny
+            // malformed frame cannot request an attacker-controlled (multi-GB) allocation.
+            const min_item_bytes = 4 + 4 + 8;
+            if (count > (payload.len - pos) / min_item_bytes) return error.Corruption;
+
             const items = try allocator.alloc(Command.VbulkinsertParams.BulkItem, count);
             errdefer {
                 for (items, 0..) |it, i| {
@@ -861,6 +867,26 @@ test "wire roundtrip VDELETE" {
     try testing.expectEqualStrings("vec:articles:", parsed.vdelete.namespace);
 }
 
+test "wire rejects impossible VBULKINSERT count before allocation" {
+    const testing = std.testing;
+
+    // Payload: empty namespace, empty metric, flags=0, count=0xffff_ffff, and no item records.
+    // The parser must reject based on remaining bytes before attempting to allocate count items.
+    var frame: [18]u8 = undefined;
+    frame[0] = @intFromEnum(CommandId.vbulkinsert);
+    std.mem.writeInt(u32, frame[1..5], 13, .big);
+    var pos: usize = 5;
+    std.mem.writeInt(u32, frame[pos..][0..4], 0, .big);
+    pos += 4;
+    std.mem.writeInt(u32, frame[pos..][0..4], 0, .big);
+    pos += 4;
+    frame[pos] = 0;
+    pos += 1;
+    std.mem.writeInt(u32, frame[pos..][0..4], 0xffff_ffff, .big);
+
+    var reader = TestSliceReader{ .buffer = &frame };
+    try testing.expectError(error.Corruption, readFrameAlloc(&reader, testing.allocator));
+}
 
 test "wire roundtrip VRABITQ_INSTALL" {
     const testing = std.testing;

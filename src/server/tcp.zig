@@ -26,6 +26,12 @@ pub const ServerConfig = struct {
     vector_registry: ?*@import("../vector/index.zig").NamespaceRegistry = null,
     /// Number of worker threads. 0 = auto (cpu_count * 2, capped at 64).
     worker_count: usize = 0,
+    /// Whether this binary listener enforces auth. Set by the composition root to
+    /// `cfg.auth.require_auth && cfg.server.auth_enabled`. Phase 1 has no AUTH-frame handling on
+    /// the binary path, so enforce ⇒ every protected command fails closed (use the WS/QUIC
+    /// gateways for authenticated access, or disable auth on a trusted network). Default false
+    /// keeps unit tests (which never authenticate) working; the composition root sets the secure value.
+    auth_enforce: bool = false,
 };
 
 pub const Server = struct {
@@ -730,6 +736,17 @@ pub const Server = struct {
     }
 
     fn executeForConnectionWithAlloc(self: *Server, cmd: Command, conn_ctx: *ConnectionContext, alloc: std.mem.Allocator) !Response {
+        // Secure-by-default: when this binary listener enforces auth it has no way to carry a
+        // token in Phase 1, so every protected command fails closed. SUBSCRIBE/UNSUBSCRIBE are
+        // handled locally (they need conn_ctx) and so bypass the executor gate — reject them here
+        // too. Note: peer replication uses REPL_MAGIC → handleReplicationConnection, which never
+        // reaches this client path, so it is unaffected.
+        if (self.config.auth_enforce) {
+            switch (cmd) {
+                .subscribe, .unsubscribe => return Response{ .err = "auth required" },
+                else => {},
+            }
+        }
         return switch (cmd) {
             .subscribe => |channel| blk: {
                 try conn_ctx.subscribe(channel);
@@ -745,6 +762,7 @@ pub const Server = struct {
                 .event_bus = self.event_bus,
                 .cluster = self.cluster,
                 .vector_registry = self.config.vector_registry,
+                .auth = if (self.config.auth_enforce) .{ .enforce = null } else .disabled,
             }, cmd),
         };
     }

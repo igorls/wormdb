@@ -53,6 +53,12 @@ pub const ServerConfig = struct {
 
     /// Server backend
     backend: Backend = .threadpool,
+
+    /// Per-transport auth opt-out for the binary TCP / io_uring / epoll listener. Secure by
+    /// default (true): when `auth.require_auth` is set, this listener rejects unauthenticated
+    /// protected commands. Set false ONLY on a trusted network / for maximum throughput — it
+    /// disables capability checks on this transport (logged loudly at startup).
+    auth_enabled: bool = true,
 };
 
 pub const Backend = enum {
@@ -108,6 +114,13 @@ pub const GatewayConfig = struct {
 
     /// Path to TLS private key file (PEM). Required for QUIC.
     tls_key_path: ?[]const u8 = null,
+
+    /// Per-transport auth opt-out for the WebSocket gateway. Secure by default (true); set
+    /// false only on a trusted network to disable capability checks on the WS listener.
+    auth_enabled: bool = true,
+
+    /// Per-transport auth opt-out for the QUIC/WebTransport gateway. Secure by default (true).
+    quic_auth_enabled: bool = true,
 };
 
 /// Authentication configuration (Signed Capability Tokens)
@@ -201,6 +214,10 @@ test "loadFromJson: empty object uses defaults" {
     try std.testing.expectEqual(PersistenceMode.full, cfg.store.persistence);
     try std.testing.expectEqual(false, cfg.gateway.enabled);
     try std.testing.expectEqual(true, cfg.auth.require_auth);
+    // Per-transport auth is secure by default on every listener.
+    try std.testing.expectEqual(true, cfg.server.auth_enabled);
+    try std.testing.expectEqual(true, cfg.gateway.auth_enabled);
+    try std.testing.expectEqual(true, cfg.gateway.quic_auth_enabled);
 }
 
 test "loadFromJson: override specific fields" {

@@ -72,6 +72,14 @@ const PROCEDURES = [_]Entry{
     .{ .name = "mem_capabilities", .func = memory.memCapabilities },
 };
 
+/// Names of the engine's built-in procedures — for the composition root's comptime `domain.validate`
+/// (so a domain procedure that collides with a builtin is a build error, not a silent shadow).
+pub const builtin_names = blk: {
+    var acc: []const []const u8 = &.{};
+    for (PROCEDURES) |e| acc = acc ++ &[_][]const u8{e.name};
+    break :blk acc;
+};
+
 /// Look up a procedure by name. O(n) scan — n is tiny at comptime-known size.
 pub fn lookup(name: []const u8) ?ProcedureFn {
     for (&PROCEDURES) |*entry| {

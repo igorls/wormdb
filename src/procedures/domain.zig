@@ -149,6 +149,82 @@ pub fn collectWsMethods(comptime manifests: anytype) []const WsMethod {
     return list;
 }
 
+/// Comptime-validate the composed domain set, turning what would otherwise be silent first-match-wins
+/// collisions into BUILD errors at the composition site: (1) no duplicate procedure names across domains
+/// or vs the engine builtins; (2) no duplicate WS method names; (3) no HTTP route whose prefix shadows
+/// another's; (4) no overlapping table-id ranges among domains that share a segment. Call from the
+/// composition root before the register* calls:
+///   `comptime domain.validate(DOMAINS, registry.builtin_names);`
+pub fn validate(comptime manifests: anytype, comptime builtin_proc_names: []const []const u8) void {
+    @setEvalBranchQuota(100_000);
+    comptime {
+        // (1) procedure names — unique across domains and disjoint from the engine builtins.
+        var procs: []const []const u8 = builtin_proc_names;
+        for (manifests) |m| {
+            for (m.procedures) |p| {
+                for (procs) |existing| {
+                    if (std.mem.eql(u8, existing, p.name))
+                        @compileError("WormDB compose error: procedure name '" ++ p.name ++ "' collides (duplicate domain proc or clash with an engine builtin)");
+                }
+                procs = procs ++ &[_][]const u8{p.name};
+            }
+        }
+        // (2) WS method names — unique across domains.
+        var ws: []const []const u8 = &.{};
+        for (manifests) |m| {
+            for (m.ws_methods) |w| {
+                for (ws) |existing| {
+                    if (std.mem.eql(u8, existing, w.name))
+                        @compileError("WormDB compose error: duplicate WS method '" ++ w.name ++ "' across domains");
+                }
+                ws = ws ++ &[_][]const u8{w.name};
+            }
+        }
+        // (3) route prefixes — none may be a leading prefix of another (first-match-wins would shadow).
+        var routes: []const Route = &.{};
+        for (manifests) |m| routes = routes ++ m.routes;
+        for (routes, 0..) |a, ia| {
+            for (routes, 0..) |bb, ib| {
+                if (ia >= ib) continue;
+                if (prefixShadows(a.prefix, bb.prefix) or prefixShadows(bb.prefix, a.prefix))
+                    @compileError("WormDB compose error: HTTP route prefixes shadow each other (one is a leading prefix of the other)");
+            }
+        }
+        // (4) table-id ranges — disjoint for domains that share a segment name (the co-mount case).
+        for (manifests, 0..) |a, ia| {
+            for (manifests, 0..) |bb, ib| {
+                if (ia >= ib) continue;
+                if (sharesSegment(a, bb) and rangesOverlap(a, bb))
+                    @compileError("WormDB compose error: domains '" ++ a.name ++ "' and '" ++ bb.name ++ "' have overlapping table-id ranges on a shared segment");
+            }
+        }
+    }
+}
+
+fn prefixShadows(comptime a: []const []const u8, comptime b: []const []const u8) bool {
+    if (a.len > b.len) return false; // `a` can only shadow `b` if it's a leading prefix
+    for (a, 0..) |seg, i| {
+        if (!std.mem.eql(u8, seg, b[i])) return false;
+    }
+    return true;
+}
+
+fn sharesSegment(comptime a: Domain, comptime b: Domain) bool {
+    for (a.segment_names) |sa| {
+        for (b.segment_names) |sb| {
+            if (std.mem.eql(u8, sa, sb)) return true;
+        }
+    }
+    return false;
+}
+
+fn rangesOverlap(comptime a: Domain, comptime b: Domain) bool {
+    // [lo,hi] inclusive; the default {0,0} means "no range claimed" → never overlaps.
+    if (a.table_id_lo == 0 and a.table_id_hi == 0) return false;
+    if (b.table_id_lo == 0 and b.table_id_hi == 0) return false;
+    return a.table_id_lo <= b.table_id_hi and b.table_id_lo <= a.table_id_hi;
+}
+
 test {
     @import("std").testing.refAllDecls(@This());
 }

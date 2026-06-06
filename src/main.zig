@@ -17,6 +17,8 @@ const wormdb = @import("wormdb");
 // the engine exactly). Composed in via registerDomains() at startup; the engine core (lib.zig)
 // imports none of it.
 const atomicassets = @import("atomicassets/mod.zig");
+// Light-API domain package — same wiring (src/lightapi is a symlink to its own repo's src/).
+const lightapi = @import("lightapi/mod.zig");
 
 const Store = wormdb.storage.Store;
 const EventBus = wormdb.event.EventBus;
@@ -35,7 +37,7 @@ const Backend = wormdb.core.config.Backend;
 const WormDBConfig = wormdb.core.config.WormDBConfig;
 const SegmentMount = wormdb.core.config.SegmentMount;
 const loadFromFile = wormdb.core.config.loadFromFile;
-const LightApiNetwork = wormdb.lightapi.config.LightApiNetwork;
+const LightApiNetwork = lightapi.config.LightApiNetwork;
 
 // Zig 0.16: "Juicy Main" — accept std.process.Init for pre-initialized
 // allocator, Io, args, and environment.
@@ -220,7 +222,7 @@ pub fn main(init: std.process.Init) !void {
     // --- Step 4: Start WormDB with resolved config ---
     // Light-API networks are a domain config section parsed by the domain itself,
     // so core stays domain-agnostic. Empty if the file or the section is absent.
-    const la_networks = wormdb.lightapi.config.loadNetworks(config_path, allocator) catch |err| blk: {
+    const la_networks = lightapi.config.loadNetworks(config_path, allocator) catch |err| blk: {
         std.log.warn("Light-API config load failed: {s}", .{@errorName(err)});
         break :blk &.{};
     };
@@ -274,13 +276,13 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig, la_networ
     // Compose domain packages: register their EXEC procedures into the engine registry.
     // The domains live in their own repos (e.g. wormdb-domain-atomicassets); the engine core
     // imports none of them — main is the composition root that wires their manifests in.
-    wormdb.procedures.registry.registerDomains(atomicassets.manifest.procedures);
-    std.log.info("Composed domain '{s}': {d} procedures, table ids {d}..={d}", .{
-        atomicassets.manifest.name,
-        atomicassets.manifest.procedures.len,
-        atomicassets.manifest.table_id_lo,
-        atomicassets.manifest.table_id_hi,
-    });
+    const DOMAINS = .{ lightapi.manifest, atomicassets.manifest };
+    wormdb.procedures.registry.registerDomains(comptime wormdb.procedures.domain.collectProcedures(DOMAINS));
+    inline for (DOMAINS) |d| {
+        std.log.info("Composed domain '{s}': {d} procedures, table ids {d}..={d}", .{
+            d.name, d.procedures.len, d.table_id_lo, d.table_id_hi,
+        });
+    }
 
     // Attach the configured frozen segments: each a read-only mmap addressed by an
     // opaque name a serving layer looks up. The engine assigns the name no meaning;
@@ -307,7 +309,7 @@ fn startServer(allocator: std.mem.Allocator, cfg: *const WormDBConfig, la_networ
     // Seed the Light-API chain metadata from the domain config (a no-op when no networks
     // are configured), so serving a snapshot segment needs no external loader. The live
     // feed overwrites block_num/sync later.
-    wormdb.lightapi.seed.run(&store, allocator, la_networks) catch |err| {
+    lightapi.seed.run(&store, allocator, la_networks) catch |err| {
         std.log.warn("Light-API metadata seed failed: {s}", .{@errorName(err)});
     };
 

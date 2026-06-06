@@ -17,12 +17,11 @@ pub const cluster = @import("cluster/mod.zig");
 pub const procedures = @import("procedures/mod.zig");
 pub const vector = @import("vector/mod.zig");
 
-// Domain serving layers — these depend on the engine above; the engine never
-// depends on them. Blockchain/Antelope knowledge lives only here and in `procedures`.
-// (AtomicAssets now lives in its own package, wormdb-domain-atomicassets, composed in by
-// the binary at build time — see build.zig + main.zig.)
+// Antelope codecs — a shared leaf library used by the domain packages (Light-API, AtomicAssets).
+// Not a serving domain itself; the engine exposes it so domains import it via @import("wormdb").
+// (Light-API + AtomicAssets each now live in their own package, composed into the binary at build
+// time — see build.zig + main.zig.)
 pub const antelope = @import("antelope/mod.zig");
-pub const lightapi = @import("lightapi/mod.zig");
 
 // Re-export commonly used types
 pub const Entry = core.types.Entry;

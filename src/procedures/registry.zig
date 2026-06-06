@@ -24,24 +24,9 @@ pub const vrabitq = @import("vrabitq.zig");
 pub const vdelete = @import("vdelete.zig");
 pub const vnsdrop = @import("vnsdrop.zig");
 pub const memory = @import("memory.zig");
-pub const lightapi_balances = @import("lightapi_balances.zig");
-pub const lightapi_account = @import("lightapi_account.zig");
-pub const lightapi_accinfo = @import("lightapi_accinfo.zig");
-pub const lightapi_tokenbalance = @import("lightapi_tokenbalance.zig");
-pub const lightapi_get = @import("lightapi_get.zig");
-pub const lightapi_topholders = @import("lightapi_topholders.zig");
-pub const lightapi_holdercount = @import("lightapi_holdercount.zig");
-pub const lightapi_topn = @import("lightapi_topn.zig");
-pub const lightapi_sync = @import("lightapi_sync.zig");
-pub const lightapi_status = @import("lightapi_status.zig");
-pub const lightapi_ws = @import("lightapi_ws.zig");
-pub const lightapi_rexbalance = @import("lightapi_rexbalance.zig");
-pub const lightapi_topram = @import("lightapi_topram.zig");
-pub const lightapi_codehash = @import("lightapi_codehash.zig");
-pub const lightapi_key = @import("lightapi_key.zig");
-pub const lightapi_networks = @import("lightapi_networks.zig");
-// AtomicAssets procedures are NOT imported here — they live in their own package
-// (wormdb-domain-atomicassets) and are registered at startup via registerDomains().
+// Light-API + AtomicAssets procedures are NOT imported here — they live in their own packages
+// (wormdb-domain-lightapi, wormdb-domain-atomicassets) and are registered at startup via
+// registerDomains() from each package's manifest.
 
 pub const ProcedureFn = domain.ProcFn;
 
@@ -85,25 +70,6 @@ const PROCEDURES = [_]Entry{
     .{ .name = "mem_drop", .func = memory.memDrop },
     .{ .name = "mem_reset_index", .func = memory.memResetIndex },
     .{ .name = "mem_capabilities", .func = memory.memCapabilities },
-    .{ .name = "lightapi_balances", .func = lightapi_balances.execute },
-    .{ .name = "lightapi_account", .func = lightapi_account.execute },
-    .{ .name = "lightapi_accinfo", .func = lightapi_accinfo.execute },
-    .{ .name = "lightapi_tokenbalance", .func = lightapi_tokenbalance.execute },
-    .{ .name = "lightapi_get", .func = lightapi_get.execute },
-    .{ .name = "lightapi_topholders", .func = lightapi_topholders.execute },
-    .{ .name = "lightapi_holdercount", .func = lightapi_holdercount.execute },
-    .{ .name = "lightapi_topn", .func = lightapi_topn.execute },
-    .{ .name = "lightapi_sync", .func = lightapi_sync.execute },
-    .{ .name = "lightapi_status", .func = lightapi_status.execute },
-    .{ .name = "lightapi_ws_balances", .func = lightapi_ws.balancesRow },
-    .{ .name = "lightapi_ws_holders", .func = lightapi_ws.holderRows },
-    .{ .name = "lightapi_ws_keyrows", .func = lightapi_ws.keyRows },
-    .{ .name = "lightapi_rexbalance", .func = lightapi_rexbalance.execute },
-    .{ .name = "lightapi_topram", .func = lightapi_topram.executeRam },
-    .{ .name = "lightapi_topstake", .func = lightapi_topram.executeStake },
-    .{ .name = "lightapi_codehash", .func = lightapi_codehash.execute },
-    .{ .name = "lightapi_key", .func = lightapi_key.execute },
-    .{ .name = "lightapi_networks", .func = lightapi_networks.execute },
 };
 
 /// Look up a procedure by name. O(n) scan — n is tiny at comptime-known size.

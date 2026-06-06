@@ -34,6 +34,14 @@ pub const Domain = struct {
     procedures: []const Entry = &.{},
 };
 
+/// Flatten the procedures of several domain manifests into one slice at comptime — the composition
+/// root passes the result to `registry.registerDomains`. `manifests` is a tuple/array of `Domain`s.
+pub fn collectProcedures(comptime manifests: anytype) []const Entry {
+    var list: []const Entry = &.{};
+    inline for (manifests) |m| list = list ++ m.procedures;
+    return list;
+}
+
 test {
     @import("std").testing.refAllDecls(@This());
 }

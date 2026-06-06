@@ -30,16 +30,21 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption(bool, "quic", enable_quic);
 
-    // MeshGuard library module (embedded mesh networking)
+    // MeshGuard library module (embedded mesh networking). Use b.path (relative to THIS
+    // package's root) not .cwd_relative, so wormdb resolves correctly when consumed as a
+    // dependency from another package (e.g. wormdb-domain-atomicassets).
     const meshguard_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = "deps/meshguard/src/lib.zig" },
+        .root_source_file = b.path("deps/meshguard/src/lib.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
 
-    // WormDB library module
-    const wormdb_mod = b.createModule(.{
+    // WormDB library module — exposed via addModule so downstream packages (domain
+    // extensions in their own repos, e.g. wormdb-domain-atomicassets) can consume the real
+    // engine types (Store, Ctx, Segment, Domain, …) with `@import("wormdb")`. linkSodium is
+    // applied to the module itself so consumers inherit the libsodium link transitively.
+    const wormdb_mod = b.addModule("wormdb", .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
@@ -49,6 +54,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "build_options", .module = build_options.createModule() },
         },
     });
+    linkSodium(b, wormdb_mod, is_windows);
 
     // Main executable
     const exe_mod = b.createModule(.{

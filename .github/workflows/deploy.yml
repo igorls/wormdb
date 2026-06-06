@@ -1,8 +1,11 @@
-name: Deploy VitePress site to Pages
+name: Deploy teaser site to Pages
 
 on:
   push:
     branches: [main]
+    paths:
+      - 'landing/**'
+      - '.github/workflows/deploy.yml'
   # Allow running manually from the Actions tab
   workflow_dispatch:
 
@@ -17,6 +20,9 @@ concurrency:
   group: pages
   cancel-in-progress: true
 
+# WormDB is private and not open-source at launch. GitHub Pages serves ONLY the
+# static teaser in landing/ — the docs/ VitePress site is intentionally NOT built
+# or published here, so internal documentation never leaves the repo.
 jobs:
   deploy:
     environment:
@@ -26,24 +32,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - name: Install dependencies
-        run: bun install
-
-      - name: Build with VitePress
-        run: bun run docs:build
-
-      - name: Upload artifact
+      - name: Upload teaser artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: docs/.vitepress/dist
+          path: landing
 
       - name: Deploy to GitHub Pages
         id: deployment

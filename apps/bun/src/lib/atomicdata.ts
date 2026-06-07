@@ -56,6 +56,14 @@ class Cursor {
 // ZigZag decode (signed intN): even -> n/2, odd -> -(n/2)-1. Identical to the contract.
 function zigzag(u: bigint): bigint { return (u >> 1n) ^ -(u & 1n); }
 
+// A varuint used as a length / identifier / count -> a JS number, guarded so a malformed oversized
+// varuint can't lose precision (and thus mis-route an identifier or request a giant allocation).
+const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
+function toLen(v: bigint): number {
+  if (v > MAX_SAFE) throw new Error("atomicdata: length/identifier exceeds MAX_SAFE_INTEGER");
+  return Number(v);
+}
+
 function leF32(b: Uint8Array): number { return new DataView(b.buffer, b.byteOffset, 4).getFloat32(0, true); }
 function leF64(b: Uint8Array): number { return new DataView(b.buffer, b.byteOffset, 8).getFloat64(0, true); }
 function leU(b: Uint8Array): bigint { let v = 0n; for (let i = b.length - 1; i >= 0; i--) v = (v << 8n) | BigInt(b[i]); return v; }
@@ -88,12 +96,13 @@ function hex(b: Uint8Array): string {
 
 const utf8 = new TextDecoder();
 
-type Value = number | string | boolean | Value[];
+type Value = number | string | boolean | null | Value[];
 
 function decodeAttribute(ty: string, c: Cursor): Value {
   if (ty.endsWith("[]")) {
     const base = ty.slice(0, -2);
-    const n = Number(c.varuint());
+    const n = toLen(c.varuint());
+    if (n > c.remaining()) throw new Error("atomicdata: array count exceeds remaining bytes"); // each elem ≥1 byte
     const arr: Value[] = [];
     for (let i = 0; i < n; i++) arr.push(decodeAttribute(base, c));
     return arr;
@@ -116,11 +125,11 @@ function decodeAttribute(ty: string, c: Cursor): Value {
     case "fixed64": return leU(c.take(8)).toString();
     case "byte": return c.u8();
     case "bool": return c.u8() === 1 ? 1 : 0; // 0/1 number, atomicassets-js parity
-    case "float": { const f = leF32(c.take(4)); return Number.isFinite(f) ? f : (null as unknown as Value); }
-    case "double": { const f = leF64(c.take(8)); return Number.isFinite(f) ? f : (null as unknown as Value); }
-    case "string": case "image": { const n = Number(c.varuint()); return utf8.decode(c.take(n)); }
-    case "ipfs": { const n = Number(c.varuint()); return base58(c.take(n)); }
-    case "bytes": { const n = Number(c.varuint()); return hex(c.take(n)); }
+    case "float": { const f = leF32(c.take(4)); return Number.isFinite(f) ? f : null; }
+    case "double": { const f = leF64(c.take(8)); return Number.isFinite(f) ? f : null; }
+    case "string": case "image": { const n = toLen(c.varuint()); return utf8.decode(c.take(n)); }
+    case "ipfs": { const n = toLen(c.varuint()); return base58(c.take(n)); }
+    case "bytes": { const n = toLen(c.varuint()); return hex(c.take(n)); }
     default: throw new Error(`atomicdata: unsupported attribute type '${ty}'`);
   }
 }
@@ -131,7 +140,7 @@ export function deserialize(data: Uint8Array | number[], format: Field[]): { idx
   const c = new Cursor(data instanceof Uint8Array ? data : Uint8Array.from(data));
   const out: { idx: number; name: string; value: Value }[] = [];
   while (c.remaining() > 0) {
-    const id = Number(c.varuint());
+    const id = toLen(c.varuint());
     const idx = id - RESERVED;
     if (idx < 0) throw new Error(`atomicdata: identifier ${id} < RESERVED(${RESERVED})`);
     const field = format[idx];

@@ -80,7 +80,7 @@ describe("canonVal + toAttrPairs (overlay string form, matches bson_canon)", () 
     expect(canonVal("265328800")).toBe("265328800"); // uint64 already a string
     expect(canonVal([18, 123, 33, 912])).toBe("[18,123,33,912]");
     expect(canonVal(["a", "b"])).toBe("[a,b]"); // string elements unquoted, matching bson_canon
-    expect(canonVal(null as any)).toBe(""); // non-finite float/double -> Null -> "" (NOT "null")
+    expect(canonVal(null)).toBe(""); // non-finite float/double -> Null -> "" (NOT "null")
   });
 
   test("a non-finite float decodes + canonicalizes to '' like bson_canon's Bson::Null", () => {

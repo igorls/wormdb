@@ -188,6 +188,12 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(ffi_lib);
 
+    // `zig build ffi` builds ONLY the embedding library. Needed for darwin cross
+    // targets (iOS) where the standalone exe can't link libSystem without the SDK,
+    // but the static lib compiles fine with `--sysroot $(xcrun --show-sdk-path)`.
+    const ffi_step = b.step("ffi", "Build only the embedding FFI library (libwormdb_ffi)");
+    ffi_step.dependOn(&b.addInstallArtifact(ffi_lib, .{}).step);
+
     // Unit tests for the engine.
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),

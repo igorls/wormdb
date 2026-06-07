@@ -166,6 +166,28 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the basic WormDB server");
     run_step.dependOn(&run_exe.step);
 
+    // Embedding FFI library — a C ABI over the engine for native apps (iOS/Swift,
+    // Android/JNI). Single-node, in-process; see src/ffi.zig and ffi/wormdb.h.
+    // iOS must static-link (apps cannot dlopen user dylibs); everything else gets
+    // a shared library by default.
+    const ffi_mod = b.createModule(.{
+        .root_source_file = b.path("src/ffi.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "wormdb", .module = wormdb_mod },
+        },
+    });
+    linkCrypto(b, ffi_mod, os_tag, abi, use_libsodium);
+    if (enable_quic) linkQuic(b, ffi_mod);
+    const ffi_lib = b.addLibrary(.{
+        .name = "wormdb_ffi",
+        .root_module = ffi_mod,
+        .linkage = if (os_tag == .ios) .static else .dynamic,
+    });
+    b.installArtifact(ffi_lib);
+
     // Unit tests for the engine.
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),

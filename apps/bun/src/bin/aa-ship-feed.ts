@@ -35,7 +35,7 @@ const execProc = async (procedure: string, args: string[]) => {
   // WormClient resolves an ERR response to {type:"error"} rather than throwing — surface it so a failed
   // aa_mint/aa_burn isn't silently treated as applied (which would advance the checkpoint + ACK past it).
   const r: any = await worm.sendCommand({ kind: "EXEC", procedure, args });
-  if (r?.type === "error") throw new Error(`EXEC ${procedure} -> ${r.value ?? "ERR"}`);
+  if (r?.type === "error") throw new Error(`EXEC ${procedure} -> ${r.value ?? r.message ?? r.error ?? "ERR"}`);
   return r;
 };
 async function getKey(k: string): Promise<string | null> {
@@ -129,9 +129,14 @@ async function applyBlock(blk: any, ws: WebSocket) {
     if (removed.has(assetId)) {
       // TRANSFER: old-owner present=false + new-owner present=true. aa_transfer PRESERVES the existing
       // forward record (block_num, template_mint, immutable/mutable data) and only moves the owner +
-      // owner add-sets — unlike aa_mint, which would reset those to the transfer block / 0. If the asset
-      // isn't known yet (mint+transfer in the same block), fall through to minting it.
-      try { await execProc("aa_transfer", [assetId, owner]); transfers++; continue; } catch { /* mint below */ }
+      // owner add-sets — unlike aa_mint, which would reset those to the transfer block / 0.
+      try { await execProc("aa_transfer", [assetId, owner]); transfers++; continue; } catch (e) {
+        // ONLY a verified "asset not known yet" (a mint+transfer in the SAME block) falls back to minting.
+        // Any other failure (transient WormWire timeout, proc/config error, internal EXEC error) must
+        // propagate so the block retries — falling through to aa_mint otherwise would reintroduce the very
+        // metadata reset aa_transfer exists to avoid, for a real transfer of an existing asset.
+        if (!/unknown or burned/i.test((e as Error).message)) throw e;
+      }
     }
     const r = await assetRow(owner, assetId);
     if (!r) continue; // raced (already moved/burned) — a later block's delta will correct it

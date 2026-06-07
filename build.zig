@@ -94,8 +94,15 @@ pub fn build(b: *std.Build) void {
     //   std    → std.crypto everywhere (no libsodium link)
     //   sodium → force libsodium (link must be available for the target)
     const CryptoBackend = enum { auto, std, sodium };
-    const crypto_backend = b.option(CryptoBackend, "crypto-backend", "Crypto backend: auto|std|sodium (default auto)") orelse .auto;
+    const crypto_backend_opt = b.option(CryptoBackend, "crypto-backend", "Crypto backend: auto|std|sodium (default auto)");
     const no_sodium = b.option(bool, "no-sodium", "Alias for -Dcrypto-backend=std") orelse false;
+    // Fail fast on contradictory flags rather than silently letting one win.
+    if (no_sodium and (crypto_backend_opt orelse .std) == .sodium) {
+        std.debug.print("error: -Dno-sodium=true conflicts with -Dcrypto-backend=sodium\n" ++
+            "  (-Dno-sodium is an alias for -Dcrypto-backend=std)\n", .{});
+        std.process.exit(1);
+    }
+    const crypto_backend = crypto_backend_opt orelse .auto;
     const auto_libsodium = (os_tag == .linux and abi != .android);
     const use_libsodium = if (no_sodium) false else switch (crypto_backend) {
         .std => false,

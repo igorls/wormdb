@@ -1,0 +1,9 @@
+# Build context = apps/bun (Dockerfile.feed). The repo-root .dockerignore is outside this context, so
+# exclude here — otherwise `COPY . .` would pull a host/CI node_modules over the freshly `bun install`ed
+# deps (bloat + arch-mismatched native modules).
+node_modules
+.git
+*.log
+dist
+build
+.DS_Store

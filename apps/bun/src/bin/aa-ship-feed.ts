@@ -31,7 +31,13 @@ const START = Number(Bun.env.START ?? 0); // checkpoint wins; else this; else LI
 
 const worm = new WormClient({ host: WORMHOST, port: PORT, keepAlive: true, timeoutMs: 60_000 });
 const set = (k: string, v: string) => worm.sendCommand({ kind: "SET", key: k, value: v, worm: false });
-const execProc = (procedure: string, args: string[]) => worm.sendCommand({ kind: "EXEC", procedure, args });
+const execProc = async (procedure: string, args: string[]) => {
+  // WormClient resolves an ERR response to {type:"error"} rather than throwing — surface it so a failed
+  // aa_mint/aa_burn isn't silently treated as applied (which would advance the checkpoint + ACK past it).
+  const r: any = await worm.sendCommand({ kind: "EXEC", procedure, args });
+  if (r?.type === "error") throw new Error(`EXEC ${procedure} -> ${r.value ?? "ERR"}`);
+  return r;
+};
 async function getKey(k: string): Promise<string | null> {
   const r = await worm.sendCommand({ kind: "GET", key: k });
   const v = (r as any)?.value ?? (r as any)?.data ?? null;
@@ -117,8 +123,16 @@ async function applyBlock(blk: any, ws: WebSocket) {
     }
   }
   let mints = 0;
+  let transfers = 0;
   let burns = 0;
   for (const [assetId, owner] of present) {
+    if (removed.has(assetId)) {
+      // TRANSFER: old-owner present=false + new-owner present=true. aa_transfer PRESERVES the existing
+      // forward record (block_num, template_mint, immutable/mutable data) and only moves the owner +
+      // owner add-sets — unlike aa_mint, which would reset those to the transfer block / 0. If the asset
+      // isn't known yet (mint+transfer in the same block), fall through to minting it.
+      try { await execProc("aa_transfer", [assetId, owner]); transfers++; continue; } catch { /* mint below */ }
+    }
     const r = await assetRow(owner, assetId);
     if (!r) continue; // raced (already moved/burned) — a later block's delta will correct it
     await execProc("aa_mint", [
@@ -149,8 +163,8 @@ async function applyBlock(blk: any, ws: WebSocket) {
     await set("syncchains", CHAIN);
     if (firstSync) { await set(`syncthr:${CHAIN}`, "240"); firstSync = false; }
   }
-  await set(`aa:meta:block:${CHAIN}`, String(bnum)); // resume checkpoint
-  if (mints || burns) console.log(`[aa-ship] block ${bnum} mint/update=${mints} burn=${burns}`);
+  await set(`aa:meta:block:${CHAIN}`, String(bnum)); // resume checkpoint (only reached if all EXECs applied)
+  if (mints || transfers || burns) console.log(`[aa-ship] block ${bnum} mint=${mints} xfer=${transfers} burn=${burns}`);
   send(ws, "get_blocks_ack_request_v0", { num_messages: 1 });
 }
 
@@ -182,9 +196,21 @@ ws.onmessage = async (ev) => {
     });
   } else if (variant === "get_blocks_result_v0") {
     if (!val.this_block) { send(ws, "get_blocks_ack_request_v0", { num_messages: 1 }); return; }
-    applyTail = applyTail
-      .then(() => applyBlock(val, ws))
-      .catch((e) => { console.log(`[aa-ship] applyBlock error:`, (e as Error).message); send(ws, "get_blocks_ack_request_v0", { num_messages: 1 }); });
+    // applyBlock is idempotent (re-decode + re-EXEC; aa_mint/transfer/burn overwrite/dedupe; the
+    // checkpoint + ACK are its LAST step, only reached on full success). On error, retry the same block
+    // a few times, then HALT (no ACK, no checkpoint advance) rather than silently skipping it — a skipped
+    // mint/burn would be lost until a segment rebuild. The operator fixes the cause and restarts (resumes
+    // from the checkpoint).
+    const bn = Number(val.this_block?.block_num ?? 0);
+    applyTail = applyTail.then(async () => {
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        try { await applyBlock(val, ws); return; } catch (e) {
+          console.log(`[aa-ship] block ${bn} apply failed (attempt ${attempt}/5): ${(e as Error).message}`);
+          if (attempt < 5) await new Promise((r) => setTimeout(r, 500 * attempt));
+        }
+      }
+      console.log(`[aa-ship] HALTED at block ${bn} — not ACKing/checkpointing (avoids silent loss); fix + restart.`);
+    });
   }
 };
 ws.onerror = (e: any) => console.log("[aa-ship] WS error:", e?.message ?? e);

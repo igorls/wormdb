@@ -60,7 +60,15 @@ async function chain(path: string, body: unknown): Promise<any> {
     headers: { Host: "127.0.0.1", "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  return r.json();
+  // Reject a transient/API error (500/429/validation) here — otherwise assetRow would see no `rows` and
+  // applyBlock would mistake a failed render for a benign race and checkpoint PAST a skipped mint/update.
+  // A real "no match" is HTTP 200 with `rows: []`, which passes through to the caller.
+  if (!r.ok) throw new Error(`chain ${path} HTTP ${r.status}`);
+  const j: any = await r.json();
+  if (j?.error || (typeof j?.code === "number" && j.code >= 400)) {
+    throw new Error(`chain ${path} API error: ${JSON.stringify(j.error ?? j.message ?? j).slice(0, 200)}`);
+  }
+  return j;
 }
 
 // Fetch one atomicassets `assets` row (current state) by owner-scope + asset_id.

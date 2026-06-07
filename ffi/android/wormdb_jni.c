@@ -70,3 +70,9 @@ Java_dev_wormdb_WormDB_nativeDelete(JNIEnv *env, jobject self, jlong handle, jby
     (*env)->ReleaseByteArrayElements(env, key, kp, JNI_ABORT);
     return rc;
 }
+
+JNIEXPORT jstring JNICALL
+Java_dev_wormdb_WormDB_nativeVersion(JNIEnv *env, jobject self, jlong handle) {
+    (void)self; (void)handle;
+    return (*env)->NewStringUTF(env, wormdb_version());
+}

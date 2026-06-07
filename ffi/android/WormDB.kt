@@ -36,6 +36,9 @@ class WormDB(path: String, persistence: Int = PERSIST_FULL) : AutoCloseable {
 
     fun delete(key: String) = delete(key.toByteArray())
 
+    /** Engine version string (e.g. "wormdb-ffi 0.1"). */
+    fun version(): String = nativeVersion(handle)
+
     override fun close() = nativeClose(handle)
 
     private external fun nativeOpen(path: String, persistence: Int): Long
@@ -43,6 +46,7 @@ class WormDB(path: String, persistence: Int = PERSIST_FULL) : AutoCloseable {
     private external fun nativeSet(handle: Long, key: ByteArray, value: ByteArray, worm: Boolean): Int
     private external fun nativeGet(handle: Long, key: ByteArray): ByteArray?
     private external fun nativeDelete(handle: Long, key: ByteArray): Int
+    private external fun nativeVersion(handle: Long): String
 
     companion object {
         const val PERSIST_FULL = 0      // WAL every write + snapshots (durable)

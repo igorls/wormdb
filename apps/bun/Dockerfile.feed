@@ -1,0 +1,10 @@
+# AtomicAssets SHiP → WormDB overlay feed (Phase 2). Built from the wormdb bun app (build context =
+# apps/bun). Run by the aa-stack compose as the `aa-feed` service; EXECs aa_mint/aa_transfer/aa_burn
+# over WormWire into wormdb-aa:6389, fed by a nodeos State-History websocket.
+FROM oven/bun:1.3-slim
+WORKDIR /app
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile
+COPY . .
+# the feed is long-lived; env (SHIP, CHAIN_API, CHAIN, WORMHOST, PORT, START, AA_CONTRACT) comes from compose.
+ENTRYPOINT ["bun", "run", "src/bin/aa-ship-feed.ts"]

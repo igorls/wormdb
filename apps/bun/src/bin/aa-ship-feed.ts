@@ -195,7 +195,15 @@ ws.onmessage = async (ev) => {
   if (variant === "get_status_result_v0") {
     const lib = Number(val.last_irreversible.block_num);
     const checkpoint = await getKey(`aa:meta:block:${CHAIN}`);
-    const start = checkpoint ? Number(checkpoint) + 1 : START > 0 ? START : lib;
+    let start = checkpoint ? Number(checkpoint) + 1 : START > 0 ? START : lib;
+    // A start below the node's State-History retention yields NO blocks (SHiP can't serve them) and the
+    // feed would silently hang. Clamp up to the available range and warn — the skipped span is a backfill
+    // gap (e.g. snapshot block far older than what the node still retains).
+    const csBegin = Number(val.chain_state_begin_block ?? 0);
+    if (csBegin > 0 && start < csBegin) {
+      console.log(`[aa-ship] WARNING: start ${start} < SHiP retention begin ${csBegin}; clamping to ${csBegin} — blocks ${start}..${csBegin - 1} are a backfill gap (older than the node retains).`);
+      start = csBegin;
+    }
     console.log(`[aa-ship] status: LIB=${lib}; resume from ${start}${checkpoint ? ` (checkpoint ${checkpoint})` : ""}`);
     send(ws, "get_blocks_request_v0", {
       start_block_num: start,

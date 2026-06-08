@@ -117,6 +117,8 @@ All integers are unsigned big-endian:
 
 The verifier rejects unsupported accumulator kinds, malformed proof bytes, `leaf_index != seq - 1`, and inclusion paths that do not reconstruct the signed checkpoint root.
 
+Canonical decoders reject `path_len > 63` and `peak_count > 64` before allocation. These are the maximum structural counts for an MMR over a `u64` leaf count.
+
 ## Verification Algorithm
 
 A verifier should:

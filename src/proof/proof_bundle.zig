@@ -5,6 +5,7 @@
 //! node. The concrete accumulator path codec is injected by callback.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const checkpoint = @import("checkpoint.zig");
 const mmr = @import("mmr.zig");
 
@@ -314,6 +315,8 @@ test "record verifier detects payload tampering" {
 }
 
 fn fixedTestKeypair() !struct { public_key: checkpoint.PublicKey, secret_key: [checkpoint.SIGNATURE_LEN]u8 } {
+    if (!builtin.is_test) @compileError("fixedTestKeypair is test-only");
+
     var public_key: checkpoint.PublicKey = undefined;
     var secret_key: [checkpoint.SIGNATURE_LEN]u8 = undefined;
     _ = try std.fmt.hexToBytes(

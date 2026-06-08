@@ -85,6 +85,8 @@ Replication happens **after local commit**. The client receives `OK` once the or
 This is an **eventually consistent** model. If a node crashes after local commit but before replication completes, other nodes may be missing the latest write. There is no quorum or consensus protocol.
 :::
 
+For WORM append logs, the planned proof layer will add meshguard-backed checkpoint witnessing and root-based anti-entropy on top of this replication model. Peers will exchange compact roots first, request missing ranges when possible, and fall back to the current full-state sync when proofs are unavailable. See [Replication Proofs](/architecture/replication-proofs).
+
 ## Cluster Flags
 
 | Flag                 | Description                                 | Default  |

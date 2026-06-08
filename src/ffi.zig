@@ -7,7 +7,8 @@
 //! Header: ffi/wormdb.h.
 //!
 //! Memory: values returned by wormdb_get are owned by the library and must be
-//! released with wormdb_free. All other buffers are caller-owned.
+//! released with wormdb_free. Scan callback key/value pointers are borrowed and
+//! valid only until the callback returns. All other buffers are caller-owned.
 //!
 //! Threading: the store is internally sharded with per-shard locks, so calls
 //! from multiple threads are safe. A single Db handle may be shared freely.
@@ -41,6 +42,34 @@ const ERR: c_int = -1;
 const PERSIST_FULL: c_int = 0; // WAL on every write + snapshots (durable)
 const PERSIST_SNAPSHOT: c_int = 1; // load/save only, no per-write IO
 const PERSIST_NONE: c_int = 2; // pure in-memory
+
+/// Stable receipt metadata exposed through the C ABI.
+pub const EntryMeta = extern struct {
+    timestamp_ms: u64,
+    is_worm: c_int,
+    value_len: usize,
+    value_sha256: [32]u8,
+};
+
+const ScanCallback = *const fn (
+    ctx: ?*anyopaque,
+    key: [*]const u8,
+    key_len: usize,
+    value: [*]const u8,
+    value_len: usize,
+    meta: *const EntryMeta,
+) callconv(.c) c_int;
+
+fn entryMetaFromScanResult(result: Store.ScanResult) EntryMeta {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(result.value, &digest, .{});
+    return .{
+        .timestamp_ms = result.timestamp,
+        .is_worm = if (result.is_worm) 1 else 0,
+        .value_len = result.value.len,
+        .value_sha256 = digest,
+    };
+}
 
 /// Open (or create) a database rooted at `dir`. WAL + snapshot live under it.
 /// `persistence` is one of WORMDB_PERSIST_*. Returns null on failure.
@@ -121,6 +150,54 @@ export fn wormdb_get(db: *Db, key: [*]const u8, key_len: usize, out_val: *?[*]u8
     return NOT_FOUND;
 }
 
+/// Get entry receipt metadata. On WORMDB_OK, out_meta is populated with the
+/// local ingest timestamp, WORM flag, value length, and SHA-256(value).
+export fn wormdb_get_meta(db: *Db, key: [*]const u8, key_len: usize, out_meta: *EntryMeta) c_int {
+    const maybe = db.store.getEntryMetadata(key[0..key_len]);
+    if (maybe) |meta| {
+        out_meta.* = .{
+            .timestamp_ms = meta.timestamp,
+            .is_worm = if (meta.is_worm) 1 else 0,
+            .value_len = meta.value_len,
+            .value_sha256 = meta.value_sha256,
+        };
+        return OK;
+    }
+    return NOT_FOUND;
+}
+
+/// Scan entries with keys matching prefix in lexicographic key order. `limit`
+/// follows Store.scanPrefix semantics: 0 means no limit; otherwise the newest
+/// lexicographic tail is returned. Callback key/value pointers and the metadata
+/// pointer are borrowed and valid only until the callback returns. If callback
+/// returns non-zero, scanning stops early and WORMDB_OK is returned.
+export fn wormdb_scan_prefix(
+    db: *Db,
+    prefix: [*]const u8,
+    prefix_len: usize,
+    limit: usize,
+    ctx: ?*anyopaque,
+    callback: ?ScanCallback,
+) c_int {
+    const cb = callback orelse return ERR;
+    const results = db.store.scanPrefix(prefix[0..prefix_len], limit, gpa) catch return ERR;
+    defer {
+        for (results) |result| {
+            gpa.free(result.key);
+            gpa.free(result.value);
+        }
+        gpa.free(results);
+    }
+
+    for (results) |result| {
+        const meta = entryMetaFromScanResult(result);
+        if (cb(ctx, result.key.ptr, result.key.len, result.value.ptr, result.value.len, &meta) != 0) {
+            break;
+        }
+    }
+    return OK;
+}
+
 /// Delete key. Missing keys succeed; deleting a WORM key returns WORMDB_ERR.
 export fn wormdb_delete(db: *Db, key: [*]const u8, key_len: usize) c_int {
     db.store.delete(key[0..key_len]) catch return ERR;
@@ -134,5 +211,5 @@ export fn wormdb_free(ptr: ?[*]u8, len: usize) void {
 
 /// Library version string (static, do not free).
 export fn wormdb_version() [*:0]const u8 {
-    return "wormdb-ffi 0.1";
+    return "wormdb-ffi 0.2";
 }

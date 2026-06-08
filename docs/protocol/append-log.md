@@ -14,7 +14,7 @@ The binary big-endian sequence suffix keeps prefix scans sorted by sequence. Seq
 
 ## Envelope Format
 
-All integer fields are unsigned big-endian. The `event_hash` is `SHA-256` over every byte before the final `event_hash` field.
+All integer fields are unsigned big-endian. The `event_hash` is the linear chain hash: `SHA-256` over every byte before the final `event_hash` field.
 
 ```text
 [8B magic = "WDBALOG1"]
@@ -32,6 +32,8 @@ All integer fields are unsigned big-endian. The `event_hash` is `SHA-256` over e
 ```
 
 `payload_hash` is `SHA-256(payload bytes)`. For the first event in a log, `prev_event_hash` is 32 zero bytes. For every later event, it must equal the previous event's `event_hash`.
+
+Proof bundles use a separate `record_hash = SHA-256(full canonical envelope bytes)`. That hash includes the trailing `event_hash` and is the leaf material used by the MMR proof path.
 
 `ingest_time_ms` is a generic local database receipt timestamp in Unix epoch milliseconds. It is not a claim that the real-world event happened at that time; applications that need device time, GPS time, or signed time claims should include those claims in the payload and sign them at the application layer.
 

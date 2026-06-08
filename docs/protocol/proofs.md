@@ -91,7 +91,33 @@ Each inclusion proof carries:
 - `path_bytes`
 - optional `extension_bytes`
 
-The proof module treats `path_bytes` as opaque. Worker C's accumulator implementation owns Merkle/MMR path codecs and inclusion math. The verifier callback receives the accumulator kind, root, leaf hash, sequence number, and path bytes.
+For `mmr_sha256_v1`, `leaf_hash` is the proof-bundle `record_hash`, where `record_hash = SHA-256(full canonical append-log envelope bytes)`. The append-log `event_hash` remains the linear chain hash over the envelope preimage before the trailing `event_hash` field.
+
+## MMR Proof Bytes
+
+`mmr_sha256_v1` inclusion proofs use canonical path bytes so bundles can be verified without a live database. The append-log MMR leaf index is `seq - 1`.
+
+All integers are unsigned big-endian:
+
+```text
+[7B magic = "WDBMMR1"]
+[2B version = 1]
+[8B leaf_index]
+[8B leaf_count]
+[4B peak_index]
+[4B path_len]
+  repeated path_len times:
+  [1B side: 0 = left, 1 = right]
+  [32B sibling_hash]
+[4B peak_count]
+  repeated peak_count times:
+  [1B height]
+  [32B peak_hash]
+```
+
+The verifier rejects unsupported accumulator kinds, malformed proof bytes, `leaf_index != seq - 1`, and inclusion paths that do not reconstruct the signed checkpoint root.
+
+Canonical decoders reject `path_len > 63` and `peak_count > 64` before allocation. These are the maximum structural counts for an MMR over a `u64` leaf count.
 
 ## Verification Algorithm
 
@@ -109,3 +135,15 @@ A verifier should:
 10. Ask the accumulator verifier to validate the inclusion path against the checkpoint root.
 
 The current code slice implements this verifier skeleton in `src/proof/proof_bundle.zig` and the checkpoint signature/hash rules in `src/proof/checkpoint.zig`.
+
+## Golden Vector
+
+The proof-spine test vector appends three deterministic WORM records to log `proof-spine:golden`, uses `SHA-256(full envelope bytes)` as each MMR leaf, signs one checkpoint covering `1..3`, and verifies the resulting range bundle.
+
+| Item | Hex |
+| --- | --- |
+| Event 1 `event_hash` | `87832c30e5bfea3d6a6493306e5ced774c68c2d5e9d34e14b8d1ff41c9be3da1` |
+| Event 2 `event_hash` | `d50efb4e4f5ab725a3eeed61540e124f186e19ac63f722921973fba48f5429b0` |
+| Event 3 `event_hash` | `cafe05fb1ac07c1170d1508465c362102b584ecb794c5d609dee20b6b6acca73` |
+| MMR root | `4c54ffe73285539577648522f02edd900db8446ec6fbc96db32b2437759e0992` |
+| Checkpoint hash | `223a06ecece492e00ab05c342061afe7ce72b8c180028d8acccb42f5480f071c` |

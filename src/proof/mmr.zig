@@ -9,16 +9,29 @@ const std = @import("std");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-pub const Hash = [32]u8;
+pub const HASH_LEN: usize = 32;
+pub const Hash = [HASH_LEN]u8;
 
 pub const DOMAIN_LEAF = "wormdb.proof.mmr.leaf.v1";
 pub const DOMAIN_PARENT = "wormdb.proof.mmr.parent.v1";
 pub const DOMAIN_ROOT = "wormdb.proof.mmr.root.v1";
 
+pub const PROOF_MAGIC = "WDBMMR1";
+pub const PROOF_VERSION: u16 = 1;
+pub const PROOF_SIDE_LEFT: u8 = 0;
+pub const PROOF_SIDE_RIGHT: u8 = 1;
+pub const PROOF_MAX_PATH_ITEMS: usize = 63;
+pub const PROOF_MAX_PEAKS: usize = 64;
+pub const PROOF_PATH_ITEM_LEN: usize = 1 + HASH_LEN;
+pub const PROOF_PEAK_ITEM_LEN: usize = 1 + HASH_LEN;
+
 pub const Error = std.mem.Allocator.Error || error{
     LeafIndexOutOfBounds,
     CorruptAccumulator,
     TooManyLeaves,
+    ProofTooLarge,
+    InvalidProofBytes,
+    UnsupportedProofVersion,
 };
 
 pub const SiblingSide = enum(u8) {
@@ -216,6 +229,98 @@ pub fn rootFromPeaks(leaf_count: u64, peaks: []const Peak) Hash {
     return out;
 }
 
+/// Encode inclusion proof bytes for proof bundles and external verifiers.
+///
+/// Format, all unsigned big-endian:
+/// `[magic][u16 version][u64 leaf_index][u64 leaf_count][u32 peak_index]`
+/// `[u32 path_len]([u8 side][32B hash])*[u32 peak_count]([u8 height][32B hash])*`
+pub fn encodeInclusionProof(allocator: std.mem.Allocator, proof: InclusionProof) Error![]u8 {
+    if (proof.peak_index > std.math.maxInt(u32)) return error.ProofTooLarge;
+    if (proof.path.len > PROOF_MAX_PATH_ITEMS) return error.ProofTooLarge;
+    if (proof.peaks.len > PROOF_MAX_PEAKS) return error.ProofTooLarge;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try appendBytes(&out, allocator, PROOF_MAGIC);
+    try appendU16(&out, allocator, PROOF_VERSION);
+    try appendU64(&out, allocator, proof.leaf_index);
+    try appendU64(&out, allocator, proof.leaf_count);
+    try appendU32(&out, allocator, @intCast(proof.peak_index));
+    try appendU32(&out, allocator, @intCast(proof.path.len));
+    for (proof.path) |item| {
+        try appendU8(&out, allocator, switch (item.side) {
+            .left => PROOF_SIDE_LEFT,
+            .right => PROOF_SIDE_RIGHT,
+        });
+        try appendBytes(&out, allocator, item.hash[0..]);
+    }
+    try appendU32(&out, allocator, @intCast(proof.peaks.len));
+    for (proof.peaks) |peak| {
+        try appendU8(&out, allocator, peak.height);
+        try appendBytes(&out, allocator, peak.hash[0..]);
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Decode proof bytes produced by `encodeInclusionProof`.
+///
+/// Caller owns the returned proof and must call `deinit`.
+pub fn decodeInclusionProof(allocator: std.mem.Allocator, bytes: []const u8) Error!InclusionProof {
+    var pos: usize = 0;
+
+    const magic = try readBytes(bytes, &pos, PROOF_MAGIC.len);
+    if (!std.mem.eql(u8, magic, PROOF_MAGIC)) return error.InvalidProofBytes;
+    const version = try readU16(bytes, &pos);
+    if (version != PROOF_VERSION) return error.UnsupportedProofVersion;
+
+    const leaf_index = try readU64(bytes, &pos);
+    const leaf_count = try readU64(bytes, &pos);
+    const peak_index = try readU32(bytes, &pos);
+    const path_len = try readU32(bytes, &pos);
+    const path_count: usize = @intCast(path_len);
+    if (path_count > PROOF_MAX_PATH_ITEMS) return error.InvalidProofBytes;
+    try ensureRemainingItems(bytes, pos, path_count, PROOF_PATH_ITEM_LEN, 4);
+
+    const path = try allocator.alloc(PathItem, path_count);
+    errdefer allocator.free(path);
+
+    for (path) |*item| {
+        const side_byte = try readU8(bytes, &pos);
+        item.side = switch (side_byte) {
+            PROOF_SIDE_LEFT => .left,
+            PROOF_SIDE_RIGHT => .right,
+            else => return error.InvalidProofBytes,
+        };
+        item.hash = try readHash(bytes, &pos);
+    }
+
+    const peak_count = try readU32(bytes, &pos);
+    const peak_count_usize: usize = @intCast(peak_count);
+    if (peak_count_usize > PROOF_MAX_PEAKS) return error.InvalidProofBytes;
+    try ensureRemainingItems(bytes, pos, peak_count_usize, PROOF_PEAK_ITEM_LEN, 0);
+
+    const peaks = try allocator.alloc(Peak, peak_count_usize);
+    errdefer allocator.free(peaks);
+
+    for (peaks) |*peak| {
+        peak.height = try readU8(bytes, &pos);
+        peak.hash = try readHash(bytes, &pos);
+    }
+
+    if (pos != bytes.len) return error.InvalidProofBytes;
+
+    return .{
+        .allocator = allocator,
+        .leaf_index = leaf_index,
+        .leaf_count = leaf_count,
+        .peak_index = peak_index,
+        .path = path,
+        .peaks = peaks,
+    };
+}
+
 pub fn verifyInclusion(proof: InclusionProof, leaf: []const u8, expected_root: Hash) bool {
     if (proof.leaf_count == 0) return false;
     if (proof.leaf_index >= proof.leaf_count) return false;
@@ -309,6 +414,74 @@ fn updateU64(h: *Sha256, value: u64) void {
     var buf: [8]u8 = undefined;
     std.mem.writeInt(u64, buf[0..8], value, .big);
     h.update(&buf);
+}
+
+fn appendU8(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: u8) !void {
+    try out.append(allocator, value);
+}
+
+fn appendU16(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: u16) !void {
+    var buf: [2]u8 = undefined;
+    std.mem.writeInt(u16, buf[0..2], value, .big);
+    try out.appendSlice(allocator, &buf);
+}
+
+fn appendU32(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: u32) !void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], value, .big);
+    try out.appendSlice(allocator, &buf);
+}
+
+fn appendU64(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: u64) !void {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, buf[0..8], value, .big);
+    try out.appendSlice(allocator, &buf);
+}
+
+fn appendBytes(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, bytes: []const u8) !void {
+    try out.appendSlice(allocator, bytes);
+}
+
+fn readU8(bytes: []const u8, pos: *usize) !u8 {
+    const b = try readBytes(bytes, pos, 1);
+    return b[0];
+}
+
+fn readU16(bytes: []const u8, pos: *usize) !u16 {
+    const b = try readBytes(bytes, pos, 2);
+    return std.mem.readInt(u16, b[0..2], .big);
+}
+
+fn readU32(bytes: []const u8, pos: *usize) !u32 {
+    const b = try readBytes(bytes, pos, 4);
+    return std.mem.readInt(u32, b[0..4], .big);
+}
+
+fn readU64(bytes: []const u8, pos: *usize) !u64 {
+    const b = try readBytes(bytes, pos, 8);
+    return std.mem.readInt(u64, b[0..8], .big);
+}
+
+fn readHash(bytes: []const u8, pos: *usize) !Hash {
+    const b = try readBytes(bytes, pos, HASH_LEN);
+    var hash: Hash = undefined;
+    @memcpy(hash[0..], b);
+    return hash;
+}
+
+fn readBytes(bytes: []const u8, pos: *usize, len: usize) ![]const u8 {
+    if (pos.* > bytes.len) return error.InvalidProofBytes;
+    if (len > bytes.len - pos.*) return error.InvalidProofBytes;
+    const out = bytes[pos.* .. pos.* + len];
+    pos.* += len;
+    return out;
+}
+
+fn ensureRemainingItems(bytes: []const u8, pos: usize, count: usize, item_len: usize, min_trailing: usize) Error!void {
+    if (pos > bytes.len) return error.InvalidProofBytes;
+    const item_bytes = std.math.mul(usize, count, item_len) catch return error.InvalidProofBytes;
+    const needed = std.math.add(usize, item_bytes, min_trailing) catch return error.InvalidProofBytes;
+    if (needed > bytes.len - pos) return error.InvalidProofBytes;
 }
 
 fn hashesEqual(a: Hash, b: Hash) bool {
@@ -408,6 +581,98 @@ test "mmr: proof tampering is rejected" {
         var bad_root = root;
         bad_root[0] ^= 0xff;
         try testing.expect(!verifyInclusion(proof, leaves[2], bad_root));
+    }
+}
+
+test "mmr: inclusion proof bytes round trip" {
+    const testing = std.testing;
+    const leaves = [_][]const u8{ "alpha", "bravo", "charlie", "delta", "echo" };
+
+    var acc = Accumulator.init(testing.allocator);
+    defer acc.deinit();
+    try appendLeaves(&acc, &leaves);
+    const root = acc.root();
+
+    var proof = try acc.prove(3, testing.allocator);
+    defer proof.deinit();
+
+    const encoded = try encodeInclusionProof(testing.allocator, proof);
+    defer testing.allocator.free(encoded);
+
+    var decoded = try decodeInclusionProof(testing.allocator, encoded);
+    defer decoded.deinit();
+
+    try testing.expectEqual(proof.leaf_index, decoded.leaf_index);
+    try testing.expectEqual(proof.leaf_count, decoded.leaf_count);
+    try testing.expectEqual(proof.peak_index, decoded.peak_index);
+    try testing.expectEqual(proof.path.len, decoded.path.len);
+    try testing.expectEqual(proof.peaks.len, decoded.peaks.len);
+    try testing.expect(verifyInclusion(decoded, leaves[3], root));
+}
+
+test "mmr: encoded proof tampering is rejected" {
+    const testing = std.testing;
+    const leaves = [_][]const u8{ "alpha", "bravo", "charlie", "delta", "echo" };
+
+    var acc = Accumulator.init(testing.allocator);
+    defer acc.deinit();
+    try appendLeaves(&acc, &leaves);
+    const root = acc.root();
+
+    var proof = try acc.prove(2, testing.allocator);
+    defer proof.deinit();
+
+    const encoded = try encodeInclusionProof(testing.allocator, proof);
+    defer testing.allocator.free(encoded);
+
+    {
+        var bad = try testing.allocator.dupe(u8, encoded);
+        defer testing.allocator.free(bad);
+        bad[0] ^= 0xff;
+        try testing.expectError(error.InvalidProofBytes, decodeInclusionProof(testing.allocator, bad));
+    }
+
+    {
+        var bad = try testing.allocator.dupe(u8, encoded);
+        defer testing.allocator.free(bad);
+        bad[encoded.len - 1] ^= 0xff;
+        var decoded = try decodeInclusionProof(testing.allocator, bad);
+        defer decoded.deinit();
+        try testing.expect(!verifyInclusion(decoded, leaves[2], root));
+    }
+}
+
+test "mmr: encoded proof impossible lengths are rejected before allocation" {
+    const testing = std.testing;
+    const leaves = [_][]const u8{ "alpha", "bravo", "charlie", "delta", "echo" };
+
+    var acc = Accumulator.init(testing.allocator);
+    defer acc.deinit();
+    try appendLeaves(&acc, &leaves);
+
+    var proof = try acc.prove(2, testing.allocator);
+    defer proof.deinit();
+
+    const encoded = try encodeInclusionProof(testing.allocator, proof);
+    defer testing.allocator.free(encoded);
+
+    const path_len_offset = PROOF_MAGIC.len + 2 + 8 + 8 + 4;
+    const peak_count_offset = path_len_offset + 4 + proof.path.len * PROOF_PATH_ITEM_LEN;
+
+    {
+        var bad = try testing.allocator.dupe(u8, encoded);
+        defer testing.allocator.free(bad);
+        const invalid_path_len: u32 = @intCast(PROOF_MAX_PATH_ITEMS + 1);
+        std.mem.writeInt(u32, bad[path_len_offset .. path_len_offset + 4][0..4], invalid_path_len, .big);
+        try testing.expectError(error.InvalidProofBytes, decodeInclusionProof(testing.allocator, bad));
+    }
+
+    {
+        var bad = try testing.allocator.dupe(u8, encoded);
+        defer testing.allocator.free(bad);
+        const invalid_peak_count: u32 = @intCast(PROOF_MAX_PEAKS + 1);
+        std.mem.writeInt(u32, bad[peak_count_offset .. peak_count_offset + 4][0..4], invalid_peak_count, .big);
+        try testing.expectError(error.InvalidProofBytes, decodeInclusionProof(testing.allocator, bad));
     }
 }
 

@@ -208,6 +208,30 @@ pub const Store = struct {
         return null;
     }
 
+    /// Stable receipt metadata for an entry, copied while the shard is locked.
+    pub const EntryMetadata = struct {
+        timestamp: u64,
+        is_worm: bool,
+        value_len: usize,
+        value_sha256: [32]u8,
+    };
+
+    pub fn getEntryMetadata(self: *Store, key: []const u8) ?EntryMetadata {
+        const si = shardIndex(key);
+        self.shards[si].mutex.lock();
+        defer self.shards[si].mutex.unlock();
+
+        const entry = self.shards[si].data.get(key) orelse return null;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(entry.value, &digest, .{});
+        return .{
+            .timestamp = entry.timestamp,
+            .is_worm = entry.flags.is_worm,
+            .value_len = entry.value.len,
+            .value_sha256 = digest,
+        };
+    }
+
     /// Read without acquiring a lock. Caller must hold the key shard lock.
     pub fn getUnsafe(self: *Store, key: []const u8) ?*const Entry {
         return self.shards[shardIndex(key)].data.get(key);
@@ -221,9 +245,16 @@ pub const Store = struct {
     /// Write — acquires only the key shard mutex.
     /// WAL enqueue happens OUTSIDE the shard lock to avoid serializing all shards.
     pub fn set(self: *Store, key: []const u8, value: []const u8, is_worm: bool) StoreError!void {
+        return self.setWithTimestamp(key, value, is_worm, @intCast(compat.nowMs()));
+    }
+
+    /// Write with caller-supplied timestamp metadata.
+    ///
+    /// Used by provenance primitives that include a local DB receipt timestamp
+    /// inside their hashed envelope and need the stored entry metadata to match.
+    pub fn setWithTimestamp(self: *Store, key: []const u8, value: []const u8, is_worm: bool, timestamp: u64) StoreError!void {
         const si = shardIndex(key);
         const shard = &self.shards[si];
-        const timestamp: u64 = @intCast(compat.nowMs());
 
         // Phase 1: Check WORM under shard lock
         shard.mutex.lock();

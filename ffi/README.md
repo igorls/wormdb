@@ -26,6 +26,8 @@ void       wormdb_close(wormdb_Db *db);
 int        wormdb_set(wormdb_Db*, const u8 *key, size_t, const u8 *val, size_t);
 int        wormdb_set_worm(...);            // write-once entry
 int        wormdb_get(wormdb_Db*, const u8 *key, size_t, u8 **out, size_t *out_len);  // free with wormdb_free
+int        wormdb_get_meta(wormdb_Db*, const u8 *key, size_t, wormdb_EntryMeta *out);
+int        wormdb_scan_prefix(wormdb_Db*, const u8 *prefix, size_t, size_t limit, void *ctx, wormdb_scan_callback);
 int        wormdb_delete(wormdb_Db*, const u8 *key, size_t);
 void       wormdb_free(u8 *ptr, size_t len);
 ```
@@ -33,6 +35,15 @@ void       wormdb_free(u8 *ptr, size_t len);
 Values from `wormdb_get` are library-owned — release with `wormdb_free`. The store
 is internally sharded with per-shard locks, so a handle is safe to share across
 threads.
+
+`wormdb_get_meta` returns a caller-owned metadata receipt for a single key:
+WormDB's local `timestamp_ms`, `is_worm`, `value_len`, and `SHA-256(value)`.
+
+`wormdb_scan_prefix` scans keys by prefix in lexicographic key order. The callback
+receives borrowed key/value pointers plus the same metadata receipt shape; copy
+anything that must survive after the callback returns. `limit == 0` means no
+limit, while a positive limit returns the lexicographic tail to match the engine's
+existing `scanPrefix` semantics.
 
 ## macOS / Swift — runnable PoC
 

@@ -72,6 +72,12 @@ If you're writing a WormWire client library, here's the minimal flow:
 
 See [Command Reference](/protocol/commands) for the exact command IDs and payload layouts for each command.
 
+## Verifiable Proof Bundles
+
+WORM applications can export independently verifiable proof packets containing record hashes, accumulator inclusion material, and signed checkpoints. See [Verifiable Proof Bundles](/protocol/proofs) for the checkpoint signing format and verifier flow.
+
+For engine-level linear provenance chains, see [Verifiable Append Log](/protocol/append-log) for the canonical event envelope and WORM sequence-key format.
+
 ## Browser Gateways
 
 Browser clients do not open raw TCP sockets and do not send the TCP `WW` preface. Use the gateway port for WormWire frames over WebSocket or QUIC/WebTransport. The gateway can also enforce SCT auth before forwarding commands to the executor. See [Gateways & Light-API](/operations/gateways).

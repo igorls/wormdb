@@ -48,6 +48,7 @@ export default defineConfig({
           items: [
             { text: 'System Design', link: '/architecture/' },
             { text: 'WORM Semantics', link: '/architecture/worm-semantics' },
+            { text: 'Replication Proofs', link: '/architecture/replication-proofs' },
             { text: 'Server Backends', link: '/architecture/server-backends' },
             { text: 'Stored Procedures', link: '/architecture/procedures' },
             { text: 'Vector Search', link: '/architecture/vector-search' },
@@ -63,6 +64,8 @@ export default defineConfig({
           items: [
             { text: 'WormWire v1', link: '/protocol/' },
             { text: 'Command Reference', link: '/protocol/commands' },
+            { text: 'Verifiable Append Log', link: '/protocol/append-log' },
+            { text: 'Verifiable Proof Bundles', link: '/protocol/proofs' },
           ]
         }
       ],

@@ -87,3 +87,9 @@ bun run apps/bun/src/bin/client.ts EXEC transfer acct:alice acct:bob 200
 ## Vectors And Memory
 
 WORM also applies to vector and memory records. Native vector inserts and `mem_add` default to immutable vector/doc records unless the caller opts out. This is useful for agent memory and embedding provenance: old memories can stay searchable without being silently rewritten by a later ingestion run.
+
+## Replicated WORM Proofs
+
+WORM prevents stored records from being rewritten, but replicated deployments also need compact ways to prove that peers saw the same immutable history. The planned replication proof layer stores checkpoint and witness records as WORM data, then uses Merkle/MMR roots to compare peer histories and repair missing ranges without a full dump when possible.
+
+See [Replication Proofs](/architecture/replication-proofs) for the checkpoint witness and anti-entropy design.

@@ -144,6 +144,7 @@ pub fn verifyStore(allocator: std.mem.Allocator, store: *Store, log_id: []const 
         const key_seq = try seqFromEventKey(prefix, r.key);
         const view = try decodeEnvelope(r.value);
         if (view.seq != key_seq) return error.SequenceKeyMismatch;
+        if (view.ingest_time_ms != r.timestamp) return error.ReceiptTimestampMismatch;
         try verifier.accept(view);
     }
     return verifier.report();
@@ -163,17 +164,23 @@ pub fn encodeEnvelope(allocator: std.mem.Allocator, input: EventInput) ![]u8 {
     if (input.payload.len > PAYLOAD_MAX) return error.EnvelopeTooLarge;
     if (input.attachment_hashes.len > ATTACHMENT_MAX) return error.EnvelopeTooLarge;
 
-    const preimage_len =
-        ENVELOPE_MAGIC.len +
-        2 +
-        4 + input.log_id.len +
-        8 +
-        HASH_LEN +
-        8 +
-        HASH_LEN +
-        4 + input.attachment_hashes.len * HASH_LEN +
-        4 + input.payload.len;
-    const total_len = preimage_len + HASH_LEN;
+    const attachment_bytes_len = std.math.mul(usize, input.attachment_hashes.len, HASH_LEN) catch {
+        return error.EnvelopeTooLarge;
+    };
+    var preimage_len: usize = 0;
+    try addEnvelopeLen(&preimage_len, ENVELOPE_MAGIC.len);
+    try addEnvelopeLen(&preimage_len, 2);
+    try addEnvelopeLen(&preimage_len, 4);
+    try addEnvelopeLen(&preimage_len, input.log_id.len);
+    try addEnvelopeLen(&preimage_len, 8);
+    try addEnvelopeLen(&preimage_len, HASH_LEN);
+    try addEnvelopeLen(&preimage_len, 8);
+    try addEnvelopeLen(&preimage_len, HASH_LEN);
+    try addEnvelopeLen(&preimage_len, 4);
+    try addEnvelopeLen(&preimage_len, attachment_bytes_len);
+    try addEnvelopeLen(&preimage_len, 4);
+    try addEnvelopeLen(&preimage_len, input.payload.len);
+    const total_len = std.math.add(usize, preimage_len, HASH_LEN) catch return error.EnvelopeTooLarge;
 
     var buf = try allocator.alloc(u8, total_len);
     errdefer allocator.free(buf);
@@ -218,7 +225,7 @@ pub fn decodeEnvelope(bytes: []const u8) !EventView {
     const ingest_time_ms = try readU64(bytes, &pos);
     const payload_hash = try readHash(bytes, &pos);
     const attachment_count = try readU32(bytes, &pos);
-    const attachment_hash_bytes = try readBytes(bytes, &pos, @as(usize, attachment_count) * HASH_LEN);
+    const attachment_hash_bytes = try readBytes(bytes, &pos, try attachmentHashBytesLen(attachment_count));
     const payload_len = try readU32(bytes, &pos);
     const payload = try readBytes(bytes, &pos, payload_len);
     const event_hash = try readHash(bytes, &pos);
@@ -248,7 +255,7 @@ pub fn verifyEnvelope(expected_log_id: []const u8, view: EventView) !void {
     const computed_event_hash = try hashEnvelopePreimage(view.bytes);
     if (!hashEql(computed_event_hash, view.event_hash)) return error.EventHashMismatch;
 
-    if (view.attachment_hash_bytes.len != @as(usize, view.attachment_count) * HASH_LEN) {
+    if (view.attachment_hash_bytes.len != try attachmentHashBytesLen(view.attachment_count)) {
         return error.InvalidEnvelope;
     }
 }
@@ -266,6 +273,14 @@ pub fn hashBytes(bytes: []const u8) Hash {
 
 pub fn hashEql(a: Hash, b: Hash) bool {
     return std.mem.eql(u8, a[0..], b[0..]);
+}
+
+fn addEnvelopeLen(total: *usize, amount: usize) !void {
+    total.* = std.math.add(usize, total.*, amount) catch return error.EnvelopeTooLarge;
+}
+
+fn attachmentHashBytesLen(count: u32) !usize {
+    return std.math.mul(usize, @as(usize, count), HASH_LEN) catch return error.InvalidEnvelope;
 }
 
 pub fn eventKeyPrefix(allocator: std.mem.Allocator, log_id: []const u8) ![]u8 {
@@ -489,4 +504,25 @@ test "append writes WORM sequence events and verifies store chain" {
     try testing.expectEqual(@as(usize, 2), report.count);
     try testing.expectEqual(@as(u64, 2), report.last_seq);
     try testing.expect(hashEql(second.event_hash, report.head_hash));
+}
+
+test "verifyStore rejects receipt timestamp mismatch" {
+    const testing = std.testing;
+    var store = try Store.init(testing.allocator, Config{ .persistence = .none });
+    defer store.deinit();
+
+    const envelope = try encodeEnvelope(testing.allocator, .{
+        .log_id = "site-a",
+        .seq = 1,
+        .prev_event_hash = ZERO_HASH,
+        .ingest_time_ms = 100,
+        .payload = "payload-one",
+    });
+    defer testing.allocator.free(envelope);
+
+    const key = try eventKey(testing.allocator, "site-a", 1);
+    defer testing.allocator.free(key);
+
+    try store.setWithTimestamp(key, envelope, true, 101);
+    try testing.expectError(error.ReceiptTimestampMismatch, verifyStore(testing.allocator, &store, "site-a"));
 }

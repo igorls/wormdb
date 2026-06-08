@@ -20,10 +20,23 @@ extern "C" {
 #define WORMDB_NOT_FOUND  1
 #define WORMDB_ERR       (-1)
 
+#define WORMDB_HASH_LEN       32
+#define WORMDB_PUBLIC_KEY_LEN 32
+#define WORMDB_SECRET_KEY_LEN 64
+
 /* Persistence modes for wormdb_open. */
 #define WORMDB_PERSIST_FULL      0  /* WAL every write + snapshots (durable)   */
 #define WORMDB_PERSIST_SNAPSHOT  1  /* load/save only, no per-write IO         */
 #define WORMDB_PERSIST_NONE      2  /* pure in-memory, lost on close           */
+
+/* Proof bundle kinds. */
+#define WORMDB_PROOF_BUNDLE_SINGLE_EVENT 1
+#define WORMDB_PROOF_BUNDLE_RANGE        2
+
+/* Accumulator kinds. */
+#define WORMDB_ACCUMULATOR_OPAQUE_ROOT     0
+#define WORMDB_ACCUMULATOR_MERKLE_SHA256_1 1
+#define WORMDB_ACCUMULATOR_MMR_SHA256_1    2
 
 /* Opaque database handle. */
 typedef struct wormdb_Db wormdb_Db;
@@ -37,8 +50,34 @@ typedef struct wormdb_EntryMeta {
     uint64_t timestamp_ms;
     int is_worm;
     size_t value_len;
-    unsigned char value_sha256[32];
+    unsigned char value_sha256[WORMDB_HASH_LEN];
 } wormdb_EntryMeta;
+
+typedef struct wormdb_AppendReceipt {
+    uint64_t seq;
+    uint64_t ingest_time_ms;
+    unsigned char prev_event_hash[WORMDB_HASH_LEN];
+    unsigned char payload_hash[WORMDB_HASH_LEN];
+    unsigned char event_hash[WORMDB_HASH_LEN];
+    unsigned char record_hash[WORMDB_HASH_LEN];
+} wormdb_AppendReceipt;
+
+typedef struct wormdb_AppendLogReport {
+    size_t count;
+    uint64_t last_seq;
+    unsigned char head_hash[WORMDB_HASH_LEN];
+} wormdb_AppendLogReport;
+
+typedef struct wormdb_ProofBundleInfo {
+    int kind;
+    uint64_t from_seq;
+    uint64_t to_seq;
+    size_t record_count;
+    size_t checkpoint_count;
+    int accumulator_kind;
+    unsigned char accumulator_root[WORMDB_HASH_LEN];
+    unsigned char checkpoint_hash[WORMDB_HASH_LEN];
+} wormdb_ProofBundleInfo;
 
 /* Prefix-scan callback.
  *
@@ -91,10 +130,61 @@ int wormdb_scan_prefix(wormdb_Db *db,
                        void *ctx,
                        wormdb_scan_callback callback);
 
+/* Append a payload to a named WORM append log. attachment_hashes is optional
+ * contiguous SHA-256 hashes: attachment_hash_count * WORMDB_HASH_LEN bytes.
+ * ingest_time_ms == 0 lets WormDB assign the local receipt time.
+ */
+int wormdb_append_log(wormdb_Db *db,
+                      const unsigned char *log_id, size_t log_id_len,
+                      const unsigned char *payload, size_t payload_len,
+                      const unsigned char *attachment_hashes,
+                      size_t attachment_hash_count,
+                      uint64_t ingest_time_ms,
+                      wormdb_AppendReceipt *out_receipt);
+
+/* Verify the stored WORM append-log chain for a log id. */
+int wormdb_append_log_verify(wormdb_Db *db,
+                             const unsigned char *log_id, size_t log_id_len,
+                             wormdb_AppendLogReport *out_report);
+
+/* Build a self-contained encoded MMR proof bundle for append-log records.
+ *
+ * public_key is 32 raw Ed25519 public-key bytes; secret_key is the 64-byte
+ * Ed25519 secret key representation expected by WormDB. created_at_ms or
+ * ingested_at_ms set to 0 are filled from WormDB's local clock.
+ *
+ * On WORMDB_OK, out_bundle/out_bundle_len receives a library-owned byte buffer
+ * that must be released with wormdb_free.
+ */
+int wormdb_proof_build_mmr_bundle(
+    wormdb_Db *db,
+    const unsigned char *log_id, size_t log_id_len,
+    uint64_t from_seq, uint64_t to_seq,
+    const unsigned char public_key[WORMDB_PUBLIC_KEY_LEN],
+    const unsigned char secret_key[WORMDB_SECRET_KEY_LEN],
+    uint64_t created_at_ms,
+    uint64_t ingested_at_ms,
+    const unsigned char *checkpoint_extension, size_t checkpoint_extension_len,
+    const unsigned char *bundle_extension, size_t bundle_extension_len,
+    unsigned char **out_bundle, size_t *out_bundle_len,
+    wormdb_ProofBundleInfo *out_info);
+
+/* Verify an encoded append-log MMR proof bundle without a database. */
+int wormdb_proof_verify_bundle(const unsigned char *bundle, size_t bundle_len,
+                               wormdb_ProofBundleInfo *out_info);
+
+/* Verify canonical MMR proof path bytes against a leaf hash and expected root.
+ * seq is the append-log sequence, so the proof leaf index must equal seq - 1.
+ */
+int wormdb_mmr_proof_verify(const unsigned char *proof_bytes, size_t proof_len,
+                            uint64_t seq,
+                            const unsigned char leaf_hash[WORMDB_HASH_LEN],
+                            const unsigned char expected_root[WORMDB_HASH_LEN]);
+
 /* Delete key (missing keys succeed; WORM keys return WORMDB_ERR). */
 int wormdb_delete(wormdb_Db *db, const unsigned char *key, size_t key_len);
 
-/* Release a buffer returned by wormdb_get. */
+/* Release a buffer returned by wormdb_get or wormdb_proof_build_mmr_bundle. */
 void wormdb_free(unsigned char *ptr, size_t len);
 
 /* Static version string (do not free). */

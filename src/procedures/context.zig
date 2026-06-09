@@ -315,12 +315,9 @@ pub const Ctx = struct {
     /// Delete a key. Caller must hold the key's shard lock.
     /// Note: this is the unsafe internal delete (no WORM check, no WAL).
     /// For procedures this is appropriate since the lock is already held.
+    /// Routed through the store so the ordered key index stays in sync.
     pub fn del(self: *Ctx, key: []const u8) void {
-        const si = shardIndexFn(key);
-        const shard = &self.store.shards[si];
-        if (shard.data.fetchRemove(key)) |removed| {
-            self.store.destroyEntry(removed.value);
-        }
+        self.store.deleteUnsafe(key);
     }
 
     /// Get entry metadata (timestamp).
@@ -415,7 +412,8 @@ pub const Ctx = struct {
 
     /// Scan for keys matching a prefix. Returns arena-allocated copies sorted by key (ascending).
     /// Locks each shard independently — does NOT require the caller to hold any locks.
-    /// O(N) over total keys; cap with `limit` to bound cost.
+    /// O(log n) seek per shard via the ordered key index + O(matches) copying;
+    /// `limit` keeps the LAST N in ascending order and bounds the copies.
     pub fn scan(self: *Ctx, prefix: []const u8, limit: usize) ![]Store.ScanResult {
         return self.store.scanPrefix(prefix, limit, self.allocator);
     }

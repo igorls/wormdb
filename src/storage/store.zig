@@ -533,7 +533,18 @@ pub const Store = struct {
         is_worm: bool,
     };
 
-    /// Scan for keys matching a prefix. Returns arena-allocated copies sorted by key (ascending).
+    /// Which end of the (ascending) match set a scan `limit` keeps.
+    pub const ScanCut = enum {
+        /// Keep the FIRST N matches — the natural cut for autocomplete,
+        /// pagination, and range reads.
+        first,
+        /// Keep the LAST N matches — "newest last" for timestamp-keyed data
+        /// (chat history, audit tails).
+        last,
+    };
+
+    /// Scan for keys matching a prefix. Returns arena-allocated copies sorted by key (ascending);
+    /// `limit` keeps the LAST N (see `scanPrefixFirst` for the first-N cut).
     /// Locks each shard individually — does NOT require the caller to hold any locks.
     /// Each shard contributes its match range via an O(log n) seek in the ordered
     /// index (not a full walk); total cost is O(SHARDS·log n + matches), with
@@ -544,6 +555,27 @@ pub const Store = struct {
         limit: usize,
         alloc: std.mem.Allocator,
     ) ![]ScanResult {
+        return self.scanPrefixCut(prefix, limit, alloc, .last);
+    }
+
+    /// `scanPrefix` with the limit keeping the FIRST N matches in ascending
+    /// order — what autocomplete and forward pagination want.
+    pub fn scanPrefixFirst(
+        self: *Store,
+        prefix: []const u8,
+        limit: usize,
+        alloc: std.mem.Allocator,
+    ) ![]ScanResult {
+        return self.scanPrefixCut(prefix, limit, alloc, .first);
+    }
+
+    fn scanPrefixCut(
+        self: *Store,
+        prefix: []const u8,
+        limit: usize,
+        alloc: std.mem.Allocator,
+        cut: ScanCut,
+    ) ![]ScanResult {
         var results: std.ArrayListUnmanaged(ScanResult) = .empty;
         errdefer {
             for (results.items) |r| {
@@ -553,19 +585,23 @@ pub const Store = struct {
             results.deinit(alloc);
         }
 
-        // Collect each shard's match range. With a limit, only a shard's LAST
-        // `limit` matches can survive the global keep-last-N cut below, so the
-        // rest are never copied.
+        // Collect each shard's match range. With a limit, only a shard's
+        // first/last `limit` matches (per the cut) can survive the global cut
+        // below, so the rest are never copied.
         for (&self.shards) |*shard| {
             shard.mutex.lock();
             defer shard.mutex.unlock();
 
             const range = prefixRange(shard.sorted.items, prefix);
             var start = range.lo;
+            var end = range.hi;
             if (limit > 0 and range.hi - range.lo > limit) {
-                start = range.hi - limit;
+                switch (cut) {
+                    .first => end = range.lo + limit,
+                    .last => start = range.hi - limit,
+                }
             }
-            for (shard.sorted.items[start..range.hi]) |e| {
+            for (shard.sorted.items[start..end]) |e| {
                 // Copy key and value into the arena so they survive after unlock
                 const key_copy = try alloc.dupe(u8, e.key);
                 errdefer alloc.free(key_copy);
@@ -587,17 +623,28 @@ pub const Store = struct {
             }
         }.lessThan);
 
-        // Apply limit (keep last N for "newest last" ordering)
+        // Apply the limit on the requested end of the ascending match set.
         if (limit > 0 and results.items.len > limit) {
-            // Free the excess oldest entries
-            const excess = results.items.len - limit;
-            for (results.items[0..excess]) |r| {
-                alloc.free(r.key);
-                alloc.free(r.value);
+            switch (cut) {
+                .first => {
+                    for (results.items[limit..]) |r| {
+                        alloc.free(r.key);
+                        alloc.free(r.value);
+                    }
+                    results.shrinkRetainingCapacity(limit);
+                },
+                .last => {
+                    // Free the excess oldest entries
+                    const excess = results.items.len - limit;
+                    for (results.items[0..excess]) |r| {
+                        alloc.free(r.key);
+                        alloc.free(r.value);
+                    }
+                    // Shift the remaining items
+                    std.mem.copyForwards(ScanResult, results.items[0..limit], results.items[excess..]);
+                    results.shrinkRetainingCapacity(limit);
+                },
             }
-            // Shift the remaining items
-            std.mem.copyForwards(ScanResult, results.items[0..limit], results.items[excess..]);
-            results.shrinkRetainingCapacity(limit);
         }
 
         return try results.toOwnedSlice(alloc);
@@ -1346,6 +1393,18 @@ test "ordered index: scanPrefix returns sorted matches and keep-last limit" {
     try testing.expectEqual(@as(usize, 2), last2.len);
     try testing.expectEqualStrings("evt:doc:0003", last2[0].key);
     try testing.expectEqualStrings("evt:doc:0010", last2[1].key);
+
+    // scanPrefixFirst keeps the FIRST N ascending — the autocomplete cut.
+    const first2 = try store.scanPrefixFirst("evt:doc:", 2, testing.allocator);
+    defer freeScanResults(testing.allocator, first2);
+    try testing.expectEqual(@as(usize, 2), first2.len);
+    try testing.expectEqualStrings("evt:doc:0001", first2[0].key);
+    try testing.expectEqualStrings("evt:doc:0002", first2[1].key);
+
+    // Without a limit both cuts return everything.
+    const first_all = try store.scanPrefixFirst("evt:doc:", 0, testing.allocator);
+    defer freeScanResults(testing.allocator, first_all);
+    try testing.expectEqual(@as(usize, 4), first_all.len);
 }
 
 test "ordered index: countPrefix boundaries (short keys, empty prefix, 0xFF)" {

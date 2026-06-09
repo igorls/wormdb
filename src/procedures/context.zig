@@ -418,6 +418,12 @@ pub const Ctx = struct {
         return self.store.scanPrefix(prefix, limit, self.allocator);
     }
 
+    /// Like `scan`, but the limit keeps the FIRST N matches in ascending order
+    /// — the natural cut for autocomplete and forward pagination.
+    pub fn scanFirst(self: *Ctx, prefix: []const u8, limit: usize) ![]Store.ScanResult {
+        return self.store.scanPrefixFirst(prefix, limit, self.allocator);
+    }
+
     /// Callback-based prefix scan — yields borrowed key/value slices (no
     /// arena copy). See Store.scanPrefixCallback for the callback contract.
     ///

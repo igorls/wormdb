@@ -108,9 +108,24 @@ fn shardRemoveLocked(shard: *Shard, key: []const u8) ?*Entry {
     if (idx < shard.sorted.items.len and shard.sorted.items[idx] == removed.value) {
         _ = shard.sorted.orderedRemove(idx);
     } else {
-        // Unreachable if every mutation goes through the shard helpers; log
-        // rather than assert so a release build degrades instead of corrupting.
-        std.log.err("store: ordered index out of sync on remove of '{s}'", .{key});
+        // Unreachable if every mutation goes through the shard helpers — but
+        // the caller is about to destroy the entry, so NEVER leave its pointer
+        // behind: sweep the index for it before giving up (a dangling pointer
+        // here would be a use-after-free on the next scan).
+        const found = blk: {
+            for (shard.sorted.items, 0..) |e, i| {
+                if (e == removed.value) {
+                    _ = shard.sorted.orderedRemove(i);
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        };
+        if (found) {
+            std.log.warn("store: ordered index position drift on remove of '{s}' (recovered)", .{key});
+        } else {
+            std.log.err("store: ordered index missing entry on remove of '{s}'", .{key});
+        }
     }
     return removed.value;
 }
@@ -606,6 +621,7 @@ pub const Store = struct {
                 const key_copy = try alloc.dupe(u8, e.key);
                 errdefer alloc.free(key_copy);
                 const val_copy = try alloc.dupe(u8, e.value);
+                errdefer alloc.free(val_copy);
 
                 try results.append(alloc, .{
                     .key = key_copy,

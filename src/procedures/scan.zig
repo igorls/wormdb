@@ -1,10 +1,13 @@
 //! Built-in SCAN procedure
 //!
 //! Scans keys by prefix, returning matching entries as JSON.
-//! EXEC scan <prefix> [limit]
+//! EXEC scan <prefix> [limit] [cut]
 //!
 //! - prefix: key prefix to match (e.g., "chat:general:", "user:")
 //! - limit: max results (default: 100, max: 1000)
+//! - cut: which end of the ascending match set the limit keeps —
+//!   "last" (default; newest-last for timestamp-keyed data) or
+//!   "first" (autocomplete / forward pagination)
 //! - Returns JSON array: [{"k":"key","v":"value","ts":1709...}, ...]
 //! - Results sorted by key ascending (lexicographic order)
 
@@ -15,7 +18,7 @@ const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
-    const prefix = ctx.arg(0) orelse return ctx.err("scan requires at least 1 arg: <prefix> [limit]");
+    const prefix = ctx.arg(0) orelse return ctx.err("scan requires at least 1 arg: <prefix> [limit] [cut]");
 
     // Parse optional limit
     var limit: usize = DEFAULT_LIMIT;
@@ -24,8 +27,21 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
         if (limit == 0) limit = DEFAULT_LIMIT;
     }
 
+    // Parse optional cut ("last" default, "first" for autocomplete).
+    var keep_first = false;
+    if (ctx.arg(2)) |cut| {
+        if (std.mem.eql(u8, cut, "first")) {
+            keep_first = true;
+        } else if (!std.mem.eql(u8, cut, "last")) {
+            return ctx.err("scan cut must be 'first' or 'last'");
+        }
+    }
+
     // Execute prefix scan (arena-allocated, safe after shard unlock)
-    const results = try ctx.scan(prefix, limit);
+    const results = if (keep_first)
+        try ctx.scanFirst(prefix, limit)
+    else
+        try ctx.scan(prefix, limit);
 
     // Build JSON response
     var json: std.ArrayListUnmanaged(u8) = .empty;

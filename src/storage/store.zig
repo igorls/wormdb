@@ -44,7 +44,91 @@ pub fn shardIndex(key: []const u8) usize {
 const Shard = struct {
     mutex: core.compat.Mutex,
     data: std.StringHashMap(*Entry),
+    /// The shard's entries sorted by key ascending — the same `*Entry` objects
+    /// as `data`, never owned separately. Maintained by `shardPutLocked` /
+    /// `shardRemoveLocked` on every mutation, it turns prefix scans and counts
+    /// into O(log n) range seeks instead of full-shard walks. Snapshot files
+    /// store keys globally sorted, so snapshot load appends at the tail and
+    /// pays no memmove churn; random-order writes pay an ordered insert
+    /// (memmove within one shard ≈ n/SHARD_COUNT pointers, trivial next to the
+    /// WAL write they accompany).
+    sorted: std.ArrayListUnmanaged(*Entry),
 };
+
+/// Three-way comparison of a key against a prefix *range*:
+///   .lt — key sorts before every key carrying `prefix`
+///   .eq — key carries `prefix`
+///   .gt — key sorts after every key carrying `prefix`
+/// Comparing against the range (rather than computing a successor key) avoids
+/// the 0xFF-increment edge cases entirely and needs no allocation.
+fn prefixCompare(key: []const u8, prefix: []const u8) std.math.Order {
+    const n = @min(key.len, prefix.len);
+    const ord = std.mem.order(u8, key[0..n], prefix[0..n]);
+    if (ord != .eq) return ord;
+    if (key.len >= prefix.len) return .eq;
+    return .lt; // key is a strict prefix of `prefix` — sorts before the range
+}
+
+/// First index in the sorted shard index whose key does not sort before `key`.
+fn lowerBoundKey(items: []const *Entry, key: []const u8) usize {
+    var lo: usize = 0;
+    var hi: usize = items.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (std.mem.order(u8, items[mid].key, key) == .lt) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
+const PrefixRange = struct { lo: usize, hi: usize };
+
+/// Half-open index range [lo, hi) of keys carrying `prefix` in a sorted shard
+/// index — two binary searches over `prefixCompare`.
+fn prefixRange(items: []const *Entry, prefix: []const u8) PrefixRange {
+    var lo: usize = 0;
+    var hi: usize = items.len;
+    while (lo < hi) { // lower bound: first key not .lt the range
+        const mid = lo + (hi - lo) / 2;
+        if (prefixCompare(items[mid].key, prefix) == .lt) lo = mid + 1 else hi = mid;
+    }
+    const start = lo;
+    hi = items.len;
+    while (lo < hi) { // upper bound: first key .gt the range
+        const mid = lo + (hi - lo) / 2;
+        if (prefixCompare(items[mid].key, prefix) == .gt) hi = mid else lo = mid + 1;
+    }
+    return .{ .lo = start, .hi = lo };
+}
+
+/// Remove `key` from a shard's hashmap + ordered index. Caller must hold the
+/// shard lock and owns destroying the returned entry.
+fn shardRemoveLocked(shard: *Shard, key: []const u8) ?*Entry {
+    const removed = shard.data.fetchRemove(key) orelse return null;
+    const idx = lowerBoundKey(shard.sorted.items, key);
+    if (idx < shard.sorted.items.len and shard.sorted.items[idx] == removed.value) {
+        _ = shard.sorted.orderedRemove(idx);
+    } else {
+        // Unreachable if every mutation goes through the shard helpers — but
+        // the caller is about to destroy the entry, so NEVER leave its pointer
+        // behind: sweep the index for it before giving up (a dangling pointer
+        // here would be a use-after-free on the next scan).
+        const found = blk: {
+            for (shard.sorted.items, 0..) |e, i| {
+                if (e == removed.value) {
+                    _ = shard.sorted.orderedRemove(i);
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        };
+        if (found) {
+            std.log.warn("store: ordered index position drift on remove of '{s}' (recovered)", .{key});
+        } else {
+            std.log.err("store: ordered index missing entry on remove of '{s}'", .{key});
+        }
+    }
+    return removed.value;
+}
 
 pub const LockPair = struct {
     low: usize,
@@ -134,6 +218,7 @@ pub const Store = struct {
             shard.* = .{
                 .mutex = .{},
                 .data = std.StringHashMap(*Entry).init(allocator),
+                .sorted = .empty,
             };
         }
 
@@ -180,12 +265,50 @@ pub const Store = struct {
                 self.destroyEntry(entry.value_ptr.*);
             }
             shard.data.deinit();
+            shard.sorted.deinit(self.allocator);
         }
     }
 
     pub fn destroyEntry(self: *Store, entry: *Entry) void {
         entry.deinit(self.allocator);
         self.allocator.destroy(entry);
+    }
+
+    /// Insert or replace `entry` in a shard's hashmap + ordered index, keeping
+    /// the two views consistent. Caller must hold the shard lock and have done
+    /// any WORM checks. All allocations are reserved up front: on error the
+    /// shard is untouched and the caller still owns `entry`; on success a
+    /// superseded entry is destroyed only after both structures point at the
+    /// new one (no dangling pointer is ever observable).
+    fn shardPutLocked(self: *Store, shard: *Shard, entry: *Entry) StoreError!void {
+        const idx = lowerBoundKey(shard.sorted.items, entry.key);
+        const replacing = idx < shard.sorted.items.len and
+            std.mem.eql(u8, shard.sorted.items[idx].key, entry.key);
+
+        shard.data.ensureUnusedCapacity(1) catch return error.OutOfMemory;
+        if (replacing) {
+            // Same key ⇒ same ordered position: swap the pointer in place. The
+            // map must re-key to the NEW entry's key bytes (the old key memory
+            // dies with the old entry), hence remove + re-insert.
+            const old = shard.data.fetchRemove(entry.key).?.value;
+            shard.data.putAssumeCapacity(entry.key, entry);
+            shard.sorted.items[idx] = entry;
+            self.destroyEntry(old);
+        } else {
+            shard.sorted.ensureUnusedCapacity(self.allocator, 1) catch return error.OutOfMemory;
+            shard.data.putAssumeCapacity(entry.key, entry);
+            shard.sorted.insertAssumeCapacity(idx, entry);
+        }
+    }
+
+    /// Delete without WAL or WORM checks — the procedure-context (`Ctx.del`)
+    /// escape hatch. Caller must hold the key's shard lock. Unlike a raw
+    /// `data.fetchRemove`, this keeps the ordered index in sync.
+    pub fn deleteUnsafe(self: *Store, key: []const u8) void {
+        const shard = &self.shards[shardIndex(key)];
+        if (shardRemoveLocked(shard, key)) |removed| {
+            self.destroyEntry(removed);
+        }
     }
 
     /// Fast read — lock only the key shard.
@@ -291,13 +414,10 @@ pub const Store = struct {
         };
         errdefer self.destroyEntry(entry);
 
-        if (shard.data.fetchRemove(key)) |removed| {
-            self.destroyEntry(removed.value);
-        }
-
-        shard.data.put(entry.key, entry) catch {
-            return error.OutOfMemory;
-        };
+        // Insert into the hashmap + ordered index together. The shard lock is
+        // held for the whole operation (upstream restructure), so no WORM
+        // re-check is needed; on error the errdefer above destroys `entry`.
+        try self.shardPutLocked(shard, entry);
 
         // Release shard lock before snapshot check to avoid deadlock
         // (writeSnapshot locks ALL shards).
@@ -340,10 +460,6 @@ pub const Store = struct {
             if (existing.flags.is_worm) return error.WormViolation;
         }
 
-        if (shard.data.fetchRemove(key)) |removed| {
-            self.destroyEntry(removed.value);
-        }
-
         const entry = if (self.config.persistence == .full) blk: {
             self.wal_enqueue_mutex.lock();
             const e = self.wal.?.appendSet(key, value, .{ .is_worm = is_worm, .is_deleted = false }, timestamp) catch {
@@ -369,7 +485,7 @@ pub const Store = struct {
         };
         errdefer self.destroyEntry(entry);
 
-        try shard.data.put(entry.key, entry);
+        try self.shardPutLocked(shard, entry);
 
         if (self.config.persistence == .full) {
             self.maybeSnapshotAndTruncate() catch {};
@@ -395,8 +511,8 @@ pub const Store = struct {
                 self.wal_enqueue_mutex.unlock();
             }
 
-            if (shard.data.fetchRemove(key)) |removed| {
-                self.destroyEntry(removed.value);
+            if (shardRemoveLocked(shard, key)) |removed| {
+                self.destroyEntry(removed);
             }
 
             if (self.config.persistence == .full) {
@@ -451,14 +567,48 @@ pub const Store = struct {
         is_worm: bool,
     };
 
-    /// Scan for keys matching a prefix. Returns arena-allocated copies sorted by key (ascending).
+    /// Which end of the (ascending) match set a scan `limit` keeps.
+    pub const ScanCut = enum {
+        /// Keep the FIRST N matches — the natural cut for autocomplete,
+        /// pagination, and range reads.
+        first,
+        /// Keep the LAST N matches — "newest last" for timestamp-keyed data
+        /// (chat history, audit tails).
+        last,
+    };
+
+    /// Scan for keys matching a prefix. Returns arena-allocated copies sorted by key (ascending);
+    /// `limit` keeps the LAST N (see `scanPrefixFirst` for the first-N cut).
     /// Locks each shard individually — does NOT require the caller to hold any locks.
-    /// O(N) over total keys in the store; cap with `limit` to bound cost.
+    /// Each shard contributes its match range via an O(log n) seek in the ordered
+    /// index (not a full walk); total cost is O(SHARDS·log n + matches), with
+    /// `limit` also bounding the per-shard copies.
     pub fn scanPrefix(
         self: *Store,
         prefix: []const u8,
         limit: usize,
         alloc: std.mem.Allocator,
+    ) ![]ScanResult {
+        return self.scanPrefixCut(prefix, limit, alloc, .last);
+    }
+
+    /// `scanPrefix` with the limit keeping the FIRST N matches in ascending
+    /// order — what autocomplete and forward pagination want.
+    pub fn scanPrefixFirst(
+        self: *Store,
+        prefix: []const u8,
+        limit: usize,
+        alloc: std.mem.Allocator,
+    ) ![]ScanResult {
+        return self.scanPrefixCut(prefix, limit, alloc, .first);
+    }
+
+    fn scanPrefixCut(
+        self: *Store,
+        prefix: []const u8,
+        limit: usize,
+        alloc: std.mem.Allocator,
+        cut: ScanCut,
     ) ![]ScanResult {
         var results: std.ArrayListUnmanaged(ScanResult) = .empty;
         errdefer {
@@ -469,27 +619,35 @@ pub const Store = struct {
             results.deinit(alloc);
         }
 
-        // Scan each shard independently
+        // Collect each shard's match range. With a limit, only a shard's
+        // first/last `limit` matches (per the cut) can survive the global cut
+        // below, so the rest are never copied.
         for (&self.shards) |*shard| {
             shard.mutex.lock();
             defer shard.mutex.unlock();
 
-            var iter = shard.data.iterator();
-            while (iter.next()) |entry| {
-                const e = entry.value_ptr.*;
-                if (e.key.len >= prefix.len and std.mem.eql(u8, e.key[0..prefix.len], prefix)) {
-                    // Copy key and value into the arena so they survive after unlock
-                    const key_copy = try alloc.dupe(u8, e.key);
-                    errdefer alloc.free(key_copy);
-                    const val_copy = try alloc.dupe(u8, e.value);
-
-                    try results.append(alloc, .{
-                        .key = key_copy,
-                        .value = val_copy,
-                        .timestamp = e.timestamp,
-                        .is_worm = e.flags.is_worm,
-                    });
+            const range = prefixRange(shard.sorted.items, prefix);
+            var start = range.lo;
+            var end = range.hi;
+            if (limit > 0 and range.hi - range.lo > limit) {
+                switch (cut) {
+                    .first => end = range.lo + limit,
+                    .last => start = range.hi - limit,
                 }
+            }
+            for (shard.sorted.items[start..end]) |e| {
+                // Copy key and value into the arena so they survive after unlock
+                const key_copy = try alloc.dupe(u8, e.key);
+                errdefer alloc.free(key_copy);
+                const val_copy = try alloc.dupe(u8, e.value);
+                errdefer alloc.free(val_copy);
+
+                try results.append(alloc, .{
+                    .key = key_copy,
+                    .value = val_copy,
+                    .timestamp = e.timestamp,
+                    .is_worm = e.flags.is_worm,
+                });
             }
         }
 
@@ -500,17 +658,28 @@ pub const Store = struct {
             }
         }.lessThan);
 
-        // Apply limit (keep last N for "newest last" ordering)
+        // Apply the limit on the requested end of the ascending match set.
         if (limit > 0 and results.items.len > limit) {
-            // Free the excess oldest entries
-            const excess = results.items.len - limit;
-            for (results.items[0..excess]) |r| {
-                alloc.free(r.key);
-                alloc.free(r.value);
+            switch (cut) {
+                .first => {
+                    for (results.items[limit..]) |r| {
+                        alloc.free(r.key);
+                        alloc.free(r.value);
+                    }
+                    results.shrinkRetainingCapacity(limit);
+                },
+                .last => {
+                    // Free the excess oldest entries
+                    const excess = results.items.len - limit;
+                    for (results.items[0..excess]) |r| {
+                        alloc.free(r.key);
+                        alloc.free(r.value);
+                    }
+                    // Shift the remaining items
+                    std.mem.copyForwards(ScanResult, results.items[0..limit], results.items[excess..]);
+                    results.shrinkRetainingCapacity(limit);
+                },
             }
-            // Shift the remaining items
-            std.mem.copyForwards(ScanResult, results.items[0..limit], results.items[excess..]);
-            results.shrinkRetainingCapacity(limit);
         }
 
         return try results.toOwnedSlice(alloc);
@@ -523,6 +692,10 @@ pub const Store = struct {
     /// callback while the matching shard is still locked. Zero allocations,
     /// zero copies. Suitable for hot paths (vector search, index rebuild)
     /// where arena-duping every matching value would be prohibitive.
+    ///
+    /// Matches are found via the ordered index (O(log n) seek per shard) and
+    /// yielded in ascending key order WITHIN each shard; no global order is
+    /// promised across shards.
     ///
     /// The callback MUST NOT:
     ///   - Retain the slices after returning (memory is only valid during the call)
@@ -546,33 +719,26 @@ pub const Store = struct {
             shard.mutex.lock();
             defer shard.mutex.unlock();
 
-            var iter = shard.data.iterator();
-            while (iter.next()) |entry| {
-                const e = entry.value_ptr.*;
-                if (e.key.len >= prefix.len and std.mem.eql(u8, e.key[0..prefix.len], prefix)) {
-                    switch (callback(context, e.key, e.value, e.timestamp, e.flags.is_worm)) {
-                        .cont => {},
-                        .stop => return,
-                    }
+            const range = prefixRange(shard.sorted.items, prefix);
+            for (shard.sorted.items[range.lo..range.hi]) |e| {
+                switch (callback(context, e.key, e.value, e.timestamp, e.flags.is_worm)) {
+                    .cont => {},
+                    .stop => return,
                 }
             }
         }
     }
 
-    /// Count keys matching a prefix. Lightweight — no allocation, no value copying.
+    /// Count keys matching a prefix. Pure binary search per shard —
+    /// O(SHARDS·log n), no allocation, no walking of the matches.
     pub fn countPrefix(self: *Store, prefix: []const u8) usize {
         var total: usize = 0;
         for (&self.shards) |*shard| {
             shard.mutex.lock();
             defer shard.mutex.unlock();
 
-            var iter = shard.data.iterator();
-            while (iter.next()) |entry| {
-                const key = entry.value_ptr.*.key;
-                if (key.len >= prefix.len and std.mem.eql(u8, key[0..prefix.len], prefix)) {
-                    total += 1;
-                }
-            }
+            const range = prefixRange(shard.sorted.items, prefix);
+            total += range.hi - range.lo;
         }
         return total;
     }
@@ -598,19 +764,16 @@ pub const Store = struct {
             }
             switch (record) {
                 .set => |set_rec| {
-                    const si = shardIndex(set_rec.key);
-                    const shard = &self.shards[si];
+                    const shard = &self.shards[shardIndex(set_rec.key)];
 
+                    // WORM-replay guard (proof spine): a replayed set must
+                    // never overwrite an existing WORM entry.
                     if (shard.data.get(set_rec.key)) |existing| {
                         if (existing.flags.is_worm) {
                             self.allocator.free(set_rec.key);
                             self.allocator.free(set_rec.value);
                             continue;
                         }
-                    }
-
-                    if (shard.data.fetchRemove(set_rec.key)) |removed| {
-                        self.destroyEntry(removed.value);
                     }
 
                     const entry = self.allocator.create(Entry) catch |err| {
@@ -625,15 +788,19 @@ pub const Store = struct {
                         .flags = set_rec.flags,
                     };
                     errdefer self.destroyEntry(entry);
-                    try shard.data.put(entry.key, entry);
+                    // shardPutLocked replaces any prior version of the key
+                    // atomically (and leaves the shard untouched on error).
+                    try self.shardPutLocked(shard, entry);
                 },
                 .delete => |key| {
-                    const si = shardIndex(key);
-                    const shard = &self.shards[si];
+                    const shard = &self.shards[shardIndex(key)];
+                    // WORM-replay guard (proof spine): never delete a WORM
+                    // entry during replay; shardRemoveLocked keeps the
+                    // ordered index in sync for the non-WORM path.
                     if (shard.data.get(key)) |existing| {
                         if (!existing.flags.is_worm) {
-                            if (shard.data.fetchRemove(key)) |removed| {
-                                self.destroyEntry(removed.value);
+                            if (shardRemoveLocked(shard, key)) |removed| {
+                                self.destroyEntry(removed);
                             }
                         }
                     }
@@ -840,23 +1007,21 @@ pub const Store = struct {
             }
 
             const entry = try self.allocator.create(Entry);
-            errdefer self.allocator.destroy(entry);
             entry.* = .{
                 .key = key,
                 .value = value,
                 .timestamp = timestamp,
                 .flags = flags,
             };
-            errdefer self.destroyEntry(entry);
 
-            const si = shardIndex(entry.key);
-            const shard = &self.shards[si];
-
-            if (shard.data.fetchRemove(entry.key)) |removed| {
-                self.destroyEntry(removed.value);
-            }
-
-            try shard.data.put(entry.key, entry);
+            // On failure shardPutLocked leaves the shard untouched — free only
+            // the Entry struct here; the errdefers above still own key/value
+            // (a destroyEntry would double-free them).
+            const shard = &self.shards[shardIndex(entry.key)];
+            self.shardPutLocked(shard, entry) catch |err| {
+                self.allocator.destroy(entry);
+                return err;
+            };
         }
 
         std.log.info("Snapshot load complete.", .{});
@@ -1288,5 +1453,206 @@ test "Snapshot v1 loads without HNSW when registry provided" {
 
         try testing.expectEqualStrings("value", store.get("plain").?.value);
         try testing.expect(registry.get("vec:") == null);
+    }
+}
+
+// ── Ordered per-shard key index ─────────────────────────────────────────────
+
+fn freeScanResults(alloc: std.mem.Allocator, results: []Store.ScanResult) void {
+    for (results) |r| {
+        alloc.free(r.key);
+        alloc.free(r.value);
+    }
+    alloc.free(results);
+}
+
+/// RAM-only store config for index tests (no WAL/snapshot file access).
+const index_test_config = Config{
+    .wal_path = "unused.wal",
+    .snapshot_path = "unused.snapshot",
+    .sync_writes = false,
+    .persistence = .none,
+};
+
+test "ordered index: scanPrefix returns sorted matches and keep-last limit" {
+    const testing = std.testing;
+    var store = try Store.init(testing.allocator, index_test_config);
+    defer store.deinit();
+
+    // Insert out of order, across shards, with range-boundary decoys.
+    try store.set("evt:doc:0003", "c", false);
+    try store.set("evt:doc:0001", "a", false);
+    try store.set("evt:doc:0002", "b", false);
+    try store.set("evt:doc:0010", "j", false);
+    try store.set("evt", "short", false); // shorter than the prefix — no match
+    try store.set("evt;doc", "after", false); // ';' > ':' — sorts after the range
+    try store.set("eva:doc", "before", false);
+    try store.set("zzz", "tail", false);
+
+    const all = try store.scanPrefix("evt:doc:", 0, testing.allocator);
+    defer freeScanResults(testing.allocator, all);
+    try testing.expectEqual(@as(usize, 4), all.len);
+    try testing.expectEqualStrings("evt:doc:0001", all[0].key);
+    try testing.expectEqualStrings("evt:doc:0002", all[1].key);
+    try testing.expectEqualStrings("evt:doc:0003", all[2].key);
+    try testing.expectEqualStrings("evt:doc:0010", all[3].key);
+    try testing.expectEqualStrings("a", all[0].value);
+
+    // The limit keeps the LAST N ascending — the documented "newest last" cut.
+    const last2 = try store.scanPrefix("evt:doc:", 2, testing.allocator);
+    defer freeScanResults(testing.allocator, last2);
+    try testing.expectEqual(@as(usize, 2), last2.len);
+    try testing.expectEqualStrings("evt:doc:0003", last2[0].key);
+    try testing.expectEqualStrings("evt:doc:0010", last2[1].key);
+
+    // scanPrefixFirst keeps the FIRST N ascending — the autocomplete cut.
+    const first2 = try store.scanPrefixFirst("evt:doc:", 2, testing.allocator);
+    defer freeScanResults(testing.allocator, first2);
+    try testing.expectEqual(@as(usize, 2), first2.len);
+    try testing.expectEqualStrings("evt:doc:0001", first2[0].key);
+    try testing.expectEqualStrings("evt:doc:0002", first2[1].key);
+
+    // Without a limit both cuts return everything.
+    const first_all = try store.scanPrefixFirst("evt:doc:", 0, testing.allocator);
+    defer freeScanResults(testing.allocator, first_all);
+    try testing.expectEqual(@as(usize, 4), first_all.len);
+}
+
+test "ordered index: countPrefix boundaries (short keys, empty prefix, 0xFF)" {
+    const testing = std.testing;
+    var store = try Store.init(testing.allocator, index_test_config);
+    defer store.deinit();
+
+    try store.set("ab", "1", false);
+    try store.set("abc", "2", false);
+    try store.set("abcd", "3", false);
+    try store.set("abd", "4", false);
+    try store.set("ac", "5", false);
+    try testing.expectEqual(@as(usize, 2), store.countPrefix("abc"));
+    try testing.expectEqual(@as(usize, 4), store.countPrefix("ab"));
+    try testing.expectEqual(@as(usize, 5), store.countPrefix("a"));
+    try testing.expectEqual(@as(usize, 5), store.countPrefix(""));
+    try testing.expectEqual(@as(usize, 0), store.countPrefix("zzz"));
+
+    // 0xFF boundary — the three-way compare needs no successor-key increment.
+    try store.set("\xff\xfe", "x", false);
+    try store.set("\xff\xff", "y", false);
+    try store.set("\xff\xff\x01", "z", false);
+    try testing.expectEqual(@as(usize, 2), store.countPrefix("\xff\xff"));
+    try testing.expectEqual(@as(usize, 3), store.countPrefix("\xff"));
+}
+
+test "ordered index: overwrite keeps one slot; delete paths stay in sync" {
+    const testing = std.testing;
+    var store = try Store.init(testing.allocator, index_test_config);
+    defer store.deinit();
+
+    try store.set("k:1", "v1", false);
+    try store.set("k:1", "v2", false);
+    try testing.expectEqual(@as(usize, 1), store.countPrefix("k:"));
+    const res = try store.scanPrefix("k:", 0, testing.allocator);
+    defer freeScanResults(testing.allocator, res);
+    try testing.expectEqual(@as(usize, 1), res.len);
+    try testing.expectEqualStrings("v2", res[0].value);
+
+    try store.delete("k:1");
+    try testing.expectEqual(@as(usize, 0), store.countPrefix("k:"));
+
+    // A refused WORM delete leaves the index intact; deleteUnsafe (the
+    // procedure-context path) removes it and keeps the index in sync.
+    try store.set("k:worm", "w", true);
+    try testing.expectError(error.WormViolation, store.delete("k:worm"));
+    try testing.expectEqual(@as(usize, 1), store.countPrefix("k:"));
+    store.deleteUnsafe("k:worm");
+    try testing.expectEqual(@as(usize, 0), store.countPrefix("k:"));
+    try testing.expect(store.get("k:worm") == null);
+}
+
+const IndexCbCounter = struct {
+    seen: usize = 0,
+    stop_after: usize = 0,
+};
+
+fn indexCbCount(ctx: *anyopaque, key: []const u8, value: []const u8, ts: u64, is_worm: bool) Store.ScanAction {
+    _ = key;
+    _ = value;
+    _ = ts;
+    _ = is_worm;
+    const c: *IndexCbCounter = @ptrCast(@alignCast(ctx));
+    c.seen += 1;
+    if (c.stop_after > 0 and c.seen >= c.stop_after) return .stop;
+    return .cont;
+}
+
+test "ordered index: scanPrefixCallback yields matches and honors stop" {
+    const testing = std.testing;
+    var store = try Store.init(testing.allocator, index_test_config);
+    defer store.deinit();
+
+    try store.set("cb:a", "1", false);
+    try store.set("cb:b", "2", false);
+    try store.set("cb:c", "3", false);
+    try store.set("cb:d", "4", false);
+    try store.set("cb:e", "5", false);
+    try store.set("other", "x", false);
+
+    var all = IndexCbCounter{};
+    store.scanPrefixCallback("cb:", @ptrCast(&all), indexCbCount);
+    try testing.expectEqual(@as(usize, 5), all.seen);
+
+    var stopped = IndexCbCounter{ .stop_after = 2 };
+    store.scanPrefixCallback("cb:", @ptrCast(&stopped), indexCbCount);
+    try testing.expectEqual(@as(usize, 2), stopped.seen);
+}
+
+test "ordered index survives snapshot load and WAL replay" {
+    const testing = std.testing;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_index_reload.wal", .{tmp_path});
+    defer testing.allocator.free(wal_path);
+
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_index_reload.snapshot", .{tmp_path});
+    defer testing.allocator.free(snapshot_path);
+
+    const file = try compat.Dir.createFile(tmp_dir.dir, "test_index_reload.wal", .{});
+    compat.File.close(file);
+
+    // Small WAL cap forces a snapshot + truncation mid-run, so the reload
+    // exercises BOTH the snapshot-load and the WAL-replay index paths.
+    const config = Config{
+        .wal_path = wal_path,
+        .snapshot_path = snapshot_path,
+        .sync_writes = false,
+        .max_wal_size = 120,
+    };
+
+    {
+        var store = try Store.init(testing.allocator, config);
+        defer store.deinit();
+        try store.set("p:0003", "c", false);
+        try store.set("p:0001", "a", false);
+        try store.set("q:zzzz", "other", false);
+        try store.set("p:0002", "b", false);
+        try store.set("p:gone", "x", false);
+        try store.delete("p:gone");
+    }
+
+    {
+        var reloaded = try Store.init(testing.allocator, config);
+        defer reloaded.deinit();
+
+        try testing.expectEqual(@as(usize, 3), reloaded.countPrefix("p:"));
+        const res = try reloaded.scanPrefix("p:", 0, testing.allocator);
+        defer freeScanResults(testing.allocator, res);
+        try testing.expectEqual(@as(usize, 3), res.len);
+        try testing.expectEqualStrings("p:0001", res[0].key);
+        try testing.expectEqualStrings("p:0002", res[1].key);
+        try testing.expectEqualStrings("p:0003", res[2].key);
+        try testing.expect(reloaded.get("p:gone") == null);
     }
 }

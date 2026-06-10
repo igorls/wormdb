@@ -331,6 +331,30 @@ pub const Store = struct {
         return null;
     }
 
+    /// Stable receipt metadata for an entry, copied while the shard is locked.
+    pub const EntryMetadata = struct {
+        timestamp: u64,
+        is_worm: bool,
+        value_len: usize,
+        value_sha256: [32]u8,
+    };
+
+    pub fn getEntryMetadata(self: *Store, key: []const u8) ?EntryMetadata {
+        const si = shardIndex(key);
+        self.shards[si].mutex.lock();
+        defer self.shards[si].mutex.unlock();
+
+        const entry = self.shards[si].data.get(key) orelse return null;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(entry.value, &digest, .{});
+        return .{
+            .timestamp = entry.timestamp,
+            .is_worm = entry.flags.is_worm,
+            .value_len = entry.value.len,
+            .value_sha256 = digest,
+        };
+    }
+
     /// Read without acquiring a lock. Caller must hold the key shard lock.
     pub fn getUnsafe(self: *Store, key: []const u8) ?*const Entry {
         return self.shards[shardIndex(key)].data.get(key);
@@ -344,21 +368,26 @@ pub const Store = struct {
     /// Write — acquires only the key shard mutex.
     /// WAL enqueue happens OUTSIDE the shard lock to avoid serializing all shards.
     pub fn set(self: *Store, key: []const u8, value: []const u8, is_worm: bool) StoreError!void {
+        return self.setWithTimestamp(key, value, is_worm, @intCast(compat.nowMs()));
+    }
+
+    /// Write with caller-supplied timestamp metadata.
+    ///
+    /// Used by provenance primitives that include a local DB receipt timestamp
+    /// inside their hashed envelope and need the stored entry metadata to match.
+    pub fn setWithTimestamp(self: *Store, key: []const u8, value: []const u8, is_worm: bool, timestamp: u64) StoreError!void {
         const si = shardIndex(key);
         const shard = &self.shards[si];
-        const timestamp: u64 = @intCast(compat.nowMs());
 
-        // Phase 1: Check WORM under shard lock
         shard.mutex.lock();
+        defer shard.mutex.unlock();
+
         if (shard.data.get(key)) |existing| {
             if (existing.flags.is_worm) {
-                shard.mutex.unlock();
                 return error.WormViolation;
             }
         }
-        shard.mutex.unlock();
 
-        // Phase 2: Create entry (+ WAL enqueue if full persistence) — no shard lock held
         const entry = if (self.config.persistence == .full) blk: {
             self.wal_enqueue_mutex.lock();
             const e = self.wal.?.appendSet(key, value, .{ .is_worm = is_worm, .is_deleted = false }, timestamp) catch {
@@ -385,19 +414,9 @@ pub const Store = struct {
         };
         errdefer self.destroyEntry(entry);
 
-        // Phase 3: Re-acquire shard lock and insert
-        shard.mutex.lock();
-        defer shard.mutex.unlock();
-
-        // Re-check WORM (another thread could have set it while we were
-        // unlocked). On any error past entry creation the errdefer above
-        // destroys `entry` — no manual destroy here (that would double-free).
-        if (shard.data.get(key)) |existing| {
-            if (existing.flags.is_worm) {
-                return error.WormViolation;
-            }
-        }
-
+        // Insert into the hashmap + ordered index together. The shard lock is
+        // held for the whole operation (upstream restructure), so no WORM
+        // re-check is needed; on error the errdefer above destroys `entry`.
         try self.shardPutLocked(shard, entry);
 
         // Release shard lock before snapshot check to avoid deadlock
@@ -747,6 +766,16 @@ pub const Store = struct {
                 .set => |set_rec| {
                     const shard = &self.shards[shardIndex(set_rec.key)];
 
+                    // WORM-replay guard (proof spine): a replayed set must
+                    // never overwrite an existing WORM entry.
+                    if (shard.data.get(set_rec.key)) |existing| {
+                        if (existing.flags.is_worm) {
+                            self.allocator.free(set_rec.key);
+                            self.allocator.free(set_rec.value);
+                            continue;
+                        }
+                    }
+
                     const entry = self.allocator.create(Entry) catch |err| {
                         self.allocator.free(set_rec.key);
                         self.allocator.free(set_rec.value);
@@ -765,8 +794,15 @@ pub const Store = struct {
                 },
                 .delete => |key| {
                     const shard = &self.shards[shardIndex(key)];
-                    if (shardRemoveLocked(shard, key)) |removed| {
-                        self.destroyEntry(removed);
+                    // WORM-replay guard (proof spine): never delete a WORM
+                    // entry during replay; shardRemoveLocked keeps the
+                    // ordered index in sync for the non-WORM path.
+                    if (shard.data.get(key)) |existing| {
+                        if (!existing.flags.is_worm) {
+                            if (shardRemoveLocked(shard, key)) |removed| {
+                                self.destroyEntry(removed);
+                            }
+                        }
                     }
                     self.allocator.free(key);
                 },
@@ -1102,6 +1138,65 @@ test "WORM enforcement" {
     try store.set("normal_key", "value1", false);
     try store.set("normal_key", "value2", false);
     try testing.expectEqualStrings("value2", store.get("normal_key").?.value);
+}
+
+test "WAL replay ignores records that would violate WORM" {
+    const testing = std.testing;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_worm_replay_guard.wal", .{tmp_path});
+    defer testing.allocator.free(wal_path);
+
+    const file = try compat.Dir.createFile(tmp_dir.dir, "test_worm_replay_guard.wal", .{});
+    compat.File.close(file);
+
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_worm_replay_guard.snapshot", .{tmp_path});
+    defer testing.allocator.free(snapshot_path);
+
+    const config = Config{
+        .wal_path = wal_path,
+        .snapshot_path = snapshot_path,
+        .sync_writes = false,
+    };
+
+    {
+        var store = try Store.init(testing.allocator, config);
+        defer store.deinit();
+
+        try store.setWithTimestamp("worm_key", "immutable", true, 100);
+        try store.set("mutable_key", "first", false);
+    }
+
+    {
+        var wal = try Wal.init(testing.allocator, wal_path, false);
+        defer wal.deinit();
+
+        const bad_set = try wal.appendSet("worm_key", "modified", .{ .is_worm = false, .is_deleted = false }, 200);
+        bad_set.deinit(testing.allocator);
+        testing.allocator.destroy(bad_set);
+        try wal.appendDelete("worm_key");
+
+        const mutable_set = try wal.appendSet("mutable_key", "second", .{ .is_worm = false, .is_deleted = false }, 201);
+        mutable_set.deinit(testing.allocator);
+        testing.allocator.destroy(mutable_set);
+        try wal.appendDelete("mutable_key");
+    }
+
+    {
+        var reloaded = try Store.init(testing.allocator, config);
+        defer reloaded.deinit();
+
+        try testing.expectEqualStrings("immutable", reloaded.get("worm_key").?.value);
+        try testing.expect(reloaded.get("worm_key").?.flags.is_worm);
+        try testing.expect(reloaded.get("mutable_key") == null);
+
+        const meta = reloaded.getEntryMetadata("worm_key").?;
+        try testing.expectEqual(@as(u64, 100), meta.timestamp);
+    }
 }
 
 test "Store replay handles overwrite and delete safely" {

@@ -9,7 +9,7 @@
 //!
 //! Verification:
 //!   1. Slice off last 64 bytes as signature
-//!   2. crypto_sign_ed25519_verify_detached(sig, payload, pubkey)
+//!   2. Ed25519 verify (std.crypto) of sig over payload against pubkey
 //!   3. Check exp > now, iat <= now
 //!   4. Parse capabilities from payload
 //!
@@ -20,27 +20,10 @@
 const std = @import("std");
 const compat = @import("../core/compat.zig");
 
-/// libsodium bindings via `extern "c"` declarations rather than `@cImport`,
-/// so the build needs only the link library — no system `sodium.h` header.
-/// (Headers are not vendored for the Windows MinGW build.) Mirrors the binding
-/// style meshguard uses in its crypto module.
-const c = struct {
-    extern "c" fn sodium_init() c_int;
-    extern "c" fn crypto_sign_ed25519_verify_detached(
-        sig: [*c]const u8,
-        m: [*c]const u8,
-        mlen: c_ulonglong,
-        pk: [*c]const u8,
-    ) c_int;
-    extern "c" fn crypto_sign_ed25519_detached(
-        sig: [*c]u8,
-        siglen_p: [*c]c_ulonglong,
-        m: [*c]const u8,
-        mlen: c_ulonglong,
-        sk: [*c]const u8,
-    ) c_int;
-    extern "c" fn crypto_sign_ed25519_keypair(pk: [*c]u8, sk: [*c]u8) c_int;
-};
+/// Ed25519 signing/verification uses Zig's std.crypto — no libsodium dependency.
+/// (SCT auth was migrated off libsodium so the basic build path is sodium-free;
+/// see meshguard#102.)
+const Ed25519 = std.crypto.sign.Ed25519;
 
 /// Operation types that can be authorized by a capability.
 pub const Operation = enum(u8) {
@@ -117,6 +100,20 @@ pub const Signature = [64]u8;
 
 const SIGNATURE_LEN = 64;
 
+fn verifyDetached(sig_bytes: [64]u8, payload: []const u8, public_key_bytes: *const PublicKey) bool {
+    const sig = Ed25519.Signature.fromBytes(sig_bytes);
+    const public_key = Ed25519.PublicKey.fromBytes(public_key_bytes.*) catch return false;
+    sig.verify(payload, public_key) catch return false;
+    return true;
+}
+
+fn signDetached(sig_dest: *[SIGNATURE_LEN]u8, payload: []const u8, secret_key_bytes: *const [64]u8) !void {
+    const secret_key = try Ed25519.SecretKey.fromBytes(secret_key_bytes.*);
+    const key_pair = try Ed25519.KeyPair.fromSecretKey(secret_key);
+    const sig = try key_pair.sign(payload, null);
+    sig_dest.* = sig.toBytes();
+}
+
 /// Verify and parse a binary SCT token.
 ///
 /// Returns the parsed token state on success, or an error describing the failure.
@@ -135,11 +132,12 @@ pub fn verifyAndParse(
 
     const payload = token[0 .. token.len - SIGNATURE_LEN];
     const sig = token[token.len - SIGNATURE_LEN ..][0..SIGNATURE_LEN];
+    const sig_bytes = sig.*;
 
     // Verify signature against any of the configured public keys
     var verified = false;
     for (public_keys) |pk| {
-        if (c.crypto_sign_ed25519_verify_detached(sig, payload.ptr, payload.len, &pk) == 0) {
+        if (verifyDetached(sig_bytes, payload, &pk)) {
             verified = true;
             break;
         }
@@ -280,17 +278,15 @@ pub fn encode(
     // Sign payload → write signature at end
     const payload = buf[0..payload_len];
     const sig_dest: *[SIGNATURE_LEN]u8 = buf[payload_len..][0..SIGNATURE_LEN];
-    _ = c.crypto_sign_ed25519_detached(sig_dest, null, payload.ptr, payload.len, secret_key);
+    try signDetached(sig_dest, payload, secret_key);
 
     return buf;
 }
 
-/// Generate an Ed25519 keypair using libsodium.
+/// Generate an Ed25519 keypair.
 pub fn generateKeypair() struct { public_key: PublicKey, secret_key: [64]u8 } {
-    var pk: PublicKey = undefined;
-    var sk: [64]u8 = undefined;
-    _ = c.crypto_sign_ed25519_keypair(&pk, &sk);
-    return .{ .public_key = pk, .secret_key = sk };
+    const kp = Ed25519.KeyPair.generate(std.Io.Threaded.global_single_threaded.io());
+    return .{ .public_key = kp.public_key.toBytes(), .secret_key = kp.secret_key.toBytes() };
 }
 
 /// Decode a base64-encoded public key into a 32-byte Ed25519 public key.
@@ -420,9 +416,6 @@ pub fn freeTokenState(allocator: std.mem.Allocator, state: *const TokenState) vo
 test "encode, verify, and parse roundtrip" {
     const testing = std.testing;
 
-    // Initialize libsodium (required for first use)
-    if (c.sodium_init() < -1) return error.SodiumInitFailed;
-
     const kp = generateKeypair();
 
     const now: u64 = @intCast(@divFloor(compat.nowMs(), 1000));
@@ -454,8 +447,6 @@ test "encode, verify, and parse roundtrip" {
 
 test "reject expired token" {
     const testing = std.testing;
-    if (c.sodium_init() < -1) return error.SodiumInitFailed;
-
     const kp = generateKeypair();
     const now: u64 = @intCast(@divFloor(compat.nowMs(), 1000));
 
@@ -469,7 +460,6 @@ test "reject expired token" {
 
 test "reject bad signature" {
     const testing = std.testing;
-    if (c.sodium_init() < -1) return error.SodiumInitFailed;
 
     const kp1 = generateKeypair();
     const kp2 = generateKeypair(); // Different key

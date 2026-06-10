@@ -1,26 +1,32 @@
 const std = @import("std");
 
-/// Link libsodium into a module, branching on target OS.
+/// Link platform crypto/system libraries into a module, branching on target OS.
 ///
-/// Linux uses the vendored shared `deps/lib/libsodium.so`. Windows (gnu/MinGW
-/// ABI) links the vendored static `deps/lib/windows-x86_64/libsodium.a` and the
-/// system libraries libsodium's Windows backend needs (advapi32/bcrypt for the
-/// CSPRNG) plus ws2_32 for Winsock, which the threadpool server and gateway use.
-fn linkSodium(b: *std.Build, mod: *std.Build.Module, is_windows: bool) void {
-    if (is_windows) {
-        mod.addLibraryPath(b.path("deps/lib/windows-x86_64"));
-        mod.linkSystemLibrary("sodium", .{ .preferred_link_mode = .static });
+/// libsodium is an OPTIONAL accelerator (meshguard#102): it is linked only when
+/// `use_libsodium` is set (resolved from `-Dcrypto-backend` / `-Dno-sodium`).
+/// Linux uses the vendored shared `deps/lib/libsodium.so`; Windows uses the
+/// vendored static `deps/lib/windows-x86_64/libsodium.a`. The std.crypto path
+/// (the default off-Linux and whenever sodium is disabled) needs no sodium link.
+///
+/// Windows always links ws2_32 (Winsock — threadpool server + gateway) and
+/// advapi32/bcrypt (CSPRNG backing) regardless of the crypto backend.
+fn linkCrypto(b: *std.Build, mod: *std.Build.Module, os_tag: std.Target.Os.Tag, abi: std.Target.Abi, use_libsodium: bool) void {
+    if (os_tag == .windows) {
+        mod.linkSystemLibrary("ws2_32", .{});
         mod.linkSystemLibrary("advapi32", .{});
         mod.linkSystemLibrary("bcrypt", .{});
-        mod.linkSystemLibrary("ws2_32", .{});
-    } else {
+        if (use_libsodium) {
+            mod.addLibraryPath(b.path("deps/lib/windows-x86_64"));
+            mod.linkSystemLibrary("sodium", .{ .preferred_link_mode = .static });
+        }
+    } else if (os_tag == .linux and abi != .android and use_libsodium) {
         mod.addLibraryPath(b.path("deps/lib"));
         mod.linkSystemLibrary("sodium", .{});
     }
 }
 
 /// Link the QUIC/WebTransport C deps (MsQuic + libwtf) into a module so consumers inherit them, exactly
-/// like linkSodium. Uses b.path (relative to THIS package's root) so it resolves when wormdb is consumed
+/// like linkCrypto. Uses b.path (relative to THIS package's root) so it resolves when wormdb is consumed
 /// as a dependency. Applied only when `-Dquic=true`. NOTE: Linux-oriented. Preconditions: `git submodule
 /// update --init` (deps/msquic, deps/libwtf) + a CMake build of MsQuic (which produces the SHARED
 /// `bin/Release/libmsquic.so`). The binary then needs libmsquic.so at runtime (set LD_LIBRARY_PATH or an
@@ -65,35 +71,65 @@ fn linkQuic(b: *std.Build, mod: *std.Build.Module) void {
     mod.linkSystemLibrary("pthread", .{});
 }
 
-// This package is the WormDB ENGINE LIBRARY only. It produces the `wormdb` module (consumed by the
-// server binary and the domain packages, each in their own repo) plus its unit tests — it does NOT
-// build the server exe. The exe is the composition root and lives in `wormdb-server`, which depends
-// on this engine + the domain packages. Splitting the exe out of the engine is what lets the domains
-// depend on `wormdb` via the package manager without a build-root self-diamond.
+// This package exports the WormDB ENGINE LIBRARY as the `wormdb` module and also
+// builds a basic standalone database executable for local/dev use. Rich domain
+// composition binaries can still live in separate repos and depend on this
+// engine module; the in-repo exe intentionally wires only the core engine.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const is_windows = target.result.os.tag == .windows;
+    const os_tag = target.result.os.tag;
+    const abi = target.result.abi;
 
     // Build option, exposed to source via @import("build_options"). QUIC's C deps (MsQuic/libwtf) are
     // wired in the server build when enabled — see wormdb-server. The engine only carries the flag +
     // the (comptime-gated) Zig code.
     const enable_quic = b.option(bool, "quic", "Enable QUIC/WebTransport gateway (requires MsQuic)") orelse false;
+
+    // ─── Crypto backend selection (meshguard#102) ───
+    // libsodium is an OPTIONAL accelerator (AVX2 ChaCha20-Poly1305 on Linux, used
+    // by the embedded meshguard tunnel), not a required dependency. wormdb itself
+    // uses std.crypto for SCT auth, so the basic build path needs no libsodium.
+    //   auto   → libsodium on Linux desktop (non-Android), std.crypto elsewhere
+    //   std    → std.crypto everywhere (no libsodium link)
+    //   sodium → force libsodium (link must be available for the target)
+    const CryptoBackend = enum { auto, std, sodium };
+    const crypto_backend_opt = b.option(CryptoBackend, "crypto-backend", "Crypto backend: auto|std|sodium (default auto)");
+    const no_sodium = b.option(bool, "no-sodium", "Alias for -Dcrypto-backend=std") orelse false;
+    // Fail fast on contradictory flags rather than silently letting one win.
+    if (no_sodium and (crypto_backend_opt orelse .std) == .sodium) {
+        std.debug.print("error: -Dno-sodium=true conflicts with -Dcrypto-backend=sodium\n" ++
+            "  (-Dno-sodium is an alias for -Dcrypto-backend=std)\n", .{});
+        std.process.exit(1);
+    }
+    const crypto_backend = crypto_backend_opt orelse .auto;
+    const auto_libsodium = (os_tag == .linux and abi != .android);
+    const use_libsodium = if (no_sodium) false else switch (crypto_backend) {
+        .std => false,
+        .sodium => true,
+        .auto => auto_libsodium,
+    };
+
     const build_options = b.addOptions();
     build_options.addOption(bool, "quic", enable_quic);
+    // Consumed by the embedded meshguard source (tunnel.zig/main.zig) so it picks
+    // the same backend linkCrypto wires for. Shared with the wormdb module too.
+    build_options.addOption(bool, "use_libsodium", use_libsodium);
     const build_options_mod = build_options.createModule();
 
     // MeshGuard library module (embedded mesh networking). b.path resolves against THIS package's root,
-    // so it works when wormdb is consumed as a dependency.
+    // so it works when wormdb is consumed as a dependency. meshguard's source reads `build_options` to
+    // select its crypto backend — wormdb (which builds meshguard from source) must provide it.
     const meshguard_mod = b.createModule(.{
         .root_source_file = b.path("deps/meshguard/src/lib.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    meshguard_mod.addImport("build_options", build_options_mod);
 
     // The engine library module — exposed via addModule so the server exe + domain packages consume the
-    // real engine types (Store, Ctx, Segment, Domain, …) with `@import("wormdb")`. linkSodium is applied
+    // real engine types (Store, Ctx, Segment, Domain, …) with `@import("wormdb")`. linkCrypto is applied
     // to the module so consumers inherit the libsodium link transitively.
     const wormdb_mod = b.addModule("wormdb", .{
         .root_source_file = b.path("src/lib.zig"),
@@ -105,8 +141,65 @@ pub fn build(b: *std.Build) void {
             .{ .name = "build_options", .module = build_options_mod },
         },
     });
-    linkSodium(b, wormdb_mod, is_windows);
+    linkCrypto(b, wormdb_mod, os_tag, abi, use_libsodium);
     if (enable_quic) linkQuic(b, wormdb_mod); // QUIC C deps inherited by consumers (server exe)
+
+    // Basic standalone WormDB executable. This is deliberately a small
+    // composition root over the engine module (no external domain packages), so
+    // `zig build`, `zig build run`, and Dockerfile-based basic usage work from
+    // this repository after the core-lib split.
+    const exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "wormdb", .module = wormdb_mod },
+            .{ .name = "meshguard", .module = meshguard_mod },
+            .{ .name = "build_options", .module = build_options_mod },
+        },
+    });
+    linkCrypto(b, exe_mod, os_tag, abi, use_libsodium);
+    if (enable_quic) linkQuic(b, exe_mod);
+
+    const exe = b.addExecutable(.{
+        .name = "wormdb",
+        .root_module = exe_mod,
+    });
+    b.installArtifact(exe);
+
+    const run_exe = b.addRunArtifact(exe);
+    if (b.args) |args| run_exe.addArgs(args);
+    const run_step = b.step("run", "Run the basic WormDB server");
+    run_step.dependOn(&run_exe.step);
+
+    // Embedding FFI library — a C ABI over the engine for native apps (iOS/Swift,
+    // Android/JNI). Single-node, in-process; see src/ffi.zig and ffi/wormdb.h.
+    // iOS must static-link (apps cannot dlopen user dylibs); everything else gets
+    // a shared library by default.
+    const ffi_mod = b.createModule(.{
+        .root_source_file = b.path("src/ffi.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "wormdb", .module = wormdb_mod },
+        },
+    });
+    linkCrypto(b, ffi_mod, os_tag, abi, use_libsodium);
+    if (enable_quic) linkQuic(b, ffi_mod);
+    const ffi_lib = b.addLibrary(.{
+        .name = "wormdb_ffi",
+        .root_module = ffi_mod,
+        .linkage = if (os_tag == .ios) .static else .dynamic,
+    });
+    b.installArtifact(ffi_lib);
+
+    // `zig build ffi` builds ONLY the embedding library. Needed for darwin cross
+    // targets (iOS) where the standalone exe can't link libSystem without the SDK,
+    // but the static lib compiles fine with `--sysroot $(xcrun --show-sdk-path)`.
+    const ffi_step = b.step("ffi", "Build only the embedding FFI library (libwormdb_ffi)");
+    ffi_step.dependOn(&b.addInstallArtifact(ffi_lib, .{}).step);
 
     // Unit tests for the engine.
     const test_mod = b.createModule(.{
@@ -119,7 +212,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "build_options", .module = build_options_mod },
         },
     });
-    linkSodium(b, test_mod, is_windows);
+    linkCrypto(b, test_mod, os_tag, abi, use_libsodium);
     if (enable_quic) linkQuic(b, test_mod);
 
     const unit_tests = b.addTest(.{ .root_module = test_mod });

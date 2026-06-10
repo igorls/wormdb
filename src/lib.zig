@@ -16,6 +16,7 @@ pub const event = @import("event/mod.zig");
 pub const cluster = @import("cluster/mod.zig");
 pub const procedures = @import("procedures/mod.zig");
 pub const vector = @import("vector/mod.zig");
+pub const proof = @import("proof/mod.zig");
 
 // The compile-time build options (e.g. `quic`). Exposed so the composition root (the server exe)
 // reads the SAME instance the engine compiled against — a second build_options module would conflict.

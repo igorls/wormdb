@@ -10,9 +10,11 @@ const core = @import("../core/mod.zig");
 pub const wal = @import("wal.zig");
 pub const store = @import("store.zig");
 pub const segment = @import("segment.zig");
+pub const sst = @import("sst.zig");
 
-// Re-export the frozen-segment reader.
+// Re-export the frozen-segment readers (u64-keyed wseg + sorted-string wsst).
 pub const Segment = segment.Segment;
+pub const Sst = sst.Sst;
 
 // Re-export types
 pub const Wal = wal.Wal;

@@ -11,3 +11,6 @@ deps/libwtf
 .playwright-mcp
 *.pdb
 *.exe
+
+# Exception: the Dockerfile ships the pre-built Linux server binary.
+!zig-out/bin/wormdb

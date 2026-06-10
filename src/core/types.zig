@@ -15,7 +15,12 @@ pub const Timestamp = u64;
 pub const EntryFlags = packed struct(u8) {
     is_worm: bool, // Write-once-read-many: cannot be modified
     is_deleted: bool, // Tombstone for deletions
-    _: u6 = 0,
+    /// Key/value/Entry live in the store's snapshot-load arena, not in
+    /// individual allocations — destroyEntry must not free them (the arena
+    /// is reclaimed wholesale at store deinit). Never persisted: snapshot
+    /// write masks it, snapshot load force-sets it.
+    arena_owned: bool = false,
+    _: u5 = 0,
 };
 
 /// A single key-value entry in the store

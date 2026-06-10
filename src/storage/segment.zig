@@ -77,7 +77,7 @@ pub const Segment = struct {
         blob: []const u8,
     };
 
-    const Mapped = struct { bytes: []const u8, backing: Backing };
+    pub const Mapped = struct { bytes: []const u8, backing: Backing };
 
     /// Open and validate a segment file. The mapping (or heap buffer) is owned
     /// by the returned Segment until `close`.
@@ -177,8 +177,9 @@ pub const Segment = struct {
     }
 
     // --- file mapping ---
+    // (pub: the sorted-string segment in sst.zig shares this mapping layer.)
 
-    fn mapFile(allocator: std.mem.Allocator, path: []const u8) !Mapped {
+    pub fn mapFile(allocator: std.mem.Allocator, path: []const u8) !Mapped {
         if (comptime builtin.os.tag == .windows) {
             // No mmap on the Windows single-node build — read the whole file.
             // (The WAX serving target is Linux; this keeps the reader testable
@@ -230,7 +231,7 @@ pub const Segment = struct {
         }
     }
 
-    fn freeBytes(allocator: std.mem.Allocator, bytes: []const u8, backing: Backing) void {
+    pub fn freeBytes(allocator: std.mem.Allocator, bytes: []const u8, backing: Backing) void {
         if (bytes.len == 0) return;
         switch (backing) {
             .heap => allocator.free(bytes),

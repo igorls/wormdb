@@ -173,6 +173,24 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the basic WormDB server");
     run_step.dependOn(&run_exe.step);
 
+    // wormdb-sst — offline builder: snapshot → frozen sorted-string segment.
+    const sst_tool_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/sst_build.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "wormdb", .module = wormdb_mod },
+        },
+    });
+    linkCrypto(b, sst_tool_mod, os_tag, abi, use_libsodium);
+    if (enable_quic) linkQuic(b, sst_tool_mod);
+    const sst_tool = b.addExecutable(.{
+        .name = "wormdb-sst",
+        .root_module = sst_tool_mod,
+    });
+    b.installArtifact(sst_tool);
+
     // Embedding FFI library — a C ABI over the engine for native apps (iOS/Swift,
     // Android/JNI). Single-node, in-process; see src/ffi.zig and ffi/wormdb.h.
     // iOS must static-link (apps cannot dlopen user dylibs); everything else gets

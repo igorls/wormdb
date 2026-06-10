@@ -222,8 +222,13 @@ pub const Ctx = struct {
     // ╚═══════════════════════════════════════════════╝
 
     /// Get the raw value for a key. Caller must hold the key's shard lock.
+    /// Falls through to the frozen sst overlay on a live miss (lock-free —
+    /// frozen slices are immutable and outlive the store).
     pub fn get(self: *Ctx, key: []const u8) ?[]const u8 {
-        const entry = self.store.getUnsafe(key) orelse return null;
+        const entry = self.store.getUnsafe(key) orelse {
+            if (self.store.sstHit(key)) |hit| return hit.value;
+            return null;
+        };
         return entry.value;
     }
 
@@ -320,9 +325,13 @@ pub const Ctx = struct {
         self.store.deleteUnsafe(key);
     }
 
-    /// Get entry metadata (timestamp).
+    /// Get entry metadata (timestamp). Frozen sst entries report their
+    /// segment's build timestamp.
     pub fn getTimestamp(self: *Ctx, key: []const u8) ?u64 {
-        const entry = self.store.getUnsafe(key) orelse return null;
+        const entry = self.store.getUnsafe(key) orelse {
+            if (self.store.sstHit(key)) |hit| return hit.timestamp;
+            return null;
+        };
         return entry.timestamp;
     }
 

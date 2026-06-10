@@ -13,6 +13,7 @@ const Wal = wal_mod.Wal;
 const compat = core.compat;
 const WalRecord = wal_mod.WalRecord;
 const Segment = @import("segment.zig").Segment;
+const Sst = @import("sst.zig").Sst;
 
 // Snapshot format:
 //   v1 → WDBSNAP1: KV entries only (legacy, still loadable).
@@ -141,6 +142,13 @@ pub const Store = struct {
     wal: ?Wal,
     wal_enqueue_mutex: core.compat.Mutex,
     config: Config,
+    /// Bump arena owning every snapshot-loaded entry (key, value, and Entry
+    /// struct — flagged `arena_owned`). Snapshot data is overwhelmingly the
+    /// static bulk of the store; three individual allocations per entry cost
+    /// more in allocator round-trips and header overhead than the arena's
+    /// one-shot reclaim loses on deleted/superseded entries (which just go
+    /// unused until restart).
+    snapshot_arena: std.heap.ArenaAllocator,
     /// Optional HNSW registry back-reference. Attached by main.zig after
     /// both objects exist; snapshot write/load use it when present.
     vector_registry: ?*NamespaceRegistry = null,
@@ -153,6 +161,15 @@ pub const Store = struct {
     /// there are only a handful of serving domains.
     segments_buf: [MAX_SEGMENTS]NamedSegment = undefined,
     segment_count: usize = 0,
+    /// Frozen sorted-string segments (`.wsst`, see sst.zig) mounted as a
+    /// TRANSPARENT overlay: GET/scan/EXEC consult live shards first, then each
+    /// sst in attach order — so live writes shadow frozen keys and procedures
+    /// need no segment awareness. Mounted by the composition root; each sst
+    /// must outlive the store. v1 limitations (documented, enforced nowhere):
+    /// DEL cannot mask a frozen key (it resurfaces), and STATUS/key counts
+    /// cover live entries only.
+    ssts_buf: [MAX_SSTS]*const Sst = undefined,
+    sst_count: usize = 0,
 
     /// Attach the per-namespace HNSW registry to this store so snapshots
     /// persist and restore graph state alongside KV data. Call after both
@@ -163,6 +180,50 @@ pub const Store = struct {
 
     const MAX_SEGMENTS: usize = 8;
     const NamedSegment = struct { name: []const u8, seg: *const Segment };
+    const MAX_SSTS: usize = 4;
+
+    /// Mount a frozen sorted-string segment into the read overlay (earlier
+    /// mounts win on duplicate keys). Call after construction; `s` must
+    /// outlive the store.
+    pub fn attachSst(self: *Store, s: *const Sst) void {
+        if (self.sst_count >= MAX_SSTS) {
+            std.log.warn("sst overlay full ({d}); dropping mount", .{MAX_SSTS});
+            return;
+        }
+        self.ssts_buf[self.sst_count] = s;
+        self.sst_count += 1;
+    }
+
+    /// Overlay lookup behind the live shards: first attached sst that has the
+    /// key wins. Lock-free — frozen mappings are immutable and immortal.
+    pub fn sstHit(self: *const Store, key: []const u8) ?Sst.Hit {
+        for (self.ssts_buf[0..self.sst_count]) |s| {
+            if (s.get(key)) |hit| return hit;
+        }
+        return null;
+    }
+
+    /// True if the live shards contain `key` (regardless of any sst).
+    fn containsLive(self: *Store, key: []const u8) bool {
+        const si = shardIndex(key);
+        self.shards[si].mutex.lock();
+        defer self.shards[si].mutex.unlock();
+        return self.shards[si].data.contains(key);
+    }
+
+    /// True if ANY live key starts with `prefix` — O(SHARDS·log n), no walk.
+    /// Scan overlays use this to skip the per-key containsLive shadow probe
+    /// entirely in the common frozen-dataset case (live store empty or
+    /// disjoint), where per-yield lock+hash probes dominate large scans.
+    fn livePrefixNonEmpty(self: *Store, prefix: []const u8) bool {
+        for (&self.shards) |*shard| {
+            shard.mutex.lock();
+            defer shard.mutex.unlock();
+            const range = prefixRange(shard.sorted.items, prefix);
+            if (range.hi > range.lo) return true;
+        }
+        return false;
+    }
 
     /// Attach a frozen read-only segment under `name`. Re-attaching the same name
     /// replaces it. Call after the store is constructed and the segment is mapped;
@@ -229,6 +290,7 @@ pub const Store = struct {
             .wal_enqueue_mutex = .{},
             .config = config,
             .vector_registry = registry,
+            .snapshot_arena = std.heap.ArenaAllocator.init(allocator),
         };
 
         // Load snapshot for full and snapshot modes, skip for none
@@ -267,9 +329,13 @@ pub const Store = struct {
             shard.data.deinit();
             shard.sorted.deinit(self.allocator);
         }
+        self.snapshot_arena.deinit();
     }
 
     pub fn destroyEntry(self: *Store, entry: *Entry) void {
+        // Arena-owned entries are reclaimed wholesale when the arena dies; a
+        // deleted/superseded one just sits unused in it until then.
+        if (entry.flags.arena_owned) return;
         entry.deinit(self.allocator);
         self.allocator.destroy(entry);
     }
@@ -321,12 +387,17 @@ pub const Store = struct {
 
     /// Safe read — copies value inside the shard lock using the caller's allocator.
     /// Prevents use-after-free when another thread deletes the key concurrently.
+    /// Falls through to the frozen sst overlay on a live miss.
     pub fn getValueDupe(self: *Store, key: []const u8, alloc: std.mem.Allocator) !?[]const u8 {
         const si = shardIndex(key);
         self.shards[si].mutex.lock();
-        defer self.shards[si].mutex.unlock();
         if (self.shards[si].data.get(key)) |entry| {
+            defer self.shards[si].mutex.unlock();
             return try alloc.dupe(u8, entry.value);
+        }
+        self.shards[si].mutex.unlock();
+        if (self.sstHit(key)) |hit| {
+            return try alloc.dupe(u8, hit.value);
         }
         return null;
     }
@@ -386,6 +457,10 @@ pub const Store = struct {
             if (existing.flags.is_worm) {
                 return error.WormViolation;
             }
+        } else if (self.sstHit(key)) |frozen| {
+            // A frozen WORM key may not be shadowed by a live write — that
+            // would silently serve the new value over the immutable one.
+            if (frozen.is_worm) return error.WormViolation;
         }
 
         const entry = if (self.config.persistence == .full) blk: {
@@ -458,6 +533,10 @@ pub const Store = struct {
 
         if (shard.data.get(key)) |existing| {
             if (existing.flags.is_worm) return error.WormViolation;
+        } else if (self.sstHit(key)) |frozen| {
+            // A frozen WORM key may not be shadowed by a live write — that
+            // would silently serve the new value over the immutable one.
+            if (frozen.is_worm) return error.WormViolation;
         }
 
         const entry = if (self.config.persistence == .full) blk: {
@@ -651,6 +730,40 @@ pub const Store = struct {
             }
         }
 
+        // Frozen sst overlay: collect the same per-source window from each
+        // mounted segment (two binary searches + an index slice). Keys present
+        // in the live shards are skipped — live writes shadow frozen data.
+        // No shard lock is held here, so the containsLive probe cannot deadlock.
+        const live_may_shadow = self.sst_count > 0 and self.livePrefixNonEmpty(prefix);
+        for (self.ssts_buf[0..self.sst_count]) |sst| {
+            const range = sst.prefixRange(prefix);
+            var start = range.lo;
+            var end = range.hi;
+            if (limit > 0 and range.hi - range.lo > limit) {
+                switch (cut) {
+                    .first => end = range.lo + limit,
+                    .last => start = range.hi - limit,
+                }
+            }
+            var i = start;
+            while (i < end) : (i += 1) {
+                const hit = sst.hitAt(i);
+                if (live_may_shadow and self.containsLive(hit.key)) continue;
+
+                const key_copy = try alloc.dupe(u8, hit.key);
+                errdefer alloc.free(key_copy);
+                const val_copy = try alloc.dupe(u8, hit.value);
+                errdefer alloc.free(val_copy);
+
+                try results.append(alloc, .{
+                    .key = key_copy,
+                    .value = val_copy,
+                    .timestamp = hit.timestamp,
+                    .is_worm = hit.is_worm,
+                });
+            }
+        }
+
         // Sort by key ascending (lexicographic = chronological for timestamp-keyed data)
         std.sort.heap(ScanResult, results.items, {}, struct {
             fn lessThan(_: void, a: ScanResult, b: ScanResult) bool {
@@ -727,6 +840,23 @@ pub const Store = struct {
                 }
             }
         }
+
+        // Frozen sst overlay — yielded after the live shards (ascending within
+        // each sst, like each shard), skipping live-shadowed keys. No shard
+        // lock is held during the callback for these.
+        const live_may_shadow = self.sst_count > 0 and self.livePrefixNonEmpty(prefix);
+        for (self.ssts_buf[0..self.sst_count]) |sst| {
+            const range = sst.prefixRange(prefix);
+            var i = range.lo;
+            while (i < range.hi) : (i += 1) {
+                const hit = sst.hitAt(i);
+                if (live_may_shadow and self.containsLive(hit.key)) continue;
+                switch (callback(context, hit.key, hit.value, hit.timestamp, hit.is_worm)) {
+                    .cont => {},
+                    .stop => return,
+                }
+            }
+        }
     }
 
     /// Count keys matching a prefix. Pure binary search per shard —
@@ -738,6 +868,14 @@ pub const Store = struct {
             defer shard.mutex.unlock();
 
             const range = prefixRange(shard.sorted.items, prefix);
+            total += range.hi - range.lo;
+        }
+        // Frozen sst ranges are added raw: a live entry shadowing a frozen key
+        // double-counts (walking arbitrarily large ranges to dedup would defeat
+        // the O(log n) contract). Exact only when live and frozen keys are
+        // disjoint — the normal frozen-dataset deployment.
+        for (self.ssts_buf[0..self.sst_count]) |sst| {
+            const range = sst.prefixRange(prefix);
             total += range.hi - range.lo;
         }
         return total;
@@ -859,34 +997,39 @@ pub const Store = struct {
             }
         }.lessThan);
 
-        try compat.File.writeAll(snapshot_file, SNAPSHOT_MAGIC);
+        // Mirror of the load path's buffering: per-field raw writes cost a
+        // kernel round-trip each (shutdown saves of multi-million-key stores
+        // took minutes of syscall overhead while holding every shard lock).
+        var writer = BufferedFileWriter{
+            .file = snapshot_file,
+            .buf = try self.allocator.alloc(u8, SNAPSHOT_READ_BUF_SIZE),
+        };
+        defer self.allocator.free(writer.buf);
+
+        try writer.writeAll(SNAPSHOT_MAGIC);
 
         var version_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, version_buf[0..4], SNAPSHOT_VERSION, .little);
-        try compat.File.writeAll(snapshot_file, version_buf[0..4]);
+        try writer.writeAll(version_buf[0..4]);
 
         var count_buf: [8]u8 = undefined;
         std.mem.writeInt(u64, count_buf[0..8], @intCast(entry_index), .little);
-        try compat.File.writeAll(snapshot_file, count_buf[0..8]);
+        try writer.writeAll(count_buf[0..8]);
 
         for (entries[0..entry_index]) |entry| {
-            var key_len_buf: [4]u8 = undefined;
-            std.mem.writeInt(u32, key_len_buf[0..4], @intCast(entry.key.len), .little);
-            try compat.File.writeAll(snapshot_file, key_len_buf[0..4]);
+            // Fixed entry header (matches the load path's single 17-byte read):
+            // key_len u32 | value_len u32 | flags u8 | timestamp u64.
+            var header_buf: [17]u8 = undefined;
+            std.mem.writeInt(u32, header_buf[0..4], @intCast(entry.key.len), .little);
+            std.mem.writeInt(u32, header_buf[4..8], @intCast(entry.value.len), .little);
+            var flags = entry.flags;
+            flags.arena_owned = false; // placement detail, never persisted
+            header_buf[8] = @bitCast(flags);
+            std.mem.writeInt(u64, header_buf[9..17], entry.timestamp, .little);
+            try writer.writeAll(header_buf[0..]);
 
-            var value_len_buf: [4]u8 = undefined;
-            std.mem.writeInt(u32, value_len_buf[0..4], @intCast(entry.value.len), .little);
-            try compat.File.writeAll(snapshot_file, value_len_buf[0..4]);
-
-            const flags_byte: u8 = @bitCast(entry.flags);
-            try compat.File.writeAll(snapshot_file, &[_]u8{flags_byte});
-
-            var timestamp_buf: [8]u8 = undefined;
-            std.mem.writeInt(u64, timestamp_buf[0..8], entry.timestamp, .little);
-            try compat.File.writeAll(snapshot_file, timestamp_buf[0..8]);
-
-            try compat.File.writeAll(snapshot_file, entry.key);
-            try compat.File.writeAll(snapshot_file, entry.value);
+            try writer.writeAll(entry.key);
+            try writer.writeAll(entry.value);
         }
 
         // ── v2 HNSW trailer (optional) ──
@@ -896,37 +1039,86 @@ pub const Store = struct {
         // per-namespace write-locks we acquire inside registry.writeTo.
         if (self.vector_registry) |reg| {
             if (reg.map.count() > 0) {
-                var snap_writer = FileWriter{ .file = snapshot_file };
-                reg.writeTo(&snap_writer) catch |err| {
+                reg.writeTo(&writer) catch |err| {
                     std.log.warn("writeSnapshot: HNSW trailer skipped: {s}", .{@errorName(err)});
                 };
             }
         }
 
+        try writer.flush();
         try compat.File.sync(snapshot_file);
         compat.File.close(snapshot_file);
 
         try compat.Dir.rename(core.compat.cwd(), temp_snapshot_path, self.config.snapshot_path);
     }
 
-    /// Thin adapter exposing `.writeAll` over an `std.Io.File`. Needed
-    /// because the registry/HNSW serializers take `anytype` writers and
-    /// `compat.File.writeAll` is a free function, not a method.
-    const FileWriter = struct {
+    /// Buffered counterpart to BufferedFileReader for the snapshot write path.
+    /// Exposes `.writeAll`, so the registry/HNSW serializers (which take
+    /// `anytype` writers) stream through the same buffer. Callers must
+    /// `flush()` before sync/close.
+    const BufferedFileWriter = struct {
         file: std.Io.File,
+        buf: []u8,
+        end: usize = 0,
+
         pub fn writeAll(self: *@This(), data: []const u8) !void {
-            try compat.File.writeAll(self.file, data);
+            // Writes at/above one buffer go straight to the file (after a
+            // flush to preserve ordering) — no point double-copying.
+            if (data.len >= self.buf.len) {
+                try self.flush();
+                return compat.File.writeAll(self.file, data);
+            }
+            if (self.end + data.len > self.buf.len) try self.flush();
+            @memcpy(self.buf[self.end..][0..data.len], data);
+            self.end += data.len;
+        }
+
+        pub fn flush(self: *@This()) !void {
+            if (self.end == 0) return;
+            try compat.File.writeAll(self.file, self.buf[0..self.end]);
+            self.end = 0;
         }
     };
 
-    /// Thin adapter exposing `.readAll` over an `std.Io.File`. Mirrors
-    /// FileWriter for the read path.
-    const FileReader = struct {
+    /// Buffered sequential reader over an `std.Io.File`. Snapshot load parses
+    /// six fields per entry; reading each straight from the file costs a kernel
+    /// round-trip per field (tens of millions of syscalls on a multi-million-key
+    /// snapshot — that, not disk bandwidth, dominated load time). Amortize them
+    /// through one big buffer. Exposes the same `.readAll` contract as
+    /// FileWriter's read twin, so the HNSW trailer consumes the tail through the
+    /// same buffer (the raw file position has read ahead once buffering starts,
+    /// so the file must not be read directly afterwards).
+    const BufferedFileReader = struct {
         file: std.Io.File,
+        buf: []u8,
+        start: usize = 0,
+        end: usize = 0,
+
         pub fn readAll(self: *@This(), dest: []u8) !usize {
-            return compat.File.readAll(self.file, dest);
+            var total: usize = 0;
+            while (total < dest.len) {
+                const avail = self.end - self.start;
+                if (avail == 0) {
+                    // Requests at/above one buffer go straight to the file once
+                    // the buffer is drained — no point double-copying.
+                    if (dest.len - total >= self.buf.len) {
+                        return total + try compat.File.readAll(self.file, dest[total..]);
+                    }
+                    self.start = 0;
+                    self.end = try compat.File.readAll(self.file, self.buf);
+                    if (self.end == 0) break; // EOF
+                    continue;
+                }
+                const n = @min(avail, dest.len - total);
+                @memcpy(dest[total..][0..n], self.buf[self.start..][0..n]);
+                self.start += n;
+                total += n;
+            }
+            return total;
         }
     };
+
+    const SNAPSHOT_READ_BUF_SIZE: usize = 4 << 20;
 
     fn loadSnapshot(self: *Store) !void {
         const snapshot_file = compat.Dir.openFile(core.compat.cwd(), self.config.snapshot_path, .{ .mode = .read_only }) catch |err| switch (err) {
@@ -940,8 +1132,14 @@ pub const Store = struct {
             return;
         }
 
+        var reader = BufferedFileReader{
+            .file = snapshot_file,
+            .buf = try self.allocator.alloc(u8, SNAPSHOT_READ_BUF_SIZE),
+        };
+        defer self.allocator.free(reader.buf);
+
         var magic_buf: [SNAPSHOT_MAGIC.len]u8 = undefined;
-        if (try compat.File.readAll(snapshot_file, magic_buf[0..]) != magic_buf.len) {
+        if (try reader.readAll(magic_buf[0..]) != magic_buf.len) {
             return error.Corruption;
         }
         if (!std.mem.eql(u8, magic_buf[0..], SNAPSHOT_MAGIC)) {
@@ -949,7 +1147,7 @@ pub const Store = struct {
         }
 
         var version_buf: [4]u8 = undefined;
-        if (try compat.File.readAll(snapshot_file, version_buf[0..4]) != version_buf.len) {
+        if (try reader.readAll(version_buf[0..4]) != version_buf.len) {
             return error.Corruption;
         }
         const version = std.mem.readInt(u32, version_buf[0..4], .little);
@@ -958,55 +1156,61 @@ pub const Store = struct {
         }
 
         var count_buf: [8]u8 = undefined;
-        if (try compat.File.readAll(snapshot_file, count_buf[0..8]) != count_buf.len) {
+        if (try reader.readAll(count_buf[0..8]) != count_buf.len) {
             return error.Corruption;
         }
         const entry_count = std.mem.readInt(u64, count_buf[0..8], .little);
+        // Every entry takes ≥17 header bytes on disk — a count beyond that is
+        // a corrupt header, and it must not reach the presize @intCast below.
+        if (entry_count > stat.size / 17) {
+            return error.Corruption;
+        }
 
         std.log.info("Loading snapshot: {d} entries...", .{entry_count});
+
+        // Pre-size every shard for its expected share (uniform hash spread,
+        // +1/8 headroom) so the load never rehashes or regrows mid-stream.
+        const per_shard: u32 = @intCast(entry_count / SHARD_COUNT + entry_count / SHARD_COUNT / 8 + 16);
+        for (&self.shards) |*shard| {
+            try shard.data.ensureTotalCapacity(per_shard);
+            try shard.sorted.ensureTotalCapacity(self.allocator, per_shard);
+        }
+
+        // All snapshot entries (key, value, Entry struct) come from the bump
+        // arena: one pointer increment instead of three allocator round-trips
+        // per entry, reclaimed wholesale at store deinit (see `snapshot_arena`).
+        const arena = self.snapshot_arena.allocator();
 
         var i: u64 = 0;
         while (i < entry_count) : (i += 1) {
             if (i > 0 and i % 500_000 == 0) {
                 std.log.info("Snapshot load progress: {d}/{d} entries loaded...", .{ i, entry_count });
             }
-            var key_len_buf: [4]u8 = undefined;
-            if (try compat.File.readAll(snapshot_file, key_len_buf[0..4]) != key_len_buf.len) {
+            // Fixed-size entry header in one read: key_len u32 | value_len u32
+            // | flags u8 | timestamp u64.
+            var header_buf: [17]u8 = undefined;
+            if (try reader.readAll(header_buf[0..]) != header_buf.len) {
                 return error.Corruption;
             }
-            const key_len: usize = @intCast(std.mem.readInt(u32, key_len_buf[0..4], .little));
+            const key_len: usize = @intCast(std.mem.readInt(u32, header_buf[0..4], .little));
+            const value_len: usize = @intCast(std.mem.readInt(u32, header_buf[4..8], .little));
+            var flags: EntryFlags = @bitCast(header_buf[8]);
+            flags.arena_owned = true; // never trust the on-disk bit; we own placement
+            const timestamp = std.mem.readInt(u64, header_buf[9..17], .little);
 
-            var value_len_buf: [4]u8 = undefined;
-            if (try compat.File.readAll(snapshot_file, value_len_buf[0..4]) != value_len_buf.len) {
-                return error.Corruption;
-            }
-            const value_len: usize = @intCast(std.mem.readInt(u32, value_len_buf[0..4], .little));
-
-            var flags_buf: [1]u8 = undefined;
-            if (try compat.File.readAll(snapshot_file, flags_buf[0..1]) != flags_buf.len) {
-                return error.Corruption;
-            }
-            const flags: EntryFlags = @bitCast(flags_buf[0]);
-
-            var timestamp_buf: [8]u8 = undefined;
-            if (try compat.File.readAll(snapshot_file, timestamp_buf[0..8]) != timestamp_buf.len) {
-                return error.Corruption;
-            }
-            const timestamp = std.mem.readInt(u64, timestamp_buf[0..8], .little);
-
-            const key = try self.allocator.alloc(u8, key_len);
-            errdefer self.allocator.free(key);
-            if (try compat.File.readAll(snapshot_file, key) != key.len) {
+            // No per-allocation errdefers: everything below is arena-owned, and
+            // on a failed load the store's deinit reclaims the arena wholesale.
+            const key = try arena.alloc(u8, key_len);
+            if (try reader.readAll(key) != key.len) {
                 return error.Corruption;
             }
 
-            const value = try self.allocator.alloc(u8, value_len);
-            errdefer self.allocator.free(value);
-            if (try compat.File.readAll(snapshot_file, value) != value.len) {
+            const value = try arena.alloc(u8, value_len);
+            if (try reader.readAll(value) != value.len) {
                 return error.Corruption;
             }
 
-            const entry = try self.allocator.create(Entry);
+            const entry = try arena.create(Entry);
             entry.* = .{
                 .key = key,
                 .value = value,
@@ -1014,14 +1218,8 @@ pub const Store = struct {
                 .flags = flags,
             };
 
-            // On failure shardPutLocked leaves the shard untouched — free only
-            // the Entry struct here; the errdefers above still own key/value
-            // (a destroyEntry would double-free them).
             const shard = &self.shards[shardIndex(entry.key)];
-            self.shardPutLocked(shard, entry) catch |err| {
-                self.allocator.destroy(entry);
-                return err;
-            };
+            try self.shardPutLocked(shard, entry);
         }
 
         std.log.info("Snapshot load complete.", .{});
@@ -1031,7 +1229,8 @@ pub const Store = struct {
         // hit EOF and we'd swallow the error below. v2 files have a
         // WDBHNSW{1,2}-marked block that restores the registry.
         if (version >= 2 and self.vector_registry != null) {
-            var reader = FileReader{ .file = snapshot_file };
+            // Continue through the shared buffered reader — it holds read-ahead
+            // bytes the raw file position is already past.
             const resolver = KvResolver{ .store = self };
             // Use a local const to satisfy the &-of-rvalue requirement.
             var resolver_mut = resolver;
@@ -1655,4 +1854,93 @@ test "ordered index survives snapshot load and WAL replay" {
         try testing.expectEqualStrings("p:0003", res[2].key);
         try testing.expect(reloaded.get("p:gone") == null);
     }
+}
+
+test "sst overlay: get, shadow, scan merge, worm enforcement" {
+    const testing = std.testing;
+    const sst_mod = @import("sst.zig");
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/frozen.snapshot", .{tmp_path});
+    defer testing.allocator.free(snapshot_path);
+    const sst_path = try std.fmt.allocPrint(testing.allocator, "{s}/frozen.wsst", .{tmp_path});
+    defer testing.allocator.free(sst_path);
+
+    // Build the frozen dataset through the REAL pipeline: store -> snapshot -> sst.
+    {
+        var frozen_src = try Store.init(testing.allocator, .{
+            .persistence = .snapshot,
+            .snapshot_path = snapshot_path,
+            .sync_writes = false,
+        });
+        try frozen_src.set("cep:1", "frozen-cep", false);
+        try frozen_src.set("idx:a", "frozen-a", false);
+        try frozen_src.set("idx:b", "frozen-b", false);
+        try frozen_src.set("worm:x", "immutable", true);
+        frozen_src.deinit(); // snapshot mode auto-saves on shutdown
+    }
+    const stats = try sst_mod.buildFromSnapshot(testing.allocator, snapshot_path, sst_path, 42);
+    try testing.expectEqual(@as(u64, 4), stats.count);
+
+    var sst = try Sst.open(testing.allocator, sst_path);
+    defer sst.close(testing.allocator);
+
+    // Mount on a fresh, EMPTY store (the frozen-dataset boot shape).
+    var store = try Store.init(testing.allocator, .{ .persistence = .none, .sync_writes = false });
+    defer store.deinit();
+    store.attachSst(&sst);
+
+    // GET falls through to the overlay; misses stay misses.
+    const v = (try store.getValueDupe("cep:1", testing.allocator)).?;
+    defer testing.allocator.free(v);
+    try testing.expectEqualStrings("frozen-cep", v);
+    try testing.expect((try store.getValueDupe("cep:none", testing.allocator)) == null);
+
+    // Live write shadows the frozen key.
+    try store.set("cep:1", "live-cep", false);
+    const v2 = (try store.getValueDupe("cep:1", testing.allocator)).?;
+    defer testing.allocator.free(v2);
+    try testing.expectEqualStrings("live-cep", v2);
+
+    // Scan merges frozen + live, live wins on duplicates, order ascending.
+    try store.set("idx:a", "live-a", false);
+    {
+        const res = try store.scanPrefixFirst("idx:", 10, testing.allocator);
+        defer {
+            for (res) |r| {
+                testing.allocator.free(r.key);
+                testing.allocator.free(r.value);
+            }
+            testing.allocator.free(res);
+        }
+        try testing.expectEqual(@as(usize, 2), res.len);
+        try testing.expectEqualStrings("idx:a", res[0].key);
+        try testing.expectEqualStrings("live-a", res[0].value); // live shadows frozen
+        try testing.expectEqualStrings("idx:b", res[1].key);
+        try testing.expectEqualStrings("frozen-b", res[1].value);
+        try testing.expectEqual(@as(u64, 42), res[1].timestamp); // segment build ts
+    }
+
+    // limit=1 keeps the FIRST match of the merged set.
+    {
+        const res = try store.scanPrefixFirst("idx:", 1, testing.allocator);
+        defer {
+            for (res) |r| {
+                testing.allocator.free(r.key);
+                testing.allocator.free(r.value);
+            }
+            testing.allocator.free(res);
+        }
+        try testing.expectEqual(@as(usize, 1), res.len);
+        try testing.expectEqualStrings("idx:a", res[0].key);
+    }
+
+    // countPrefix covers frozen ranges (disjoint live/frozen here for idx:b).
+    try testing.expectEqual(@as(usize, 1), store.countPrefix("worm:"));
+
+    // A frozen WORM key may not be shadowed by a live write.
+    try testing.expectError(error.WormViolation, store.set("worm:x", "overwrite", false));
 }

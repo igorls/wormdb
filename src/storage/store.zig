@@ -33,6 +33,8 @@ const SNAPSHOT_VERSION: u32 = 2;
 /// `Store.attachVectorRegistry` after both are constructed (main.zig).
 const hnsw_index_mod = @import("../vector/index.zig");
 pub const NamespaceRegistry = hnsw_index_mod.NamespaceRegistry;
+const distance = @import("../vector/distance.zig");
+const Metric = @import("../vector/metric.zig").Metric;
 
 const SHARD_COUNT: usize = 256;
 
@@ -300,6 +302,9 @@ pub const Store = struct {
         // Only replay WAL in full mode
         if (config.persistence == .full) {
             try store.replayWal();
+        }
+        if (config.persistence != .none) {
+            try store.rebuildMemoryVectorIndexesFromKv();
         }
 
         return store;
@@ -953,6 +958,102 @@ pub const Store = struct {
         }
     }
 
+    const MemoryRebuildCtx = struct {
+        ns_idx: *hnsw_index_mod.NamespaceIndex,
+        expected_dim: usize = 0,
+        inserted: usize = 0,
+        skipped: usize = 0,
+        oom: bool = false,
+    };
+
+    fn rebuildMemoryVectorMatch(
+        raw_ctx: *anyopaque,
+        key: []const u8,
+        value: []const u8,
+        timestamp: u64,
+        is_worm: bool,
+    ) ScanAction {
+        _ = is_worm;
+        const ctx: *MemoryRebuildCtx = @ptrCast(@alignCast(raw_ctx));
+        const vec = distance.bytesToF32(value) orelse {
+            ctx.skipped += 1;
+            return .cont;
+        };
+        if (ctx.expected_dim == 0) {
+            ctx.expected_dim = vec.len;
+        } else if (vec.len != ctx.expected_dim) {
+            ctx.skipped += 1;
+            return .cont;
+        }
+        _ = ctx.ns_idx.insertLocked(key, vec, timestamp) catch |err| {
+            if (err == error.OutOfMemory) {
+                ctx.oom = true;
+                return .stop;
+            }
+            ctx.skipped += 1;
+            return .cont;
+        };
+        ctx.inserted += 1;
+        return .cont;
+    }
+
+    fn rebuildMemoryVectorIndexesFromKv(self: *Store) !void {
+        const reg = self.vector_registry orelse return;
+        const configs = try self.scanPrefix("__meta:mem:", 0, self.allocator);
+        defer {
+            for (configs) |cfg| {
+                self.allocator.free(cfg.key);
+                self.allocator.free(cfg.value);
+            }
+            self.allocator.free(configs);
+        }
+
+        for (configs) |cfg| {
+            const ns = memoryNamespaceFromConfigKey(cfg.key) orelse continue;
+            const metric_name = extractJsonField(cfg.value, "metric") orelse "cosine";
+            const metric = Metric.fromStr(metric_name) orelse .cosine;
+            const vec_namespace = try std.fmt.allocPrint(self.allocator, "vec:mem:{s}:", .{ns});
+            defer self.allocator.free(vec_namespace);
+
+            const ns_idx = reg.getOrCreate(vec_namespace, metric) catch |err| {
+                std.log.warn("startup vector rebuild: skip '{s}': {s}", .{ vec_namespace, @errorName(err) });
+                continue;
+            };
+            ns_idx.lock.lock();
+            defer ns_idx.lock.unlock();
+            ns_idx.clearLocked();
+
+            var rb = MemoryRebuildCtx{ .ns_idx = ns_idx };
+            self.scanPrefixCallback(vec_namespace, @ptrCast(&rb), rebuildMemoryVectorMatch);
+            if (rb.oom) return error.OutOfMemory;
+            if (rb.inserted > 0 or rb.skipped > 0) {
+                std.log.info("startup vector rebuild: {s} inserted={d} skipped={d}", .{
+                    vec_namespace,
+                    rb.inserted,
+                    rb.skipped,
+                });
+            }
+        }
+    }
+
+    fn memoryNamespaceFromConfigKey(key: []const u8) ?[]const u8 {
+        const prefix = "__meta:mem:";
+        const suffix = ":config";
+        if (!std.mem.startsWith(u8, key, prefix)) return null;
+        if (!std.mem.endsWith(u8, key, suffix)) return null;
+        if (key.len <= prefix.len + suffix.len) return null;
+        return key[prefix.len .. key.len - suffix.len];
+    }
+
+    fn extractJsonField(json: []const u8, field: []const u8) ?[]const u8 {
+        var needle_buf: [96]u8 = undefined;
+        const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\":\"", .{field}) catch return null;
+        const start_rel = std.mem.indexOf(u8, json, needle) orelse return null;
+        const start = start_rel + needle.len;
+        const end_rel = std.mem.indexOfScalar(u8, json[start..], '"') orelse return null;
+        return json[start .. start + end_rel];
+    }
+
     fn maybeSnapshotAndTruncate(self: *Store) !void {
         // Background WAL writer and truncation are not coordinated yet.
         // Keep truncation disabled in sync_writes mode to avoid races.
@@ -1481,6 +1582,70 @@ test "Store restores from snapshot then replays WAL" {
         try testing.expectEqualStrings("12345678901234567890123456789012345678901234567890", reloaded.get("k1").?.value);
         try testing.expectEqualStrings("v2", reloaded.get("k2").?.value);
         try testing.expect(reloaded.get("k2").?.flags.is_worm);
+    }
+}
+
+test "memory vector HNSW rebuilds from WAL-replayed KV" {
+    const testing = std.testing;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_mem_vector_wal_rebuild.wal", .{tmp_path});
+    defer testing.allocator.free(wal_path);
+
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_mem_vector_wal_rebuild.snapshot", .{tmp_path});
+    defer testing.allocator.free(snapshot_path);
+
+    const wal_file = try compat.Dir.createFile(tmp_dir.dir, "test_mem_vector_wal_rebuild.wal", .{});
+    compat.File.close(wal_file);
+
+    const config = Config{
+        .wal_path = wal_path,
+        .snapshot_path = snapshot_path,
+        .sync_writes = false,
+    };
+
+    const vec_a = [_]f32{ 1, 0, 0, 0 };
+    const vec_b = [_]f32{ 0, 1, 0, 0 };
+    const vec_a_bytes_ptr: [*]const u8 = @ptrCast(&vec_a);
+    const vec_b_bytes_ptr: [*]const u8 = @ptrCast(&vec_b);
+    const vec_a_bytes = vec_a_bytes_ptr[0 .. 4 * @sizeOf(f32)];
+    const vec_b_bytes = vec_b_bytes_ptr[0 .. 4 * @sizeOf(f32)];
+
+    {
+        var registry = NamespaceRegistry.init(testing.allocator, .{});
+        defer registry.deinit();
+
+        var store = try Store.initWithRegistry(testing.allocator, config, &registry);
+        defer store.deinit();
+
+        try store.set("__meta:mem:demo:config", "{\"embedder_id\":\"bge-m3\",\"metric\":\"dot\",\"created_at\":1}", false);
+        try store.setWithTimestamp("vec:mem:demo:doc-a", vec_a_bytes, false, 111);
+        try store.setWithTimestamp("vec:mem:demo:doc-b", vec_b_bytes, false, 222);
+
+        try testing.expect(registry.get("vec:mem:demo:") == null);
+    }
+
+    {
+        var registry = NamespaceRegistry.init(testing.allocator, .{});
+        defer registry.deinit();
+
+        var reloaded = try Store.initWithRegistry(testing.allocator, config, &registry);
+        defer reloaded.deinit();
+
+        const idx = registry.get("vec:mem:demo:").?;
+        idx.lock.lockShared();
+        defer idx.lock.unlockShared();
+
+        try testing.expectEqual(Metric.dot, idx.metric);
+        try testing.expectEqual(@as(usize, 2), idx.len());
+        try testing.expect(idx.nodeIdFor("vec:mem:demo:doc-a") != null);
+        try testing.expect(idx.nodeIdFor("vec:mem:demo:doc-b") != null);
+        try testing.expectEqual(@as(u64, 111), idx.timestamps.items[idx.nodeIdFor("vec:mem:demo:doc-a").?]);
+        try testing.expectEqual(@as(u64, 222), idx.timestamps.items[idx.nodeIdFor("vec:mem:demo:doc-b").?]);
     }
 }
 

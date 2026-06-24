@@ -203,9 +203,10 @@ in the contract itself.
 ## Limitations + follow-ups
 
 - **HNSW is a derived serving index.** Snapshot v2 persists the graph,
-  tombstones, and RaBitQ params, but WAL-only changes after the most
-  recent snapshot still need `vreindex` if you want the graph fully
-  caught up after recovery.
+  tombstones, and RaBitQ params. On startup, memory namespaces are also
+  rebuilt from WAL-replayed `vec:mem:<ns>:` keys using
+  `__meta:mem:<ns>:config`, so normal `mem_add` ingest recovers without
+  a manual `vreindex`.
 - **No partial-failure rollback** in `mem_add`. Vector-first ordering
   means the common failure case (dim mismatch) fails cleanly before any
   write, but vector-lands-then-doc-fails leaves an orphan. `mem_drop`

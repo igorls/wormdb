@@ -29,6 +29,28 @@ The checkpoint signature input is domain-separated as `wormdb.checkpoint.sign.v1
 
 `EXEC append_log_checkpoint` stores the canonical checkpoint bytes as a WORM record keyed by the checkpoint hash. `EXEC append_log_proof_bundle` includes those exact bytes as `checkpoint.canonical_record_hex` so external verifier tooling can decode and hash the same material.
 
+## Witness Record
+
+A witness record is a countersignature over an existing checkpoint. It does not claim authorship of the append-log records; it proves that a second identity observed the same checkpoint root and hash.
+
+| Field | Meaning |
+| --- | --- |
+| `version` | Witness format version. Current value: `1`. |
+| `log_id` | Application or namespace log identifier. |
+| `from_seq`, `to_seq` | Inclusive sequence range copied from the checkpoint. |
+| `accumulator_kind` | Root type copied from the checkpoint. |
+| `accumulator_root` | 32-byte checkpoint accumulator root. |
+| `checkpoint_hash` | Hash of the canonical checkpoint record being witnessed. |
+| `witness_identity` | Signature identity bytes. For Ed25519 v1 this is the 32-byte public key. |
+| `signature_scheme` | Current value: Ed25519. |
+| `signature` | Signature over the canonical witness signing payload. |
+| `observed_at_ms` | Witness-supplied observation time in Unix epoch milliseconds. |
+| `extension_bytes` | Signed opaque claim bytes for app-specific metadata. |
+
+The witness signature input is domain-separated as `wormdb.witness.sign.v1` and includes every witness field except `signature`. The witness record hash is domain-separated as `wormdb.witness.record.v1` and includes the signing payload plus the signature bytes.
+
+`EXEC append_log_witness` creates a witness from a stored checkpoint. In clustered mode, omitting explicit witness/signature arguments signs with the local meshguard/WormDB Ed25519 identity. `EXEC append_log_witness_import` verifies and stores canonical witness bytes received from a peer, relay, or offline transfer. `EXEC append_log_witness_verify` checks the stored witness against the checkpoint and public key.
+
 ## Extension Claims
 
 WormDB intentionally does not acquire GPS, read device clocks, or interpret supervisor workflow notes. Those claims belong in `extension_bytes`, encoded by the app in a stable format such as CBOR, protobuf, or canonical JSON.

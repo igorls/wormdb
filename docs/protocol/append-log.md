@@ -80,6 +80,34 @@ proof:append-log-checkpoint:v1:<sha256(log_id) hex>:<checkpoint_hash hex>
 
 For test/dev signing, pass `sk=<128 hex chars>` with the Ed25519 secret key bytes. For externally signed records, pass `sig=<128 hex chars>` and make sure the supplied timestamp/options match the bytes that were signed. `ext=<hex>` carries signed opaque extension bytes. The response is canonical JSON with checkpoint metadata, `checkpoint_hash`, and `canonical_record_hex`.
 
+Create and store a witness countersignature over an existing checkpoint:
+
+```bash
+bun run apps/bun/src/bin/client.ts EXEC append_log_witness <log_id> <checkpoint_hash_hex> [witness_pubkey_hex] [sk=<secret_key_hex>|sig=<signature_hex>] [observed_at_ms=<ms>] [ext=<hex>]
+```
+
+When clustering is enabled and no witness public key or signature material is supplied, WormDB signs with the local meshguard/WormDB identity. Otherwise, callers can pass a 32-byte Ed25519 public key plus either `sk=<128 hex chars>` for local signing or `sig=<128 hex chars>` for an externally produced signature. The signature covers the checkpoint identity, range, accumulator kind/root, checkpoint hash, witness identity, observation timestamp, and opaque extension bytes.
+
+Witness records are stored as WORM keys and replicate through the normal durable procedure write path:
+
+```text
+proof:append-log-witness:v1:<sha256(log_id) hex>:<checkpoint_hash hex>:<sha256(witness_pubkey) hex>
+```
+
+Import a canonical witness received from a peer or offline packet:
+
+```bash
+bun run apps/bun/src/bin/client.ts EXEC append_log_witness_import <log_id> <checkpoint_hash_hex> <canonical_witness_hex>
+```
+
+Verify the stored witness for a checkpoint and witness identity:
+
+```bash
+bun run apps/bun/src/bin/client.ts EXEC append_log_witness_verify <log_id> <checkpoint_hash_hex> <witness_pubkey_hex>
+```
+
+The response is `{"valid":false}` or `{"valid":true,"witness":{...}}` with witness metadata, `witness_record_hash`, and `canonical_record_hex`.
+
 Export a verifier-friendly JSON proof bundle for a single event or contiguous range:
 
 ```bash

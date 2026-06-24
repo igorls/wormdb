@@ -326,6 +326,22 @@ pub const Ctx = struct {
         }
     }
 
+    /// Set a WORM key durably with caller-supplied metadata timestamp.
+    /// Used by proof procedures whose canonical bytes already include the
+    /// receipt/observation timestamp and need WAL + replication semantics.
+    pub fn setDurableWormWithTimestamp(self: *Ctx, key: []const u8, val: []const u8, entry_timestamp: u64) !void {
+        const held = self.saveAndReleaseAllHeldShards();
+        defer self.reacquireAllHeldShards(held);
+
+        try self.store.setWithTimestamp(key, val, true, entry_timestamp);
+
+        if (self.cluster) |c| {
+            c.replicateWrite(key, val, true) catch |e| {
+                std.log.warn("procedure replication failed: {s}", .{@errorName(e)});
+            };
+        }
+    }
+
     /// Delete a key durably — goes through the WAL and replicates to peers.
     /// Returns `error.WormViolation` when the target key is immutable; the
     /// store's WORM check is authoritative. Lock dance mirrors `setDurable`.

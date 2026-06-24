@@ -225,6 +225,14 @@ pub const Cluster = struct {
         self.vector_registry = registry;
     }
 
+    pub fn identityPublicKey(self: *const Cluster) [32]u8 {
+        return self.identity.public_key.toBytes();
+    }
+
+    pub fn signWithIdentity(self: *const Cluster, message: []const u8) ![64]u8 {
+        return try Keys.sign(message, self.identity.secret_key);
+    }
+
     /// Start the mesh network: bind gossip socket, init SWIM, seed peers, start discovery thread.
     pub fn start(self: *Cluster) void {
         if (self.running.load(.acquire)) return;

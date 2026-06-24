@@ -104,7 +104,7 @@ restarts without a format bump.
 Stored in `__meta:mem:<ns>:config` as part of a small JSON blob:
 
 ```json
-{ "embedder_id": "text-embedding-3-large", "metric": "cosine", "created_at": 1780000000 }
+{ "embedder_id": "text-embedding-3-large", "metric": "cosine", "decay_tau_hours": 168, "created_at": 1780000000 }
 ```
 
 `mem_init` writes this eagerly and is idempotent-if-matching —
@@ -152,8 +152,11 @@ Returned shape:
 Three query-time knobs:
 
 - **`lambda`** (0–1): blends raw similarity with exponential temporal
-  decay over a 1-week time constant. `lambda=0` is pure similarity,
+  decay. `lambda=0` is pure similarity,
   `lambda=1` is pure recency, in between trades off.
+- **`decay_tau_hours`**: exponential time constant. `mem_query` accepts
+  this after `snippet_chars`; if omitted, it uses the namespace config
+  from `mem_init`, then the 168-hour default.
 - **`min_score`**: filters results below a threshold.
 - **`snippet_chars`**: caps doc text returned per hit. `0` = full text,
   `-1` = omit doc entirely (useful when the caller already has it and
@@ -186,7 +189,7 @@ The shape of a thin adapter:
 
 ```ts
 class MemoryAdapter {
-  initialize(embedder_id, metric)        → mem_init
+  initialize(embedder_id, metric, opts)  → mem_init
   ingest(doc_id, text, embedding, meta)  → mem_add
   ingestMany(rows)                       → mem_bulk_add
   get(doc_id)                            → mem_get

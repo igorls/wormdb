@@ -10,7 +10,7 @@
 //! roughly an order of magnitude faster than brute-force while maintaining
 //! >95% recall on natural embedding distributions.
 //!
-//! EXEC vsearch <query_key> <top_k> [<namespace>] [<metric>] [<decay>] [<mode>]
+//! EXEC vsearch <query_key> <top_k> [<namespace>] [<metric>] [<decay>] [<mode>] [<decay_tau_hours>]
 //!
 //! - query_key:  key holding the query vector (raw f32 bytes)
 //! - top_k:      max results to return (1–100)
@@ -19,6 +19,7 @@
 //! - decay:      temporal decay factor (0.0 = no decay)
 //! - mode:       "auto" (default — BQ prefilter if hashes exist, else
 //!               brute-force) or "exact" (always brute-force)
+//! - decay_tau_hours: temporal decay time constant (default: 168)
 //!
 //! Returns JSON array sorted by descending score:
 //!   [{"k":"vec:ns:id","s":0.95,"ts":1709...}, ...]
@@ -46,7 +47,7 @@ const STAGE1_OVERSAMPLE: usize = 20;
 /// HNSW recall tracks ef closely; we reuse the same oversample budget so
 /// the stage-1→stage-2 shape stays consistent across dispatch paths.
 const HNSW_EF_SEARCH_FACTOR: usize = 1;
-const DECAY_TIME_CONSTANT_HOURS: f32 = 168.0; // ~1 week time constant
+const DEFAULT_DECAY_TAU_HOURS: f32 = 168.0; // ~1 week time constant
 
 const Mode = enum {
     /// HNSW graph search if an index exists, else RaBitQ/BQ prefilter,
@@ -91,11 +92,17 @@ const TopKCandidate = topk_mod.TopK(Candidate, candidateScore);
 // ║  Shared helpers                                    ║
 // ╚═══════════════════════════════════════════════════╝
 
-inline fn applyDecay(raw_sim: f32, timestamp: u64, decay: f32, now_ms: u64) f32 {
+fn parseDecayTauHours(raw: []const u8) ?f32 {
+    const tau = std.fmt.parseFloat(f32, raw) catch return null;
+    if (!std.math.isFinite(tau) or tau <= 0.0) return null;
+    return tau;
+}
+
+inline fn applyDecay(raw_sim: f32, timestamp: u64, decay: f32, now_ms: u64, decay_tau_hours: f32) f32 {
     if (decay <= 0.0) return raw_sim;
     const age_ms = if (now_ms > timestamp) now_ms - timestamp else 0;
     const age_hours: f32 = @as(f32, @floatFromInt(age_ms)) / 3_600_000.0;
-    const recency = @exp(-age_hours / DECAY_TIME_CONSTANT_HOURS);
+    const recency = @exp(-age_hours / decay_tau_hours);
     return (1.0 - decay) * raw_sim + decay * recency;
 }
 
@@ -119,6 +126,7 @@ const BQScanCtx = struct {
     query_bq: []const u8,
     query_key: []const u8,
     decay: f32,
+    decay_tau_hours: f32,
     now_ms: u64,
     heap: *TopKCandidate,
     allocator: std.mem.Allocator,
@@ -170,7 +178,7 @@ fn onBQMatch(
     const ham_dist = distance.hamming(sc.query_bq, bq_value);
     const total_bits: f32 = @floatFromInt(sc.code_bytes * 8);
     const sim = 1.0 - @as(f32, @floatFromInt(ham_dist)) / total_bits;
-    const score = applyDecay(sim, timestamp, sc.decay, sc.now_ms);
+    const score = applyDecay(sim, timestamp, sc.decay, sc.now_ms, sc.decay_tau_hours);
 
     if (score <= sc.heap.thresholdScore()) return .cont;
 
@@ -193,6 +201,7 @@ const RabitqScanCtx = struct {
     code_bytes: usize,
     dim: usize,
     decay: f32,
+    decay_tau_hours: f32,
     now_ms: u64,
     heap: *TopKCandidate,
     allocator: std.mem.Allocator,
@@ -236,7 +245,7 @@ fn onRabitqMatch(
         break :blk (cos_clamped + 1.0) * 0.5;
     } else 1.0 / (1.0 + d2_clamped);
 
-    const score = applyDecay(raw_sim, timestamp, sc.decay, sc.now_ms);
+    const score = applyDecay(raw_sim, timestamp, sc.decay, sc.now_ms, sc.decay_tau_hours);
 
     if (score <= sc.heap.thresholdScore()) return .cont;
 
@@ -257,6 +266,7 @@ const ExactScanCtx = struct {
     query_vec: []align(1) const f32,
     metric: Metric,
     decay: f32,
+    decay_tau_hours: f32,
     now_ms: u64,
     heap: *TopKCandidate,
     allocator: std.mem.Allocator,
@@ -279,7 +289,7 @@ fn onExactMatch(
     if (vec.len != sc.query_vec.len) return .cont;
 
     const raw_sim = computeExactSim(sc.metric, sc.query_vec, vec);
-    const score = applyDecay(raw_sim, timestamp, sc.decay, sc.now_ms);
+    const score = applyDecay(raw_sim, timestamp, sc.decay, sc.now_ms, sc.decay_tau_hours);
 
     if (score <= sc.heap.thresholdScore()) return .cont;
 
@@ -312,6 +322,7 @@ fn runHnswDispatch(
     top_k: usize,
     metric: Metric,
     decay: f32,
+    decay_tau_hours: f32,
     now_ms: u64,
     heap: *TopKCandidate,
 ) !bool {
@@ -354,7 +365,7 @@ fn runHnswDispatch(
         if (vec.len != query_vec.len) continue;
 
         const raw_sim = computeExactSim(metric, query_vec, vec);
-        const score = applyDecay(raw_sim, stage1_ts[i], decay, now_ms);
+        const score = applyDecay(raw_sim, stage1_ts[i], decay, now_ms, decay_tau_hours);
 
         heap.push(.{ .key = stage1_keys[i], .score = score, .timestamp = stage1_ts[i] });
     }
@@ -419,7 +430,7 @@ fn appendJsonEscaped(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     // ── Parse args ───────────────────────────────────────────────
     const query_key = ctx.arg(0) orelse
-        return ctx.err("vsearch requires at least 2 args: <query_key> <top_k> [namespace] [metric] [decay] [mode]");
+        return ctx.err("vsearch requires at least 2 args: <query_key> <top_k> [namespace] [metric] [decay] [mode] [decay_tau_hours]");
 
     const top_k_raw = ctx.argInt(usize, 1) orelse
         return ctx.err("vsearch: top_k must be a positive integer");
@@ -438,6 +449,10 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     }
 
     const mode = if (ctx.arg(5)) |m| Mode.fromStr(m) else Mode.auto;
+    const decay_tau_hours = if (ctx.arg(6)) |raw|
+        parseDecayTauHours(raw) orelse return ctx.err("vsearch: decay_tau_hours must be positive")
+    else
+        DEFAULT_DECAY_TAU_HOURS;
 
     // ── Load query vector (locks internally, safe before scans) ──
     const query_bytes = (try ctx.getCopy(query_key)) orelse
@@ -469,6 +484,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
                         top_k,
                         metric,
                         decay,
+                        decay_tau_hours,
                         now_ms,
                         &final_heap,
                     )) {
@@ -572,6 +588,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
                     .code_bytes = rabitq.codeBytes(dim),
                     .dim = dim,
                     .decay = decay,
+                    .decay_tau_hours = decay_tau_hours,
                     .now_ms = now_ms,
                     .heap = &stage1_heap,
                     .allocator = ctx.allocator,
@@ -596,7 +613,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
                             const vec = distance.bytesToF32(vec_bytes) orelse continue;
                             if (vec.len != query_vec.len) continue;
                             const raw_sim = computeExactSim(metric, query_vec, vec);
-                            const score = applyDecay(raw_sim, cand.timestamp, decay, now_ms);
+                            const score = applyDecay(raw_sim, cand.timestamp, decay, now_ms, decay_tau_hours);
                             final_heap.push(.{ .key = cand.key, .score = score, .timestamp = cand.timestamp });
                         }
                     }
@@ -622,6 +639,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
                 .query_bq = query_bq,
                 .query_key = query_key,
                 .decay = decay,
+                .decay_tau_hours = decay_tau_hours,
                 .now_ms = now_ms,
                 .heap = &stage1_heap,
                 .allocator = ctx.allocator,
@@ -639,7 +657,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
                     const vec = distance.bytesToF32(vec_bytes) orelse continue;
                     if (vec.len != query_vec.len) continue;
                     const raw_sim = computeExactSim(metric, query_vec, vec);
-                    const score = applyDecay(raw_sim, cand.timestamp, decay, now_ms);
+                    const score = applyDecay(raw_sim, cand.timestamp, decay, now_ms, decay_tau_hours);
                     final_heap.push(.{ .key = cand.key, .score = score, .timestamp = cand.timestamp });
                 }
                 return emitJson(ctx, final_heap.sortedDesc());
@@ -657,6 +675,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
         .query_vec = query_vec,
         .metric = metric,
         .decay = decay,
+        .decay_tau_hours = decay_tau_hours,
         .now_ms = now_ms,
         .heap = &final_heap,
         .allocator = ctx.allocator,

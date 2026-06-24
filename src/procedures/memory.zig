@@ -11,11 +11,12 @@
 //!   mem:<ns>:<id>:meta        metadata JSON (mutable; raw passthrough)
 //!   vec:mem:<ns>:<id>         embedding (raw f32 bytes)
 //!   bq:vec:mem:<ns>:<id>      BQ companion (written by applyVinsert)
-//!   __meta:mem:<ns>:config    {"embedder_id":"...","metric":"...","created_at":N}
+//!   __meta:mem:<ns>:config    {"embedder_id":"...","metric":"...","decay_tau_hours":168,"vector_only":false,"created_at":N}
 //!
 //! ── Procedure surface ───────────────────────────────────────────────
-//!   mem_init         <ns> <embedder_id> <metric> [<decay_tau_hours>]
+//!   mem_init         <ns> <embedder_id> <metric> [<decay_tau_hours>] [vector_only=true]
 //!   mem_add          <ns> <doc_id> <text> <embedding> [<meta_json>] [<worm>] [<embedder_id>]
+//!   mem_add          <ns> <doc_id> <embedding> [<meta_json>] [<worm>] [<embedder_id>]  (vector_only)
 //!   mem_meta_set     <ns> <doc_id> <meta_json>
 //!   mem_bulk_add     <ns> <count> [<id> <embedding> <meta_json>]×N
 //!   mem_get          <ns> <doc_id>
@@ -180,6 +181,40 @@ fn parseDecayTauHours(raw: []const u8) ?f32 {
     return tau;
 }
 
+fn extractConfigBool(json: []const u8, field: []const u8) ?bool {
+    var needle_buf: [96]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\":", .{field}) catch return null;
+    const start = std.mem.indexOf(u8, json, needle) orelse return null;
+    var tail = json[start + needle.len ..];
+    while (tail.len > 0 and (tail[0] == ' ' or tail[0] == '\t')) tail = tail[1..];
+    if (std.mem.startsWith(u8, tail, "true")) return true;
+    if (std.mem.startsWith(u8, tail, "false")) return false;
+    return null;
+}
+
+fn parseMemInitVectorOnlyFlag(raw: []const u8) ?bool {
+    if (std.mem.eql(u8, raw, "vector_only") or
+        std.mem.eql(u8, raw, "vector_only=true") or
+        std.mem.eql(u8, raw, "vector_only=1") or
+        std.mem.eql(u8, raw, "true") or
+        std.mem.eql(u8, raw, "1"))
+    {
+        return true;
+    }
+    if (std.mem.eql(u8, raw, "vector_only=false") or
+        std.mem.eql(u8, raw, "vector_only=0") or
+        std.mem.eql(u8, raw, "false") or
+        std.mem.eql(u8, raw, "0"))
+    {
+        return false;
+    }
+    return null;
+}
+
+fn isVectorOnlyConfig(cfg: ?[]const u8) bool {
+    return if (cfg) |bytes| extractConfigBool(bytes, "vector_only") orelse false else false;
+}
+
 // ╔═══════════════════════════════════════════════════╗
 // ║  Distance + decay shared with vsearch              ║
 // ╚═══════════════════════════════════════════════════╝
@@ -213,6 +248,7 @@ pub fn memCapabilities(ctx: *Ctx) anyerror!Ctx.Result {
         \\"retrieval_unit":"chunk",
         \\"temporal_decay":true,
         \\"bulk_add":true,
+        \\"vector_only":true,
         \\"verbatim":true,
         \\"local":true,
         \\"structured_facts":false,
@@ -241,11 +277,23 @@ pub fn memInit(ctx: *Ctx) anyerror!Ctx.Result {
         return ctx.err("mem_init: embedder_id must be 1..128 bytes, chars in [A-Za-z0-9._/-]");
     const metric = Metric.fromStr(metric_str) orelse
         return ctx.err("mem_init: unknown metric (cosine|dot|l2)");
-    const decay_tau_arg = ctx.arg(3);
-    const decay_tau_hours = if (decay_tau_arg) |raw|
-        parseDecayTauHours(raw) orelse return ctx.err("mem_init: decay_tau_hours must be positive")
-    else
-        DEFAULT_DECAY_TAU_HOURS;
+    // Options after <metric> may appear in any order: a positive float sets
+    // decay_tau_hours, a vector_only=true|false flag sets vector-only mode.
+    var vector_only = false;
+    var decay_tau_hours: f32 = DEFAULT_DECAY_TAU_HOURS;
+    var decay_tau_provided = false;
+    var opt_i: usize = 3;
+    while (opt_i < ctx.argCount()) : (opt_i += 1) {
+        const opt = ctx.arg(opt_i).?;
+        if (parseMemInitVectorOnlyFlag(opt)) |v| {
+            vector_only = v;
+        } else if (parseDecayTauHours(opt)) |tau| {
+            decay_tau_hours = tau;
+            decay_tau_provided = true;
+        } else {
+            return ctx.err("mem_init: unknown option (expected <decay_tau_hours> or vector_only=true|false)");
+        }
+    }
 
     const config_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
     defer ctx.allocator.free(config_key);
@@ -262,7 +310,10 @@ pub fn memInit(ctx: *Ctx) anyerror!Ctx.Result {
             return ctx.err("mem_init: embedder_id differs from existing namespace config");
         if (!std.mem.eql(u8, cfg_metric, metric.name()))
             return ctx.err("mem_init: metric differs from existing namespace config");
-        if (decay_tau_arg == null) return ctx.ok();
+        const cfg_vector_only = extractConfigBool(cfg, "vector_only") orelse false;
+        if (cfg_vector_only != vector_only)
+            return ctx.err("mem_init: vector_only differs from existing namespace config");
+        if (!decay_tau_provided) return ctx.ok();
         const cfg_tau = extractConfigFloat(cfg, "decay_tau_hours") orelse DEFAULT_DECAY_TAU_HOURS;
         if (@abs(cfg_tau - decay_tau_hours) < 0.0001) return ctx.ok();
     }
@@ -290,6 +341,8 @@ pub fn memInit(ctx: *Ctx) anyerror!Ctx.Result {
     var tau_buf: [32]u8 = undefined;
     const tau_str = std.fmt.bufPrint(&tau_buf, "{d}", .{decay_tau_hours}) catch "168";
     try cfg.appendSlice(ctx.allocator, tau_str);
+    try cfg.appendSlice(ctx.allocator, ",\"vector_only\":");
+    try cfg.appendSlice(ctx.allocator, if (vector_only) "true" else "false");
     try cfg.appendSlice(ctx.allocator, ",\"created_at\":");
     try writeU64(&cfg, ctx.allocator, ctx.timestamp());
     try cfg.append(ctx.allocator, '}');
@@ -306,20 +359,11 @@ pub fn memAdd(ctx: *Ctx) anyerror!Ctx.Result {
     const usage = "mem_add requires: <ns> <doc_id> <text> <embedding> [<meta_json>] [<worm>] [<embedder_id>]";
     const ns = ctx.arg(0) orelse return ctx.err(usage);
     const doc_id = ctx.arg(1) orelse return ctx.err(usage);
-    const text = ctx.arg(2) orelse return ctx.err(usage);
-    const embedding = ctx.arg(3) orelse return ctx.err(usage);
-    const meta_json: []const u8 = ctx.arg(4) orelse "";
-    const is_worm = if (ctx.arg(5)) |w| !std.mem.eql(u8, w, "0") else true;
-    const embedder_id_arg: ?[]const u8 = ctx.arg(6);
 
     if (!validateNs(ns))
         return ctx.err("mem_add: invalid ns");
     if (!validateDocId(doc_id))
         return ctx.err("mem_add: invalid doc_id");
-    if (embedder_id_arg) |req_emb| {
-        if (!validateEmbedderId(req_emb))
-            return ctx.err("mem_add: invalid embedder_id");
-    }
 
     // ── Pick metric from config (default cosine if no init) and
     //    optionally enforce embedder match. Read config once.
@@ -337,6 +381,29 @@ pub fn memAdd(ctx: *Ctx) anyerror!Ctx.Result {
         }
         break :blk .cosine;
     };
+
+    const vector_only = isVectorOnlyConfig(cfg_bytes);
+    const text: []const u8 = if (vector_only) "" else ctx.arg(2) orelse return ctx.err(usage);
+    const embedding = if (vector_only)
+        ctx.arg(2) orelse return ctx.err("mem_add vector_only requires: <ns> <doc_id> <embedding> [<meta_json>] [<worm>] [<embedder_id>]")
+    else
+        ctx.arg(3) orelse return ctx.err(usage);
+    const meta_json: []const u8 = if (vector_only) ctx.arg(3) orelse "" else ctx.arg(4) orelse "";
+    const is_worm = if (if (vector_only) ctx.arg(4) else ctx.arg(5)) |w| !std.mem.eql(u8, w, "0") else true;
+    const embedder_id_arg: ?[]const u8 = if (vector_only) ctx.arg(5) else ctx.arg(6);
+
+    if (vector_only and distance.bytesToF32(embedding) == null) {
+        if (ctx.arg(3)) |maybe_embedding| {
+            if (distance.bytesToF32(maybe_embedding) != null) {
+                return ctx.err("mem_add: vector_only namespace uses <ns> <doc_id> <embedding> [<meta_json>] [<worm>] [<embedder_id>] (no text arg)");
+            }
+        }
+    }
+
+    if (embedder_id_arg) |req_emb| {
+        if (!validateEmbedderId(req_emb))
+            return ctx.err("mem_add: invalid embedder_id");
+    }
 
     // Embedder enforcement: only when caller asserts an id AND the
     // namespace has an existing config. Lazy-init namespaces (no
@@ -398,19 +465,21 @@ pub fn memAdd(ctx: *Ctx) anyerror!Ctx.Result {
     };
 
     // ── Doc body ────────────────────────────────────────────────
-    if (is_worm) {
-        ctx.setDurableWorm(doc_key, text) catch |err| switch (err) {
-            error.WormViolation => {
-                // Vector was already applied — it now has no doc body.
-                // Surface a clear message; operator can mem_drop to recover.
-                return ctx.err("mem_add: doc_id already exists (WORM) — vector written but doc body refused; consider mem_drop");
-            },
-            else => return ctx.err(ctx.fmt("mem_add: doc write failed: {s}", .{@errorName(err)})),
-        };
-    } else {
-        ctx.setDurable(doc_key, text) catch |err| {
-            return ctx.err(ctx.fmt("mem_add: doc write failed: {s}", .{@errorName(err)}));
-        };
+    if (!vector_only) {
+        if (is_worm) {
+            ctx.setDurableWorm(doc_key, text) catch |err| switch (err) {
+                error.WormViolation => {
+                    // Vector was already applied — it now has no doc body.
+                    // Surface a clear message; operator can mem_drop to recover.
+                    return ctx.err("mem_add: doc_id already exists (WORM) — vector written but doc body refused; consider mem_drop");
+                },
+                else => return ctx.err(ctx.fmt("mem_add: doc write failed: {s}", .{@errorName(err)})),
+            };
+        } else {
+            ctx.setDurable(doc_key, text) catch |err| {
+                return ctx.err(ctx.fmt("mem_add: doc write failed: {s}", .{@errorName(err)}));
+            };
+        }
     }
 
     // ── Metadata (always mutable) ───────────────────────────────
@@ -607,6 +676,13 @@ pub fn memGet(ctx: *Ctx) anyerror!Ctx.Result {
     if (!validateNs(ns)) return ctx.err("mem_get: invalid ns");
     if (!validateDocId(doc_id)) return ctx.err("mem_get: invalid doc_id");
 
+    const config_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
+    defer ctx.allocator.free(config_key);
+    const cfg_bytes = try ctx.getCopy(config_key);
+    if (isVectorOnlyConfig(cfg_bytes)) {
+        return ctx.err("mem_get: namespace is vector_only");
+    }
+
     const doc_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}", .{ ns, doc_id });
     defer ctx.allocator.free(doc_key);
     const meta_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}:meta", .{ ns, doc_id });
@@ -778,9 +854,11 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
     const query_vec = distance.bytesToF32(embedding) orelse
         return ctx.err("mem_query: embedding must be non-empty f32 bytes (len multiple of 4)");
 
-    const cfg_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
-    defer ctx.allocator.free(cfg_key);
-    const cfg_bytes = try ctx.getCopy(cfg_key);
+    const cfg_bytes: ?[]const u8 = blk: {
+        const cfg_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
+        defer ctx.allocator.free(cfg_key);
+        break :blk try ctx.getCopy(cfg_key);
+    };
 
     // Resolve metric: config metric wins; default cosine.
     const metric: Metric = blk: {
@@ -788,6 +866,7 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
         const m_str = extractConfigField(cfg, "metric") orelse break :blk .cosine;
         break :blk Metric.fromStr(m_str) orelse .cosine;
     };
+    const vector_only = isVectorOnlyConfig(cfg_bytes);
 
     const configured_decay_tau_hours: f32 = blk: {
         const cfg = cfg_bytes orelse break :blk DEFAULT_DECAY_TAU_HOURS;
@@ -863,12 +942,9 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
         if (!std.mem.startsWith(u8, r.key, ns_prefix)) continue;
         const doc_id = r.key[ns_prefix.len..];
 
-        const doc_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}", .{ ns, doc_id });
-        defer ctx.allocator.free(doc_key);
         const meta_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}:meta", .{ ns, doc_id });
         defer ctx.allocator.free(meta_key);
 
-        const doc_bytes = try ctx.getCopy(doc_key); // may be null if vec was orphaned
         const meta_bytes = try ctx.getCopy(meta_key);
 
         if (emitted > 0) try json.append(ctx.allocator, ',');
@@ -882,7 +958,11 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
         try writeU64(&json, ctx.allocator, r.timestamp);
 
         // Doc text (subject to snippet_chars).
-        if (snippet_chars >= 0) {
+        if (!vector_only and snippet_chars >= 0) {
+            const doc_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}", .{ ns, doc_id });
+            defer ctx.allocator.free(doc_key);
+            const doc_bytes = try ctx.getCopy(doc_key); // may be null if vec was orphaned
+
             try json.appendSlice(ctx.allocator, ",\"doc\":");
             if (doc_bytes) |d| {
                 try json.append(ctx.allocator, '"');
@@ -1432,6 +1512,7 @@ pub fn memResetIndex(ctx: *Ctx) anyerror!Ctx.Result {
         return ctx.err("mem_reset_index: existing config missing metric field");
     const metric = Metric.fromStr(cfg_metric_str) orelse
         return ctx.err("mem_reset_index: existing config has unknown metric");
+    const vector_only = extractConfigBool(existing, "vector_only") orelse false;
 
     const vec_prefix = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
     defer ctx.allocator.free(vec_prefix);
@@ -1512,7 +1593,9 @@ pub fn memResetIndex(ctx: *Ctx) anyerror!Ctx.Result {
     try cfg.appendSlice(ctx.allocator, new_embedder_id);
     try cfg.appendSlice(ctx.allocator, "\",\"metric\":\"");
     try cfg.appendSlice(ctx.allocator, metric.name());
-    try cfg.appendSlice(ctx.allocator, "\",\"created_at\":");
+    try cfg.appendSlice(ctx.allocator, "\",\"vector_only\":");
+    try cfg.appendSlice(ctx.allocator, if (vector_only) "true" else "false");
+    try cfg.appendSlice(ctx.allocator, ",\"created_at\":");
     try writeU64(&cfg, ctx.allocator, ctx.timestamp());
     try cfg.append(ctx.allocator, '}');
     try ctx.setDurable(config_key, cfg.items);
@@ -1526,7 +1609,9 @@ pub fn memResetIndex(ctx: *Ctx) anyerror!Ctx.Result {
     try appendJsonEscaped(&json, ctx.allocator, new_embedder_id);
     try json.appendSlice(ctx.allocator, "\",\"metric\":\"");
     try json.appendSlice(ctx.allocator, metric.name());
-    try json.appendSlice(ctx.allocator, "\",\"vectors_to_reingest\":");
+    try json.appendSlice(ctx.allocator, "\",\"vector_only\":");
+    try json.appendSlice(ctx.allocator, if (vector_only) "true" else "false");
+    try json.appendSlice(ctx.allocator, ",\"vectors_to_reingest\":");
     try writeUsize(&json, ctx.allocator, vectors_dropped);
     try json.append(ctx.allocator, '}');
     return ctx.value(try json.toOwnedSlice(ctx.allocator));
@@ -1586,6 +1671,19 @@ test "extractConfigFloat pulls numeric field from our own JSON layout" {
     const cfg = "{\"embedder_id\":\"bge-m3\",\"metric\":\"cosine\",\"decay_tau_hours\":24,\"created_at\":12345}";
     try testing.expectApproxEqAbs(@as(f32, 24.0), extractConfigFloat(cfg, "decay_tau_hours").?, 0.001);
     try testing.expect(extractConfigFloat(cfg, "missing") == null);
+}
+
+test "extractConfigBool pulls boolean fields from config JSON" {
+    const cfg = "{\"embedder_id\":\"bge-m3\",\"metric\":\"cosine\",\"vector_only\":true,\"created_at\":12345}";
+    try testing.expectEqual(true, extractConfigBool(cfg, "vector_only").?);
+    try testing.expect(extractConfigBool(cfg, "missing") == null);
+}
+
+test "parseMemInitVectorOnlyFlag accepts explicit true and false forms" {
+    try testing.expectEqual(true, parseMemInitVectorOnlyFlag("vector_only=true").?);
+    try testing.expectEqual(true, parseMemInitVectorOnlyFlag("vector_only").?);
+    try testing.expectEqual(false, parseMemInitVectorOnlyFlag("vector_only=false").?);
+    try testing.expect(parseMemInitVectorOnlyFlag("decay_tau_hours=24") == null);
 }
 
 test "appendJsonEscaped handles quotes, backslashes, and control chars" {
@@ -2110,6 +2208,112 @@ test "mem_bulk_add: duplicate ids reject whole batch before writes" {
     try testing.expect(result == .err);
     try testing.expect(std.mem.indexOf(u8, result.err, "duplicate") != null);
     try testing.expect(fx.store.get("vec:mem:demo:doc-1") == null);
+}
+
+test "mem_init: persists vector_only and rejects mode flips" {
+    var fx = try TestStoreFixture.init("meminit_vector_only");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const init = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine", "vector_only=true" }, arena);
+    try testing.expect(init == .ok);
+
+    const cfg = (try fx.store.getValueDupe("__meta:mem:demo:config", arena)).?;
+    try testing.expect(std.mem.indexOf(u8, cfg, "\"vector_only\":true") != null);
+
+    const same = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine", "vector_only=true" }, arena);
+    try testing.expect(same == .ok);
+
+    const flip = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena);
+    try testing.expect(flip == .err);
+    try testing.expect(std.mem.indexOf(u8, flip.err, "vector_only") != null);
+}
+
+test "mem_add/query/get: vector_only namespace stores vector and meta without doc body" {
+    var fx = try TestStoreFixture.init("memadd_vector_only");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine", "vector_only=true" }, arena);
+
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const add = try runProc(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-1", emb, "{\"kind\":\"semantic\"}", "0", "bge-m3" },
+        arena,
+    );
+    try testing.expect(add == .ok);
+
+    try testing.expect(fx.store.get("mem:demo:doc-1") == null);
+    try testing.expect(fx.store.get("mem:demo:doc-1:meta") != null);
+    try testing.expect(fx.store.get("vec:mem:demo:doc-1") != null);
+    try testing.expect(fx.store.get("bq:vec:mem:demo:doc-1") != null);
+
+    const get = try runProc(&fx.store, memGet, &.{ "demo", "doc-1" }, arena);
+    try testing.expect(get == .err);
+    try testing.expect(std.mem.indexOf(u8, get.err, "vector_only") != null);
+
+    const query = try runProc(
+        &fx.store,
+        memQuery,
+        &.{ "demo", emb, "1" },
+        arena,
+    );
+    try testing.expect(query == .value);
+    try testing.expect(std.mem.indexOf(u8, query.value.?, "\"id\":\"doc-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, query.value.?, "\"meta\":{\"kind\":\"semantic\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, query.value.?, "\"doc\"") == null);
+}
+
+test "mem_add: vector_only rejects legacy doc-text shape when embedding is recognizable" {
+    var fx = try TestStoreFixture.init("memadd_vector_only_legacy_shape");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine", "vector_only=true" }, arena);
+
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const add = try runProc(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-1", "text body", emb },
+        arena,
+    );
+    try testing.expect(add == .err);
+    try testing.expect(std.mem.indexOf(u8, add.err, "no text arg") != null);
+    try testing.expect(fx.store.get("vec:mem:demo:doc-1") == null);
+}
+
+test "mem_add: default namespace still stores doc and meta" {
+    var fx = try TestStoreFixture.init("memadd_default_still_docs");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena);
+
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const add = try runProc(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-1", "hello", emb, "{\"kind\":\"semantic\"}", "0" },
+        arena,
+    );
+    try testing.expect(add == .ok);
+    try testing.expect(fx.store.get("mem:demo:doc-1") != null);
+    try testing.expect(fx.store.get("mem:demo:doc-1:meta") != null);
 }
 
 test "mem_reset_index: drops vectors, preserves docs, rewrites config" {

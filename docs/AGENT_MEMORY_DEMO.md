@@ -17,7 +17,7 @@ goes through the same WAL + replication path the rest of the server uses.
 
 | Procedure          | Purpose                                                        |
 | ------------------ | -------------------------------------------------------------- |
-| `mem_init`         | Optionally pre-declare a namespace's embedder and metric       |
+| `mem_init`         | Optionally pre-declare a namespace's embedder, metric, and mode |
 | `mem_add`          | Atomic: doc + metadata + embedding + event, in one EXEC        |
 | `mem_meta_set`     | Update metadata for an existing memory without re-embedding     |
 | `mem_bulk_add`     | Backfill embeddings + metadata through one vector batch        |
@@ -39,7 +39,7 @@ mem:<ns>:<id>             doc body            (WORM by default)
 mem:<ns>:<id>:meta        metadata JSON       (mutable passthrough)
 vec:mem:<ns>:<id>         embedding (f32 LE)  (via applyVinsert)
 bq:vec:mem:<ns>:<id>      BQ companion        (written by applyVinsert)
-__meta:mem:<ns>:config    { embedder_id, metric, created_at }
+__meta:mem:<ns>:config    { embedder_id, metric, vector_only, created_at }
 ```
 
 Two consequences worth noticing:
@@ -108,16 +108,15 @@ Stored in `__meta:mem:<ns>:config` as part of a small JSON blob:
 ```
 
 `mem_init` writes this eagerly and is idempotent-if-matching —
-re-initing with the same embedder + metric is a no-op, a different
-embedder or metric errors. `mem_add` reads it to pick the metric for
-`applyVinsert`; if config is absent, cosine is the default.
+re-initing with the same embedder + metric + mode is a no-op, a different
+embedder, metric, or `vector_only` setting errors. `mem_add` reads it to
+pick the metric for `applyVinsert`; if config is absent, cosine is the default.
 
-The embedder-id is *not* enforced at insert time in v1. Clients that
-need strict guarantees pin the embedder by always calling `mem_init`
-before any adds. Mixing embedders with different output dimensions is
-caught by dim-freeze; mixing embedders with the same dim is a
-client-side discipline problem that `mem_stats` makes observable but
-doesn't prevent.
+Embedder enforcement is opt-in per insert: clients that need strict
+guarantees call `mem_init` before adds and pass the configured
+`embedder_id` assertion to `mem_add`. Mixing embedders with different
+output dimensions is still caught by dim-freeze; same-dimension swaps
+are caught when the caller provides that assertion.
 
 `mem_verify` goes further than `mem_stats` for reconciliation. It compares
 document, vector, and BQ IDs and returns bounded lists for `orphan_vectors`,
@@ -148,6 +147,11 @@ Returned shape:
   ...
 ]
 ```
+
+Vector-only namespaces use `mem_init ... vector_only=true` and the shorter
+`mem_add <ns> <id> <embedding> [meta_json] [worm] [embedder_id]` form. They
+skip document-body writes, keep vectors/BQ/metadata, return query hits without
+a `doc` field, and make `mem_get` return a clear vector-only error.
 
 Three query-time knobs:
 

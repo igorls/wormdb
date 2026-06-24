@@ -14,6 +14,7 @@ export type Capabilities = {
   retrieval_unit: "chunk" | "turn" | "session";
   temporal_decay: boolean;
   bulk_add?: boolean;
+  vector_only?: boolean;
   verbatim: boolean;
   local: boolean;
   structured_facts: boolean;
@@ -43,6 +44,7 @@ export type NamespaceStats = {
   config: null | {
     embedder_id: string;
     metric: Metric;
+    vector_only?: boolean;
     created_at: number;
   };
   hnsw?: {
@@ -64,6 +66,11 @@ export type DropResult = {
 export type AddOptions = {
   meta?: unknown;
   worm?: boolean;
+  embedderId?: string;
+};
+
+export type InitOptions = {
+  vectorOnly?: boolean;
 };
 
 export type BulkAddRow = {
@@ -124,11 +131,15 @@ export class MemClient {
     return JSON.parse(unwrapValue(resp as WormResp, "mem_capabilities"));
   }
 
-  async init(ns: string, embedderId: string, metric: Metric = "cosine"): Promise<void> {
+  async init(ns: string, embedderId: string, metric: Metric = "cosine", options: InitOptions = {}): Promise<void> {
+    const args = [ns, embedderId, metric];
+    if (options.vectorOnly !== undefined) {
+      args.push(options.vectorOnly ? "vector_only=true" : "vector_only=false");
+    }
     const resp = await this.wire.sendCommand({
       kind: "EXEC",
       procedure: "mem_init",
-      args: [ns, embedderId, metric],
+      args,
     });
     unwrapOk(resp as WormResp, "mem_init");
   }
@@ -143,13 +154,46 @@ export class MemClient {
     const args: (string | Uint8Array)[] = [ns, docId, text, embedding];
     if (options.meta !== undefined) {
       args.push(JSON.stringify(options.meta));
-    } else if (options.worm !== undefined) {
+    } else if (options.worm !== undefined || options.embedderId !== undefined) {
       // Meta is positional before worm — push an empty placeholder if
-      // the caller wants to set worm without meta.
+      // the caller wants to set worm/embedder without meta.
       args.push("");
     }
     if (options.worm !== undefined) {
       args.push(options.worm ? "1" : "0");
+    } else if (options.embedderId !== undefined) {
+      args.push("1");
+    }
+    if (options.embedderId !== undefined) {
+      args.push(options.embedderId);
+    }
+    const resp = await this.wire.sendCommand({
+      kind: "EXEC",
+      procedure: "mem_add",
+      args,
+    });
+    unwrapOk(resp as WormResp, "mem_add");
+  }
+
+  async addVectorOnly(
+    ns: string,
+    docId: string,
+    embedding: Uint8Array,
+    options: AddOptions = {},
+  ): Promise<void> {
+    const args: (string | Uint8Array)[] = [ns, docId, embedding];
+    if (options.meta !== undefined) {
+      args.push(JSON.stringify(options.meta));
+    } else if (options.worm !== undefined || options.embedderId !== undefined) {
+      args.push("");
+    }
+    if (options.worm !== undefined) {
+      args.push(options.worm ? "1" : "0");
+    } else if (options.embedderId !== undefined) {
+      args.push("1");
+    }
+    if (options.embedderId !== undefined) {
+      args.push(options.embedderId);
     }
     const resp = await this.wire.sendCommand({
       kind: "EXEC",

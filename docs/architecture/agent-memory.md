@@ -8,8 +8,9 @@ For the end-to-end demo notes, see [Agent Memory Demo](/AGENT_MEMORY_DEMO).
 
 | Procedure | Purpose |
 | --------- | ------- |
-| `mem_init <ns> <embedder_id> <metric> [decay_tau_hours]` | Predeclare a memory namespace, embedder, metric, and optional decay time constant |
+| `mem_init <ns> <embedder_id> <metric> [decay_tau_hours] [vector_only=true]` | Predeclare a memory namespace, embedder, metric, optional decay time constant, and optional vector-only mode |
 | `mem_add <ns> <doc_id> <text> <embedding> [meta_json] [worm] [embedder_id]` | Add one memory chunk plus embedding |
+| `mem_add <ns> <doc_id> <embedding> [meta_json] [worm] [embedder_id]` | Add one vector-only memory row |
 | `mem_meta_set <ns> <doc_id> <meta_json>` | Update metadata for an existing memory without re-embedding |
 | `mem_bulk_add <ns> <count> [id embedding meta_json]×N` | Add many memory embeddings and metadata rows in one vector batch |
 | `mem_get <ns> <doc_id>` | Fetch document text joined with metadata |
@@ -28,7 +29,7 @@ mem:<ns>:<id>              document body, WORM by default
 mem:<ns>:<id>:meta         metadata JSON
 vec:mem:<ns>:<id>          raw embedding bytes
 bq:vec:mem:<ns>:<id>       quantized companion
-__meta:mem:<ns>:config     {"embedder_id":"...","metric":"...","decay_tau_hours":168,"created_at":...}
+__meta:mem:<ns>:config     {"embedder_id":"...","metric":"...","decay_tau_hours":168,"vector_only":false,"created_at":...}
 ```
 
 Chunking lives on the client. `mem_add` indexes one chunk; applications that have long documents or conversations should split them and call `mem_add` with derived IDs.
@@ -39,6 +40,12 @@ that the document exists. The metadata bytes are stored raw and returned raw in
 `mem_get`/`mem_query`, matching the existing `mem_add` contract.
 
 `mem_bulk_add` is the sidecar/backfill path for already-chunked and already-embedded memory rows. It prevalidates the whole batch for id safety, duplicate ids, vector byte shape, uniform dimensions, existing namespace dim/metric compatibility, and existing vector state before writing. Vector/BQ/HNSW work uses the native bulk vector apply path; metadata rows are written durably afterward. A successful batch publishes one `mem:<ns>:added.bulk` event whose payload is the JSON id list.
+
+## Vector-Only Mode
+
+`mem_init <ns> <embedder_id> <metric> vector_only=true` creates a namespace for sidecar layouts where document bodies live outside WormDB. In this mode, `mem_add` uses the shorter form `<ns> <doc_id> <embedding> [meta_json] [worm] [embedder_id]`, writes `vec:*`, `bq:*`, and optional metadata, and intentionally skips `mem:<ns>:<id>` document bodies.
+
+`mem_query` returns hits as `[{id, score, ts, meta}]` with no `doc` field, and `mem_get` rejects with a deterministic `vector_only` error. Dim and metric freezing still happen through the normal vector namespace.
 
 ## Embedder Enforcement
 

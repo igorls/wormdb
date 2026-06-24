@@ -23,6 +23,7 @@ goes through the same WAL + replication path the rest of the server uses.
 | `mem_get`          | Single-doc fetch with metadata join                            |
 | `mem_query`        | HNSW → brute-force fallback, joined with doc + metadata        |
 | `mem_stats`        | Counts, dim, HNSW state, config                                 |
+| `mem_verify`       | Drift report for docs, vectors, BQ, and HNSW                    |
 | `mem_drop`         | Scan-delete everything under a namespace (doc, meta, vec, BQ)   |
 | `mem_reset_index`  | Drop vec/BQ/HNSW for a namespace and switch its embedder id     |
 | `mem_capabilities` | Self-describing capability block for adapter discovery         |
@@ -108,6 +109,11 @@ before any adds. Mixing embedders with different output dimensions is
 caught by dim-freeze; mixing embedders with the same dim is a
 client-side discipline problem that `mem_stats` makes observable but
 doesn't prevent.
+
+`mem_verify` goes further than `mem_stats` for reconciliation. It compares
+document, vector, and BQ IDs and returns bounded lists for `orphan_vectors`,
+`orphan_docs`, and `missing_bq`, which is the shape sidecar clients need when
+WormDB drifts from their canonical row store.
 
 ## Query path
 

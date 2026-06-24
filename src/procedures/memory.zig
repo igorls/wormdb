@@ -20,6 +20,7 @@
 //!   mem_get          <ns> <doc_id>
 //!   mem_query        <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>]
 //!   mem_stats        <ns>
+//!   mem_verify       <ns>
 //!   mem_drop         <ns>
 //!   mem_reset_index  <ns> <new_embedder_id>
 //!   mem_capabilities
@@ -63,6 +64,7 @@ const MAX_TOP_K: usize = 100;
 const DEFAULT_SNIPPET_CHARS: i64 = 512;
 const DECAY_TIME_CONSTANT_HOURS: f32 = 168.0;
 const HNSW_EF_SEARCH_FACTOR: usize = 10;
+const MAX_VERIFY_ORPHANS: usize = 100;
 
 // ╔═══════════════════════════════════════════════════╗
 // ║  Input validation                                  ║
@@ -150,6 +152,10 @@ fn extractConfigField(json: []const u8, field: []const u8) ?[]const u8 {
     return tail[0..end];
 }
 
+fn configVectorOnly(json: []const u8) bool {
+    return std.mem.indexOf(u8, json, "\"vector_only\":true") != null;
+}
+
 // ╔═══════════════════════════════════════════════════╗
 // ║  Distance + decay shared with vsearch              ║
 // ╚═══════════════════════════════════════════════════╝
@@ -186,6 +192,7 @@ pub fn memCapabilities(ctx: *Ctx) anyerror!Ctx.Result {
         \\"local":true,
         \\"structured_facts":false,
         \\"metadata_update":true,
+        \\"health_verify":true,
         \\"metrics":["cosine","dot","l2"]}
     ;
     return ctx.value(json);
@@ -782,6 +789,194 @@ pub fn memStats(ctx: *Ctx) anyerror!Ctx.Result {
 }
 
 // ╔═══════════════════════════════════════════════════╗
+// ║  mem_verify                                        ║
+// ╚═══════════════════════════════════════════════════╝
+
+const VerifyKind = enum { doc, vector, bq };
+
+const VerifyIdSet = struct {
+    allocator: std.mem.Allocator,
+    map: std.StringHashMap(void),
+    count: usize = 0,
+
+    fn init(allocator: std.mem.Allocator) VerifyIdSet {
+        return .{
+            .allocator = allocator,
+            .map = std.StringHashMap(void).init(allocator),
+        };
+    }
+
+    fn deinit(self: *VerifyIdSet) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.map.deinit();
+    }
+
+    fn add(self: *VerifyIdSet, id: []const u8) !void {
+        if (self.map.contains(id)) return;
+        const id_copy = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(id_copy);
+        try self.map.put(id_copy, {});
+        self.count += 1;
+    }
+
+    fn has(self: *const VerifyIdSet, id: []const u8) bool {
+        return self.map.contains(id);
+    }
+};
+
+const VerifyCollectCtx = struct {
+    prefix: []const u8,
+    kind: VerifyKind,
+    ids: *VerifyIdSet,
+    oom: bool = false,
+};
+
+fn collectVerifyId(
+    raw_ctx: *anyopaque,
+    key: []const u8,
+    value: []const u8,
+    timestamp: u64,
+    is_worm: bool,
+) Store.ScanAction {
+    _ = value;
+    _ = timestamp;
+    _ = is_worm;
+
+    const vc: *VerifyCollectCtx = @ptrCast(@alignCast(raw_ctx));
+    if (key.len < vc.prefix.len) return .cont;
+    const id = key[vc.prefix.len..];
+
+    // `mem:<ns>:` includes both docs and metadata sidecars. Doc IDs cannot
+    // contain `:`, so a `:meta` suffix is the metadata key, not a document.
+    if (vc.kind == .doc and std.mem.endsWith(u8, id, ":meta")) return .cont;
+
+    vc.ids.add(id) catch {
+        vc.oom = true;
+        return .stop;
+    };
+    return .cont;
+}
+
+fn appendDiffArray(
+    json: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    source: *const VerifyIdSet,
+    missing_from: *const VerifyIdSet,
+    limit: usize,
+) !bool {
+    var emitted: usize = 0;
+    var truncated = false;
+    try json.append(allocator, '[');
+    var it = source.map.iterator();
+    while (it.next()) |entry| {
+        const id = entry.key_ptr.*;
+        if (missing_from.has(id)) continue;
+        if (emitted == limit) {
+            truncated = true;
+            continue;
+        }
+        if (emitted > 0) try json.append(allocator, ',');
+        try json.append(allocator, '"');
+        try appendJsonEscaped(json, allocator, id);
+        try json.append(allocator, '"');
+        emitted += 1;
+    }
+    try json.append(allocator, ']');
+    return truncated;
+}
+
+fn collectVerifySet(ctx: *Ctx, prefix: []const u8, kind: VerifyKind, ids: *VerifyIdSet) !void {
+    var collector = VerifyCollectCtx{
+        .prefix = prefix,
+        .kind = kind,
+        .ids = ids,
+    };
+    ctx.scanCallback(prefix, @ptrCast(&collector), collectVerifyId);
+    if (collector.oom) return error.OutOfMemory;
+}
+
+pub fn memVerify(ctx: *Ctx) anyerror!Ctx.Result {
+    const ns = ctx.arg(0) orelse return ctx.err("mem_verify requires: <ns>");
+    if (!validateNs(ns)) return ctx.err("mem_verify: invalid ns");
+
+    const doc_prefix = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:", .{ns});
+    defer ctx.allocator.free(doc_prefix);
+    const vec_prefix = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
+    defer ctx.allocator.free(vec_prefix);
+    const bq_prefix = try std.fmt.allocPrint(ctx.allocator, "bq:vec:mem:{s}:", .{ns});
+    defer ctx.allocator.free(bq_prefix);
+    const config_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
+    defer ctx.allocator.free(config_key);
+
+    var doc_ids = VerifyIdSet.init(ctx.allocator);
+    defer doc_ids.deinit();
+    var vec_ids = VerifyIdSet.init(ctx.allocator);
+    defer vec_ids.deinit();
+    var bq_ids = VerifyIdSet.init(ctx.allocator);
+    defer bq_ids.deinit();
+
+    collectVerifySet(ctx, doc_prefix, .doc, &doc_ids) catch {
+        return ctx.err("mem_verify: out of memory collecting doc ids");
+    };
+    collectVerifySet(ctx, vec_prefix, .vector, &vec_ids) catch {
+        return ctx.err("mem_verify: out of memory collecting vector ids");
+    };
+    collectVerifySet(ctx, bq_prefix, .bq, &bq_ids) catch {
+        return ctx.err("mem_verify: out of memory collecting bq ids");
+    };
+
+    const config_bytes = try ctx.getCopy(config_key);
+    const vector_only = if (config_bytes) |cfg| configVectorOnly(cfg) else false;
+
+    var hnsw_node_count: usize = 0;
+    if (ctx.vector_registry) |reg| {
+        if (reg.get(vec_prefix)) |ns_idx| {
+            ns_idx.lock.lockShared();
+            defer ns_idx.lock.unlockShared();
+            hnsw_node_count = ns_idx.len();
+        }
+    }
+
+    var json: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer json.deinit(ctx.allocator);
+    try json.appendSlice(ctx.allocator, "{\"namespace\":\"");
+    try appendJsonEscaped(&json, ctx.allocator, ns);
+    try json.appendSlice(ctx.allocator, "\",\"doc_count\":");
+    try writeUsize(&json, ctx.allocator, doc_ids.count);
+    try json.appendSlice(ctx.allocator, ",\"vector_count\":");
+    try writeUsize(&json, ctx.allocator, vec_ids.count);
+    try json.appendSlice(ctx.allocator, ",\"bq_count\":");
+    try writeUsize(&json, ctx.allocator, bq_ids.count);
+    try json.appendSlice(ctx.allocator, ",\"hnsw_node_count\":");
+    try writeUsize(&json, ctx.allocator, hnsw_node_count);
+    try json.appendSlice(ctx.allocator, ",\"orphan_limit\":");
+    try writeUsize(&json, ctx.allocator, MAX_VERIFY_ORPHANS);
+
+    try json.appendSlice(ctx.allocator, ",\"orphan_vectors\":");
+    const orphan_vectors_truncated = try appendDiffArray(&json, ctx.allocator, &vec_ids, &doc_ids, MAX_VERIFY_ORPHANS);
+
+    try json.appendSlice(ctx.allocator, ",\"orphan_docs\":");
+    const orphan_docs_truncated = if (vector_only) blk: {
+        try json.appendSlice(ctx.allocator, "[]");
+        break :blk false;
+    } else try appendDiffArray(&json, ctx.allocator, &doc_ids, &vec_ids, MAX_VERIFY_ORPHANS);
+
+    try json.appendSlice(ctx.allocator, ",\"missing_bq\":");
+    const missing_bq_truncated = try appendDiffArray(&json, ctx.allocator, &vec_ids, &bq_ids, MAX_VERIFY_ORPHANS);
+
+    try json.appendSlice(ctx.allocator, ",\"orphan_vectors_truncated\":");
+    try json.appendSlice(ctx.allocator, if (orphan_vectors_truncated) "true" else "false");
+    try json.appendSlice(ctx.allocator, ",\"orphan_docs_truncated\":");
+    try json.appendSlice(ctx.allocator, if (orphan_docs_truncated) "true" else "false");
+    try json.appendSlice(ctx.allocator, ",\"missing_bq_truncated\":");
+    try json.appendSlice(ctx.allocator, if (missing_bq_truncated) "true" else "false");
+    try json.append(ctx.allocator, '}');
+
+    return ctx.value(try json.toOwnedSlice(ctx.allocator));
+}
+
+// ╔═══════════════════════════════════════════════════╗
 // ║  mem_drop                                          ║
 // ╚═══════════════════════════════════════════════════╝
 
@@ -1292,6 +1487,84 @@ test "mem_meta_set: rejects missing doc_id" {
     try testing.expect(update == .err);
     try testing.expectEqualStrings("mem_meta_set: doc_id not found", update.err);
     try testing.expect(fx.store.get("mem:demo:missing:meta") == null);
+}
+
+test "mem_verify: reports orphan vector ids" {
+    var fx = try TestStoreFixture.init("memverify_orphan_vec");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    try fx.store.set("mem:demo:ok", "doc", false);
+    try fx.store.set("vec:mem:demo:ok", emb, false);
+    try fx.store.set("bq:vec:mem:demo:ok", "x", false);
+    try fx.store.set("vec:mem:demo:orphan-vec", emb, false);
+
+    const result = try runProc(&fx.store, memVerify, &.{"demo"}, arena);
+    try testing.expect(result == .value);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"doc_count\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"vector_count\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"bq_count\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"hnsw_node_count\":0") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"orphan_vectors\":[") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"orphan-vec\"") != null);
+}
+
+test "mem_verify: reports orphan docs and ignores metadata sidecars" {
+    var fx = try TestStoreFixture.init("memverify_orphan_doc");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try fx.store.set("mem:demo:doc-only", "doc", false);
+    try fx.store.set("mem:demo:doc-only:meta", "{\"k\":1}", false);
+
+    const result = try runProc(&fx.store, memVerify, &.{"demo"}, arena);
+    try testing.expect(result == .value);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"doc_count\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"vector_count\":0") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"orphan_docs\":[") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"doc-only\"") != null);
+}
+
+test "mem_verify: reports vectors missing BQ entries" {
+    var fx = try TestStoreFixture.init("memverify_missing_bq");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    try fx.store.set("mem:demo:missing-bq", "doc", false);
+    try fx.store.set("vec:mem:demo:missing-bq", emb, false);
+
+    const result = try runProc(&fx.store, memVerify, &.{"demo"}, arena);
+    try testing.expect(result == .value);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"missing_bq\":[") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"missing-bq\"") != null);
+}
+
+test "mem_verify: vector-only config suppresses orphan docs" {
+    var fx = try TestStoreFixture.init("memverify_vector_only");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try fx.store.set("__meta:mem:demo:config", "{\"embedder_id\":\"bge-m3\",\"metric\":\"cosine\",\"vector_only\":true}", false);
+    try fx.store.set("mem:demo:sidecar-row", "doc", false);
+
+    const result = try runProc(&fx.store, memVerify, &.{"demo"}, arena);
+    try testing.expect(result == .value);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"doc_count\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"orphan_docs\":[]") != null);
 }
 
 test "mem_add: invalid embedder_id arg rejected before state changes" {

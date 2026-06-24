@@ -13,9 +13,18 @@ pub const Subscriber = struct {
     write_fn: *const fn (ctx: *anyopaque, data: []const u8) void,
     ctx: *anyopaque,
     filter: ?predicate.Predicate = null,
+    // Owned copy of the raw filter bytes. The parsed `filter` predicate stores
+    // slices into this buffer (it does not copy field/literal strings), so the
+    // buffer must outlive the predicate and is freed together with it. Without
+    // this the predicate would dangle into the transient per-command buffer.
+    filter_src: ?[]u8 = null,
+    filter_allocator: ?std.mem.Allocator = null,
 
     fn deinit(self: *Subscriber) void {
         if (self.filter) |*filter| filter.deinit();
+        if (self.filter_src) |src| {
+            if (self.filter_allocator) |a| a.free(src);
+        }
     }
 };
 
@@ -92,8 +101,17 @@ pub const EventBus = struct {
         write_fn: *const fn (ctx: *anyopaque, data: []const u8) void,
         ctx: *anyopaque,
     ) !u64 {
-        var parsed_filter = if (filter_raw) |raw| try predicate.parse(self.allocator, raw) else null;
+        // Own a copy of the raw filter bytes: the parsed predicate borrows
+        // slices from it and the subscription outlives the caller's buffer.
+        var filter_src: ?[]u8 = null;
+        errdefer if (filter_src) |src| self.allocator.free(src);
+        var parsed_filter: ?predicate.Predicate = null;
         errdefer if (parsed_filter) |*filter| filter.deinit();
+        if (filter_raw) |raw| {
+            const owned = try self.allocator.dupe(u8, raw);
+            filter_src = owned;
+            parsed_filter = try predicate.parse(self.allocator, owned);
+        }
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -117,8 +135,11 @@ pub const EventBus = struct {
             .write_fn = write_fn,
             .ctx = ctx,
             .filter = parsed_filter,
+            .filter_src = filter_src,
+            .filter_allocator = self.allocator,
         });
         parsed_filter = null;
+        filter_src = null;
 
         _ = self.stats.subscriber_count.fetchAdd(1, .monotonic);
         return sub_id;

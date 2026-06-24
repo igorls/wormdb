@@ -2184,6 +2184,72 @@ test "mem_query: filters HNSW refine candidates by metadata before top-k" {
     try testing.expect(std.mem.indexOf(u8, result.value.?, "\"id\":\"doc-private\"") == null);
 }
 
+test "mem_query returns full top-k after WAL replay restart without vreindex" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/memquery_wal_restart.wal", .{tmp_path});
+    defer testing.allocator.free(wal_path);
+
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/memquery_wal_restart.snapshot", .{tmp_path});
+    defer testing.allocator.free(snapshot_path);
+
+    const wal_file = try compat.Dir.createFile(tmp_dir.dir, "memquery_wal_restart.wal", .{});
+    compat.File.close(wal_file);
+
+    const config = @import("../core/config.zig").Config{
+        .wal_path = wal_path,
+        .snapshot_path = snapshot_path,
+        .sync_writes = false,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const emb_a = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const emb_b = try packF32(arena, &[_]f32{ 0.0, 1.0, 0.0, 0.0 });
+    const emb_c = try packF32(arena, &[_]f32{ 0.9, 0.1, 0.0, 0.0 });
+
+    {
+        var registry = IndexModule.NamespaceRegistry.init(testing.allocator, .{});
+        defer registry.deinit();
+
+        var store = try StoreModule.Store.initWithRegistry(testing.allocator, config, &registry);
+        defer store.deinit();
+
+        _ = try runProcWithRegistry(&store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena, &registry);
+        _ = try runProcWithRegistry(&store, memAdd, &.{ "demo", "doc-a", "alpha", emb_a, "{}", "0" }, arena, &registry);
+        _ = try runProcWithRegistry(&store, memAdd, &.{ "demo", "doc-b", "beta", emb_b, "{}", "0" }, arena, &registry);
+        _ = try runProcWithRegistry(&store, memAdd, &.{ "demo", "doc-c", "near alpha", emb_c, "{}", "0" }, arena, &registry);
+    }
+
+    {
+        var registry = IndexModule.NamespaceRegistry.init(testing.allocator, .{});
+        defer registry.deinit();
+
+        var reloaded = try StoreModule.Store.initWithRegistry(testing.allocator, config, &registry);
+        defer reloaded.deinit();
+
+        const health = try runProcWithRegistry(&reloaded, memHealth, &.{"demo"}, arena, &registry);
+        try testing.expect(health == .value);
+        try testing.expect(std.mem.indexOf(u8, health.value.?, "\"index_caught_up\":true") != null);
+        try testing.expect(std.mem.indexOf(u8, health.value.?, "\"pending_vectors\":0") != null);
+
+        const result = try runProcWithRegistry(&reloaded, memQuery, &.{ "demo", emb_a, "3", "0", "-999", "0" }, arena, &registry);
+        try testing.expect(result == .value);
+        const value = result.value.?;
+        const pos_a = std.mem.indexOf(u8, value, "\"id\":\"doc-a\"") orelse return error.MissingDocA;
+        const pos_c = std.mem.indexOf(u8, value, "\"id\":\"doc-c\"") orelse return error.MissingDocC;
+        const pos_b = std.mem.indexOf(u8, value, "\"id\":\"doc-b\"") orelse return error.MissingDocB;
+        try testing.expect(pos_a < pos_c);
+        try testing.expect(pos_c < pos_b);
+    }
+}
+
 test "mem_get: enforces namespace-scoped read capability" {
     var fx = try TestStoreFixture.init("memget_auth_scope");
     defer fx.deinit();

@@ -22,6 +22,7 @@ For the long implementation notes and roadmap, see [Vector Search Deep Dive](/VE
 vec:<namespace>:<id>      raw f32 bytes used directly by the server
 bq:vec:<namespace>:<id>   BQ or RaBitQ companion bytes
 __meta:<namespace>:count  local per-node insert counter
+__meta:vecns:<namespace>  persisted metric config for restart rebuild
 ```
 
 The server treats vector payloads as raw bytes and interprets them as `f32` values. On the supported little-endian targets, clients should pack embeddings as little-endian `f32` bytes. Vector inserts are WORM by default in the native Bun client helpers and the procedure layer. Non-WORM vectors can be deleted, but deletes tombstone HNSW nodes until the namespace is rebuilt.
@@ -61,13 +62,15 @@ See [Command Reference](/protocol/commands) for the payload layouts.
 
 ## Recovery And Rebuilds
 
-Snapshot format v2 appends a `WDBHNSW2` trailer with HNSW graph state, tombstones, timestamps, and RaBitQ parameters. WAL replay after the latest snapshot restores the durable `vec:*` keys but does not replay every index mutation. Run:
+Snapshot format v2 appends a `WDBHNSW2` trailer with HNSW graph state, tombstones, timestamps, and RaBitQ parameters. WAL replay after the latest snapshot restores durable `vec:*` keys. Namespaces written through `VINSERT`, `VBULKINSERT`, or the `vinsert` procedure also persist `__meta:vecns:<namespace>`, so startup can rebuild their HNSW graphs from recovered KV using the original metric.
+
+Run:
 
 ```bash
 bun run apps/bun/src/bin/client.ts EXEC vreindex vec:articles:
 ```
 
-Use `vreindex` after raw `SET` ingest, manual recovery from an old snapshot, or WAL-only catch-up where the serving index must be immediately current.
+Use `vreindex` after raw `SET` ingest, manual recovery from old data that lacks `__meta:vecns:*`, or suspected index corruption.
 
 ## Current Limits
 

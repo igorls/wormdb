@@ -71,7 +71,7 @@ EXEC vstats vec:articles:
 ### Current limitations
 
 - **Search is node-local** — vector writes replicate, but `vsearch` does not scatter to peers and merge top-K results yet.
-- **Derived graph recovery** — snapshot v2 restores HNSW/RaBitQ state, and memory namespaces (`vec:mem:<ns>:` with `__meta:mem:<ns>:config`) are rebuilt from WAL-replayed KV on startup. Raw/custom vector namespaces may still need `vreindex` when the metric cannot be inferred.
+- **Derived graph recovery** — snapshot v2 restores HNSW/RaBitQ state, and vector namespaces with persisted metric metadata (`__meta:vecns:<namespace>` or memory config) are rebuilt from WAL-replayed KV on startup. Raw `SET` ingest may still need `vreindex` when the metric cannot be inferred.
 - **Filtered ANN is not first-class** — metadata-aware search still needs the planned filter expression path.
 - **Deletes use tombstones** — `VDELETE`/`vdelete` tombstone graph nodes for non-WORM vectors; compaction is via rebuild/drop flows.
 
@@ -388,8 +388,8 @@ Snapshot format extension (WDBSNAP2):
 - [ ] **Index serializer** — Write HNSW graph to binary format
 - [ ] **Index deserializer** — Rebuild graph from binary on startup
 - [ ] **Snapshot version bump** — `WDBSNAP1` → `WDBSNAP2` with backward compat
-- [x] **Memory index WAL recovery** — Rebuild memory HNSW graphs from WAL-replayed durable vector keys
-- [ ] **Generic incremental index WAL** — Log raw/custom vector namespace mutations with metric metadata
+- [x] **Configured index WAL recovery** — Rebuild configured HNSW graphs from WAL-replayed durable vector keys
+- [ ] **Generic incremental index WAL** — Add first-class vector mutation WAL records
 - [ ] **Lazy rebuild fallback** — If index is corrupt, rebuild from stored vectors
 
 ---

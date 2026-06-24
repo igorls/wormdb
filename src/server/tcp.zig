@@ -419,6 +419,7 @@ pub const Server = struct {
                     error.IoError => "I/O error",
                     error.KeyNotFound => "key not found",
                     error.Corruption => "data corruption",
+                    error.InvalidPredicate => "invalid filter predicate",
                 };
                 wire.writeResponse(&w, .{ .err = err_msg }) catch {};
                 w.flush() catch {};

@@ -25,6 +25,7 @@ pub const vdelete = @import("vdelete.zig");
 pub const vnsdrop = @import("vnsdrop.zig");
 pub const memory = @import("memory.zig");
 pub const auth_mint_scoped = @import("auth_mint_scoped.zig");
+pub const append_log = @import("append_log.zig");
 // Light-API + AtomicAssets procedures are NOT imported here — they live in their own packages
 // (wormdb-domain-lightapi, wormdb-domain-atomicassets) and are registered at startup via
 // registerDomains() from each package's manifest.
@@ -64,6 +65,13 @@ const PROCEDURES = [_]Entry{
     .{ .name = "vdelete", .func = vdelete.execute },
     .{ .name = "vnsdrop", .func = vnsdrop.execute },
     .{ .name = "auth_mint_scoped", .func = auth_mint_scoped.execute },
+    .{ .name = "append_log_append", .func = append_log.appendExecute },
+    .{ .name = "append_log_verify", .func = append_log.verifyExecute },
+    .{ .name = "append_log_mmr_proof", .func = append_log.mmrProofExecute },
+    .{ .name = "append_log_mmr_verify", .func = append_log.mmrVerifyExecute },
+    .{ .name = "append_log_checkpoint", .func = append_log.checkpointExecute },
+    .{ .name = "append_log_proof_bundle", .func = append_log.proofBundleExecute },
+    .{ .name = "append_log_proof_verify", .func = append_log.proofVerifyExecute },
     .{ .name = "mem_init", .func = memory.memInit },
     .{ .name = "mem_add", .func = memory.memAdd },
     .{ .name = "mem_meta_set", .func = memory.memMetaSet },

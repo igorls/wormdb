@@ -27,6 +27,8 @@ All integers in canonical proof material are big-endian. Variable-length byte fi
 
 The checkpoint signature input is domain-separated as `wormdb.checkpoint.sign.v1` and includes every checkpoint field except `signature`. The checkpoint hash is domain-separated as `wormdb.checkpoint.record.v1` and includes the signing payload plus the signature bytes.
 
+`EXEC append_log_checkpoint` stores the canonical checkpoint bytes as a WORM record keyed by the checkpoint hash. `EXEC append_log_proof_bundle` includes those exact bytes as `checkpoint.canonical_record_hex` so external verifier tooling can decode and hash the same material.
+
 ## Extension Claims
 
 WormDB intentionally does not acquire GPS, read device clocks, or interpret supervisor workflow notes. Those claims belong in `extension_bytes`, encoded by the app in a stable format such as CBOR, protobuf, or canonical JSON.
@@ -141,6 +143,13 @@ Encoded proof bundles use canonical bytes for FFI and packet transfer:
 ```
 
 The append-log MMR builder scans and verifies the stored log prefix through `to_seq`, builds the MMR with absolute leaf indexes (`seq - 1`), carries only the requested `from_seq..to_seq` records, signs one `mmr_sha256_v1` checkpoint, encodes the bundle, and verifies it before returning bytes.
+
+The EXEC proof-bundle exporter uses canonical JSON for transport. Binary fields are lowercase hex:
+
+- `records[].canonical_record_hex` is the exact append-log envelope bytes.
+- `records[].record_hash` is `SHA-256(canonical_record_hex bytes)`.
+- `inclusion_proofs[].proof_hex` is the `mmr_sha256_v1` proof-byte format below.
+- `checkpoint.canonical_record_hex` is the exact checkpoint record bytes whose hash is `checkpoint.checkpoint_hash`.
 
 ## MMR Proof Bytes
 

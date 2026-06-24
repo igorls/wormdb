@@ -195,6 +195,69 @@ pub fn eqlHash(a: Hash, b: Hash) bool {
     return std.mem.eql(u8, a[0..], b[0..]);
 }
 
+/// Decode canonical checkpoint bytes produced by `encodeCanonical`.
+///
+/// Returned slices borrow from `bytes`; callers must keep the canonical buffer
+/// alive while using the record.
+pub fn decodeCanonical(bytes: []const u8) !CheckpointRecord {
+    var pos: usize = 0;
+    try readTerminatedDomain(bytes, &pos, CHECKPOINT_RECORD_DOMAIN);
+    const signing_payload = try readLenBytes(bytes, &pos);
+    const signature_bytes = try readFixed(bytes, &pos, SIGNATURE_LEN);
+    if (pos != bytes.len) return error.InvalidCheckpointRecord;
+
+    var record = try decodeSigningPayload(signing_payload);
+    record.signature = signature_bytes[0..SIGNATURE_LEN].*;
+    try record.validateShape();
+    return record;
+}
+
+fn decodeSigningPayload(bytes: []const u8) !CheckpointRecord {
+    var pos: usize = 0;
+    try readTerminatedDomain(bytes, &pos, CHECKPOINT_SIGNING_DOMAIN);
+
+    const version = try readU8(bytes, &pos);
+    const log_id = try readLenBytes(bytes, &pos);
+    const from_seq = try readU64(bytes, &pos);
+    const to_seq = try readU64(bytes, &pos);
+    const accumulator_kind: AccumulatorKind = switch (try readU8(bytes, &pos)) {
+        0 => .opaque_root,
+        1 => .merkle_sha256_v1,
+        2 => .mmr_sha256_v1,
+        else => return error.UnsupportedAccumulatorKind,
+    };
+    const accumulator_root = try readHash(bytes, &pos);
+    const previous_checkpoint_hash: ?Hash = switch (try readU8(bytes, &pos)) {
+        0 => null,
+        1 => try readHash(bytes, &pos),
+        else => return error.InvalidCheckpointRecord,
+    };
+    const creator_identity = try readLenBytes(bytes, &pos);
+    const signature_scheme: SignatureScheme = switch (try readU8(bytes, &pos)) {
+        1 => .ed25519,
+        else => return error.UnsupportedSignatureScheme,
+    };
+    const created_at_ms = try readU64(bytes, &pos);
+    const ingested_at_ms = try readU64(bytes, &pos);
+    const extension_bytes = try readLenBytes(bytes, &pos);
+    if (pos != bytes.len) return error.InvalidCheckpointRecord;
+
+    return .{
+        .version = version,
+        .log_id = log_id,
+        .from_seq = from_seq,
+        .to_seq = to_seq,
+        .accumulator_kind = accumulator_kind,
+        .accumulator_root = accumulator_root,
+        .previous_checkpoint_hash = previous_checkpoint_hash,
+        .creator_identity = creator_identity,
+        .signature_scheme = signature_scheme,
+        .created_at_ms = created_at_ms,
+        .ingested_at_ms = ingested_at_ms,
+        .extension_bytes = extension_bytes,
+    };
+}
+
 fn ensureU32Len(bytes: []const u8) !void {
     if (bytes.len > std.math.maxInt(u32)) return error.FieldTooLarge;
 }
@@ -224,6 +287,41 @@ fn appendLenBytes(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator
     std.mem.writeInt(u32, len_buf[0..4], @intCast(bytes.len), .big);
     try out.appendSlice(allocator, &len_buf);
     try out.appendSlice(allocator, bytes);
+}
+
+fn readTerminatedDomain(bytes: []const u8, pos: *usize, domain: []const u8) !void {
+    const got = try readFixed(bytes, pos, domain.len);
+    if (!std.mem.eql(u8, got, domain)) return error.InvalidCheckpointRecord;
+    if (try readU8(bytes, pos) != 0) return error.InvalidCheckpointRecord;
+}
+
+fn readU8(bytes: []const u8, pos: *usize) !u8 {
+    const out = try readFixed(bytes, pos, 1);
+    return out[0];
+}
+
+fn readU64(bytes: []const u8, pos: *usize) !u64 {
+    const out = try readFixed(bytes, pos, 8);
+    return std.mem.readInt(u64, out[0..8], .big);
+}
+
+fn readHash(bytes: []const u8, pos: *usize) !Hash {
+    const out = try readFixed(bytes, pos, HASH_LEN);
+    return out[0..HASH_LEN].*;
+}
+
+fn readLenBytes(bytes: []const u8, pos: *usize) ![]const u8 {
+    const len_bytes = try readFixed(bytes, pos, 4);
+    const len = std.mem.readInt(u32, len_bytes[0..4], .big);
+    return try readFixed(bytes, pos, len);
+}
+
+fn readFixed(bytes: []const u8, pos: *usize, len: usize) ![]const u8 {
+    if (pos.* > bytes.len) return error.InvalidCheckpointRecord;
+    if (len > bytes.len - pos.*) return error.InvalidCheckpointRecord;
+    const out = bytes[pos.* .. pos.* + len];
+    pos.* += len;
+    return out;
 }
 
 fn testKeypair() struct { public_key: PublicKey, secret_key: [SIGNATURE_LEN]u8 } {
@@ -266,6 +364,18 @@ test "checkpoint signs and verifies canonical payload" {
     const payload_hash = try signed.signingPayloadHash(testing.allocator);
     const payload_hash_again = try signed.signingPayloadHash(testing.allocator);
     try testing.expect(eqlHash(payload_hash, payload_hash_again));
+
+    const canonical = try signed.encodeCanonical(testing.allocator);
+    defer testing.allocator.free(canonical);
+    const decoded = try decodeCanonical(canonical);
+    try testing.expectEqual(@as(u64, 1), decoded.from_seq);
+    try testing.expectEqual(@as(u64, 8), decoded.to_seq);
+    try testing.expectEqual(AccumulatorKind.merkle_sha256_v1, decoded.accumulator_kind);
+    try testing.expect(eqlHash(signed.accumulator_root, decoded.accumulator_root));
+    try testing.expectEqualStrings(signed.log_id, decoded.log_id);
+    try testing.expectEqualStrings(signed.creator_identity, decoded.creator_identity);
+    try testing.expectEqualStrings(signed.extension_bytes, decoded.extension_bytes);
+    try testing.expect(try decoded.verifySignature(testing.allocator));
 }
 
 test "checkpoint signature covers extension claim bytes" {

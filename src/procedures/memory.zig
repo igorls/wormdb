@@ -20,7 +20,7 @@
 //!   mem_meta_set     <ns> <doc_id> <meta_json>
 //!   mem_bulk_add     <ns> <count> [<id> <embedding> <meta_json>]×N
 //!   mem_get          <ns> <doc_id>
-//!   mem_query        <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>] [<decay_tau_hours>]
+//!   mem_query        <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>] [<decay_tau_hours>] [<filter>]
 //!   mem_range        <ns> <since_ms> <until_ms> [<limit>] [<filter>]
 //!   mem_stats        <ns>
 //!   mem_verify       <ns>
@@ -43,9 +43,12 @@
 //! * mem_query skips the BQ prefilter — HNSW is eagerly created by
 //!   mem_init, so cold-start (post-restart until vreindex) is the only
 //!   HNSW-absent case, and brute-force is the simpler fallback there.
+//! * mem_query filters are parsed by predicate.zig and evaluated before
+//!   top-K admission, either during HNSW refine or the brute-force scan.
 
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
+const predicate = @import("predicate.zig");
 const vector_ops = @import("vector_ops.zig");
 const distance = @import("../vector/distance.zig");
 const topk_mod = @import("../vector/topk.zig");
@@ -213,6 +216,17 @@ fn parseMemInitVectorOnlyFlag(raw: []const u8) ?bool {
 
 fn isVectorOnlyConfig(cfg: ?[]const u8) bool {
     return if (cfg) |bytes| extractConfigBool(bytes, "vector_only") orelse false else false;
+}
+
+// A trailing mem_query option is a filter predicate when it carries the
+// `filter=` prefix; otherwise it is parsed as a bare decay_tau_hours value.
+fn argLooksLikeFilter(raw: []const u8) bool {
+    const pfx = "filter=";
+    if (raw.len < pfx.len) return false;
+    for (pfx, 0..) |c, i| {
+        if (std.ascii.toLower(raw[i]) != c) return false;
+    }
+    return true;
 }
 
 // ╔═══════════════════════════════════════════════════╗
@@ -744,6 +758,28 @@ const BruteScanCtx = struct {
     oom: bool,
 };
 
+fn docIdFromVecKey(vec_key: []const u8, vec_prefix: []const u8) ?[]const u8 {
+    if (vec_key.len <= vec_prefix.len) return null;
+    if (!std.mem.startsWith(u8, vec_key, vec_prefix)) return null;
+    return vec_key[vec_prefix.len..];
+}
+
+fn candidateMatchesFilter(
+    ctx: *Ctx,
+    pred: ?*const predicate.Predicate,
+    ns: []const u8,
+    vec_prefix: []const u8,
+    vec_key: []const u8,
+    timestamp: u64,
+) !bool {
+    const p = pred orelse return true;
+    const doc_id = docIdFromVecKey(vec_key, vec_prefix) orelse return false;
+    const meta_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}:meta", .{ ns, doc_id });
+    defer ctx.allocator.free(meta_key);
+    const meta_bytes = try ctx.getCopy(meta_key);
+    return p.matches(meta_bytes, timestamp);
+}
+
 fn onBruteMatch(
     raw_ctx: *anyopaque,
     key: []const u8,
@@ -775,6 +811,7 @@ fn onBruteMatch(
 /// module that both call into.
 fn runHnswDispatch(
     ctx: *Ctx,
+    ns: []const u8,
     ns_idx: *IndexModule.NamespaceIndex,
     query_vec: []align(1) const f32,
     top_k: usize,
@@ -782,6 +819,7 @@ fn runHnswDispatch(
     decay: f32,
     decay_tau_hours: f32,
     now_ms: u64,
+    filter: ?*const predicate.Predicate,
     heap: *TopKCandidate,
 ) !bool {
     const stage1_size = top_k * HNSW_EF_SEARCH_FACTOR;
@@ -798,6 +836,9 @@ fn runHnswDispatch(
 
     if (n_stage1 == 0) return false;
 
+    const vec_prefix = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
+    defer ctx.allocator.free(vec_prefix);
+
     const stage1_keys = try ctx.allocator.alloc([]u8, n_stage1);
     const stage1_ts = try ctx.allocator.alloc(u64, n_stage1);
     {
@@ -810,6 +851,8 @@ fn runHnswDispatch(
     }
 
     for (0..n_stage1) |i| {
+        if (!try candidateMatchesFilter(ctx, filter, ns, vec_prefix, stage1_keys[i], stage1_ts[i])) continue;
+
         const vec_bytes = (try ctx.getCopy(stage1_keys[i])) orelse continue;
         const vec = distance.bytesToF32(vec_bytes) orelse continue;
         if (vec.len != query_vec.len) continue;
@@ -820,6 +863,31 @@ fn runHnswDispatch(
     }
 
     return true;
+}
+
+fn runFilteredBruteScan(
+    ctx: *Ctx,
+    ns: []const u8,
+    vec_namespace: []const u8,
+    query_vec: []align(1) const f32,
+    metric: Metric,
+    decay: f32,
+    decay_tau_hours: f32,
+    now_ms: u64,
+    filter: *const predicate.Predicate,
+    heap: *TopKCandidate,
+) !void {
+    const results = try ctx.scan(vec_namespace, 0);
+    for (results) |r| {
+        const vec = distance.bytesToF32(r.value) orelse continue;
+        if (vec.len != query_vec.len) continue;
+        if (!try candidateMatchesFilter(ctx, filter, ns, vec_namespace, r.key, r.timestamp)) continue;
+
+        const raw_sim = computeExactSim(metric, query_vec, vec);
+        const score = applyDecay(raw_sim, r.timestamp, decay, now_ms, decay_tau_hours);
+        if (score <= heap.thresholdScore()) continue;
+        heap.push(.{ .key = r.key, .score = score, .timestamp = r.timestamp });
+    }
 }
 
 pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
@@ -851,6 +919,28 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
         snippet_chars = std.fmt.parseInt(i64, s, 10) catch DEFAULT_SNIPPET_CHARS;
     }
 
+    // Trailing options (args 6 and 7), in any order: a `filter=...` predicate
+    // and/or a bare decay_tau_hours value. The `filter=` prefix disambiguates.
+    var parsed_filter: ?predicate.Predicate = null;
+    defer if (parsed_filter) |*p| p.deinit();
+    var decay_tau_override: ?f32 = null;
+    {
+        var opt_i: usize = 6;
+        while (opt_i <= 7) : (opt_i += 1) {
+            const raw = ctx.arg(opt_i) orelse continue;
+            if (raw.len == 0) continue;
+            if (argLooksLikeFilter(raw)) {
+                if (parsed_filter != null) return ctx.err("mem_query: filter specified more than once");
+                parsed_filter = predicate.parse(ctx.allocator, raw) catch
+                    return ctx.err("mem_query: invalid filter predicate");
+            } else {
+                decay_tau_override = parseDecayTauHours(raw) orelse
+                    return ctx.err("mem_query: decay_tau_hours must be positive");
+            }
+        }
+    }
+    const filter_ptr: ?*const predicate.Predicate = if (parsed_filter) |*p| p else null;
+
     const query_vec = distance.bytesToF32(embedding) orelse
         return ctx.err("mem_query: embedding must be non-empty f32 bytes (len multiple of 4)");
 
@@ -872,10 +962,7 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
         const cfg = cfg_bytes orelse break :blk DEFAULT_DECAY_TAU_HOURS;
         break :blk extractConfigFloat(cfg, "decay_tau_hours") orelse DEFAULT_DECAY_TAU_HOURS;
     };
-    const decay_tau_hours = if (ctx.arg(6)) |raw|
-        parseDecayTauHours(raw) orelse return ctx.err("mem_query: decay_tau_hours must be positive")
-    else
-        configured_decay_tau_hours;
+    const decay_tau_hours = decay_tau_override orelse configured_decay_tau_hours;
 
     const vec_namespace = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
     defer ctx.allocator.free(vec_namespace);
@@ -892,6 +979,7 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
             if (ns_idx.metric == metric and ns_idx.len() > 0) {
                 used_hnsw = try runHnswDispatch(
                     ctx,
+                    ns,
                     ns_idx,
                     query_vec,
                     top_k,
@@ -899,6 +987,7 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
                     decay,
                     decay_tau_hours,
                     now_ms,
+                    filter_ptr,
                     &final_heap,
                 );
             }
@@ -909,18 +998,22 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
     // Triggered on cold-start (post-restart before vreindex) or when
     // no index has ever been created for this namespace.
     if (!used_hnsw) {
-        var brute_sc = BruteScanCtx{
-            .query_vec = query_vec,
-            .metric = metric,
-            .decay = decay,
-            .decay_tau_hours = decay_tau_hours,
-            .now_ms = now_ms,
-            .heap = &final_heap,
-            .allocator = ctx.allocator,
-            .oom = false,
-        };
-        ctx.scanCallback(vec_namespace, @ptrCast(&brute_sc), onBruteMatch);
-        if (brute_sc.oom) return ctx.err("mem_query: out of memory during brute-force scan");
+        if (filter_ptr) |filter| {
+            try runFilteredBruteScan(ctx, ns, vec_namespace, query_vec, metric, decay, decay_tau_hours, now_ms, filter, &final_heap);
+        } else {
+            var brute_sc = BruteScanCtx{
+                .query_vec = query_vec,
+                .metric = metric,
+                .decay = decay,
+                .decay_tau_hours = decay_tau_hours,
+                .now_ms = now_ms,
+                .heap = &final_heap,
+                .allocator = ctx.allocator,
+                .oom = false,
+            };
+            ctx.scanCallback(vec_namespace, @ptrCast(&brute_sc), onBruteMatch);
+            if (brute_sc.oom) return ctx.err("mem_query: out of memory during brute-force scan");
+        }
     }
 
     // ── Enrich results with doc + meta lookups ──────────────────
@@ -1816,6 +1909,150 @@ fn runProcWithBus(
     var ctx = Ctx.init(store, args, arena, null, null, bus, null);
     defer ctx.deinit();
     return try proc(&ctx);
+}
+
+fn runProcWithRegistry(
+    store: *StoreModule.Store,
+    proc: *const fn (ctx: *Ctx) anyerror!Ctx.Result,
+    args: []const []const u8,
+    arena: std.mem.Allocator,
+    registry: *IndexModule.NamespaceRegistry,
+) !Ctx.Result {
+    var ctx = Ctx.init(store, args, arena, null, null, null, registry);
+    defer ctx.deinit();
+    return try proc(&ctx);
+}
+
+test "mem_query: filters brute-force candidates by metadata before top-k" {
+    var fx = try TestStoreFixture.init("memquery_filter_brute");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena);
+
+    const emb1 = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const emb2 = try packF32(arena, &[_]f32{ 0.98, 0.02, 0.0, 0.0 });
+    _ = try runProc(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-1", "semantic public", emb1, "{\"privacy_level\":1,\"category\":\"semantic\",\"sourceType\":\"chat\",\"minImportance\":0.9}", "0" },
+        arena,
+    );
+    _ = try runProc(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-2", "episodic private", emb2, "{\"privacy_level\":3,\"category\":\"episodic\",\"sourceType\":\"tool\",\"minImportance\":0.4}", "0" },
+        arena,
+    );
+
+    const result = try runProc(
+        &fx.store,
+        memQuery,
+        &.{
+            "demo",
+            emb1,
+            "5",
+            "0",
+            "-999",
+            "0",
+            "filter=privacy_level<=1 AND category=\"semantic\" AND sourceType IN (\"chat\",\"note\") AND minImportance>=0.8",
+        },
+        arena,
+    );
+    try testing.expect(result == .value);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"id\":\"doc-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"id\":\"doc-2\"") == null);
+}
+
+test "mem_query: supports ts filters and rejects invalid predicates" {
+    var fx = try TestStoreFixture.init("memquery_filter_ts");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena);
+
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    _ = try runProc(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-1", "now", emb, "{\"category\":\"semantic\"}", "0" },
+        arena,
+    );
+
+    const included = try runProc(
+        &fx.store,
+        memQuery,
+        &.{ "demo", emb, "5", "0", "-999", "0", "filter=ts>=0" },
+        arena,
+    );
+    try testing.expect(included == .value);
+    try testing.expect(std.mem.indexOf(u8, included.value.?, "\"id\":\"doc-1\"") != null);
+
+    const excluded = try runProc(
+        &fx.store,
+        memQuery,
+        &.{ "demo", emb, "5", "0", "-999", "0", "filter=ts>9999999999999999" },
+        arena,
+    );
+    try testing.expect(excluded == .value);
+    try testing.expectEqualStrings("[]", excluded.value.?);
+
+    const invalid = try runProc(
+        &fx.store,
+        memQuery,
+        &.{ "demo", emb, "5", "0", "-999", "0", "filter=meta.user.name=\"x\"" },
+        arena,
+    );
+    try testing.expect(invalid == .err);
+    try testing.expect(std.mem.indexOf(u8, invalid.err, "filter") != null);
+}
+
+test "mem_query: filters HNSW refine candidates by metadata before top-k" {
+    var fx = try TestStoreFixture.init("memquery_filter_hnsw");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var registry = IndexModule.NamespaceRegistry.init(testing.allocator, .{});
+    defer registry.deinit();
+
+    _ = try runProcWithRegistry(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena, &registry);
+
+    const emb_public = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const emb_private = try packF32(arena, &[_]f32{ 0.99, 0.01, 0.0, 0.0 });
+    _ = try runProcWithRegistry(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-public", "public", emb_public, "{\"privacy_level\":1,\"category\":\"semantic\"}", "0" },
+        arena,
+        &registry,
+    );
+    _ = try runProcWithRegistry(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-private", "private", emb_private, "{\"privacy_level\":5,\"category\":\"semantic\"}", "0" },
+        arena,
+        &registry,
+    );
+
+    const result = try runProcWithRegistry(
+        &fx.store,
+        memQuery,
+        &.{ "demo", emb_private, "1", "0", "-999", "0", "filter=privacy_level<=1 AND category=\"semantic\"" },
+        arena,
+        &registry,
+    );
+    try testing.expect(result == .value);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"id\":\"doc-public\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"id\":\"doc-private\"") == null);
 }
 
 test "mem_add: accepts call without embedder_id arg (backward compat)" {

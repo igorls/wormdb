@@ -83,6 +83,7 @@ export type QueryOptions = {
   lambda?: number;
   minScore?: number;
   snippetChars?: number;
+  filter?: string;
 };
 
 export class MemError extends Error {
@@ -232,22 +233,27 @@ export class MemClient {
     options: QueryOptions = {},
   ): Promise<QueryHit[]> {
     const args: (string | Uint8Array)[] = [ns, embedding, String(k)];
-    // Positional: lambda, min_score, snippet_chars — push placeholders
+    // Positional: lambda, min_score, snippet_chars, filter — push placeholders
     // only as far as the trailing set requires.
     const lambdaSet = options.lambda !== undefined;
     const minSet = options.minScore !== undefined;
     const snipSet = options.snippetChars !== undefined;
+    const filterSet = options.filter !== undefined && options.filter.trim().length > 0;
 
-    if (lambdaSet || minSet || snipSet) {
+    if (lambdaSet || minSet || snipSet || filterSet) {
       args.push(options.lambda !== undefined ? String(options.lambda) : "0");
     }
-    if (minSet || snipSet) {
+    if (minSet || snipSet || filterSet) {
       // Empty string placeholder → server parseFloat fails → falls back
       // to -inf (no filter). Avoids arguing about JS's `-Infinity` text form.
       args.push(options.minScore !== undefined ? String(options.minScore) : "");
     }
-    if (snipSet) {
-      args.push(String(options.snippetChars));
+    if (snipSet || filterSet) {
+      args.push(options.snippetChars !== undefined ? String(options.snippetChars) : "");
+    }
+    if (filterSet) {
+      const filter = options.filter!.trim();
+      args.push(/^filter=/i.test(filter) ? filter : `filter=${filter}`);
     }
     const resp = await this.wire.sendCommand({
       kind: "EXEC",

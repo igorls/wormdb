@@ -129,9 +129,10 @@ WormDB drifts from their canonical row store.
 
 - **HNSW** when the namespace has a registered index with matching metric.
   Stage-1 beam of `k × 10` → stage-2 exact refine with the query's
-  metric + optional temporal decay.
+  metric, optional metadata filter, and optional temporal decay.
 - **Brute-force** prefix scan as the fallback. Triggered on cold start
   (post-restart before `vreindex`) or when no index has been created yet.
+  Metadata filters are applied during this scan before top-K admission.
 
 Unlike general `vsearch`, `mem_query` skips the BQ prefilter. For memory
 namespaces the HNSW index is eagerly created by `mem_init`, so the only
@@ -153,7 +154,7 @@ Vector-only namespaces use `mem_init ... vector_only=true` and the shorter
 skip document-body writes, keep vectors/BQ/metadata, return query hits without
 a `doc` field, and make `mem_get` return a clear vector-only error.
 
-Three query-time knobs:
+Five query-time knobs:
 
 - **`lambda`** (0–1): blends raw similarity with exponential temporal
   decay. `lambda=0` is pure similarity,
@@ -167,6 +168,13 @@ Three query-time knobs:
   only wants scores). Default 512. Matters under realistic session
   sizes where multi-KB docs would otherwise blow p95 latency on the
   enrichment path.
+- **`filter`**: server-side predicate over top-level metadata fields or
+  synthetic `ts`. Supports `=`, `<`, `<=`, `>=`, `>`, `AND`, and
+  `IN (...)`, for example:
+
+  ```text
+  filter='privacy_level<=1 AND sourceType IN ("chat","note")'
+  ```
 
 ## What the showcase validates
 

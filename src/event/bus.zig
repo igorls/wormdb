@@ -6,11 +6,17 @@
 const std = @import("std");
 const core = @import("../core/mod.zig");
 const compat = core.compat;
+const predicate = core.predicate;
 
 pub const Subscriber = struct {
     id: u64,
     write_fn: *const fn (ctx: *anyopaque, data: []const u8) void,
     ctx: *anyopaque,
+    filter: ?predicate.Predicate = null,
+
+    fn deinit(self: *Subscriber) void {
+        if (self.filter) |*filter| filter.deinit();
+    }
 };
 
 pub const Channel = struct {
@@ -29,6 +35,10 @@ pub const Channel = struct {
     }
 
     pub fn deinit(self: *Channel) void {
+        var iter = self.subscribers.iterator();
+        while (iter.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
         self.subscribers.deinit();
     }
 };
@@ -72,6 +82,19 @@ pub const EventBus = struct {
         write_fn: *const fn (ctx: *anyopaque, data: []const u8) void,
         ctx: *anyopaque,
     ) !u64 {
+        return self.subscribeFiltered(channel_name, null, write_fn, ctx);
+    }
+
+    pub fn subscribeFiltered(
+        self: *EventBus,
+        channel_name: []const u8,
+        filter_raw: ?[]const u8,
+        write_fn: *const fn (ctx: *anyopaque, data: []const u8) void,
+        ctx: *anyopaque,
+    ) !u64 {
+        var parsed_filter = if (filter_raw) |raw| try predicate.parse(self.allocator, raw) else null;
+        errdefer if (parsed_filter) |*filter| filter.deinit();
+
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -93,7 +116,9 @@ pub const EventBus = struct {
             .id = sub_id,
             .write_fn = write_fn,
             .ctx = ctx,
+            .filter = parsed_filter,
         });
+        parsed_filter = null;
 
         _ = self.stats.subscriber_count.fetchAdd(1, .monotonic);
         return sub_id;
@@ -107,7 +132,9 @@ pub const EventBus = struct {
             channel.mutex.lock();
             defer channel.mutex.unlock();
 
-            if (channel.subscribers.fetchRemove(sub_id)) |_| {
+            if (channel.subscribers.fetchRemove(sub_id)) |removed| {
+                var sub = removed.value;
+                sub.deinit();
                 _ = self.stats.subscriber_count.fetchSub(1, .monotonic);
             }
         }
@@ -120,6 +147,7 @@ pub const EventBus = struct {
         const channel = self.channels.get(channel_name) orelse return;
         const event_msg = try std.fmt.allocPrint(self.allocator, ">EVENT {s}\r\n{s}\r\n", .{ channel_name, message });
         defer self.allocator.free(event_msg);
+        const ts_ms = eventTimestamp(self.allocator, message);
 
         channel.mutex.lock();
         defer channel.mutex.unlock();
@@ -127,6 +155,9 @@ pub const EventBus = struct {
         var iter = channel.subscribers.iterator();
         while (iter.next()) |entry| {
             const sub = entry.value_ptr.*;
+            if (sub.filter) |filter| {
+                if (!filter.matches(message, ts_ms)) continue;
+            }
             sub.write_fn(sub.ctx, event_msg);
         }
 
@@ -147,6 +178,20 @@ pub const EventBus = struct {
         return self.stats.publish_count.load(.monotonic);
     }
 };
+
+fn eventTimestamp(allocator: std.mem.Allocator, message: []const u8) u64 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, message, .{}) catch return 0;
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return 0;
+    const ts = parsed.value.object.get("ts") orelse return 0;
+    return switch (ts) {
+        .integer => |n| if (n >= 0) @intCast(n) else 0,
+        .float => |n| if (n >= 0) @intFromFloat(n) else 0,
+        .number_string => |s| std.fmt.parseUnsigned(u64, s, 10) catch 0,
+        else => 0,
+    };
+}
 
 test "EventBus subscribe and publish" {
     const testing = std.testing;
@@ -182,4 +227,61 @@ test "EventBus subscribe and publish" {
 
     bus.unsubscribe("test_channel", sub_id);
     try testing.expectEqual(@as(u64, 0), bus.subscriberCount());
+}
+
+test "EventBus filtered subscribe drops non-matching messages" {
+    const testing = std.testing;
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    var received_len: usize = 0;
+    var received_count: usize = 0;
+
+    const TestContext = struct {
+        data: []u8,
+        len: *usize,
+        count: *usize,
+
+        fn write(ctx: *anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            @memcpy(self.data[0..data.len], data);
+            self.len.* = data.len;
+            self.count.* += 1;
+        }
+    };
+
+    var ctx = TestContext{
+        .data = try testing.allocator.alloc(u8, 1024),
+        .len = &received_len,
+        .count = &received_count,
+    };
+    defer testing.allocator.free(ctx.data);
+
+    const sub_id = try bus.subscribeFiltered("memory", "filter='meta.about=\"user-x\"'", TestContext.write, @ptrCast(&ctx));
+    defer bus.unsubscribe("memory", sub_id);
+
+    try bus.publish("memory", "{\"id\":\"a\",\"ts\":1,\"about\":\"user-y\"}");
+    try bus.publish("memory", "{\"id\":\"b\",\"ts\":2,\"about\":\"user-x\"}");
+
+    try testing.expectEqual(@as(usize, 1), received_count);
+    try testing.expect(std.mem.containsAtLeast(u8, ctx.data[0..received_len], 1, "user-x"));
+    try testing.expect(!std.mem.containsAtLeast(u8, ctx.data[0..received_len], 1, "user-y"));
+}
+
+test "EventBus rejects malformed subscription filter" {
+    const testing = std.testing;
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    const TestContext = struct {
+        fn write(_: *anyopaque, _: []const u8) void {}
+    };
+
+    var ctx: u8 = 0;
+    try testing.expectError(
+        error.InvalidPredicate,
+        bus.subscribeFiltered("memory", "filter='meta.user.name=\"x\"'", TestContext.write, @ptrCast(&ctx)),
+    );
 }

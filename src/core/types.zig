@@ -53,7 +53,7 @@ pub const Command = union(enum) {
     status: void, // STATUS
     cluster_status: void, // CLUSTER STATUS
     cluster_peers: void, // CLUSTER PEERS
-    subscribe: []const u8, // SUB <channel>
+    subscribe: SubscribeParams, // SUB <channel> [filter='<expr>']
     unsubscribe: []const u8, // UNSUB <channel>
     publish: PublishParams, // PUB <channel> <message>
     exec: ExecParams, // EXEC <procedure> <args...>
@@ -73,6 +73,11 @@ pub const Command = union(enum) {
     pub const PublishParams = struct {
         channel: []const u8,
         message: []const u8,
+    };
+
+    pub const SubscribeParams = struct {
+        channel: []const u8,
+        filter: ?[]const u8 = null,
     };
 
     pub const ExecParams = struct {

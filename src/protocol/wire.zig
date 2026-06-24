@@ -92,7 +92,7 @@ fn parseCommandPayload(cmd_id: CommandId, payload: []const u8, allocator: std.me
     var pos: usize = 0;
 
     switch (cmd_id) {
-        .get, .delete, .subscribe, .unsubscribe => {
+        .get, .delete, .unsubscribe => {
             const field = try readBytesField(payload, &pos, allocator);
             if (pos != payload.len) {
                 allocator.free(field);
@@ -101,10 +101,22 @@ fn parseCommandPayload(cmd_id: CommandId, payload: []const u8, allocator: std.me
             return switch (cmd_id) {
                 .get => .{ .get = field },
                 .delete => .{ .delete = field },
-                .subscribe => .{ .subscribe = field },
                 .unsubscribe => .{ .unsubscribe = field },
                 else => unreachable,
             };
+        },
+        .subscribe => {
+            const channel = try readBytesField(payload, &pos, allocator);
+            errdefer allocator.free(channel);
+
+            const filter = if (pos < payload.len) try readBytesField(payload, &pos, allocator) else null;
+            errdefer if (filter) |f| allocator.free(f);
+
+            if (pos != payload.len) return error.Corruption;
+            return .{ .subscribe = .{
+                .channel = channel,
+                .filter = filter,
+            } };
         },
         .set => {
             if (payload.len < 1) return error.Corruption;
@@ -373,7 +385,7 @@ pub fn parseCommandPayloadZeroCopy(cmd_id: CommandId, payload: []const u8, alloc
     var pos: usize = 0;
 
     switch (cmd_id) {
-        .get, .delete, .subscribe, .unsubscribe => {
+        .get, .delete, .unsubscribe => {
             const field = try sliceBytesField(payload, &pos);
             if (pos != payload.len) return error.Corruption;
             // Cast const slice to mutable — safe because arena owns the backing memory
@@ -382,10 +394,18 @@ pub fn parseCommandPayloadZeroCopy(cmd_id: CommandId, payload: []const u8, alloc
             return switch (cmd_id) {
                 .get => .{ .get = field_mut },
                 .delete => .{ .delete = field_mut },
-                .subscribe => .{ .subscribe = field_mut },
                 .unsubscribe => .{ .unsubscribe = field_mut },
                 else => unreachable,
             };
+        },
+        .subscribe => {
+            const channel = try sliceBytesField(payload, &pos);
+            const filter = if (pos < payload.len) try sliceBytesField(payload, &pos) else null;
+            if (pos != payload.len) return error.Corruption;
+            return .{ .subscribe = .{
+                .channel = @constCast(channel),
+                .filter = if (filter) |f| @constCast(f) else null,
+            } };
         },
         .set => {
             if (payload.len < 1) return error.Corruption;
@@ -568,9 +588,14 @@ pub fn writeCommand(writer: anytype, cmd: Command) !void {
             try writeHeader(w, @intFromEnum(CommandId.delete), @intCast(4 + key.len));
             try writeLenPrefixed(w, key);
         },
-        .subscribe => |channel| {
-            try writeHeader(w, @intFromEnum(CommandId.subscribe), @intCast(4 + channel.len));
-            try writeLenPrefixed(w, channel);
+        .subscribe => |params| {
+            var payload_len: usize = 4 + params.channel.len;
+            if (params.filter) |filter| payload_len += 4 + filter.len;
+            if (payload_len > MAX_PAYLOAD_LENGTH) return error.PayloadTooLarge;
+
+            try writeHeader(w, @intFromEnum(CommandId.subscribe), @intCast(payload_len));
+            try writeLenPrefixed(w, params.channel);
+            if (params.filter) |filter| try writeLenPrefixed(w, filter);
         },
         .unsubscribe => |channel| {
             try writeHeader(w, @intFromEnum(CommandId.unsubscribe), @intCast(4 + channel.len));

@@ -1,7 +1,7 @@
 export type ParsedCommand =
   | { kind: "GET"; key: string }
   | { kind: "DEL"; key: string }
-  | { kind: "SUB"; channel: string }
+  | { kind: "SUB"; channel: string; filter?: string }
   | { kind: "UNSUB"; channel: string }
   | { kind: "STATUS" }
   | { kind: "CLUSTER_STATUS" }
@@ -47,8 +47,13 @@ export function parseCommand(command: string): ParsedCommand {
   }
 
   if (verb === "SUB") {
-    if (parts.length < 2) throw new Error("Invalid SUB command");
-    return { kind: "SUB", channel: parts[1] };
+    const match = command.trim().match(/^SUB\s+(\S+)(?:\s+(.+))?$/i);
+    if (!match) throw new Error("Invalid SUB command");
+    return {
+      kind: "SUB",
+      channel: match[1],
+      ...(match[2] ? { filter: match[2] } : {}),
+    };
   }
 
   if (verb === "UNSUB") {

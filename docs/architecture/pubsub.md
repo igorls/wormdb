@@ -26,9 +26,12 @@ sequenceDiagram
 
 ```bash
 bun run apps/bun/src/bin/client.ts SUB <channel>
+bun run apps/bun/src/bin/client.ts SUB mem:demo:added filter='meta.about="user-x"'
 ```
 
 The client stays connected and prints each incoming message. The connection remains open until the client disconnects or calls `UNSUB`.
+
+Filtered subscriptions evaluate the predicate on the server before delivery. The grammar matches `mem_query` filters: top-level metadata fields, `meta.<field>` aliases, synthetic `ts`, `=`, comparisons, `AND`, and `IN (...)`. Subscriptions without a filter are unchanged; malformed filters are rejected by `SUB`.
 
 ### UNSUB — Unsubscribe
 

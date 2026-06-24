@@ -59,7 +59,7 @@ Two consequences worth noticing:
    emission + cluster replication.
 3. **Doc body** (WORM if requested).
 4. **Metadata** (always mutable).
-5. **Publish** to `mem:<ns>:added`.
+5. **Publish** a compact JSON event to `mem:<ns>:added`.
 
 Steps 2–5 are not transactional. If the vector lands but the doc write
 fails (WORM violation on the doc key, say), the vector is an orphan

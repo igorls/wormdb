@@ -372,7 +372,7 @@ fn rootFromMountains(leaf_count: u64, peaks: []const Mountain) Hash {
     return out;
 }
 
-fn peaksAreCanonical(leaf_count: u64, peaks: []const Peak) bool {
+pub fn peaksAreCanonical(leaf_count: u64, peaks: []const Peak) bool {
     if (leaf_count == 0) return peaks.len == 0;
     if (peaks.len == 0) return false;
 

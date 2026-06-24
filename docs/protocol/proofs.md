@@ -49,7 +49,7 @@ A witness record is a countersignature over an existing checkpoint. It does not 
 
 The witness signature input is domain-separated as `wormdb.witness.sign.v1` and includes every witness field except `signature`. The witness record hash is domain-separated as `wormdb.witness.record.v1` and includes the signing payload plus the signature bytes.
 
-`EXEC append_log_witness` creates a witness from a stored checkpoint. In clustered mode, omitting explicit witness/signature arguments signs with the local meshguard/WormDB Ed25519 identity. `EXEC append_log_witness_import` verifies and stores canonical witness bytes received from a peer, relay, or offline transfer. `EXEC append_log_witness_verify` checks the stored witness against the checkpoint and public key.
+`EXEC append_log_witness` creates a witness from a stored checkpoint. In clustered mode, omitting explicit witness/signature arguments signs with the local meshguard/WormDB Ed25519 identity. `EXEC append_log_witness_request` asks live cluster peers to run that restricted witness procedure over the replication transport; peer-side replication sockets still reject all other `EXEC` procedures. `EXEC append_log_witness_import` verifies and stores canonical witness bytes received from a peer, relay, or offline transfer. `EXEC append_log_witness_verify` checks the stored witness against the checkpoint and public key.
 
 ## Extension Claims
 

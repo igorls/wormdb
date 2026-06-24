@@ -95,7 +95,7 @@ Replication happens **after local commit**. The client receives `OK` once the or
 This is an **eventually consistent** model. If a node crashes after local commit but before replication completes, other nodes may be missing the latest write. There is no quorum or consensus protocol.
 :::
 
-For WORM append logs, the proof layer can store meshguard/WormDB identity-backed checkpoint witnesses as WORM data. Root-based anti-entropy is still planned on top of this replication model: peers will exchange compact roots first, request missing ranges when possible, and fall back to the current full-state sync when proofs are unavailable. See [Replication Proofs](/architecture/replication-proofs).
+For WORM append logs, the proof layer can store meshguard/WormDB identity-backed checkpoint witnesses as WORM data. `EXEC append_log_witness_request <log_id> <checkpoint_hash_hex>` asks live peers to countersign a local checkpoint over the replication connection; the peer stores the witness through the durable WORM path and it replicates back like any other proof record. Root-based anti-entropy is still planned on top of this replication model: peers will exchange compact roots first, request missing ranges when possible, and fall back to the current full-state sync when proofs are unavailable. See [Replication Proofs](/architecture/replication-proofs).
 
 ## Cluster Flags
 

@@ -8,6 +8,7 @@
 //! EXEC append_log_proof_bundle <log_id> <from_seq> <to_seq> <checkpoint_hash_hex>
 //! EXEC append_log_proof_verify <log_id> <seq> <record_hash_hex> <checkpoint_hash_hex> <proof_hex>
 //! EXEC append_log_witness <log_id> <checkpoint_hash_hex> [witness_pubkey_hex] [sk=<secret_key_hex>|sig=<signature_hex>] [observed_at_ms=<ms>] [ext=<hex>]
+//! EXEC append_log_witness_request <log_id> <checkpoint_hash_hex>
 //! EXEC append_log_witness_import <log_id> <checkpoint_hash_hex> <canonical_witness_hex>
 //! EXEC append_log_witness_verify <log_id> <checkpoint_hash_hex> <witness_pubkey_hex>
 //!
@@ -427,6 +428,40 @@ pub fn witnessExecute(ctx: *Ctx) anyerror!Ctx.Result {
     _ = try storeWitnessCanonical(ctx, log_id, record, canonical);
     const record_hash = try record.recordHash(ctx.allocator);
     return ctx.value(try witnessJson(ctx.allocator, record, record_hash, canonical));
+}
+
+pub fn witnessRequestExecute(ctx: *Ctx) anyerror!Ctx.Result {
+    const usage = "append_log_witness_request requires: <log_id> <checkpoint_hash_hex>";
+    const log_id = ctx.arg(0) orelse return ctx.err(usage);
+    const checkpoint_hash_hex = ctx.arg(1) orelse return ctx.err(usage);
+    if (ctx.argCount() != 2) return ctx.err(usage);
+
+    const checkpoint_hash = parseHashHex(checkpoint_hash_hex) catch
+        return ctx.err("append_log_witness_request: checkpoint hash must be 64 hex chars");
+
+    const loaded = loadCheckpoint(ctx.allocator, ctx.store, log_id, checkpoint_hash) catch |err| {
+        return ctx.err(switch (err) {
+            error.CheckpointNotFound => "append_log_witness_request: checkpoint not found",
+            else => "append_log_witness_request: checkpoint load failed",
+        });
+    };
+    defer loaded.deinit(ctx.allocator);
+    if (!try loaded.record.verifySignature(ctx.allocator))
+        return ctx.err("append_log_witness_request: checkpoint signature invalid");
+    if (!std.mem.eql(u8, loaded.record.log_id, log_id))
+        return ctx.err("append_log_witness_request: checkpoint log id mismatch");
+
+    const cluster = ctx.cluster orelse
+        return ctx.err("append_log_witness_request: cluster not enabled");
+    const requested = cluster.requestCheckpointWitnesses(log_id, checkpoint_hash_hex) catch
+        return ctx.err("append_log_witness_request: request dispatch failed");
+
+    var json: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer json.deinit(ctx.allocator);
+    try json.appendSlice(ctx.allocator, "{\"requested\":");
+    try appendUsize(&json, ctx.allocator, requested);
+    try json.appendSlice(ctx.allocator, "}");
+    return ctx.value(try json.toOwnedSlice(ctx.allocator));
 }
 
 pub fn witnessImportExecute(ctx: *Ctx) anyerror!Ctx.Result {
@@ -1198,6 +1233,9 @@ test "append_log checkpoint, bundle, and proof verify procedures round trip" {
 
     const witness_verified = try runProc(&store, witnessVerifyExecute, &.{ "audit-log", checkpoint_hash, public_key_hex }, allocator);
     try testing.expect(std.mem.containsAtLeast(u8, witness_verified.value.?, 1, "\"valid\":true"));
+
+    const witness_request = try runProc(&store, witnessRequestExecute, &.{ "audit-log", checkpoint_hash }, allocator);
+    try testing.expectEqualStrings("append_log_witness_request: cluster not enabled", witness_request.err);
 
     const bundle_response = try runProc(&store, proofBundleExecute, &.{ "audit-log", "2", "2", checkpoint_hash }, allocator);
     const bundle_value = bundle_response.value.?;

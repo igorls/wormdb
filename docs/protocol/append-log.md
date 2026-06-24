@@ -94,6 +94,14 @@ Witness records are stored as WORM keys and replicate through the normal durable
 proof:append-log-witness:v1:<sha256(log_id) hex>:<checkpoint_hash hex>:<sha256(witness_pubkey) hex>
 ```
 
+Ask live cluster peers to countersign a stored checkpoint with their own meshguard/WormDB identities:
+
+```bash
+bun run apps/bun/src/bin/client.ts EXEC append_log_witness_request <log_id> <checkpoint_hash_hex>
+```
+
+The requester validates that the checkpoint exists locally and has a valid creator signature, then sends a restricted peer-to-peer `EXEC append_log_witness` over the replication connection. Peers reject all other `EXEC` calls on replication sockets. Each peer stores its witness through the durable WORM path, so the witness record replicates back like any other WORM proof record. The immediate response is `{"requested":<count>}` for peers that accepted the request frame; it is not a quorum acknowledgement.
+
 Import a canonical witness received from a peer or offline packet:
 
 ```bash

@@ -584,6 +584,29 @@ pub const Server = struct {
                     };
                     wire.writeResponse(stream, .ok) catch return;
                 },
+                .exec => |params| {
+                    if (!std.mem.eql(u8, params.procedure, "append_log_witness")) {
+                        wire.writeResponse(stream, .{ .err = "unsupported replication command" }) catch return;
+                        continue;
+                    }
+
+                    var arena = std.heap.ArenaAllocator.init(self.allocator);
+                    defer arena.deinit();
+                    const response = executor.execute(.{
+                        .store = self.store,
+                        .event_bus = self.event_bus,
+                        .allocator = arena.allocator(),
+                        .cluster = self.cluster,
+                        .auth = .trusted,
+                        .auth_mint = self.config.auth_mint,
+                        .vector_registry = self.config.vector_registry,
+                    }, cmd) catch |e| {
+                        std.log.warn("replication: append_log_witness failed: {s}", .{@errorName(e)});
+                        wire.writeResponse(stream, .{ .err = "append_log_witness failed" }) catch return;
+                        continue;
+                    };
+                    wire.writeResponse(stream, response) catch return;
+                },
                 else => {
                     wire.writeResponse(stream, .{ .err = "unsupported replication command" }) catch return;
                 },

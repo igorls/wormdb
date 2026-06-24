@@ -569,6 +569,34 @@ pub const Cluster = struct {
         }
     }
 
+    /// Ask currently connected/alive peers to countersign an append-log
+    /// checkpoint using their local cluster identity. The peer-side TCP
+    /// replication handler only accepts this one EXEC over REPL_MAGIC.
+    pub fn requestCheckpointWitnesses(
+        self: *Cluster,
+        log_id: []const u8,
+        checkpoint_hash_hex: []const u8,
+    ) !usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.ensurePeersConnectedLocked();
+
+        var requested: usize = 0;
+        var args = [_][]const u8{ log_id, checkpoint_hash_hex };
+        var iter = self.peers.iterator();
+        while (iter.next()) |entry| {
+            var peer = entry.value_ptr;
+            if (peer.sendCommand(.{ .exec = .{
+                .procedure = "append_log_witness",
+                .args = args[0..],
+            } })) {
+                requested += 1;
+            }
+        }
+        return requested;
+    }
+
     /// Replicate a RaBitQ params install (centroid + rotation) to all
     /// alive peers. Issued by `EXEC vrabitq` *before* its re-encode pass
     /// streams the per-vector bq:* SETs, so peers have the params in

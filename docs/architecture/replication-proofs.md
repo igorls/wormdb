@@ -299,9 +299,10 @@ claims such as GPS coordinates or supervisor names in generic cluster status.
    records under the same key should return `WORM` violation.
 3. Add signature helpers that can verify meshguard Ed25519 identities and later
    external public keys without changing the stored record shape.
-4. Extend WormWire with proof-aware messages: root summary, range request, range
-   response, witness request, and witness response. Keep ordinary SET/VINSERT
-   replication unchanged.
+4. Add live checkpoint witnessing over the mesh replication channel. The current
+   implementation uses a restricted peer-side `EXEC append_log_witness` request
+   so peers countersign with local meshguard/WormDB identity material while
+   ordinary SET/VINSERT replication remains unchanged.
 5. Replace reconnect full-sync first with root exchange first. Use full-sync
    only when proofs are unavailable, ranges are too large, or roots cannot be
    narrowed.

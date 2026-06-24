@@ -73,6 +73,7 @@ const PROCEDURES = [_]Entry{
     .{ .name = "append_log_proof_bundle", .func = append_log.proofBundleExecute },
     .{ .name = "append_log_proof_verify", .func = append_log.proofVerifyExecute },
     .{ .name = "append_log_witness", .func = append_log.witnessExecute },
+    .{ .name = "append_log_witness_request", .func = append_log.witnessRequestExecute },
     .{ .name = "append_log_witness_import", .func = append_log.witnessImportExecute },
     .{ .name = "append_log_witness_verify", .func = append_log.witnessVerifyExecute },
     .{ .name = "mem_init", .func = memory.memInit },

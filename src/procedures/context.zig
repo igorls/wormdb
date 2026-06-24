@@ -20,8 +20,15 @@ const Response = @import("../core/types.zig").Response;
 const Cluster = @import("../cluster/mod.zig").Cluster;
 const EventBus = @import("../event/mod.zig").EventBus;
 const NamespaceRegistry = @import("../vector/index.zig").NamespaceRegistry;
+const auth = @import("../server/auth.zig");
 
 const shardIndexFn = @import("../storage/store.zig").shardIndex;
+
+pub const AuthMintConfig = struct {
+    secret_key: *const [64]u8,
+    default_ttl_s: u64,
+    max_ttl_s: u64,
+};
 
 pub const Ctx = struct {
     store: *Store,
@@ -29,6 +36,11 @@ pub const Ctx = struct {
     allocator: std.mem.Allocator,
     /// Authenticated identity (SCT subject). Null if unauthenticated.
     _identity: ?[]const u8,
+    /// Full auth decision for namespace-aware procedures. Defaults to
+    /// trusted so unit tests and internal callers preserve existing behavior.
+    auth_context: auth.AuthContext = .trusted,
+    /// Optional signing config for auth_mint_scoped.
+    auth_mint: ?AuthMintConfig = null,
     /// Cluster handle — when present, `setDurable`/`setDurableWorm` replicate
     /// their writes to peers (matches wire-level SET semantics). Null in
     /// single-node mode or tests.
@@ -51,6 +63,7 @@ pub const Ctx = struct {
     const MAX_LOCKS = 16;
 
     pub const Result = Response;
+    pub const NamespaceAccess = enum { read, write, delete };
 
     /// Held-lock snapshot. Returned by saveAndReleaseAllHeldShards so the
     /// procedure can re-acquire after an operation (store.set + replicate)
@@ -75,6 +88,29 @@ pub const Ctx = struct {
             .args = args,
             .allocator = allocator,
             ._identity = id,
+            .cluster = cluster,
+            .event_bus = event_bus,
+            .vector_registry = vector_registry,
+        };
+    }
+
+    pub fn initWithAuth(
+        store: *Store,
+        args: []const []const u8,
+        allocator: std.mem.Allocator,
+        auth_context: auth.AuthContext,
+        auth_mint: ?AuthMintConfig,
+        cluster: ?*Cluster,
+        event_bus: ?*EventBus,
+        vector_registry: ?*NamespaceRegistry,
+    ) Ctx {
+        return .{
+            .store = store,
+            .args = args,
+            .allocator = allocator,
+            ._identity = auth_context.identity(),
+            .auth_context = auth_context,
+            .auth_mint = auth_mint,
             .cluster = cluster,
             .event_bus = event_bus,
             .vector_registry = vector_registry,
@@ -386,6 +422,42 @@ pub const Ctx = struct {
     /// Returns null if the connection is not authenticated.
     pub fn identity(self: *const Ctx) ?[]const u8 {
         return self._identity;
+    }
+
+    pub fn permits(self: *const Ctx, op: auth.Operation, target: []const u8) bool {
+        return switch (self.auth_context) {
+            .trusted, .disabled => true,
+            .enforce => |maybe_state| blk: {
+                const state = maybe_state orelse break :blk false;
+                break :blk state.permits(op, target);
+            },
+        };
+    }
+
+    pub fn requireNamespace(self: *Ctx, ns: []const u8, access: NamespaceAccess) !void {
+        const mem_prefix = try std.fmt.allocPrint(self.allocator, "mem:{s}:", .{ns});
+        defer self.allocator.free(mem_prefix);
+        const vec_prefix = try std.fmt.allocPrint(self.allocator, "vec:mem:{s}:", .{ns});
+        defer self.allocator.free(vec_prefix);
+        const bq_prefix = try std.fmt.allocPrint(self.allocator, "bq:vec:mem:{s}:", .{ns});
+        defer self.allocator.free(bq_prefix);
+        const config_prefix = try std.fmt.allocPrint(self.allocator, "__meta:mem:{s}:", .{ns});
+        defer self.allocator.free(config_prefix);
+
+        const op: auth.Operation = switch (access) {
+            .read => .get,
+            .write => .set,
+            .delete => .delete,
+        };
+
+        if (!self.permits(op, mem_prefix)) return error.PermissionDenied;
+        if (!self.permits(op, vec_prefix)) return error.PermissionDenied;
+        if (!self.permits(op, bq_prefix)) return error.PermissionDenied;
+        if (!self.permits(op, config_prefix)) return error.PermissionDenied;
+    }
+
+    pub fn authMintConfig(self: *const Ctx) ?AuthMintConfig {
+        return self.auth_mint;
     }
 
     /// Publish an event to all subscribers of `channel`. No-op if the event

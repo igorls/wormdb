@@ -28,6 +28,21 @@ int        wormdb_set_worm(...);            // write-once entry
 int        wormdb_get(wormdb_Db*, const u8 *key, size_t, u8 **out, size_t *out_len);  // free with wormdb_free
 int        wormdb_get_meta(wormdb_Db*, const u8 *key, size_t, wormdb_EntryMeta *out);
 int        wormdb_scan_prefix(wormdb_Db*, const u8 *prefix, size_t, size_t limit, void *ctx, wormdb_scan_callback);
+int        wormdb_append_log(wormdb_Db*, const u8 *log_id, size_t, const u8 *payload, size_t,
+                             const u8 *attachment_hashes, size_t attachment_hash_count,
+                             uint64_t ingest_time_ms, wormdb_AppendReceipt *out);
+int        wormdb_append_log_verify(wormdb_Db*, const u8 *log_id, size_t, wormdb_AppendLogReport *out);
+int        wormdb_proof_build_mmr_bundle(wormdb_Db*, const u8 *log_id, size_t,
+                                         uint64_t from_seq, uint64_t to_seq,
+                                         const u8 public_key[32], const u8 secret_key[64],
+                                         uint64_t created_at_ms, uint64_t ingested_at_ms,
+                                         const u8 *checkpoint_ext, size_t checkpoint_ext_len,
+                                         const u8 *bundle_ext, size_t bundle_ext_len,
+                                         u8 **out_bundle, size_t *out_len,
+                                         wormdb_ProofBundleInfo *out_info);
+int        wormdb_proof_verify_bundle(const u8 *bundle, size_t, wormdb_ProofBundleInfo *out_info);
+int        wormdb_mmr_proof_verify(const u8 *proof, size_t, uint64_t seq,
+                                   const u8 leaf_hash[32], const u8 expected_root[32]);
 int        wormdb_delete(wormdb_Db*, const u8 *key, size_t);
 void       wormdb_free(u8 *ptr, size_t len);
 ```
@@ -44,6 +59,12 @@ receives borrowed key/value pointers plus the same metadata receipt shape; copy
 anything that must survive after the callback returns. `limit == 0` means no
 limit, while a positive limit returns the lexicographic tail to match the engine's
 existing `scanPrefix` semantics.
+
+The proof calls expose the WORM append-log and MMR proof spine to native apps:
+append opaque payload bytes to a named immutable log, verify the local chain,
+build one encoded proof bundle for a sequence range, and verify that bundle on
+another device without opening a database. Encoded bundles and `wormdb_get`
+buffers are released with `wormdb_free`.
 
 ## macOS / Swift — runnable PoC
 
@@ -101,6 +122,8 @@ Add [`WormDB.kt`](android/WormDB.kt) (package `dev.wormdb`) to your sources; it
 - ✅ Swift PoC builds + runs on macOS: set/get (string + 256-byte binary), WORM
   rejection, delete, and persistence across reopen via WAL replay.
 - ✅ `wormdb_jni.c` compiles against the JDK's `jni.h` (JNI ABI correct).
+- ✅ `zig build test` runs FFI tests for append-log writes, encoded MMR bundle
+  construction/verification, and direct MMR proof-byte verification.
 - ✅ FFI library cross-compiles to `aarch64-linux-musl` (ARM, static-friendly,
   no libsodium) — same class of build as Android/iOS, which additionally need
   their NDK/SDK libc.

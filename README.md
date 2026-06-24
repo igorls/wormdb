@@ -327,7 +327,7 @@ Default client port is `6389` (avoids Redis `6379` collision). Override with `--
 - [x] Stored procedures (`EXEC`) with replication + event-bus from the procedure context
 - [x] KV procedures (`kv_put`, `kv_get`, `kv_stats`, `scan`, `transfer`, `increment`)
 - [x] Chat procedures (`chat_send`, `chat_history`)
-- [x] Memory procedures (`mem_init`, `mem_add`, `mem_get`, `mem_query`, `mem_stats`, `mem_drop`, `mem_capabilities`)
+- [x] Memory procedures (`mem_init`, `mem_add`, `mem_bulk_add`, `mem_get`, `mem_query`, `mem_range`, `mem_stats`, `mem_drop`, `mem_capabilities`)
 - [x] Vector search — SIMD distances, BQ prefilter, HNSW graph index, per-namespace metric
 - [x] `vreindex` bulk rebuild for HNSW
 - [x] Native vector wire commands (`VINSERT`, `VDELETE`, `VBULKINSERT`) with replication-aware apply paths

@@ -8,11 +8,16 @@ For the end-to-end demo notes, see [Agent Memory Demo](/AGENT_MEMORY_DEMO).
 
 | Procedure | Purpose |
 | --------- | ------- |
-| `mem_init <ns> <embedder_id> <metric>` | Predeclare a memory namespace, embedder, and metric |
+| `mem_init <ns> <embedder_id> <metric> [decay_tau_hours] [vector_only=true]` | Predeclare a memory namespace, embedder, metric, optional decay time constant, and optional vector-only mode |
 | `mem_add <ns> <doc_id> <text> <embedding> [meta_json] [worm] [embedder_id]` | Add one memory chunk plus embedding |
+| `mem_add <ns> <doc_id> <embedding> [meta_json] [worm] [embedder_id]` | Add one vector-only memory row |
+| `mem_meta_set <ns> <doc_id> <meta_json>` | Update metadata for an existing memory without re-embedding |
+| `mem_bulk_add <ns> <count> [id embedding meta_json]×N` | Add many memory embeddings and metadata rows in one vector batch |
 | `mem_get <ns> <doc_id>` | Fetch document text joined with metadata |
-| `mem_query <ns> <embedding> <k> [lambda] [min_score] [snippet_chars]` | Search and return enriched memories |
+| `mem_query <ns> <embedding> <k> [lambda] [min_score] [snippet_chars] [decay_tau_hours] [filter]` | Search and return enriched memories |
+| `mem_range <ns> <since_ms> <until_ms> [limit] [filter]` | Scan memories by document timestamp |
 | `mem_stats <ns>` | Return count, dimension, HNSW, and config state |
+| `mem_verify <ns>` | Report structural drift between docs, vectors, BQ, and HNSW |
 | `mem_drop <ns>` | Delete memory namespace data |
 | `mem_reset_index <ns> <new_embedder_id>` | Drop vector/BQ/HNSW state while preserving document bodies |
 | `mem_capabilities` | Return a self-describing adapter capability block |
@@ -24,10 +29,23 @@ mem:<ns>:<id>              document body, WORM by default
 mem:<ns>:<id>:meta         metadata JSON
 vec:mem:<ns>:<id>          raw embedding bytes
 bq:vec:mem:<ns>:<id>       quantized companion
-__meta:mem:<ns>:config     {"embedder_id":"...","metric":"...","created_at":...}
+__meta:mem:<ns>:config     {"embedder_id":"...","metric":"...","decay_tau_hours":168,"vector_only":false,"created_at":...}
 ```
 
 Chunking lives on the client. `mem_add` indexes one chunk; applications that have long documents or conversations should split them and call `mem_add` with derived IDs.
+
+Metadata is a mutable passthrough side key. Applications may update it directly
+with `SET mem:<ns>:<id>:meta <json>`, or use `mem_meta_set` to first validate
+that the document exists. The metadata bytes are stored raw and returned raw in
+`mem_get`/`mem_query`, matching the existing `mem_add` contract.
+
+`mem_bulk_add` is the sidecar/backfill path for already-chunked and already-embedded memory rows. It prevalidates the whole batch for id safety, duplicate ids, vector byte shape, uniform dimensions, existing namespace dim/metric compatibility, and existing vector state before writing. Vector/BQ/HNSW work uses the native bulk vector apply path; metadata rows are written durably afterward. A successful batch publishes one `mem:<ns>:added.bulk` event whose payload is the JSON id list.
+
+## Vector-Only Mode
+
+`mem_init <ns> <embedder_id> <metric> vector_only=true` creates a namespace for sidecar layouts where document bodies live outside WormDB. In this mode, `mem_add` uses the shorter form `<ns> <doc_id> <embedding> [meta_json] [worm] [embedder_id]`, writes `vec:*`, `bq:*`, and optional metadata, and intentionally skips `mem:<ns>:<id>` document bodies.
+
+`mem_query` returns hits as `[{id, score, ts, meta}]` with no `doc` field, and `mem_get` rejects with a deterministic `vector_only` error. Dim and metric freezing still happen through the normal vector namespace.
 
 ## Embedder Enforcement
 
@@ -45,7 +63,20 @@ bun run apps/bun/src/bin/client.ts EXEC mem_reset_index notes openai/text-embedd
 
 `mem_query` uses HNSW when the memory namespace has an index and falls back to brute-force when the index is absent. It intentionally skips the general BQ prefilter because `mem_init` eagerly prepares HNSW and the memory query result must be joined with document text and metadata.
 
-The optional `lambda` argument applies temporal decay with the same one-week time constant used by vector search. `min_score` filters weak matches, and `snippet_chars` controls how much document text is returned per hit.
+The optional `lambda` argument applies temporal decay. `decay_tau_hours` controls the exponential time constant and defaults to the namespace config, then 168 hours. `min_score` filters weak matches, and `snippet_chars` controls how much document text is returned per hit.
+
+`mem_verify` is the structural health check for sidecar drift. It returns
+document, vector, BQ, and HNSW counts plus bounded `orphan_vectors`,
+`orphan_docs`, and `missing_bq` lists so clients can decide whether to reconcile
+from their canonical row store or run `mem_reset_index`.
+
+`mem_range` is a timestamp-window workaround for timeline views. It scans `mem:<ns>:` document keys, skips `:meta` companions, sorts by document timestamp ascending, and returns `[{id, ts, meta}]`. `limit` defaults to 100; `0` means no response cap. The optional filter slot is reserved for the shared predicate parser tracked in #2.
+
+`filter` narrows candidates before top-K admission. It applies during brute-force scan and during HNSW stage-2 exact refine. The predicate grammar is intentionally small: `=`, `<`, `<=`, `>=`, `>`, `AND`, and `IN (...)` over string or numeric literals. Fields are top-level metadata keys, `meta.<field>` aliases, or the synthetic `ts` field.
+
+```text
+filter='ts>=1780000000 AND category="semantic" AND privacy_level<=1 AND sourceType IN ("chat","note")'
+```
 
 ## Events
 

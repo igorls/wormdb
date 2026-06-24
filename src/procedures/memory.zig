@@ -11,14 +11,19 @@
 //!   mem:<ns>:<id>:meta        metadata JSON (mutable; raw passthrough)
 //!   vec:mem:<ns>:<id>         embedding (raw f32 bytes)
 //!   bq:vec:mem:<ns>:<id>      BQ companion (written by applyVinsert)
-//!   __meta:mem:<ns>:config    {"embedder_id":"...","metric":"...","created_at":N}
+//!   __meta:mem:<ns>:config    {"embedder_id":"...","metric":"...","decay_tau_hours":168,"vector_only":false,"created_at":N}
 //!
 //! ── Procedure surface ───────────────────────────────────────────────
-//!   mem_init         <ns> <embedder_id> <metric>
+//!   mem_init         <ns> <embedder_id> <metric> [<decay_tau_hours>] [vector_only=true]
 //!   mem_add          <ns> <doc_id> <text> <embedding> [<meta_json>] [<worm>] [<embedder_id>]
+//!   mem_add          <ns> <doc_id> <embedding> [<meta_json>] [<worm>] [<embedder_id>]  (vector_only)
+//!   mem_meta_set     <ns> <doc_id> <meta_json>
+//!   mem_bulk_add     <ns> <count> [<id> <embedding> <meta_json>]×N
 //!   mem_get          <ns> <doc_id>
-//!   mem_query        <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>]
+//!   mem_query        <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>] [<decay_tau_hours>] [<filter>]
+//!   mem_range        <ns> <since_ms> <until_ms> [<limit>] [<filter>]
 //!   mem_stats        <ns>
+//!   mem_verify       <ns>
 //!   mem_drop         <ns>
 //!   mem_reset_index  <ns> <new_embedder_id>
 //!   mem_capabilities
@@ -38,9 +43,12 @@
 //! * mem_query skips the BQ prefilter — HNSW is eagerly created by
 //!   mem_init, so cold-start (post-restart until vreindex) is the only
 //!   HNSW-absent case, and brute-force is the simpler fallback there.
+//! * mem_query filters are parsed by predicate.zig and evaluated before
+//!   top-K admission, either during HNSW refine or the brute-force scan.
 
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
+const predicate = @import("predicate.zig");
 const vector_ops = @import("vector_ops.zig");
 const distance = @import("../vector/distance.zig");
 const topk_mod = @import("../vector/topk.zig");
@@ -48,6 +56,8 @@ const hnsw_mod = @import("../vector/hnsw.zig");
 const metric_mod = @import("../vector/metric.zig");
 const IndexModule = @import("../vector/index.zig");
 const Store = @import("../storage/store.zig").Store;
+const Command = @import("../core/types.zig").Command;
+const auth = @import("../server/auth.zig");
 
 const Metric = metric_mod.Metric;
 
@@ -59,9 +69,13 @@ const MAX_NS_LEN: usize = 64;
 const MAX_DOC_ID_LEN: usize = 256;
 const MAX_EMBEDDER_ID_LEN: usize = 128;
 const MAX_TOP_K: usize = 100;
+const DEFAULT_RANGE_LIMIT: usize = 100;
+const MAX_RANGE_LIMIT: usize = 10_000;
+const MAX_BULK_ADD: usize = 10_000;
 const DEFAULT_SNIPPET_CHARS: i64 = 512;
-const DECAY_TIME_CONSTANT_HOURS: f32 = 168.0;
+const DEFAULT_DECAY_TAU_HOURS: f32 = 168.0;
 const HNSW_EF_SEARCH_FACTOR: usize = 10;
+const MAX_VERIFY_ORPHANS: usize = 100;
 
 // ╔═══════════════════════════════════════════════════╗
 // ║  Input validation                                  ║
@@ -149,15 +163,82 @@ fn extractConfigField(json: []const u8, field: []const u8) ?[]const u8 {
     return tail[0..end];
 }
 
+fn configVectorOnly(json: []const u8) bool {
+    return std.mem.indexOf(u8, json, "\"vector_only\":true") != null;
+}
+
+fn extractConfigFloat(json: []const u8, field: []const u8) ?f32 {
+    var needle_buf: [96]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\":", .{field}) catch return null;
+    const start = std.mem.indexOf(u8, json, needle) orelse return null;
+    const value_start = start + needle.len;
+    const tail = json[value_start..];
+    var end: usize = 0;
+    while (end < tail.len and tail[end] != ',' and tail[end] != '}') : (end += 1) {}
+    if (end == 0) return null;
+    return std.fmt.parseFloat(f32, tail[0..end]) catch null;
+}
+
+fn parseDecayTauHours(raw: []const u8) ?f32 {
+    const tau = std.fmt.parseFloat(f32, raw) catch return null;
+    if (!std.math.isFinite(tau) or tau <= 0.0) return null;
+    return tau;
+}
+
+fn extractConfigBool(json: []const u8, field: []const u8) ?bool {
+    var needle_buf: [96]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\":", .{field}) catch return null;
+    const start = std.mem.indexOf(u8, json, needle) orelse return null;
+    var tail = json[start + needle.len ..];
+    while (tail.len > 0 and (tail[0] == ' ' or tail[0] == '\t')) tail = tail[1..];
+    if (std.mem.startsWith(u8, tail, "true")) return true;
+    if (std.mem.startsWith(u8, tail, "false")) return false;
+    return null;
+}
+
+fn parseMemInitVectorOnlyFlag(raw: []const u8) ?bool {
+    if (std.mem.eql(u8, raw, "vector_only") or
+        std.mem.eql(u8, raw, "vector_only=true") or
+        std.mem.eql(u8, raw, "vector_only=1") or
+        std.mem.eql(u8, raw, "true") or
+        std.mem.eql(u8, raw, "1"))
+    {
+        return true;
+    }
+    if (std.mem.eql(u8, raw, "vector_only=false") or
+        std.mem.eql(u8, raw, "vector_only=0") or
+        std.mem.eql(u8, raw, "false") or
+        std.mem.eql(u8, raw, "0"))
+    {
+        return false;
+    }
+    return null;
+}
+
+fn isVectorOnlyConfig(cfg: ?[]const u8) bool {
+    return if (cfg) |bytes| extractConfigBool(bytes, "vector_only") orelse false else false;
+}
+
+// A trailing mem_query option is a filter predicate when it carries the
+// `filter=` prefix; otherwise it is parsed as a bare decay_tau_hours value.
+fn argLooksLikeFilter(raw: []const u8) bool {
+    const pfx = "filter=";
+    if (raw.len < pfx.len) return false;
+    for (pfx, 0..) |c, i| {
+        if (std.ascii.toLower(raw[i]) != c) return false;
+    }
+    return true;
+}
+
 // ╔═══════════════════════════════════════════════════╗
 // ║  Distance + decay shared with vsearch              ║
 // ╚═══════════════════════════════════════════════════╝
 
-inline fn applyDecay(raw_sim: f32, timestamp: u64, decay: f32, now_ms: u64) f32 {
+inline fn applyDecay(raw_sim: f32, timestamp: u64, decay: f32, now_ms: u64, decay_tau_hours: f32) f32 {
     if (decay <= 0.0) return raw_sim;
     const age_ms = if (now_ms > timestamp) now_ms - timestamp else 0;
     const age_hours: f32 = @as(f32, @floatFromInt(age_ms)) / 3_600_000.0;
-    const recency = @exp(-age_hours / DECAY_TIME_CONSTANT_HOURS);
+    const recency = @exp(-age_hours / decay_tau_hours);
     return (1.0 - decay) * raw_sim + decay * recency;
 }
 
@@ -181,9 +262,13 @@ pub fn memCapabilities(ctx: *Ctx) anyerror!Ctx.Result {
         \\{"name":"wormdb-agent-memory","version":"1",
         \\"retrieval_unit":"chunk",
         \\"temporal_decay":true,
+        \\"bulk_add":true,
+        \\"vector_only":true,
         \\"verbatim":true,
         \\"local":true,
         \\"structured_facts":false,
+        \\"metadata_update":true,
+        \\"health_verify":true,
         \\"metrics":["cosine","dot","l2"]}
     ;
     return ctx.value(json);
@@ -195,18 +280,36 @@ pub fn memCapabilities(ctx: *Ctx) anyerror!Ctx.Result {
 
 pub fn memInit(ctx: *Ctx) anyerror!Ctx.Result {
     const ns = ctx.arg(0) orelse
-        return ctx.err("mem_init requires: <ns> <embedder_id> <metric>");
+        return ctx.err("mem_init requires: <ns> <embedder_id> <metric> [<decay_tau_hours>]");
     const embedder_id = ctx.arg(1) orelse
-        return ctx.err("mem_init requires: <ns> <embedder_id> <metric>");
+        return ctx.err("mem_init requires: <ns> <embedder_id> <metric> [<decay_tau_hours>]");
     const metric_str = ctx.arg(2) orelse
-        return ctx.err("mem_init requires: <ns> <embedder_id> <metric>");
+        return ctx.err("mem_init requires: <ns> <embedder_id> <metric> [<decay_tau_hours>]");
 
     if (!validateNs(ns))
         return ctx.err("mem_init: ns must be 1..64 bytes, chars in [A-Za-z0-9._/-]");
+    ctx.requireNamespace(ns, .write) catch return ctx.err("permission denied");
     if (!validateEmbedderId(embedder_id))
         return ctx.err("mem_init: embedder_id must be 1..128 bytes, chars in [A-Za-z0-9._/-]");
     const metric = Metric.fromStr(metric_str) orelse
         return ctx.err("mem_init: unknown metric (cosine|dot|l2)");
+    // Options after <metric> may appear in any order: a positive float sets
+    // decay_tau_hours, a vector_only=true|false flag sets vector-only mode.
+    var vector_only = false;
+    var decay_tau_hours: f32 = DEFAULT_DECAY_TAU_HOURS;
+    var decay_tau_provided = false;
+    var opt_i: usize = 3;
+    while (opt_i < ctx.argCount()) : (opt_i += 1) {
+        const opt = ctx.arg(opt_i).?;
+        if (parseMemInitVectorOnlyFlag(opt)) |v| {
+            vector_only = v;
+        } else if (parseDecayTauHours(opt)) |tau| {
+            decay_tau_hours = tau;
+            decay_tau_provided = true;
+        } else {
+            return ctx.err("mem_init: unknown option (expected <decay_tau_hours> or vector_only=true|false)");
+        }
+    }
 
     const config_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
     defer ctx.allocator.free(config_key);
@@ -223,7 +326,12 @@ pub fn memInit(ctx: *Ctx) anyerror!Ctx.Result {
             return ctx.err("mem_init: embedder_id differs from existing namespace config");
         if (!std.mem.eql(u8, cfg_metric, metric.name()))
             return ctx.err("mem_init: metric differs from existing namespace config");
-        return ctx.ok();
+        const cfg_vector_only = extractConfigBool(cfg, "vector_only") orelse false;
+        if (cfg_vector_only != vector_only)
+            return ctx.err("mem_init: vector_only differs from existing namespace config");
+        if (!decay_tau_provided) return ctx.ok();
+        const cfg_tau = extractConfigFloat(cfg, "decay_tau_hours") orelse DEFAULT_DECAY_TAU_HOURS;
+        if (@abs(cfg_tau - decay_tau_hours) < 0.0001) return ctx.ok();
     }
 
     // ── Freeze the vector namespace with the declared metric ────
@@ -245,7 +353,13 @@ pub fn memInit(ctx: *Ctx) anyerror!Ctx.Result {
     try cfg.appendSlice(ctx.allocator, embedder_id);
     try cfg.appendSlice(ctx.allocator, "\",\"metric\":\"");
     try cfg.appendSlice(ctx.allocator, metric.name());
-    try cfg.appendSlice(ctx.allocator, "\",\"created_at\":");
+    try cfg.appendSlice(ctx.allocator, "\",\"decay_tau_hours\":");
+    var tau_buf: [32]u8 = undefined;
+    const tau_str = std.fmt.bufPrint(&tau_buf, "{d}", .{decay_tau_hours}) catch "168";
+    try cfg.appendSlice(ctx.allocator, tau_str);
+    try cfg.appendSlice(ctx.allocator, ",\"vector_only\":");
+    try cfg.appendSlice(ctx.allocator, if (vector_only) "true" else "false");
+    try cfg.appendSlice(ctx.allocator, ",\"created_at\":");
     try writeU64(&cfg, ctx.allocator, ctx.timestamp());
     try cfg.append(ctx.allocator, '}');
 
@@ -261,20 +375,12 @@ pub fn memAdd(ctx: *Ctx) anyerror!Ctx.Result {
     const usage = "mem_add requires: <ns> <doc_id> <text> <embedding> [<meta_json>] [<worm>] [<embedder_id>]";
     const ns = ctx.arg(0) orelse return ctx.err(usage);
     const doc_id = ctx.arg(1) orelse return ctx.err(usage);
-    const text = ctx.arg(2) orelse return ctx.err(usage);
-    const embedding = ctx.arg(3) orelse return ctx.err(usage);
-    const meta_json: []const u8 = ctx.arg(4) orelse "";
-    const is_worm = if (ctx.arg(5)) |w| !std.mem.eql(u8, w, "0") else true;
-    const embedder_id_arg: ?[]const u8 = ctx.arg(6);
 
     if (!validateNs(ns))
         return ctx.err("mem_add: invalid ns");
+    ctx.requireNamespace(ns, .write) catch return ctx.err("permission denied");
     if (!validateDocId(doc_id))
         return ctx.err("mem_add: invalid doc_id");
-    if (embedder_id_arg) |req_emb| {
-        if (!validateEmbedderId(req_emb))
-            return ctx.err("mem_add: invalid embedder_id");
-    }
 
     // ── Pick metric from config (default cosine if no init) and
     //    optionally enforce embedder match. Read config once.
@@ -292,6 +398,29 @@ pub fn memAdd(ctx: *Ctx) anyerror!Ctx.Result {
         }
         break :blk .cosine;
     };
+
+    const vector_only = isVectorOnlyConfig(cfg_bytes);
+    const text: []const u8 = if (vector_only) "" else ctx.arg(2) orelse return ctx.err(usage);
+    const embedding = if (vector_only)
+        ctx.arg(2) orelse return ctx.err("mem_add vector_only requires: <ns> <doc_id> <embedding> [<meta_json>] [<worm>] [<embedder_id>]")
+    else
+        ctx.arg(3) orelse return ctx.err(usage);
+    const meta_json: []const u8 = if (vector_only) ctx.arg(3) orelse "" else ctx.arg(4) orelse "";
+    const is_worm = if (if (vector_only) ctx.arg(4) else ctx.arg(5)) |w| !std.mem.eql(u8, w, "0") else true;
+    const embedder_id_arg: ?[]const u8 = if (vector_only) ctx.arg(5) else ctx.arg(6);
+
+    if (vector_only and distance.bytesToF32(embedding) == null) {
+        if (ctx.arg(3)) |maybe_embedding| {
+            if (distance.bytesToF32(maybe_embedding) != null) {
+                return ctx.err("mem_add: vector_only namespace uses <ns> <doc_id> <embedding> [<meta_json>] [<worm>] [<embedder_id>] (no text arg)");
+            }
+        }
+    }
+
+    if (embedder_id_arg) |req_emb| {
+        if (!validateEmbedderId(req_emb))
+            return ctx.err("mem_add: invalid embedder_id");
+    }
 
     // Embedder enforcement: only when caller asserts an id AND the
     // namespace has an existing config. Lazy-init namespaces (no
@@ -353,19 +482,21 @@ pub fn memAdd(ctx: *Ctx) anyerror!Ctx.Result {
     };
 
     // ── Doc body ────────────────────────────────────────────────
-    if (is_worm) {
-        ctx.setDurableWorm(doc_key, text) catch |err| switch (err) {
-            error.WormViolation => {
-                // Vector was already applied — it now has no doc body.
-                // Surface a clear message; operator can mem_drop to recover.
-                return ctx.err("mem_add: doc_id already exists (WORM) — vector written but doc body refused; consider mem_drop");
-            },
-            else => return ctx.err(ctx.fmt("mem_add: doc write failed: {s}", .{@errorName(err)})),
-        };
-    } else {
-        ctx.setDurable(doc_key, text) catch |err| {
-            return ctx.err(ctx.fmt("mem_add: doc write failed: {s}", .{@errorName(err)}));
-        };
+    if (!vector_only) {
+        if (is_worm) {
+            ctx.setDurableWorm(doc_key, text) catch |err| switch (err) {
+                error.WormViolation => {
+                    // Vector was already applied — it now has no doc body.
+                    // Surface a clear message; operator can mem_drop to recover.
+                    return ctx.err("mem_add: doc_id already exists (WORM) — vector written but doc body refused; consider mem_drop");
+                },
+                else => return ctx.err(ctx.fmt("mem_add: doc write failed: {s}", .{@errorName(err)})),
+            };
+        } else {
+            ctx.setDurable(doc_key, text) catch |err| {
+                return ctx.err(ctx.fmt("mem_add: doc write failed: {s}", .{@errorName(err)}));
+            };
+        }
     }
 
     // ── Metadata (always mutable) ───────────────────────────────
@@ -381,6 +512,179 @@ pub fn memAdd(ctx: *Ctx) anyerror!Ctx.Result {
 }
 
 // ╔═══════════════════════════════════════════════════╗
+// ║  mem_meta_set                                      ║
+// ╚═══════════════════════════════════════════════════╝
+
+pub fn memMetaSet(ctx: *Ctx) anyerror!Ctx.Result {
+    const usage = "mem_meta_set requires: <ns> <doc_id> <meta_json>";
+    const ns = ctx.arg(0) orelse return ctx.err(usage);
+    const doc_id = ctx.arg(1) orelse return ctx.err(usage);
+    const meta_json = ctx.arg(2) orelse return ctx.err(usage);
+
+    if (!validateNs(ns)) return ctx.err("mem_meta_set: invalid ns");
+    if (!validateDocId(doc_id)) return ctx.err("mem_meta_set: invalid doc_id");
+    ctx.requireNamespace(ns, .write) catch return ctx.err("permission denied");
+
+    const doc_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}", .{ ns, doc_id });
+    defer ctx.allocator.free(doc_key);
+    const meta_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}:meta", .{ ns, doc_id });
+    defer ctx.allocator.free(meta_key);
+
+    if ((try ctx.getCopy(doc_key)) == null) {
+        return ctx.err("mem_meta_set: doc_id not found");
+    }
+
+    ctx.setDurable(meta_key, meta_json) catch |err| {
+        return ctx.err(ctx.fmt("mem_meta_set: meta write failed: {s}", .{@errorName(err)}));
+    };
+    return ctx.ok();
+}
+
+// ╔═══════════════════════════════════════════════════╗
+// ║  mem_bulk_add                                      ║
+// ╚═══════════════════════════════════════════════════╝
+
+const BulkMetaWrite = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+pub fn memBulkAdd(ctx: *Ctx) anyerror!Ctx.Result {
+    const usage = "mem_bulk_add requires: <ns> <count> [<id> <embedding> <meta_json>]×N";
+    const ns = ctx.arg(0) orelse return ctx.err(usage);
+    const count = ctx.argInt(usize, 1) orelse return ctx.err("mem_bulk_add: count must be an integer");
+
+    if (!validateNs(ns)) return ctx.err("mem_bulk_add: invalid ns");
+    ctx.requireNamespace(ns, .write) catch return ctx.err("permission denied");
+    if (count > MAX_BULK_ADD)
+        return ctx.err(ctx.fmt("mem_bulk_add: count must be <= {d}", .{MAX_BULK_ADD}));
+
+    const expected_args = 2 + count * 3;
+    if (ctx.argCount() != expected_args)
+        return ctx.err(usage);
+    if (count == 0) return ctx.ok();
+
+    const cfg_bytes: ?[]const u8 = blk: {
+        const cfg_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
+        defer ctx.allocator.free(cfg_key);
+        break :blk try ctx.getCopy(cfg_key);
+    };
+
+    const metric: Metric = blk: {
+        if (cfg_bytes) |cfg| {
+            if (extractConfigField(cfg, "metric")) |m_str| {
+                if (Metric.fromStr(m_str)) |m| break :blk m;
+            }
+        }
+        break :blk .cosine;
+    };
+
+    const vec_namespace = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
+    defer ctx.allocator.free(vec_namespace);
+    const channel = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:added.bulk", .{ns});
+    defer ctx.allocator.free(channel);
+
+    if (ctx.vector_registry) |reg| {
+        if (reg.get(vec_namespace)) |ns_idx| {
+            if (ns_idx.metric != metric)
+                return ctx.err("mem_bulk_add: metric differs from existing vector namespace");
+        }
+    }
+
+    const items = try ctx.allocator.alloc(Command.VbulkinsertParams.BulkItem, count);
+    const metas = try ctx.allocator.alloc(BulkMetaWrite, count);
+    const ids = try ctx.allocator.alloc([]const u8, count);
+
+    var seen = std.StringHashMap(void).init(ctx.allocator);
+    defer seen.deinit();
+
+    var expected_dim: ?usize = null;
+    if (ctx.vector_registry) |reg| {
+        if (reg.get(vec_namespace)) |ns_idx| {
+            expected_dim = ns_idx.expectedDim();
+        }
+    }
+
+    var batch_dim: ?usize = null;
+    const now_ms = ctx.timestamp();
+
+    for (0..count) |i| {
+        const base = 2 + i * 3;
+        const doc_id = ctx.arg(base).?;
+        const embedding = ctx.arg(base + 1).?;
+        const meta_json = ctx.arg(base + 2).?;
+
+        if (!validateDocId(doc_id))
+            return ctx.err("mem_bulk_add: invalid doc_id");
+        const seen_gop = try seen.getOrPut(doc_id);
+        if (seen_gop.found_existing)
+            return ctx.err("mem_bulk_add: duplicate doc_id in batch");
+
+        const vec = distance.bytesToF32(embedding) orelse
+            return ctx.err("mem_bulk_add: embedding must be non-empty f32 bytes (len multiple of 4)");
+        if (batch_dim) |d| {
+            if (vec.len != d) return ctx.err("mem_bulk_add: all embeddings in a batch must have the same dimension");
+        } else {
+            batch_dim = vec.len;
+        }
+        if (expected_dim) |d| {
+            if (vec.len != d) return ctx.err("mem_bulk_add: embedding dim does not match the namespace");
+        }
+
+        const vec_key = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:{s}", .{ ns, doc_id });
+        const bq_key = try std.fmt.allocPrint(ctx.allocator, "bq:vec:mem:{s}:{s}", .{ ns, doc_id });
+        defer ctx.allocator.free(bq_key);
+        if ((try ctx.getCopy(vec_key)) != null or (try ctx.getCopy(bq_key)) != null)
+            return ctx.err("mem_bulk_add: doc_id already has vector state");
+
+        const meta_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}:meta", .{ ns, doc_id });
+        items[i] = .{ .key = vec_key, .vector = embedding, .timestamp = now_ms };
+        metas[i] = .{ .key = meta_key, .value = meta_json };
+        ids[i] = doc_id;
+    }
+
+    vector_ops.applyVbulkinsert(
+        ctx.store,
+        ctx.cluster,
+        ctx.event_bus,
+        ctx.vector_registry,
+        ctx.allocator,
+        vec_namespace,
+        metric,
+        true,
+        false,
+        items,
+        true,
+    ) catch |err| {
+        return switch (err) {
+            error.KeyMissingNamespace => ctx.err("mem_bulk_add: internal vector key outside namespace"),
+        };
+    };
+
+    for (metas) |m| {
+        if (m.value.len > 0) {
+            ctx.setDurable(m.key, m.value) catch |err| {
+                return ctx.err(ctx.fmt("mem_bulk_add: meta write failed: {s}", .{@errorName(err)}));
+            };
+        }
+    }
+
+    var event_json: std.ArrayListUnmanaged(u8) = .empty;
+    defer event_json.deinit(ctx.allocator);
+    try event_json.append(ctx.allocator, '[');
+    for (ids, 0..) |id, i| {
+        if (i > 0) try event_json.append(ctx.allocator, ',');
+        try event_json.append(ctx.allocator, '"');
+        try appendJsonEscaped(&event_json, ctx.allocator, id);
+        try event_json.append(ctx.allocator, '"');
+    }
+    try event_json.append(ctx.allocator, ']');
+    ctx.publish(channel, event_json.items);
+
+    return ctx.ok();
+}
+
+// ╔═══════════════════════════════════════════════════╗
 // ║  mem_get                                           ║
 // ╚═══════════════════════════════════════════════════╝
 
@@ -389,7 +693,15 @@ pub fn memGet(ctx: *Ctx) anyerror!Ctx.Result {
     const doc_id = ctx.arg(1) orelse return ctx.err("mem_get requires: <ns> <doc_id>");
 
     if (!validateNs(ns)) return ctx.err("mem_get: invalid ns");
+    ctx.requireNamespace(ns, .read) catch return ctx.err("permission denied");
     if (!validateDocId(doc_id)) return ctx.err("mem_get: invalid doc_id");
+
+    const config_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
+    defer ctx.allocator.free(config_key);
+    const cfg_bytes = try ctx.getCopy(config_key);
+    if (isVectorOnlyConfig(cfg_bytes)) {
+        return ctx.err("mem_get: namespace is vector_only");
+    }
 
     const doc_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}", .{ ns, doc_id });
     defer ctx.allocator.free(doc_key);
@@ -445,11 +757,34 @@ const BruteScanCtx = struct {
     query_vec: []align(1) const f32,
     metric: Metric,
     decay: f32,
+    decay_tau_hours: f32,
     now_ms: u64,
     heap: *TopKCandidate,
     allocator: std.mem.Allocator,
     oom: bool,
 };
+
+fn docIdFromVecKey(vec_key: []const u8, vec_prefix: []const u8) ?[]const u8 {
+    if (vec_key.len <= vec_prefix.len) return null;
+    if (!std.mem.startsWith(u8, vec_key, vec_prefix)) return null;
+    return vec_key[vec_prefix.len..];
+}
+
+fn candidateMatchesFilter(
+    ctx: *Ctx,
+    pred: ?*const predicate.Predicate,
+    ns: []const u8,
+    vec_prefix: []const u8,
+    vec_key: []const u8,
+    timestamp: u64,
+) !bool {
+    const p = pred orelse return true;
+    const doc_id = docIdFromVecKey(vec_key, vec_prefix) orelse return false;
+    const meta_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}:meta", .{ ns, doc_id });
+    defer ctx.allocator.free(meta_key);
+    const meta_bytes = try ctx.getCopy(meta_key);
+    return p.matches(meta_bytes, timestamp);
+}
 
 fn onBruteMatch(
     raw_ctx: *anyopaque,
@@ -464,7 +799,7 @@ fn onBruteMatch(
     if (vec.len != sc.query_vec.len) return .cont;
 
     const raw_sim = computeExactSim(sc.metric, sc.query_vec, vec);
-    const score = applyDecay(raw_sim, timestamp, sc.decay, sc.now_ms);
+    const score = applyDecay(raw_sim, timestamp, sc.decay, sc.now_ms, sc.decay_tau_hours);
 
     if (score <= sc.heap.thresholdScore()) return .cont;
 
@@ -482,12 +817,15 @@ fn onBruteMatch(
 /// module that both call into.
 fn runHnswDispatch(
     ctx: *Ctx,
+    ns: []const u8,
     ns_idx: *IndexModule.NamespaceIndex,
     query_vec: []align(1) const f32,
     top_k: usize,
     metric: Metric,
     decay: f32,
+    decay_tau_hours: f32,
     now_ms: u64,
+    filter: ?*const predicate.Predicate,
     heap: *TopKCandidate,
 ) !bool {
     const stage1_size = top_k * HNSW_EF_SEARCH_FACTOR;
@@ -504,6 +842,9 @@ fn runHnswDispatch(
 
     if (n_stage1 == 0) return false;
 
+    const vec_prefix = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
+    defer ctx.allocator.free(vec_prefix);
+
     const stage1_keys = try ctx.allocator.alloc([]u8, n_stage1);
     const stage1_ts = try ctx.allocator.alloc(u64, n_stage1);
     {
@@ -516,27 +857,55 @@ fn runHnswDispatch(
     }
 
     for (0..n_stage1) |i| {
+        if (!try candidateMatchesFilter(ctx, filter, ns, vec_prefix, stage1_keys[i], stage1_ts[i])) continue;
+
         const vec_bytes = (try ctx.getCopy(stage1_keys[i])) orelse continue;
         const vec = distance.bytesToF32(vec_bytes) orelse continue;
         if (vec.len != query_vec.len) continue;
 
         const raw_sim = computeExactSim(metric, query_vec, vec);
-        const score = applyDecay(raw_sim, stage1_ts[i], decay, now_ms);
+        const score = applyDecay(raw_sim, stage1_ts[i], decay, now_ms, decay_tau_hours);
         heap.push(.{ .key = stage1_keys[i], .score = score, .timestamp = stage1_ts[i] });
     }
 
     return true;
 }
 
+fn runFilteredBruteScan(
+    ctx: *Ctx,
+    ns: []const u8,
+    vec_namespace: []const u8,
+    query_vec: []align(1) const f32,
+    metric: Metric,
+    decay: f32,
+    decay_tau_hours: f32,
+    now_ms: u64,
+    filter: *const predicate.Predicate,
+    heap: *TopKCandidate,
+) !void {
+    const results = try ctx.scan(vec_namespace, 0);
+    for (results) |r| {
+        const vec = distance.bytesToF32(r.value) orelse continue;
+        if (vec.len != query_vec.len) continue;
+        if (!try candidateMatchesFilter(ctx, filter, ns, vec_namespace, r.key, r.timestamp)) continue;
+
+        const raw_sim = computeExactSim(metric, query_vec, vec);
+        const score = applyDecay(raw_sim, r.timestamp, decay, now_ms, decay_tau_hours);
+        if (score <= heap.thresholdScore()) continue;
+        heap.push(.{ .key = r.key, .score = score, .timestamp = r.timestamp });
+    }
+}
+
 pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
     const ns = ctx.arg(0) orelse
-        return ctx.err("mem_query requires: <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>]");
+        return ctx.err("mem_query requires: <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>] [<decay_tau_hours>]");
     const embedding = ctx.arg(1) orelse
-        return ctx.err("mem_query requires: <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>]");
+        return ctx.err("mem_query requires: <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>] [<decay_tau_hours>]");
     const top_k_raw = ctx.argInt(usize, 2) orelse
         return ctx.err("mem_query: k must be a positive integer");
 
     if (!validateNs(ns)) return ctx.err("mem_query: invalid ns");
+    ctx.requireNamespace(ns, .read) catch return ctx.err("permission denied");
 
     const top_k = @min(if (top_k_raw == 0) @as(usize, 10) else top_k_raw, MAX_TOP_K);
 
@@ -557,17 +926,50 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
         snippet_chars = std.fmt.parseInt(i64, s, 10) catch DEFAULT_SNIPPET_CHARS;
     }
 
+    // Trailing options (args 6 and 7), in any order: a `filter=...` predicate
+    // and/or a bare decay_tau_hours value. The `filter=` prefix disambiguates.
+    var parsed_filter: ?predicate.Predicate = null;
+    defer if (parsed_filter) |*p| p.deinit();
+    var decay_tau_override: ?f32 = null;
+    {
+        var opt_i: usize = 6;
+        while (opt_i <= 7) : (opt_i += 1) {
+            const raw = ctx.arg(opt_i) orelse continue;
+            if (raw.len == 0) continue;
+            if (argLooksLikeFilter(raw)) {
+                if (parsed_filter != null) return ctx.err("mem_query: filter specified more than once");
+                parsed_filter = predicate.parse(ctx.allocator, raw) catch
+                    return ctx.err("mem_query: invalid filter predicate");
+            } else {
+                decay_tau_override = parseDecayTauHours(raw) orelse
+                    return ctx.err("mem_query: decay_tau_hours must be positive");
+            }
+        }
+    }
+    const filter_ptr: ?*const predicate.Predicate = if (parsed_filter) |*p| p else null;
+
     const query_vec = distance.bytesToF32(embedding) orelse
         return ctx.err("mem_query: embedding must be non-empty f32 bytes (len multiple of 4)");
 
-    // Resolve metric: config metric wins; default cosine.
-    const metric: Metric = blk: {
+    const cfg_bytes: ?[]const u8 = blk: {
         const cfg_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
         defer ctx.allocator.free(cfg_key);
-        const cfg = (try ctx.getCopy(cfg_key)) orelse break :blk .cosine;
+        break :blk try ctx.getCopy(cfg_key);
+    };
+
+    // Resolve metric: config metric wins; default cosine.
+    const metric: Metric = blk: {
+        const cfg = cfg_bytes orelse break :blk .cosine;
         const m_str = extractConfigField(cfg, "metric") orelse break :blk .cosine;
         break :blk Metric.fromStr(m_str) orelse .cosine;
     };
+    const vector_only = isVectorOnlyConfig(cfg_bytes);
+
+    const configured_decay_tau_hours: f32 = blk: {
+        const cfg = cfg_bytes orelse break :blk DEFAULT_DECAY_TAU_HOURS;
+        break :blk extractConfigFloat(cfg, "decay_tau_hours") orelse DEFAULT_DECAY_TAU_HOURS;
+    };
+    const decay_tau_hours = decay_tau_override orelse configured_decay_tau_hours;
 
     const vec_namespace = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
     defer ctx.allocator.free(vec_namespace);
@@ -584,12 +986,15 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
             if (ns_idx.metric == metric and ns_idx.len() > 0) {
                 used_hnsw = try runHnswDispatch(
                     ctx,
+                    ns,
                     ns_idx,
                     query_vec,
                     top_k,
                     metric,
                     decay,
+                    decay_tau_hours,
                     now_ms,
+                    filter_ptr,
                     &final_heap,
                 );
             }
@@ -600,17 +1005,22 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
     // Triggered on cold-start (post-restart before vreindex) or when
     // no index has ever been created for this namespace.
     if (!used_hnsw) {
-        var brute_sc = BruteScanCtx{
-            .query_vec = query_vec,
-            .metric = metric,
-            .decay = decay,
-            .now_ms = now_ms,
-            .heap = &final_heap,
-            .allocator = ctx.allocator,
-            .oom = false,
-        };
-        ctx.scanCallback(vec_namespace, @ptrCast(&brute_sc), onBruteMatch);
-        if (brute_sc.oom) return ctx.err("mem_query: out of memory during brute-force scan");
+        if (filter_ptr) |filter| {
+            try runFilteredBruteScan(ctx, ns, vec_namespace, query_vec, metric, decay, decay_tau_hours, now_ms, filter, &final_heap);
+        } else {
+            var brute_sc = BruteScanCtx{
+                .query_vec = query_vec,
+                .metric = metric,
+                .decay = decay,
+                .decay_tau_hours = decay_tau_hours,
+                .now_ms = now_ms,
+                .heap = &final_heap,
+                .allocator = ctx.allocator,
+                .oom = false,
+            };
+            ctx.scanCallback(vec_namespace, @ptrCast(&brute_sc), onBruteMatch);
+            if (brute_sc.oom) return ctx.err("mem_query: out of memory during brute-force scan");
+        }
     }
 
     // ── Enrich results with doc + meta lookups ──────────────────
@@ -632,12 +1042,9 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
         if (!std.mem.startsWith(u8, r.key, ns_prefix)) continue;
         const doc_id = r.key[ns_prefix.len..];
 
-        const doc_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}", .{ ns, doc_id });
-        defer ctx.allocator.free(doc_key);
         const meta_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}:meta", .{ ns, doc_id });
         defer ctx.allocator.free(meta_key);
 
-        const doc_bytes = try ctx.getCopy(doc_key); // may be null if vec was orphaned
         const meta_bytes = try ctx.getCopy(meta_key);
 
         if (emitted > 0) try json.append(ctx.allocator, ',');
@@ -651,7 +1058,11 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
         try writeU64(&json, ctx.allocator, r.timestamp);
 
         // Doc text (subject to snippet_chars).
-        if (snippet_chars >= 0) {
+        if (!vector_only and snippet_chars >= 0) {
+            const doc_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}", .{ ns, doc_id });
+            defer ctx.allocator.free(doc_key);
+            const doc_bytes = try ctx.getCopy(doc_key); // may be null if vec was orphaned
+
             try json.appendSlice(ctx.allocator, ",\"doc\":");
             if (doc_bytes) |d| {
                 try json.append(ctx.allocator, '"');
@@ -680,12 +1091,139 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
 }
 
 // ╔═══════════════════════════════════════════════════╗
+// ║  mem_range                                         ║
+// ╚═══════════════════════════════════════════════════╝
+
+const RangeItem = struct {
+    id: []u8,
+    timestamp: u64,
+};
+
+const RangeScanCtx = struct {
+    prefix_len: usize,
+    since_ms: u64,
+    until_ms: u64,
+    items: std.ArrayListUnmanaged(RangeItem),
+    allocator: std.mem.Allocator,
+    oom: bool,
+};
+
+fn rangeItemLessThan(_: void, a: RangeItem, b: RangeItem) bool {
+    if (a.timestamp == b.timestamp) return std.mem.lessThan(u8, a.id, b.id);
+    return a.timestamp < b.timestamp;
+}
+
+fn onRangeDoc(
+    raw_ctx: *anyopaque,
+    key: []const u8,
+    value: []const u8,
+    timestamp: u64,
+    is_worm: bool,
+) Store.ScanAction {
+    _ = value;
+    _ = is_worm;
+    const sc: *RangeScanCtx = @ptrCast(@alignCast(raw_ctx));
+    if (timestamp < sc.since_ms or timestamp > sc.until_ms) return .cont;
+    if (key.len <= sc.prefix_len) return .cont;
+
+    const id = key[sc.prefix_len..];
+    // `mem:<ns>:` also contains metadata keys (`<id>:meta`). Stored memory
+    // doc ids cannot contain ':', so any colon-bearing suffix is not a doc.
+    if (std.mem.indexOfScalar(u8, id, ':') != null) return .cont;
+
+    const id_copy = sc.allocator.dupe(u8, id) catch {
+        sc.oom = true;
+        return .stop;
+    };
+    sc.items.append(sc.allocator, .{ .id = id_copy, .timestamp = timestamp }) catch {
+        sc.allocator.free(id_copy);
+        sc.oom = true;
+        return .stop;
+    };
+    return .cont;
+}
+
+pub fn memRange(ctx: *Ctx) anyerror!Ctx.Result {
+    const usage = "mem_range requires: <ns> <since_ms> <until_ms> [<limit>] [<filter>]";
+    const ns = ctx.arg(0) orelse return ctx.err(usage);
+    const since_ms = ctx.argInt(u64, 1) orelse return ctx.err("mem_range: since_ms must be an integer");
+    const until_ms = ctx.argInt(u64, 2) orelse return ctx.err("mem_range: until_ms must be an integer");
+
+    if (!validateNs(ns)) return ctx.err("mem_range: invalid ns");
+    ctx.requireNamespace(ns, .read) catch return ctx.err("permission denied");
+    if (since_ms > until_ms) return ctx.err("mem_range: since_ms must be <= until_ms");
+
+    var limit: usize = DEFAULT_RANGE_LIMIT;
+    if (ctx.arg(3)) |raw_limit| {
+        limit = std.fmt.parseInt(usize, raw_limit, 10) catch
+            return ctx.err("mem_range: limit must be a non-negative integer");
+        if (limit > MAX_RANGE_LIMIT) {
+            return ctx.err(ctx.fmt("mem_range: limit must be <= {d}", .{MAX_RANGE_LIMIT}));
+        }
+    }
+
+    if (ctx.arg(4) != null) {
+        return ctx.err("mem_range: filter predicates are not implemented yet; blocked on shared predicate parser (#2)");
+    }
+
+    const doc_prefix = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:", .{ns});
+    defer ctx.allocator.free(doc_prefix);
+
+    var scan_ctx = RangeScanCtx{
+        .prefix_len = doc_prefix.len,
+        .since_ms = since_ms,
+        .until_ms = until_ms,
+        .items = .empty,
+        .allocator = ctx.allocator,
+        .oom = false,
+    };
+    defer {
+        for (scan_ctx.items.items) |item| scan_ctx.allocator.free(item.id);
+        scan_ctx.items.deinit(scan_ctx.allocator);
+    }
+
+    ctx.scanCallback(doc_prefix, @ptrCast(&scan_ctx), onRangeDoc);
+    if (scan_ctx.oom) return ctx.err("mem_range: out of memory during scan");
+
+    std.sort.heap(RangeItem, scan_ctx.items.items, {}, rangeItemLessThan);
+
+    const emit_count = if (limit == 0) scan_ctx.items.items.len else @min(limit, scan_ctx.items.items.len);
+
+    var json: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer json.deinit(ctx.allocator);
+    try json.append(ctx.allocator, '[');
+
+    for (scan_ctx.items.items[0..emit_count], 0..) |item, i| {
+        if (i > 0) try json.append(ctx.allocator, ',');
+        try json.appendSlice(ctx.allocator, "{\"id\":\"");
+        try appendJsonEscaped(&json, ctx.allocator, item.id);
+        try json.appendSlice(ctx.allocator, "\",\"ts\":");
+        try writeU64(&json, ctx.allocator, item.timestamp);
+        try json.appendSlice(ctx.allocator, ",\"meta\":");
+
+        const meta_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}:meta", .{ ns, item.id });
+        defer ctx.allocator.free(meta_key);
+        if (try ctx.getCopy(meta_key)) |meta| {
+            try json.appendSlice(ctx.allocator, meta);
+        } else {
+            try json.appendSlice(ctx.allocator, "null");
+        }
+
+        try json.append(ctx.allocator, '}');
+    }
+    try json.append(ctx.allocator, ']');
+
+    return ctx.value(try json.toOwnedSlice(ctx.allocator));
+}
+
+// ╔═══════════════════════════════════════════════════╗
 // ║  mem_stats                                         ║
 // ╚═══════════════════════════════════════════════════╝
 
 pub fn memStats(ctx: *Ctx) anyerror!Ctx.Result {
     const ns = ctx.arg(0) orelse return ctx.err("mem_stats requires: <ns>");
     if (!validateNs(ns)) return ctx.err("mem_stats: invalid ns");
+    ctx.requireNamespace(ns, .read) catch return ctx.err("permission denied");
 
     const vec_namespace = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
     defer ctx.allocator.free(vec_namespace);
@@ -752,6 +1290,195 @@ pub fn memStats(ctx: *Ctx) anyerror!Ctx.Result {
 }
 
 // ╔═══════════════════════════════════════════════════╗
+// ║  mem_verify                                        ║
+// ╚═══════════════════════════════════════════════════╝
+
+const VerifyKind = enum { doc, vector, bq };
+
+const VerifyIdSet = struct {
+    allocator: std.mem.Allocator,
+    map: std.StringHashMap(void),
+    count: usize = 0,
+
+    fn init(allocator: std.mem.Allocator) VerifyIdSet {
+        return .{
+            .allocator = allocator,
+            .map = std.StringHashMap(void).init(allocator),
+        };
+    }
+
+    fn deinit(self: *VerifyIdSet) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.map.deinit();
+    }
+
+    fn add(self: *VerifyIdSet, id: []const u8) !void {
+        if (self.map.contains(id)) return;
+        const id_copy = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(id_copy);
+        try self.map.put(id_copy, {});
+        self.count += 1;
+    }
+
+    fn has(self: *const VerifyIdSet, id: []const u8) bool {
+        return self.map.contains(id);
+    }
+};
+
+const VerifyCollectCtx = struct {
+    prefix: []const u8,
+    kind: VerifyKind,
+    ids: *VerifyIdSet,
+    oom: bool = false,
+};
+
+fn collectVerifyId(
+    raw_ctx: *anyopaque,
+    key: []const u8,
+    value: []const u8,
+    timestamp: u64,
+    is_worm: bool,
+) Store.ScanAction {
+    _ = value;
+    _ = timestamp;
+    _ = is_worm;
+
+    const vc: *VerifyCollectCtx = @ptrCast(@alignCast(raw_ctx));
+    if (key.len < vc.prefix.len) return .cont;
+    const id = key[vc.prefix.len..];
+
+    // `mem:<ns>:` includes both docs and metadata sidecars. Doc IDs cannot
+    // contain `:`, so a `:meta` suffix is the metadata key, not a document.
+    if (vc.kind == .doc and std.mem.endsWith(u8, id, ":meta")) return .cont;
+
+    vc.ids.add(id) catch {
+        vc.oom = true;
+        return .stop;
+    };
+    return .cont;
+}
+
+fn appendDiffArray(
+    json: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    source: *const VerifyIdSet,
+    missing_from: *const VerifyIdSet,
+    limit: usize,
+) !bool {
+    var emitted: usize = 0;
+    var truncated = false;
+    try json.append(allocator, '[');
+    var it = source.map.iterator();
+    while (it.next()) |entry| {
+        const id = entry.key_ptr.*;
+        if (missing_from.has(id)) continue;
+        if (emitted == limit) {
+            truncated = true;
+            continue;
+        }
+        if (emitted > 0) try json.append(allocator, ',');
+        try json.append(allocator, '"');
+        try appendJsonEscaped(json, allocator, id);
+        try json.append(allocator, '"');
+        emitted += 1;
+    }
+    try json.append(allocator, ']');
+    return truncated;
+}
+
+fn collectVerifySet(ctx: *Ctx, prefix: []const u8, kind: VerifyKind, ids: *VerifyIdSet) !void {
+    var collector = VerifyCollectCtx{
+        .prefix = prefix,
+        .kind = kind,
+        .ids = ids,
+    };
+    ctx.scanCallback(prefix, @ptrCast(&collector), collectVerifyId);
+    if (collector.oom) return error.OutOfMemory;
+}
+
+pub fn memVerify(ctx: *Ctx) anyerror!Ctx.Result {
+    const ns = ctx.arg(0) orelse return ctx.err("mem_verify requires: <ns>");
+    if (!validateNs(ns)) return ctx.err("mem_verify: invalid ns");
+    ctx.requireNamespace(ns, .read) catch return ctx.err("permission denied");
+
+    const doc_prefix = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:", .{ns});
+    defer ctx.allocator.free(doc_prefix);
+    const vec_prefix = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
+    defer ctx.allocator.free(vec_prefix);
+    const bq_prefix = try std.fmt.allocPrint(ctx.allocator, "bq:vec:mem:{s}:", .{ns});
+    defer ctx.allocator.free(bq_prefix);
+    const config_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
+    defer ctx.allocator.free(config_key);
+
+    var doc_ids = VerifyIdSet.init(ctx.allocator);
+    defer doc_ids.deinit();
+    var vec_ids = VerifyIdSet.init(ctx.allocator);
+    defer vec_ids.deinit();
+    var bq_ids = VerifyIdSet.init(ctx.allocator);
+    defer bq_ids.deinit();
+
+    collectVerifySet(ctx, doc_prefix, .doc, &doc_ids) catch {
+        return ctx.err("mem_verify: out of memory collecting doc ids");
+    };
+    collectVerifySet(ctx, vec_prefix, .vector, &vec_ids) catch {
+        return ctx.err("mem_verify: out of memory collecting vector ids");
+    };
+    collectVerifySet(ctx, bq_prefix, .bq, &bq_ids) catch {
+        return ctx.err("mem_verify: out of memory collecting bq ids");
+    };
+
+    const config_bytes = try ctx.getCopy(config_key);
+    const vector_only = if (config_bytes) |cfg| configVectorOnly(cfg) else false;
+
+    var hnsw_node_count: usize = 0;
+    if (ctx.vector_registry) |reg| {
+        if (reg.get(vec_prefix)) |ns_idx| {
+            ns_idx.lock.lockShared();
+            defer ns_idx.lock.unlockShared();
+            hnsw_node_count = ns_idx.len();
+        }
+    }
+
+    var json: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer json.deinit(ctx.allocator);
+    try json.appendSlice(ctx.allocator, "{\"namespace\":\"");
+    try appendJsonEscaped(&json, ctx.allocator, ns);
+    try json.appendSlice(ctx.allocator, "\",\"doc_count\":");
+    try writeUsize(&json, ctx.allocator, doc_ids.count);
+    try json.appendSlice(ctx.allocator, ",\"vector_count\":");
+    try writeUsize(&json, ctx.allocator, vec_ids.count);
+    try json.appendSlice(ctx.allocator, ",\"bq_count\":");
+    try writeUsize(&json, ctx.allocator, bq_ids.count);
+    try json.appendSlice(ctx.allocator, ",\"hnsw_node_count\":");
+    try writeUsize(&json, ctx.allocator, hnsw_node_count);
+    try json.appendSlice(ctx.allocator, ",\"orphan_limit\":");
+    try writeUsize(&json, ctx.allocator, MAX_VERIFY_ORPHANS);
+
+    try json.appendSlice(ctx.allocator, ",\"orphan_vectors\":");
+    const orphan_vectors_truncated = try appendDiffArray(&json, ctx.allocator, &vec_ids, &doc_ids, MAX_VERIFY_ORPHANS);
+
+    try json.appendSlice(ctx.allocator, ",\"orphan_docs\":");
+    const orphan_docs_truncated = if (vector_only) blk: {
+        try json.appendSlice(ctx.allocator, "[]");
+        break :blk false;
+    } else try appendDiffArray(&json, ctx.allocator, &doc_ids, &vec_ids, MAX_VERIFY_ORPHANS);
+
+    try json.appendSlice(ctx.allocator, ",\"missing_bq\":");
+    const missing_bq_truncated = try appendDiffArray(&json, ctx.allocator, &vec_ids, &bq_ids, MAX_VERIFY_ORPHANS);
+
+    try json.appendSlice(ctx.allocator, ",\"orphan_vectors_truncated\":");
+    try json.appendSlice(ctx.allocator, if (orphan_vectors_truncated) "true" else "false");
+    try json.appendSlice(ctx.allocator, ",\"orphan_docs_truncated\":");
+    try json.appendSlice(ctx.allocator, if (orphan_docs_truncated) "true" else "false");
+    try json.appendSlice(ctx.allocator, ",\"missing_bq_truncated\":");
+    try json.appendSlice(ctx.allocator, if (missing_bq_truncated) "true" else "false");
+    try json.append(ctx.allocator, '}');
+
+    return ctx.value(try json.toOwnedSlice(ctx.allocator));
+}
+
+// ╔═══════════════════════════════════════════════════╗
 // ║  mem_drop                                          ║
 // ╚═══════════════════════════════════════════════════╝
 
@@ -787,6 +1514,7 @@ fn collectDropKey(
 pub fn memDrop(ctx: *Ctx) anyerror!Ctx.Result {
     const ns = ctx.arg(0) orelse return ctx.err("mem_drop requires: <ns>");
     if (!validateNs(ns)) return ctx.err("mem_drop: invalid ns");
+    ctx.requireNamespace(ns, .delete) catch return ctx.err("permission denied");
 
     const mem_prefix = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:", .{ns});
     defer ctx.allocator.free(mem_prefix);
@@ -876,6 +1604,7 @@ pub fn memResetIndex(ctx: *Ctx) anyerror!Ctx.Result {
         return ctx.err("mem_reset_index requires: <ns> <new_embedder_id>");
 
     if (!validateNs(ns)) return ctx.err("mem_reset_index: invalid ns");
+    ctx.requireNamespace(ns, .delete) catch return ctx.err("permission denied");
     if (!validateEmbedderId(new_embedder_id))
         return ctx.err("mem_reset_index: invalid embedder_id");
 
@@ -888,6 +1617,7 @@ pub fn memResetIndex(ctx: *Ctx) anyerror!Ctx.Result {
         return ctx.err("mem_reset_index: existing config missing metric field");
     const metric = Metric.fromStr(cfg_metric_str) orelse
         return ctx.err("mem_reset_index: existing config has unknown metric");
+    const vector_only = extractConfigBool(existing, "vector_only") orelse false;
 
     const vec_prefix = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
     defer ctx.allocator.free(vec_prefix);
@@ -968,7 +1698,9 @@ pub fn memResetIndex(ctx: *Ctx) anyerror!Ctx.Result {
     try cfg.appendSlice(ctx.allocator, new_embedder_id);
     try cfg.appendSlice(ctx.allocator, "\",\"metric\":\"");
     try cfg.appendSlice(ctx.allocator, metric.name());
-    try cfg.appendSlice(ctx.allocator, "\",\"created_at\":");
+    try cfg.appendSlice(ctx.allocator, "\",\"vector_only\":");
+    try cfg.appendSlice(ctx.allocator, if (vector_only) "true" else "false");
+    try cfg.appendSlice(ctx.allocator, ",\"created_at\":");
     try writeU64(&cfg, ctx.allocator, ctx.timestamp());
     try cfg.append(ctx.allocator, '}');
     try ctx.setDurable(config_key, cfg.items);
@@ -982,7 +1714,9 @@ pub fn memResetIndex(ctx: *Ctx) anyerror!Ctx.Result {
     try appendJsonEscaped(&json, ctx.allocator, new_embedder_id);
     try json.appendSlice(ctx.allocator, "\",\"metric\":\"");
     try json.appendSlice(ctx.allocator, metric.name());
-    try json.appendSlice(ctx.allocator, "\",\"vectors_to_reingest\":");
+    try json.appendSlice(ctx.allocator, "\",\"vector_only\":");
+    try json.appendSlice(ctx.allocator, if (vector_only) "true" else "false");
+    try json.appendSlice(ctx.allocator, ",\"vectors_to_reingest\":");
     try writeUsize(&json, ctx.allocator, vectors_dropped);
     try json.append(ctx.allocator, '}');
     return ctx.value(try json.toOwnedSlice(ctx.allocator));
@@ -1038,6 +1772,25 @@ test "extractConfigField pulls string field from our own JSON layout" {
     try testing.expect(extractConfigField(cfg, "missing") == null);
 }
 
+test "extractConfigFloat pulls numeric field from our own JSON layout" {
+    const cfg = "{\"embedder_id\":\"bge-m3\",\"metric\":\"cosine\",\"decay_tau_hours\":24,\"created_at\":12345}";
+    try testing.expectApproxEqAbs(@as(f32, 24.0), extractConfigFloat(cfg, "decay_tau_hours").?, 0.001);
+    try testing.expect(extractConfigFloat(cfg, "missing") == null);
+}
+
+test "extractConfigBool pulls boolean fields from config JSON" {
+    const cfg = "{\"embedder_id\":\"bge-m3\",\"metric\":\"cosine\",\"vector_only\":true,\"created_at\":12345}";
+    try testing.expectEqual(true, extractConfigBool(cfg, "vector_only").?);
+    try testing.expect(extractConfigBool(cfg, "missing") == null);
+}
+
+test "parseMemInitVectorOnlyFlag accepts explicit true and false forms" {
+    try testing.expectEqual(true, parseMemInitVectorOnlyFlag("vector_only=true").?);
+    try testing.expectEqual(true, parseMemInitVectorOnlyFlag("vector_only").?);
+    try testing.expectEqual(false, parseMemInitVectorOnlyFlag("vector_only=false").?);
+    try testing.expect(parseMemInitVectorOnlyFlag("decay_tau_hours=24") == null);
+}
+
 test "appendJsonEscaped handles quotes, backslashes, and control chars" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -1046,24 +1799,35 @@ test "appendJsonEscaped handles quotes, backslashes, and control chars" {
 }
 
 test "applyDecay: lambda=0 is a no-op" {
-    const s = applyDecay(0.8, 1000, 0.0, 2000);
+    const s = applyDecay(0.8, 1000, 0.0, 2000, DEFAULT_DECAY_TAU_HOURS);
     try testing.expectApproxEqAbs(@as(f32, 0.8), s, 1e-6);
 }
 
 test "applyDecay: lambda=1 returns pure recency in [0,1]" {
     const now: u64 = 10_000_000_000; // ~116 days in ms
     const ts: u64 = now; // zero age
-    const s = applyDecay(0.5, ts, 1.0, now);
+    const s = applyDecay(0.5, ts, 1.0, now, DEFAULT_DECAY_TAU_HOURS);
     try testing.expectApproxEqAbs(@as(f32, 1.0), s, 1e-6);
 
     // 116 days at a 1-week time constant → exp(-~16.5) ≈ 7e-8 ≪ 0.01
-    const s_old = applyDecay(0.5, 0, 1.0, now);
+    const s_old = applyDecay(0.5, 0, 1.0, now, DEFAULT_DECAY_TAU_HOURS);
     try testing.expect(s_old < 0.01);
 
     // One time-constant (168 h) → exp(-1) ≈ 0.368
     const one_tau_ms: u64 = 168 * 3_600_000;
-    const s_tau = applyDecay(0.5, 0, 1.0, one_tau_ms);
+    const s_tau = applyDecay(0.5, 0, 1.0, one_tau_ms, DEFAULT_DECAY_TAU_HOURS);
     try testing.expectApproxEqAbs(@as(f32, 0.3679), s_tau, 0.001);
+}
+
+test "applyDecay: configurable tau controls old-memory decay" {
+    const now: u64 = 48 * 3_600_000;
+    const old_ts: u64 = 0;
+
+    const tau_24h = applyDecay(0.5, old_ts, 1.0, now, 24.0);
+    const tau_1y = applyDecay(0.5, old_ts, 1.0, now, 8760.0);
+
+    try testing.expect(tau_24h < 0.14);
+    try testing.expect(tau_1y > 0.99);
 }
 
 // ╔═══════════════════════════════════════════════════╗
@@ -1077,6 +1841,7 @@ test "applyDecay: lambda=1 returns pure recency in [0,1]" {
 
 const compat = @import("../core/compat.zig");
 const StoreModule = @import("../storage/store.zig");
+const EventBus = @import("../event/bus.zig").EventBus;
 
 /// Pack a slice of f32s as little-endian bytes — what mem_add expects on
 /// the wire. Lifetime: caller owns the returned slice.
@@ -1146,6 +1911,223 @@ fn runProc(
     return try proc(&ctx);
 }
 
+fn runProcWithBus(
+    store: *StoreModule.Store,
+    proc: *const fn (ctx: *Ctx) anyerror!Ctx.Result,
+    args: []const []const u8,
+    arena: std.mem.Allocator,
+    bus: *EventBus,
+) !Ctx.Result {
+    var ctx = Ctx.init(store, args, arena, null, null, bus, null);
+    defer ctx.deinit();
+    return try proc(&ctx);
+}
+
+fn runProcWithAuth(
+    store: *StoreModule.Store,
+    proc: *const fn (ctx: *Ctx) anyerror!Ctx.Result,
+    args: []const []const u8,
+    arena: std.mem.Allocator,
+    auth_context: auth.AuthContext,
+) !Ctx.Result {
+    var ctx = Ctx.initWithAuth(store, args, arena, auth_context, null, null, null, null);
+    defer ctx.deinit();
+    return try proc(&ctx);
+}
+
+fn runProcWithRegistry(
+    store: *StoreModule.Store,
+    proc: *const fn (ctx: *Ctx) anyerror!Ctx.Result,
+    args: []const []const u8,
+    arena: std.mem.Allocator,
+    registry: *IndexModule.NamespaceRegistry,
+) !Ctx.Result {
+    var ctx = Ctx.init(store, args, arena, null, null, null, registry);
+    defer ctx.deinit();
+    return try proc(&ctx);
+}
+
+test "mem_query: filters brute-force candidates by metadata before top-k" {
+    var fx = try TestStoreFixture.init("memquery_filter_brute");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena);
+
+    const emb1 = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const emb2 = try packF32(arena, &[_]f32{ 0.98, 0.02, 0.0, 0.0 });
+    _ = try runProc(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-1", "semantic public", emb1, "{\"privacy_level\":1,\"category\":\"semantic\",\"sourceType\":\"chat\",\"minImportance\":0.9}", "0" },
+        arena,
+    );
+    _ = try runProc(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-2", "episodic private", emb2, "{\"privacy_level\":3,\"category\":\"episodic\",\"sourceType\":\"tool\",\"minImportance\":0.4}", "0" },
+        arena,
+    );
+
+    const result = try runProc(
+        &fx.store,
+        memQuery,
+        &.{
+            "demo",
+            emb1,
+            "5",
+            "0",
+            "-999",
+            "0",
+            "filter=privacy_level<=1 AND category=\"semantic\" AND sourceType IN (\"chat\",\"note\") AND minImportance>=0.8",
+        },
+        arena,
+    );
+    try testing.expect(result == .value);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"id\":\"doc-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"id\":\"doc-2\"") == null);
+}
+
+test "mem_query: supports ts filters and rejects invalid predicates" {
+    var fx = try TestStoreFixture.init("memquery_filter_ts");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena);
+
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    _ = try runProc(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-1", "now", emb, "{\"category\":\"semantic\"}", "0" },
+        arena,
+    );
+
+    const included = try runProc(
+        &fx.store,
+        memQuery,
+        &.{ "demo", emb, "5", "0", "-999", "0", "filter=ts>=0" },
+        arena,
+    );
+    try testing.expect(included == .value);
+    try testing.expect(std.mem.indexOf(u8, included.value.?, "\"id\":\"doc-1\"") != null);
+
+    const excluded = try runProc(
+        &fx.store,
+        memQuery,
+        &.{ "demo", emb, "5", "0", "-999", "0", "filter=ts>9999999999999999" },
+        arena,
+    );
+    try testing.expect(excluded == .value);
+    try testing.expectEqualStrings("[]", excluded.value.?);
+
+    const invalid = try runProc(
+        &fx.store,
+        memQuery,
+        &.{ "demo", emb, "5", "0", "-999", "0", "filter=meta.user.name=\"x\"" },
+        arena,
+    );
+    try testing.expect(invalid == .err);
+    try testing.expect(std.mem.indexOf(u8, invalid.err, "filter") != null);
+}
+
+test "mem_query: filters HNSW refine candidates by metadata before top-k" {
+    var fx = try TestStoreFixture.init("memquery_filter_hnsw");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var registry = IndexModule.NamespaceRegistry.init(testing.allocator, .{});
+    defer registry.deinit();
+
+    _ = try runProcWithRegistry(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena, &registry);
+
+    const emb_public = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const emb_private = try packF32(arena, &[_]f32{ 0.99, 0.01, 0.0, 0.0 });
+    _ = try runProcWithRegistry(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-public", "public", emb_public, "{\"privacy_level\":1,\"category\":\"semantic\"}", "0" },
+        arena,
+        &registry,
+    );
+    _ = try runProcWithRegistry(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-private", "private", emb_private, "{\"privacy_level\":5,\"category\":\"semantic\"}", "0" },
+        arena,
+        &registry,
+    );
+
+    const result = try runProcWithRegistry(
+        &fx.store,
+        memQuery,
+        &.{ "demo", emb_private, "1", "0", "-999", "0", "filter=privacy_level<=1 AND category=\"semantic\"" },
+        arena,
+        &registry,
+    );
+    try testing.expect(result == .value);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"id\":\"doc-public\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"id\":\"doc-private\"") == null);
+}
+
+test "mem_get: enforces namespace-scoped read capability" {
+    var fx = try TestStoreFixture.init("memget_auth_scope");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "astrid", "bge-m3", "cosine" }, arena);
+    _ = try runProc(&fx.store, memInit, &.{ "raven", "bge-m3", "cosine" }, arena);
+
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    _ = try runProc(&fx.store, memAdd, &.{ "astrid", "doc-1", "allowed", emb, "{}", "0" }, arena);
+    _ = try runProc(&fx.store, memAdd, &.{ "raven", "doc-1", "denied", emb, "{}", "0" }, arena);
+
+    const caps = [_]auth.Capability{
+        .{ .op = .get, .match_type = .prefix, .pattern = "mem:astrid:" },
+        .{ .op = .get, .match_type = .prefix, .pattern = "vec:mem:astrid:" },
+        .{ .op = .get, .match_type = .prefix, .pattern = "bq:vec:mem:astrid:" },
+        .{ .op = .get, .match_type = .prefix, .pattern = "__meta:mem:astrid:" },
+    };
+    const state = auth.TokenState{
+        .subject = "mem:astrid",
+        .iat = 0,
+        .exp = 0,
+        .jti = 0,
+        .capabilities = &caps,
+    };
+
+    const allowed = try runProcWithAuth(
+        &fx.store,
+        memGet,
+        &.{ "astrid", "doc-1" },
+        arena,
+        .{ .enforce = &state },
+    );
+    try testing.expect(allowed == .value);
+
+    const denied = try runProcWithAuth(
+        &fx.store,
+        memGet,
+        &.{ "raven", "doc-1" },
+        arena,
+        .{ .enforce = &state },
+    );
+    try testing.expect(denied == .err);
+    try testing.expectEqualStrings("permission denied", denied.err);
+}
+
 test "mem_add: accepts call without embedder_id arg (backward compat)" {
     var fx = try TestStoreFixture.init("memadd_compat");
     defer fx.deinit();
@@ -1164,6 +2146,27 @@ test "mem_add: accepts call without embedder_id arg (backward compat)" {
         arena,
     );
     try testing.expect(result == .ok);
+}
+
+test "mem_init: persists and updates decay_tau_hours" {
+    var fx = try TestStoreFixture.init("meminit_decay_tau");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const init_24 = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine", "24" }, arena);
+    try testing.expect(init_24 == .ok);
+
+    const cfg_24 = (try fx.store.getValueDupe("__meta:mem:demo:config", arena)).?;
+    try testing.expectApproxEqAbs(@as(f32, 24.0), extractConfigFloat(cfg_24, "decay_tau_hours").?, 0.001);
+
+    const init_48 = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine", "48" }, arena);
+    try testing.expect(init_48 == .ok);
+
+    const cfg_48 = (try fx.store.getValueDupe("__meta:mem:demo:config", arena)).?;
+    try testing.expectApproxEqAbs(@as(f32, 48.0), extractConfigFloat(cfg_48, "decay_tau_hours").?, 0.001);
 }
 
 test "mem_add: rejects mismatched embedder_id" {
@@ -1212,6 +2215,136 @@ test "mem_add: accepts matching embedder_id" {
     try testing.expect(fx.store.get("mem:demo:doc-1") != null);
 }
 
+test "mem_meta_set: updates metadata returned by mem_get" {
+    var fx = try TestStoreFixture.init("mem_meta_set");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena);
+
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const add = try runProc(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-1", "hello", emb, "{\"recall_count\":0}", "0", "bge-m3" },
+        arena,
+    );
+    try testing.expect(add == .ok);
+
+    const update = try runProc(
+        &fx.store,
+        memMetaSet,
+        &.{ "demo", "doc-1", "{\"recall_count\":1,\"accessed_at\":42}" },
+        arena,
+    );
+    try testing.expect(update == .ok);
+
+    const got = try runProc(&fx.store, memGet, &.{ "demo", "doc-1" }, arena);
+    try testing.expect(got == .value);
+    try testing.expect(std.mem.indexOf(u8, got.value.?, "\"recall_count\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, got.value.?, "\"accessed_at\":42") != null);
+}
+
+test "mem_meta_set: rejects missing doc_id" {
+    var fx = try TestStoreFixture.init("mem_meta_set_missing");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const update = try runProc(
+        &fx.store,
+        memMetaSet,
+        &.{ "demo", "missing", "{\"recall_count\":1}" },
+        arena,
+    );
+    try testing.expect(update == .err);
+    try testing.expectEqualStrings("mem_meta_set: doc_id not found", update.err);
+    try testing.expect(fx.store.get("mem:demo:missing:meta") == null);
+}
+
+test "mem_verify: reports orphan vector ids" {
+    var fx = try TestStoreFixture.init("memverify_orphan_vec");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    try fx.store.set("mem:demo:ok", "doc", false);
+    try fx.store.set("vec:mem:demo:ok", emb, false);
+    try fx.store.set("bq:vec:mem:demo:ok", "x", false);
+    try fx.store.set("vec:mem:demo:orphan-vec", emb, false);
+
+    const result = try runProc(&fx.store, memVerify, &.{"demo"}, arena);
+    try testing.expect(result == .value);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"doc_count\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"vector_count\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"bq_count\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"hnsw_node_count\":0") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"orphan_vectors\":[") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"orphan-vec\"") != null);
+}
+
+test "mem_verify: reports orphan docs and ignores metadata sidecars" {
+    var fx = try TestStoreFixture.init("memverify_orphan_doc");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try fx.store.set("mem:demo:doc-only", "doc", false);
+    try fx.store.set("mem:demo:doc-only:meta", "{\"k\":1}", false);
+
+    const result = try runProc(&fx.store, memVerify, &.{"demo"}, arena);
+    try testing.expect(result == .value);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"doc_count\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"vector_count\":0") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"orphan_docs\":[") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"doc-only\"") != null);
+}
+
+test "mem_verify: reports vectors missing BQ entries" {
+    var fx = try TestStoreFixture.init("memverify_missing_bq");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    try fx.store.set("mem:demo:missing-bq", "doc", false);
+    try fx.store.set("vec:mem:demo:missing-bq", emb, false);
+
+    const result = try runProc(&fx.store, memVerify, &.{"demo"}, arena);
+    try testing.expect(result == .value);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"missing_bq\":[") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"missing-bq\"") != null);
+}
+
+test "mem_verify: vector-only config suppresses orphan docs" {
+    var fx = try TestStoreFixture.init("memverify_vector_only");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try fx.store.set("__meta:mem:demo:config", "{\"embedder_id\":\"bge-m3\",\"metric\":\"cosine\",\"vector_only\":true}", false);
+    try fx.store.set("mem:demo:sidecar-row", "doc", false);
+
+    const result = try runProc(&fx.store, memVerify, &.{"demo"}, arena);
+    try testing.expect(result == .value);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"doc_count\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, result.value.?, "\"orphan_docs\":[]") != null);
+}
+
 test "mem_add: invalid embedder_id arg rejected before state changes" {
     var fx = try TestStoreFixture.init("memadd_invalid");
     defer fx.deinit();
@@ -1232,6 +2365,265 @@ test "mem_add: invalid embedder_id arg rejected before state changes" {
     try testing.expect(result == .err);
     try testing.expect(fx.store.get("mem:demo:doc-1") == null);
     try testing.expect(fx.store.get("vec:mem:demo:doc-1") == null);
+}
+
+test "mem_range: returns docs in timestamp order with meta and limit" {
+    var fx = try TestStoreFixture.init("memrange_order");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try fx.store.setWithTimestamp("mem:demo:old", "old", false, 1_000);
+    try fx.store.setWithTimestamp("mem:demo:in-b", "second", false, 3_000);
+    try fx.store.setWithTimestamp("mem:demo:in-a", "first", false, 2_000);
+    try fx.store.setWithTimestamp("mem:demo:new", "new", false, 4_000);
+    try fx.store.setWithTimestamp("mem:demo:in-a:meta", "{\"kind\":\"a\"}", false, 2_100);
+
+    const limited = try runProc(
+        &fx.store,
+        memRange,
+        &.{ "demo", "1500", "3500", "1" },
+        arena,
+    );
+    try testing.expect(limited == .value);
+    try testing.expectEqualStrings(
+        "[{\"id\":\"in-a\",\"ts\":2000,\"meta\":{\"kind\":\"a\"}}]",
+        limited.value.?,
+    );
+
+    const all = try runProc(
+        &fx.store,
+        memRange,
+        &.{ "demo", "1500", "3500", "0" },
+        arena,
+    );
+    try testing.expect(all == .value);
+    try testing.expectEqualStrings(
+        "[{\"id\":\"in-a\",\"ts\":2000,\"meta\":{\"kind\":\"a\"}},{\"id\":\"in-b\",\"ts\":3000,\"meta\":null}]",
+        all.value.?,
+    );
+}
+
+test "mem_range: rejects filter until shared predicate parser lands" {
+    var fx = try TestStoreFixture.init("memrange_filter");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const result = try runProc(
+        &fx.store,
+        memRange,
+        &.{ "demo", "0", "1000", "10", "category=\"semantic\"" },
+        arena,
+    );
+    try testing.expect(result == .err);
+    try testing.expect(std.mem.indexOf(u8, result.err, "filter") != null);
+}
+
+test "mem_bulk_add: stores vectors and meta, then publishes one bulk memory event" {
+    var fx = try TestStoreFixture.init("membulk_success");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    const Capture = struct {
+        buf: []u8,
+        len: usize = 0,
+
+        fn write(raw: *anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const n = @min(self.buf.len, data.len);
+            @memcpy(self.buf[0..n], data[0..n]);
+            self.len = n;
+        }
+    };
+
+    var capture = Capture{ .buf = try testing.allocator.alloc(u8, 1024) };
+    defer testing.allocator.free(capture.buf);
+    _ = try bus.subscribe("mem:demo:added.bulk", Capture.write, @ptrCast(&capture));
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena);
+
+    const emb1 = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const emb2 = try packF32(arena, &[_]f32{ 0.0, 1.0, 0.0, 0.0 });
+    const result = try runProcWithBus(
+        &fx.store,
+        memBulkAdd,
+        &.{ "demo", "2", "doc-1", emb1, "{\"k\":1}", "doc-2", emb2, "{\"k\":2}" },
+        arena,
+        &bus,
+    );
+    try testing.expect(result == .ok);
+
+    try testing.expect(fx.store.get("vec:mem:demo:doc-1") != null);
+    try testing.expect(fx.store.get("vec:mem:demo:doc-2") != null);
+    try testing.expect(fx.store.get("bq:vec:mem:demo:doc-1") != null);
+    try testing.expect(fx.store.get("mem:demo:doc-1:meta") != null);
+    try testing.expect(fx.store.get("mem:demo:doc-1") == null);
+
+    const event = capture.buf[0..capture.len];
+    try testing.expect(std.mem.indexOf(u8, event, "mem:demo:added.bulk") != null);
+    try testing.expect(std.mem.indexOf(u8, event, "[\"doc-1\",\"doc-2\"]") != null);
+}
+
+test "mem_bulk_add: dimension mismatch rejects whole batch before writes" {
+    var fx = try TestStoreFixture.init("membulk_dim_mismatch");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena);
+
+    const emb1 = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const emb_bad = try packF32(arena, &[_]f32{ 1.0, 0.0 });
+    const result = try runProc(
+        &fx.store,
+        memBulkAdd,
+        &.{ "demo", "2", "doc-1", emb1, "{}", "doc-2", emb_bad, "{}" },
+        arena,
+    );
+    try testing.expect(result == .err);
+    try testing.expect(std.mem.indexOf(u8, result.err, "same dimension") != null);
+    try testing.expect(fx.store.get("vec:mem:demo:doc-1") == null);
+    try testing.expect(fx.store.get("mem:demo:doc-1:meta") == null);
+}
+
+test "mem_bulk_add: duplicate ids reject whole batch before writes" {
+    var fx = try TestStoreFixture.init("membulk_duplicate");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const emb1 = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const emb2 = try packF32(arena, &[_]f32{ 0.0, 1.0, 0.0, 0.0 });
+    const result = try runProc(
+        &fx.store,
+        memBulkAdd,
+        &.{ "demo", "2", "doc-1", emb1, "{}", "doc-1", emb2, "{}" },
+        arena,
+    );
+    try testing.expect(result == .err);
+    try testing.expect(std.mem.indexOf(u8, result.err, "duplicate") != null);
+    try testing.expect(fx.store.get("vec:mem:demo:doc-1") == null);
+}
+
+test "mem_init: persists vector_only and rejects mode flips" {
+    var fx = try TestStoreFixture.init("meminit_vector_only");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const init = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine", "vector_only=true" }, arena);
+    try testing.expect(init == .ok);
+
+    const cfg = (try fx.store.getValueDupe("__meta:mem:demo:config", arena)).?;
+    try testing.expect(std.mem.indexOf(u8, cfg, "\"vector_only\":true") != null);
+
+    const same = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine", "vector_only=true" }, arena);
+    try testing.expect(same == .ok);
+
+    const flip = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena);
+    try testing.expect(flip == .err);
+    try testing.expect(std.mem.indexOf(u8, flip.err, "vector_only") != null);
+}
+
+test "mem_add/query/get: vector_only namespace stores vector and meta without doc body" {
+    var fx = try TestStoreFixture.init("memadd_vector_only");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine", "vector_only=true" }, arena);
+
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const add = try runProc(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-1", emb, "{\"kind\":\"semantic\"}", "0", "bge-m3" },
+        arena,
+    );
+    try testing.expect(add == .ok);
+
+    try testing.expect(fx.store.get("mem:demo:doc-1") == null);
+    try testing.expect(fx.store.get("mem:demo:doc-1:meta") != null);
+    try testing.expect(fx.store.get("vec:mem:demo:doc-1") != null);
+    try testing.expect(fx.store.get("bq:vec:mem:demo:doc-1") != null);
+
+    const get = try runProc(&fx.store, memGet, &.{ "demo", "doc-1" }, arena);
+    try testing.expect(get == .err);
+    try testing.expect(std.mem.indexOf(u8, get.err, "vector_only") != null);
+
+    const query = try runProc(
+        &fx.store,
+        memQuery,
+        &.{ "demo", emb, "1" },
+        arena,
+    );
+    try testing.expect(query == .value);
+    try testing.expect(std.mem.indexOf(u8, query.value.?, "\"id\":\"doc-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, query.value.?, "\"meta\":{\"kind\":\"semantic\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, query.value.?, "\"doc\"") == null);
+}
+
+test "mem_add: vector_only rejects legacy doc-text shape when embedding is recognizable" {
+    var fx = try TestStoreFixture.init("memadd_vector_only_legacy_shape");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine", "vector_only=true" }, arena);
+
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const add = try runProc(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-1", "text body", emb },
+        arena,
+    );
+    try testing.expect(add == .err);
+    try testing.expect(std.mem.indexOf(u8, add.err, "no text arg") != null);
+    try testing.expect(fx.store.get("vec:mem:demo:doc-1") == null);
+}
+
+test "mem_add: default namespace still stores doc and meta" {
+    var fx = try TestStoreFixture.init("memadd_default_still_docs");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena);
+
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const add = try runProc(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-1", "hello", emb, "{\"kind\":\"semantic\"}", "0" },
+        arena,
+    );
+    try testing.expect(add == .ok);
+    try testing.expect(fx.store.get("mem:demo:doc-1") != null);
+    try testing.expect(fx.store.get("mem:demo:doc-1:meta") != null);
 }
 
 test "mem_reset_index: drops vectors, preserves docs, rewrites config" {

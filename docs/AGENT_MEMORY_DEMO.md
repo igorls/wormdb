@@ -17,11 +17,15 @@ goes through the same WAL + replication path the rest of the server uses.
 
 | Procedure          | Purpose                                                        |
 | ------------------ | -------------------------------------------------------------- |
-| `mem_init`         | Optionally pre-declare a namespace's embedder and metric       |
+| `mem_init`         | Optionally pre-declare a namespace's embedder, metric, and mode |
 | `mem_add`          | Atomic: doc + metadata + embedding + event, in one EXEC        |
+| `mem_meta_set`     | Update metadata for an existing memory without re-embedding     |
+| `mem_bulk_add`     | Backfill embeddings + metadata through one vector batch        |
 | `mem_get`          | Single-doc fetch with metadata join                            |
 | `mem_query`        | HNSW → brute-force fallback, joined with doc + metadata        |
+| `mem_range`        | Timestamp-window scan returning ids, timestamps, and metadata  |
 | `mem_stats`        | Counts, dim, HNSW state, config                                 |
+| `mem_verify`       | Drift report for docs, vectors, BQ, and HNSW                    |
 | `mem_drop`         | Scan-delete everything under a namespace (doc, meta, vec, BQ)   |
 | `mem_reset_index`  | Drop vec/BQ/HNSW for a namespace and switch its embedder id     |
 | `mem_capabilities` | Self-describing capability block for adapter discovery         |
@@ -35,7 +39,7 @@ mem:<ns>:<id>             doc body            (WORM by default)
 mem:<ns>:<id>:meta        metadata JSON       (mutable passthrough)
 vec:mem:<ns>:<id>         embedding (f32 LE)  (via applyVinsert)
 bq:vec:mem:<ns>:<id>      BQ companion        (written by applyVinsert)
-__meta:mem:<ns>:config    { embedder_id, metric, created_at }
+__meta:mem:<ns>:config    { embedder_id, metric, vector_only, created_at }
 ```
 
 Two consequences worth noticing:
@@ -44,8 +48,15 @@ Two consequences worth noticing:
   vectors without touching other `vec:*` namespaces used outside the
   memory subsystem.
 - `mem:<ns>:` covers *both* docs and `:meta` entries in a single prefix
-  scan — handy for `mem_stats` and `mem_drop`, which is why `doc_keys`
-  in the stats output is labelled as a raw count rather than "docs".
+  scan — handy for `mem_range`, `mem_stats`, and `mem_drop`, which is
+  why `doc_keys` in the stats output is labelled as a raw count rather
+  than "docs".
+
+Metadata can be updated without touching the vector. The stable low-level
+contract is a direct mutable `SET mem:<ns>:<id>:meta <json>`; the ergonomic
+stored-procedure wrapper is `EXEC mem_meta_set <ns> <id> <json>`.
+`mem_meta_set` validates that `mem:<ns>:<id>` exists, then durably writes the
+metadata key. The JSON is stored as caller-supplied bytes, matching `mem_add`.
 
 ## What counts as atomic
 
@@ -60,6 +71,12 @@ Two consequences worth noticing:
 3. **Doc body** (WORM if requested).
 4. **Metadata** (always mutable).
 5. **Publish** to `mem:<ns>:added`.
+
+`mem_bulk_add <ns> <count> [id embedding meta_json]×N` is the backfill
+variant for sidecar-style migrations. It validates the entire batch
+before writing, uses WormDB's native bulk vector path for vector/BQ/HNSW
+work, writes metadata durably, and emits one `mem:<ns>:added.bulk`
+event with the JSON id list.
 
 Steps 2–5 are not transactional. If the vector lands but the doc write
 fails (WORM violation on the doc key, say), the vector is an orphan
@@ -87,20 +104,24 @@ restarts without a format bump.
 Stored in `__meta:mem:<ns>:config` as part of a small JSON blob:
 
 ```json
-{ "embedder_id": "text-embedding-3-large", "metric": "cosine", "created_at": 1780000000 }
+{ "embedder_id": "text-embedding-3-large", "metric": "cosine", "decay_tau_hours": 168, "created_at": 1780000000 }
 ```
 
 `mem_init` writes this eagerly and is idempotent-if-matching —
-re-initing with the same embedder + metric is a no-op, a different
-embedder or metric errors. `mem_add` reads it to pick the metric for
-`applyVinsert`; if config is absent, cosine is the default.
+re-initing with the same embedder + metric + mode is a no-op, a different
+embedder, metric, or `vector_only` setting errors. `mem_add` reads it to
+pick the metric for `applyVinsert`; if config is absent, cosine is the default.
 
-The embedder-id is *not* enforced at insert time in v1. Clients that
-need strict guarantees pin the embedder by always calling `mem_init`
-before any adds. Mixing embedders with different output dimensions is
-caught by dim-freeze; mixing embedders with the same dim is a
-client-side discipline problem that `mem_stats` makes observable but
-doesn't prevent.
+Embedder enforcement is opt-in per insert: clients that need strict
+guarantees call `mem_init` before adds and pass the configured
+`embedder_id` assertion to `mem_add`. Mixing embedders with different
+output dimensions is still caught by dim-freeze; same-dimension swaps
+are caught when the caller provides that assertion.
+
+`mem_verify` goes further than `mem_stats` for reconciliation. It compares
+document, vector, and BQ IDs and returns bounded lists for `orphan_vectors`,
+`orphan_docs`, and `missing_bq`, which is the shape sidecar clients need when
+WormDB drifts from their canonical row store.
 
 ## Query path
 
@@ -108,9 +129,10 @@ doesn't prevent.
 
 - **HNSW** when the namespace has a registered index with matching metric.
   Stage-1 beam of `k × 10` → stage-2 exact refine with the query's
-  metric + optional temporal decay.
+  metric, optional metadata filter, and optional temporal decay.
 - **Brute-force** prefix scan as the fallback. Triggered on cold start
   (post-restart before `vreindex`) or when no index has been created yet.
+  Metadata filters are applied during this scan before top-K admission.
 
 Unlike general `vsearch`, `mem_query` skips the BQ prefilter. For memory
 namespaces the HNSW index is eagerly created by `mem_init`, so the only
@@ -127,17 +149,32 @@ Returned shape:
 ]
 ```
 
-Three query-time knobs:
+Vector-only namespaces use `mem_init ... vector_only=true` and the shorter
+`mem_add <ns> <id> <embedding> [meta_json] [worm] [embedder_id]` form. They
+skip document-body writes, keep vectors/BQ/metadata, return query hits without
+a `doc` field, and make `mem_get` return a clear vector-only error.
+
+Five query-time knobs:
 
 - **`lambda`** (0–1): blends raw similarity with exponential temporal
-  decay over a 1-week time constant. `lambda=0` is pure similarity,
+  decay. `lambda=0` is pure similarity,
   `lambda=1` is pure recency, in between trades off.
+- **`decay_tau_hours`**: exponential time constant. `mem_query` accepts
+  this after `snippet_chars`; if omitted, it uses the namespace config
+  from `mem_init`, then the 168-hour default.
 - **`min_score`**: filters results below a threshold.
 - **`snippet_chars`**: caps doc text returned per hit. `0` = full text,
   `-1` = omit doc entirely (useful when the caller already has it and
   only wants scores). Default 512. Matters under realistic session
   sizes where multi-KB docs would otherwise blow p95 latency on the
   enrichment path.
+- **`filter`**: server-side predicate over top-level metadata fields or
+  synthetic `ts`. Supports `=`, `<`, `<=`, `>=`, `>`, `AND`, and
+  `IN (...)`, for example:
+
+  ```text
+  filter='privacy_level<=1 AND sourceType IN ("chat","note")'
+  ```
 
 ## What the showcase validates
 
@@ -164,10 +201,12 @@ The shape of a thin adapter:
 
 ```ts
 class MemoryAdapter {
-  initialize(embedder_id, metric)        → mem_init
+  initialize(embedder_id, metric, opts)  → mem_init
   ingest(doc_id, text, embedding, meta)  → mem_add
+  ingestMany(rows)                       → mem_bulk_add
   get(doc_id)                            → mem_get
   retrieve(query_emb, k, opts)           → mem_query
+  range(since_ms, until_ms, limit)        → mem_range
   stats()                                → mem_stats
   reset()                                → mem_drop
   capabilities()                         → mem_capabilities
@@ -203,9 +242,10 @@ in the contract itself.
 ## Limitations + follow-ups
 
 - **HNSW is a derived serving index.** Snapshot v2 persists the graph,
-  tombstones, and RaBitQ params, but WAL-only changes after the most
-  recent snapshot still need `vreindex` if you want the graph fully
-  caught up after recovery.
+  tombstones, and RaBitQ params. On startup, memory namespaces are also
+  rebuilt from WAL-replayed `vec:mem:<ns>:` keys using
+  `__meta:mem:<ns>:config`, so normal `mem_add` ingest recovers without
+  a manual `vreindex`.
 - **No partial-failure rollback** in `mem_add`. Vector-first ordering
   means the common failure case (dim mismatch) fails cleanly before any
   write, but vector-lands-then-doc-fails leaves an orphan. `mem_drop`

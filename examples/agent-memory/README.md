@@ -23,6 +23,9 @@ bun run examples/agent-memory/client/query.ts "cherry blossom kyoto" --ns demo -
 # Recency-biased query (λ=0.4 leans toward newer sessions)
 bun run examples/agent-memory/client/query.ts "rust programming" --ns demo --lambda 0.4
 
+# Metadata-filtered query
+bun run examples/agent-memory/client/query.ts "travel plans" --ns demo --filter 'persona="alice" AND role IN ("user","assistant")'
+
 # Full bench: 2k synthetic docs, 200 queries, recall@10 vs brute force
 bun run examples/agent-memory/client/bench.ts --n 2000 --queries 200
 ```
@@ -34,7 +37,7 @@ bun run examples/agent-memory/client/bench.ts --n 2000 --queries 200
 | `mem_init`             | Freezes embedder id + metric on the namespace          |
 | `mem_add`              | Atomic doc + meta + vector + event in one EXEC         |
 | `mem_get`              | Single-key retrieval with meta join                    |
-| `mem_query`            | HNSW → brute-force fallback, with decay + snippet cap  |
+| `mem_query`            | HNSW → brute-force fallback, with filters, decay + snippets |
 | `mem_stats`            | Namespace size, dim, HNSW state                         |
 | `mem_drop`             | Cleanup for reset runs                                  |
 | `mem_capabilities`     | Capability block (temporal decay, metrics, etc.)        |

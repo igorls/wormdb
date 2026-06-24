@@ -53,6 +53,7 @@ export default defineConfig({
             { text: 'Stored Procedures', link: '/architecture/procedures' },
             { text: 'Vector Search', link: '/architecture/vector-search' },
             { text: 'Agent Memory', link: '/architecture/agent-memory' },
+            { text: 'Scoped Auth Tokens', link: '/AUTH_SCOPED' },
             { text: 'Pub/Sub', link: '/architecture/pubsub' },
             { text: 'Benchmarks', link: '/architecture/benchmarks' },
           ]

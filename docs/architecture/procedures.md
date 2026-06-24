@@ -76,6 +76,8 @@ All locks are automatically released when the procedure returns — you never ne
 | `ctx.randomHex(n)`     | Generate random hex string of `n` bytes         |
 | `ctx.timestamp()`      | Current server timestamp in milliseconds        |
 | `ctx.identity()`       | Authenticated SCT subject, if present           |
+| `ctx.permits(op, target)` | Check the caller's SCT capability, or true for trusted/internal callers |
+| `ctx.requireNamespace(ns, access)` | Enforce scoped memory namespace access (`read`, `write`, `delete`) |
 | `ctx.publish(c, msg)`  | Best-effort pub/sub event from inside a procedure |
 
 ::: warning
@@ -93,7 +95,8 @@ The registry currently includes several procedure families:
 | Atomic KV | `increment`, `transfer`, `kv_put`, `kv_get`, `kv_stats`, `scan` |
 | Collaboration demos | `chat_send`, `chat_history` |
 | Vector search | `vinsert`, `vsearch`, `vsim`, `vstats`, `vreindex`, `vrabitq`, `vdelete`, `vnsdrop` |
-| Agent memory | `mem_init`, `mem_add`, `mem_get`, `mem_query`, `mem_stats`, `mem_drop`, `mem_reset_index`, `mem_capabilities` |
+| Agent memory | `mem_init`, `mem_add`, `mem_meta_set`, `mem_bulk_add`, `mem_get`, `mem_query`, `mem_range`, `mem_stats`, `mem_verify`, `mem_drop`, `mem_reset_index`, `mem_capabilities` |
+| Auth | `auth_mint_scoped` |
 | Light-API | `lightapi_*` procedures served through the gateway's HTTP and JSON-RPC routes |
 
 ### `increment`

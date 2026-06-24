@@ -13,6 +13,8 @@ export type Capabilities = {
   version: string;
   retrieval_unit: "chunk" | "turn" | "session";
   temporal_decay: boolean;
+  bulk_add?: boolean;
+  vector_only?: boolean;
   verbatim: boolean;
   local: boolean;
   structured_facts: boolean;
@@ -42,6 +44,7 @@ export type NamespaceStats = {
   config: null | {
     embedder_id: string;
     metric: Metric;
+    vector_only?: boolean;
     created_at: number;
   };
   hnsw?: {
@@ -63,12 +66,24 @@ export type DropResult = {
 export type AddOptions = {
   meta?: unknown;
   worm?: boolean;
+  embedderId?: string;
+};
+
+export type InitOptions = {
+  vectorOnly?: boolean;
+};
+
+export type BulkAddRow = {
+  id: string;
+  embedding: Uint8Array;
+  meta?: unknown;
 };
 
 export type QueryOptions = {
   lambda?: number;
   minScore?: number;
   snippetChars?: number;
+  filter?: string;
 };
 
 export class MemError extends Error {
@@ -117,11 +132,15 @@ export class MemClient {
     return JSON.parse(unwrapValue(resp as WormResp, "mem_capabilities"));
   }
 
-  async init(ns: string, embedderId: string, metric: Metric = "cosine"): Promise<void> {
+  async init(ns: string, embedderId: string, metric: Metric = "cosine", options: InitOptions = {}): Promise<void> {
+    const args = [ns, embedderId, metric];
+    if (options.vectorOnly !== undefined) {
+      args.push(options.vectorOnly ? "vector_only=true" : "vector_only=false");
+    }
     const resp = await this.wire.sendCommand({
       kind: "EXEC",
       procedure: "mem_init",
-      args: [ns, embedderId, metric],
+      args,
     });
     unwrapOk(resp as WormResp, "mem_init");
   }
@@ -136,13 +155,18 @@ export class MemClient {
     const args: (string | Uint8Array)[] = [ns, docId, text, embedding];
     if (options.meta !== undefined) {
       args.push(JSON.stringify(options.meta));
-    } else if (options.worm !== undefined) {
+    } else if (options.worm !== undefined || options.embedderId !== undefined) {
       // Meta is positional before worm — push an empty placeholder if
-      // the caller wants to set worm without meta.
+      // the caller wants to set worm/embedder without meta.
       args.push("");
     }
     if (options.worm !== undefined) {
       args.push(options.worm ? "1" : "0");
+    } else if (options.embedderId !== undefined) {
+      args.push("1");
+    }
+    if (options.embedderId !== undefined) {
+      args.push(options.embedderId);
     }
     const resp = await this.wire.sendCommand({
       kind: "EXEC",
@@ -150,6 +174,47 @@ export class MemClient {
       args,
     });
     unwrapOk(resp as WormResp, "mem_add");
+  }
+
+  async addVectorOnly(
+    ns: string,
+    docId: string,
+    embedding: Uint8Array,
+    options: AddOptions = {},
+  ): Promise<void> {
+    const args: (string | Uint8Array)[] = [ns, docId, embedding];
+    if (options.meta !== undefined) {
+      args.push(JSON.stringify(options.meta));
+    } else if (options.worm !== undefined || options.embedderId !== undefined) {
+      args.push("");
+    }
+    if (options.worm !== undefined) {
+      args.push(options.worm ? "1" : "0");
+    } else if (options.embedderId !== undefined) {
+      args.push("1");
+    }
+    if (options.embedderId !== undefined) {
+      args.push(options.embedderId);
+    }
+    const resp = await this.wire.sendCommand({
+      kind: "EXEC",
+      procedure: "mem_add",
+      args,
+    });
+    unwrapOk(resp as WormResp, "mem_add");
+  }
+
+  async bulkAdd(ns: string, rows: BulkAddRow[]): Promise<void> {
+    const args: (string | Uint8Array)[] = [ns, String(rows.length)];
+    for (const row of rows) {
+      args.push(row.id, row.embedding, row.meta === undefined ? "" : JSON.stringify(row.meta));
+    }
+    const resp = await this.wire.sendCommand({
+      kind: "EXEC",
+      procedure: "mem_bulk_add",
+      args,
+    });
+    unwrapOk(resp as WormResp, "mem_bulk_add");
   }
 
   async get(ns: string, docId: string): Promise<DocRecord> {
@@ -168,22 +233,27 @@ export class MemClient {
     options: QueryOptions = {},
   ): Promise<QueryHit[]> {
     const args: (string | Uint8Array)[] = [ns, embedding, String(k)];
-    // Positional: lambda, min_score, snippet_chars — push placeholders
+    // Positional: lambda, min_score, snippet_chars, filter — push placeholders
     // only as far as the trailing set requires.
     const lambdaSet = options.lambda !== undefined;
     const minSet = options.minScore !== undefined;
     const snipSet = options.snippetChars !== undefined;
+    const filterSet = options.filter !== undefined && options.filter.trim().length > 0;
 
-    if (lambdaSet || minSet || snipSet) {
+    if (lambdaSet || minSet || snipSet || filterSet) {
       args.push(options.lambda !== undefined ? String(options.lambda) : "0");
     }
-    if (minSet || snipSet) {
+    if (minSet || snipSet || filterSet) {
       // Empty string placeholder → server parseFloat fails → falls back
       // to -inf (no filter). Avoids arguing about JS's `-Infinity` text form.
       args.push(options.minScore !== undefined ? String(options.minScore) : "");
     }
-    if (snipSet) {
-      args.push(String(options.snippetChars));
+    if (snipSet || filterSet) {
+      args.push(options.snippetChars !== undefined ? String(options.snippetChars) : "");
+    }
+    if (filterSet) {
+      const filter = options.filter!.trim();
+      args.push(/^filter=/i.test(filter) ? filter : `filter=${filter}`);
     }
     const resp = await this.wire.sendCommand({
       kind: "EXEC",

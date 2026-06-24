@@ -66,6 +66,7 @@ const PROCEDURES = [_]Entry{
     .{ .name = "mem_add", .func = memory.memAdd },
     .{ .name = "mem_get", .func = memory.memGet },
     .{ .name = "mem_query", .func = memory.memQuery },
+    .{ .name = "mem_range", .func = memory.memRange },
     .{ .name = "mem_stats", .func = memory.memStats },
     .{ .name = "mem_drop", .func = memory.memDrop },
     .{ .name = "mem_reset_index", .func = memory.memResetIndex },

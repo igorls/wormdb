@@ -12,6 +12,7 @@ For the end-to-end demo notes, see [Agent Memory Demo](/AGENT_MEMORY_DEMO).
 | `mem_add <ns> <doc_id> <text> <embedding> [meta_json] [worm] [embedder_id]` | Add one memory chunk plus embedding |
 | `mem_get <ns> <doc_id>` | Fetch document text joined with metadata |
 | `mem_query <ns> <embedding> <k> [lambda] [min_score] [snippet_chars]` | Search and return enriched memories |
+| `mem_range <ns> <since_ms> <until_ms> [limit] [filter]` | Scan memories by document timestamp |
 | `mem_stats <ns>` | Return count, dimension, HNSW, and config state |
 | `mem_drop <ns>` | Delete memory namespace data |
 | `mem_reset_index <ns> <new_embedder_id>` | Drop vector/BQ/HNSW state while preserving document bodies |
@@ -46,6 +47,8 @@ bun run apps/bun/src/bin/client.ts EXEC mem_reset_index notes openai/text-embedd
 `mem_query` uses HNSW when the memory namespace has an index and falls back to brute-force when the index is absent. It intentionally skips the general BQ prefilter because `mem_init` eagerly prepares HNSW and the memory query result must be joined with document text and metadata.
 
 The optional `lambda` argument applies temporal decay with the same one-week time constant used by vector search. `min_score` filters weak matches, and `snippet_chars` controls how much document text is returned per hit.
+
+`mem_range` is a timestamp-window workaround for timeline views. It scans `mem:<ns>:` document keys, skips `:meta` companions, sorts by document timestamp ascending, and returns `[{id, ts, meta}]`. `limit` defaults to 100; `0` means no response cap. The optional filter slot is reserved for the shared predicate parser tracked in #2.
 
 ## Events
 

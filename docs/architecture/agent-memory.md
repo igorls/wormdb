@@ -17,6 +17,7 @@ For the end-to-end demo notes, see [Agent Memory Demo](/AGENT_MEMORY_DEMO).
 | `mem_query <ns> <embedding> <k> [lambda] [min_score] [snippet_chars] [decay_tau_hours] [filter]` | Search and return enriched memories |
 | `mem_range <ns> <since_ms> <until_ms> [limit] [filter]` | Scan memories by document timestamp |
 | `mem_stats <ns>` | Return count, dimension, HNSW, and config state |
+| `mem_health <ns>` | Return vector-index catch-up status for restart/recovery probes |
 | `mem_verify <ns>` | Report structural drift between docs, vectors, BQ, and HNSW |
 | `mem_drop <ns>` | Delete memory namespace data |
 | `mem_reset_index <ns> <new_embedder_id>` | Drop vector/BQ/HNSW state while preserving document bodies |
@@ -71,6 +72,8 @@ document, vector, BQ, and HNSW counts plus bounded `orphan_vectors`,
 from their canonical row store or run `mem_reset_index`.
 
 `mem_range` is a timestamp-window workaround for timeline views. It scans `mem:<ns>:` document keys, skips `:meta` companions, sorts by document timestamp ascending, and returns `[{id, ts, meta}]`. `limit` defaults to 100; `0` means no response cap. The optional `filter` argument uses the same predicate grammar as `mem_query` and is applied before the response limit.
+
+`mem_health` is a lightweight readiness probe for vector recovery. It compares durable `vec:mem:<ns>:` rows with the live HNSW index and BQ companion count, returning `index_caught_up`, `pending_vectors`, `vector_count`, `bq_count`, and HNSW counters. Use it after restart before routing latency-sensitive `mem_query` traffic to a namespace.
 
 `filter` narrows candidates before top-K admission. It applies during brute-force scan and during HNSW stage-2 exact refine. The predicate grammar is intentionally small: `=`, `<`, `<=`, `>=`, `>`, `AND`, and `IN (...)` over string or numeric literals. Fields are top-level metadata keys, `meta.<field>` aliases, or the synthetic `ts` field.
 

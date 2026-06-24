@@ -12,6 +12,14 @@ proof:append-log:v1:<sha256(log_id) hex>:event:<8B seq BE>
 
 The binary big-endian sequence suffix keeps prefix scans sorted by sequence. Sequence reuse is prevented by the WORM key write: two appenders racing for the same next sequence cannot both commit.
 
+Each successful append also stores a WORM accumulator-state record:
+
+```text
+proof:append-log-mmr-state:v1:<sha256(log_id) hex>:state:<8B seq BE>
+```
+
+The state value contains the log id, last sequence, head event hash, `mmr_sha256_v1` root, and canonical MMR peaks for that sequence. Appends load the latest state by prefix tail scan and update the MMR root incrementally. If the state is absent or stale, WormDB falls back to a full WORM-chain verification and state rebuild before writing the next event.
+
 ## Procedure Surface
 
 Append a canonical event envelope to a named log:
@@ -23,7 +31,7 @@ bun run apps/bun/src/bin/client.ts EXEC append_log_append <log_id> <payload> [ts
 `ts=<ms>` is optional; when omitted WormDB records the current local receipt timestamp. Each attachment hash is a 64-character hex SHA-256 digest. The response is JSON:
 
 ```json
-{"seq":1,"ingest_time_ms":1700000000000,"key_hex":"...","prev_event_hash":"...","payload_hash":"...","event_hash":"..."}
+{"seq":1,"ingest_time_ms":1700000000000,"key_hex":"...","prev_event_hash":"...","payload_hash":"...","event_hash":"...","accumulator_kind":"mmr_sha256_v1","accumulator_root":"...","accumulator_leaf_count":1}
 ```
 
 Verify the stored chain for a log:
@@ -56,7 +64,7 @@ Verify proof bytes directly:
 bun run apps/bun/src/bin/client.ts EXEC append_log_mmr_verify <record_hash_hex> <root_hex> <proof_hex>
 ```
 
-The response is `{"valid":true}` or `{"valid":false}`. This procedure uses the canonical `mmr_sha256_v1` proof-byte format from [Verifiable Proof Bundles](/protocol/proofs). Current MMR proof generation rebuilds the accumulator from stored append-log envelopes on demand; durable root/checkpoint persistence is covered by the checkpoint/proof-bundle layer.
+The response is `{"valid":true}` or `{"valid":false}`. This procedure uses the canonical `mmr_sha256_v1` proof-byte format from [Verifiable Proof Bundles](/protocol/proofs). Appends persist the latest MMR root and peaks incrementally; proof generation still rebuilds path nodes from stored append-log envelopes when serving an inclusion proof.
 
 Create and store a signed checkpoint record:
 

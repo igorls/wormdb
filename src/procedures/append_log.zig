@@ -546,7 +546,11 @@ fn appendResultJson(allocator: std.mem.Allocator, result: append_log.AppendResul
     try appendHashHex(&json, allocator, result.payload_hash);
     try json.appendSlice(allocator, "\",\"event_hash\":\"");
     try appendHashHex(&json, allocator, result.event_hash);
-    try json.appendSlice(allocator, "\"}");
+    try json.appendSlice(allocator, "\",\"accumulator_kind\":\"mmr_sha256_v1\",\"accumulator_root\":\"");
+    try appendHashHex(&json, allocator, result.accumulator_root);
+    try json.appendSlice(allocator, "\",\"accumulator_leaf_count\":");
+    try appendU64(&json, allocator, result.accumulator_leaf_count);
+    try json.appendSlice(allocator, "}");
     return json.toOwnedSlice(allocator);
 }
 

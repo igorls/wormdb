@@ -100,7 +100,7 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
                 const s = cluster.status();
                 const payload = try std.fmt.allocPrint(
                     ctx.allocator,
-                    "keys={d}\nwal_size={d}\ncluster_nodes={d}\ncluster_alive={d}\ncluster_suspected={d}\ncluster_dead={d}\nreplication_factor={d}\n",
+                    "keys={d}\nwal_size={d}\ncluster_nodes={d}\ncluster_alive={d}\ncluster_suspected={d}\ncluster_dead={d}\nreplication_factor={d}\nproof_checkpoint_records={d}\nproof_witness_records={d}\nproof_last_verified_ms={d}\nanti_entropy_mode={s}\n",
                     .{
                         key_count,
                         wal_size,
@@ -109,6 +109,10 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
                         s.suspected_nodes,
                         s.dead_nodes,
                         s.replication_factor,
+                        s.proof_checkpoint_records,
+                        s.proof_witness_records,
+                        s.proof_last_verified_ms,
+                        s.anti_entropy_mode,
                     },
                 );
                 break :blk Response{ .value = payload };
@@ -126,13 +130,17 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
                 const s = cluster.status();
                 const payload = try std.fmt.allocPrint(
                     ctx.allocator,
-                    "cluster_enabled=1\ncluster_nodes={d}\ncluster_alive={d}\ncluster_suspected={d}\ncluster_dead={d}\nreplication_factor={d}\n",
+                    "cluster_enabled=1\ncluster_nodes={d}\ncluster_alive={d}\ncluster_suspected={d}\ncluster_dead={d}\nreplication_factor={d}\nproof_checkpoint_records={d}\nproof_witness_records={d}\nproof_last_verified_ms={d}\nanti_entropy_mode={s}\n",
                     .{
                         s.total_nodes,
                         s.alive_nodes,
                         s.suspected_nodes,
                         s.dead_nodes,
                         s.replication_factor,
+                        s.proof_checkpoint_records,
+                        s.proof_witness_records,
+                        s.proof_last_verified_ms,
+                        s.anti_entropy_mode,
                     },
                 );
                 break :blk Response{ .value = payload };
@@ -140,7 +148,7 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
 
             const payload = try ctx.allocator.dupe(
                 u8,
-                "cluster_enabled=0\ncluster_nodes=0\ncluster_alive=0\ncluster_suspected=0\ncluster_dead=0\n",
+                "cluster_enabled=0\ncluster_nodes=0\ncluster_alive=0\ncluster_suspected=0\ncluster_dead=0\nproof_checkpoint_records=0\nproof_witness_records=0\nproof_last_verified_ms=0\nanti_entropy_mode=disabled\n",
             );
             break :blk Response{ .value = payload };
         },

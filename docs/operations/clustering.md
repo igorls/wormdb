@@ -40,6 +40,10 @@ cluster_alive=3
 cluster_suspected=0
 cluster_dead=0
 replication_factor=0
+proof_checkpoint_records=0
+proof_witness_records=0
+proof_last_verified_ms=0
+anti_entropy_mode=full
 ```
 
 For detailed per-peer information:
@@ -56,11 +60,17 @@ mesh_ip=10.0.0.2
 state=alive
 gossip_endpoint=10.0.0.2:51821
 wormwire=connected
+root_sync=unknown
+root_sync_last_ms=0
+root_sync_missing_ranges=0
 ---
 mesh_ip=10.0.0.3
 state=alive
 gossip_endpoint=10.0.0.3:51821
 wormwire=connected
+root_sync=unknown
+root_sync_last_ms=0
+root_sync_missing_ranges=0
 ```
 
 ## How Replication Works

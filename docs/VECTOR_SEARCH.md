@@ -59,7 +59,7 @@ EXEC vinsert doc-001 <f32_bytes>
 EXEC vinsert doc-002 <f32_bytes> 1 vec:articles:
 
 # Semantic search with temporal recency bias
-EXEC vsearch query-vec 10 vec: cosine 0.3
+EXEC vsearch query-vec 10 vec: cosine 0.3 auto 168
 
 # Compare two vectors directly
 EXEC vsim vec:doc-001 vec:doc-002 cosine

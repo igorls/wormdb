@@ -30,7 +30,7 @@ The server treats vector payloads as raw bytes and interprets them as `f32` valu
 
 ```text
 EXEC vinsert <key> <vector_bytes> [<worm>] [<namespace>] [<metric>]
-EXEC vsearch <query_key> <top_k> [<namespace>] [<metric>] [<decay>] [<mode>]
+EXEC vsearch <query_key> <top_k> [<namespace>] [<metric>] [<decay>] [<mode>] [<decay_tau_hours>]
 EXEC vsim <key_a> <key_b> [<metric>]
 EXEC vstats [<namespace>]
 EXEC vreindex [<namespace>] [<metric>]
@@ -45,7 +45,7 @@ EXEC vnsdrop <namespace> [<purge>]
 2. RaBitQ/BQ prefilter when quantized companions are present and the requested mode supports it.
 3. Brute-force exact scan as the fallback and when `mode=exact`.
 
-The optional decay argument is a weight in `[0, 1]` that blends similarity with recency using a one-week time constant. Explicit modes are `auto`, `exact`, `bq`, and `bq_rerank`. RaBitQ-estimator dispatch is wired for `l2` and `cosine`; `dot` queries fall back to the exact scan when RaBitQ params are installed.
+The optional decay argument is a weight in `[0, 1]` that blends similarity with recency; `decay_tau_hours` controls the exponential time constant and defaults to 168. Explicit modes are `auto`, `exact`, `bq`, and `bq_rerank`. RaBitQ-estimator dispatch is wired for `l2` and `cosine`; `dot` queries fall back to the exact scan when RaBitQ params are installed.
 
 ## Native Wire Commands
 

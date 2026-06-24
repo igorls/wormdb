@@ -14,10 +14,10 @@
 //!   __meta:mem:<ns>:config    {"embedder_id":"...","metric":"...","created_at":N}
 //!
 //! ── Procedure surface ───────────────────────────────────────────────
-//!   mem_init         <ns> <embedder_id> <metric>
+//!   mem_init         <ns> <embedder_id> <metric> [<decay_tau_hours>]
 //!   mem_add          <ns> <doc_id> <text> <embedding> [<meta_json>] [<worm>] [<embedder_id>]
 //!   mem_get          <ns> <doc_id>
-//!   mem_query        <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>]
+//!   mem_query        <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>] [<decay_tau_hours>]
 //!   mem_stats        <ns>
 //!   mem_drop         <ns>
 //!   mem_reset_index  <ns> <new_embedder_id>
@@ -60,7 +60,7 @@ const MAX_DOC_ID_LEN: usize = 256;
 const MAX_EMBEDDER_ID_LEN: usize = 128;
 const MAX_TOP_K: usize = 100;
 const DEFAULT_SNIPPET_CHARS: i64 = 512;
-const DECAY_TIME_CONSTANT_HOURS: f32 = 168.0;
+const DEFAULT_DECAY_TAU_HOURS: f32 = 168.0;
 const HNSW_EF_SEARCH_FACTOR: usize = 10;
 
 // ╔═══════════════════════════════════════════════════╗
@@ -149,15 +149,33 @@ fn extractConfigField(json: []const u8, field: []const u8) ?[]const u8 {
     return tail[0..end];
 }
 
+fn extractConfigFloat(json: []const u8, field: []const u8) ?f32 {
+    var needle_buf: [96]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\":", .{field}) catch return null;
+    const start = std.mem.indexOf(u8, json, needle) orelse return null;
+    const value_start = start + needle.len;
+    const tail = json[value_start..];
+    var end: usize = 0;
+    while (end < tail.len and tail[end] != ',' and tail[end] != '}') : (end += 1) {}
+    if (end == 0) return null;
+    return std.fmt.parseFloat(f32, tail[0..end]) catch null;
+}
+
+fn parseDecayTauHours(raw: []const u8) ?f32 {
+    const tau = std.fmt.parseFloat(f32, raw) catch return null;
+    if (!std.math.isFinite(tau) or tau <= 0.0) return null;
+    return tau;
+}
+
 // ╔═══════════════════════════════════════════════════╗
 // ║  Distance + decay shared with vsearch              ║
 // ╚═══════════════════════════════════════════════════╝
 
-inline fn applyDecay(raw_sim: f32, timestamp: u64, decay: f32, now_ms: u64) f32 {
+inline fn applyDecay(raw_sim: f32, timestamp: u64, decay: f32, now_ms: u64, decay_tau_hours: f32) f32 {
     if (decay <= 0.0) return raw_sim;
     const age_ms = if (now_ms > timestamp) now_ms - timestamp else 0;
     const age_hours: f32 = @as(f32, @floatFromInt(age_ms)) / 3_600_000.0;
-    const recency = @exp(-age_hours / DECAY_TIME_CONSTANT_HOURS);
+    const recency = @exp(-age_hours / decay_tau_hours);
     return (1.0 - decay) * raw_sim + decay * recency;
 }
 
@@ -195,11 +213,11 @@ pub fn memCapabilities(ctx: *Ctx) anyerror!Ctx.Result {
 
 pub fn memInit(ctx: *Ctx) anyerror!Ctx.Result {
     const ns = ctx.arg(0) orelse
-        return ctx.err("mem_init requires: <ns> <embedder_id> <metric>");
+        return ctx.err("mem_init requires: <ns> <embedder_id> <metric> [<decay_tau_hours>]");
     const embedder_id = ctx.arg(1) orelse
-        return ctx.err("mem_init requires: <ns> <embedder_id> <metric>");
+        return ctx.err("mem_init requires: <ns> <embedder_id> <metric> [<decay_tau_hours>]");
     const metric_str = ctx.arg(2) orelse
-        return ctx.err("mem_init requires: <ns> <embedder_id> <metric>");
+        return ctx.err("mem_init requires: <ns> <embedder_id> <metric> [<decay_tau_hours>]");
 
     if (!validateNs(ns))
         return ctx.err("mem_init: ns must be 1..64 bytes, chars in [A-Za-z0-9._/-]");
@@ -207,6 +225,11 @@ pub fn memInit(ctx: *Ctx) anyerror!Ctx.Result {
         return ctx.err("mem_init: embedder_id must be 1..128 bytes, chars in [A-Za-z0-9._/-]");
     const metric = Metric.fromStr(metric_str) orelse
         return ctx.err("mem_init: unknown metric (cosine|dot|l2)");
+    const decay_tau_arg = ctx.arg(3);
+    const decay_tau_hours = if (decay_tau_arg) |raw|
+        parseDecayTauHours(raw) orelse return ctx.err("mem_init: decay_tau_hours must be positive")
+    else
+        DEFAULT_DECAY_TAU_HOURS;
 
     const config_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
     defer ctx.allocator.free(config_key);
@@ -223,7 +246,9 @@ pub fn memInit(ctx: *Ctx) anyerror!Ctx.Result {
             return ctx.err("mem_init: embedder_id differs from existing namespace config");
         if (!std.mem.eql(u8, cfg_metric, metric.name()))
             return ctx.err("mem_init: metric differs from existing namespace config");
-        return ctx.ok();
+        if (decay_tau_arg == null) return ctx.ok();
+        const cfg_tau = extractConfigFloat(cfg, "decay_tau_hours") orelse DEFAULT_DECAY_TAU_HOURS;
+        if (@abs(cfg_tau - decay_tau_hours) < 0.0001) return ctx.ok();
     }
 
     // ── Freeze the vector namespace with the declared metric ────
@@ -245,7 +270,11 @@ pub fn memInit(ctx: *Ctx) anyerror!Ctx.Result {
     try cfg.appendSlice(ctx.allocator, embedder_id);
     try cfg.appendSlice(ctx.allocator, "\",\"metric\":\"");
     try cfg.appendSlice(ctx.allocator, metric.name());
-    try cfg.appendSlice(ctx.allocator, "\",\"created_at\":");
+    try cfg.appendSlice(ctx.allocator, "\",\"decay_tau_hours\":");
+    var tau_buf: [32]u8 = undefined;
+    const tau_str = std.fmt.bufPrint(&tau_buf, "{d}", .{decay_tau_hours}) catch "168";
+    try cfg.appendSlice(ctx.allocator, tau_str);
+    try cfg.appendSlice(ctx.allocator, ",\"created_at\":");
     try writeU64(&cfg, ctx.allocator, ctx.timestamp());
     try cfg.append(ctx.allocator, '}');
 
@@ -445,6 +474,7 @@ const BruteScanCtx = struct {
     query_vec: []align(1) const f32,
     metric: Metric,
     decay: f32,
+    decay_tau_hours: f32,
     now_ms: u64,
     heap: *TopKCandidate,
     allocator: std.mem.Allocator,
@@ -464,7 +494,7 @@ fn onBruteMatch(
     if (vec.len != sc.query_vec.len) return .cont;
 
     const raw_sim = computeExactSim(sc.metric, sc.query_vec, vec);
-    const score = applyDecay(raw_sim, timestamp, sc.decay, sc.now_ms);
+    const score = applyDecay(raw_sim, timestamp, sc.decay, sc.now_ms, sc.decay_tau_hours);
 
     if (score <= sc.heap.thresholdScore()) return .cont;
 
@@ -487,6 +517,7 @@ fn runHnswDispatch(
     top_k: usize,
     metric: Metric,
     decay: f32,
+    decay_tau_hours: f32,
     now_ms: u64,
     heap: *TopKCandidate,
 ) !bool {
@@ -521,7 +552,7 @@ fn runHnswDispatch(
         if (vec.len != query_vec.len) continue;
 
         const raw_sim = computeExactSim(metric, query_vec, vec);
-        const score = applyDecay(raw_sim, stage1_ts[i], decay, now_ms);
+        const score = applyDecay(raw_sim, stage1_ts[i], decay, now_ms, decay_tau_hours);
         heap.push(.{ .key = stage1_keys[i], .score = score, .timestamp = stage1_ts[i] });
     }
 
@@ -530,9 +561,9 @@ fn runHnswDispatch(
 
 pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
     const ns = ctx.arg(0) orelse
-        return ctx.err("mem_query requires: <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>]");
+        return ctx.err("mem_query requires: <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>] [<decay_tau_hours>]");
     const embedding = ctx.arg(1) orelse
-        return ctx.err("mem_query requires: <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>]");
+        return ctx.err("mem_query requires: <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>] [<decay_tau_hours>]");
     const top_k_raw = ctx.argInt(usize, 2) orelse
         return ctx.err("mem_query: k must be a positive integer");
 
@@ -560,14 +591,25 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
     const query_vec = distance.bytesToF32(embedding) orelse
         return ctx.err("mem_query: embedding must be non-empty f32 bytes (len multiple of 4)");
 
+    const cfg_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
+    defer ctx.allocator.free(cfg_key);
+    const cfg_bytes = try ctx.getCopy(cfg_key);
+
     // Resolve metric: config metric wins; default cosine.
     const metric: Metric = blk: {
-        const cfg_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
-        defer ctx.allocator.free(cfg_key);
-        const cfg = (try ctx.getCopy(cfg_key)) orelse break :blk .cosine;
+        const cfg = cfg_bytes orelse break :blk .cosine;
         const m_str = extractConfigField(cfg, "metric") orelse break :blk .cosine;
         break :blk Metric.fromStr(m_str) orelse .cosine;
     };
+
+    const configured_decay_tau_hours: f32 = blk: {
+        const cfg = cfg_bytes orelse break :blk DEFAULT_DECAY_TAU_HOURS;
+        break :blk extractConfigFloat(cfg, "decay_tau_hours") orelse DEFAULT_DECAY_TAU_HOURS;
+    };
+    const decay_tau_hours = if (ctx.arg(6)) |raw|
+        parseDecayTauHours(raw) orelse return ctx.err("mem_query: decay_tau_hours must be positive")
+    else
+        configured_decay_tau_hours;
 
     const vec_namespace = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
     defer ctx.allocator.free(vec_namespace);
@@ -589,6 +631,7 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
                     top_k,
                     metric,
                     decay,
+                    decay_tau_hours,
                     now_ms,
                     &final_heap,
                 );
@@ -604,6 +647,7 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
             .query_vec = query_vec,
             .metric = metric,
             .decay = decay,
+            .decay_tau_hours = decay_tau_hours,
             .now_ms = now_ms,
             .heap = &final_heap,
             .allocator = ctx.allocator,
@@ -1038,6 +1082,12 @@ test "extractConfigField pulls string field from our own JSON layout" {
     try testing.expect(extractConfigField(cfg, "missing") == null);
 }
 
+test "extractConfigFloat pulls numeric field from our own JSON layout" {
+    const cfg = "{\"embedder_id\":\"bge-m3\",\"metric\":\"cosine\",\"decay_tau_hours\":24,\"created_at\":12345}";
+    try testing.expectApproxEqAbs(@as(f32, 24.0), extractConfigFloat(cfg, "decay_tau_hours").?, 0.001);
+    try testing.expect(extractConfigFloat(cfg, "missing") == null);
+}
+
 test "appendJsonEscaped handles quotes, backslashes, and control chars" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(testing.allocator);
@@ -1046,24 +1096,35 @@ test "appendJsonEscaped handles quotes, backslashes, and control chars" {
 }
 
 test "applyDecay: lambda=0 is a no-op" {
-    const s = applyDecay(0.8, 1000, 0.0, 2000);
+    const s = applyDecay(0.8, 1000, 0.0, 2000, DEFAULT_DECAY_TAU_HOURS);
     try testing.expectApproxEqAbs(@as(f32, 0.8), s, 1e-6);
 }
 
 test "applyDecay: lambda=1 returns pure recency in [0,1]" {
     const now: u64 = 10_000_000_000; // ~116 days in ms
     const ts: u64 = now; // zero age
-    const s = applyDecay(0.5, ts, 1.0, now);
+    const s = applyDecay(0.5, ts, 1.0, now, DEFAULT_DECAY_TAU_HOURS);
     try testing.expectApproxEqAbs(@as(f32, 1.0), s, 1e-6);
 
     // 116 days at a 1-week time constant → exp(-~16.5) ≈ 7e-8 ≪ 0.01
-    const s_old = applyDecay(0.5, 0, 1.0, now);
+    const s_old = applyDecay(0.5, 0, 1.0, now, DEFAULT_DECAY_TAU_HOURS);
     try testing.expect(s_old < 0.01);
 
     // One time-constant (168 h) → exp(-1) ≈ 0.368
     const one_tau_ms: u64 = 168 * 3_600_000;
-    const s_tau = applyDecay(0.5, 0, 1.0, one_tau_ms);
+    const s_tau = applyDecay(0.5, 0, 1.0, one_tau_ms, DEFAULT_DECAY_TAU_HOURS);
     try testing.expectApproxEqAbs(@as(f32, 0.3679), s_tau, 0.001);
+}
+
+test "applyDecay: configurable tau controls old-memory decay" {
+    const now: u64 = 48 * 3_600_000;
+    const old_ts: u64 = 0;
+
+    const tau_24h = applyDecay(0.5, old_ts, 1.0, now, 24.0);
+    const tau_1y = applyDecay(0.5, old_ts, 1.0, now, 8760.0);
+
+    try testing.expect(tau_24h < 0.14);
+    try testing.expect(tau_1y > 0.99);
 }
 
 // ╔═══════════════════════════════════════════════════╗
@@ -1164,6 +1225,27 @@ test "mem_add: accepts call without embedder_id arg (backward compat)" {
         arena,
     );
     try testing.expect(result == .ok);
+}
+
+test "mem_init: persists and updates decay_tau_hours" {
+    var fx = try TestStoreFixture.init("meminit_decay_tau");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const init_24 = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine", "24" }, arena);
+    try testing.expect(init_24 == .ok);
+
+    const cfg_24 = (try fx.store.getValueDupe("__meta:mem:demo:config", arena)).?;
+    try testing.expectApproxEqAbs(@as(f32, 24.0), extractConfigFloat(cfg_24, "decay_tau_hours").?, 0.001);
+
+    const init_48 = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine", "48" }, arena);
+    try testing.expect(init_48 == .ok);
+
+    const cfg_48 = (try fx.store.getValueDupe("__meta:mem:demo:config", arena)).?;
+    try testing.expectApproxEqAbs(@as(f32, 48.0), extractConfigFloat(cfg_48, "decay_tau_hours").?, 0.001);
 }
 
 test "mem_add: rejects mismatched embedder_id" {

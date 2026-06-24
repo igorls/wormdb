@@ -192,6 +192,8 @@ pub const StoreError = error{
 pub const WalRecordType = enum(u8) {
     set = 0x01,
     delete = 0x02,
+    vinsert = 0x03,
+    vdelete = 0x04,
 };
 
 test {

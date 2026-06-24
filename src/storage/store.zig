@@ -511,6 +511,40 @@ pub const Store = struct {
         shard.mutex.lock();
     }
 
+    /// Append a vector-insert metadata record to the WAL. The vector bytes
+    /// themselves are already durable through the normal SET record for `key`;
+    /// this record carries replay metadata needed to update HNSW directly.
+    pub fn appendVectorInsertWal(
+        self: *Store,
+        key: []const u8,
+        namespace: []const u8,
+        metric: []const u8,
+        is_worm: bool,
+        is_async: bool,
+        timestamp: u64,
+    ) StoreError!void {
+        if (self.config.persistence != .full) return;
+        if (self.wal == null) return;
+        var flags: u8 = 0;
+        if (is_worm) flags |= 0x01;
+        if (is_async) flags |= 0x02;
+
+        self.wal_enqueue_mutex.lock();
+        defer self.wal_enqueue_mutex.unlock();
+        self.wal.?.appendVinsert(key, namespace, metric, flags, timestamp) catch return error.IoError;
+    }
+
+    /// Append a vector-delete metadata record to the WAL. The KV deletion is
+    /// already durable through the normal DELETE record.
+    pub fn appendVectorDeleteWal(self: *Store, key: []const u8, namespace: []const u8) StoreError!void {
+        if (self.config.persistence != .full) return;
+        if (self.wal == null) return;
+
+        self.wal_enqueue_mutex.lock();
+        defer self.wal_enqueue_mutex.unlock();
+        self.wal.?.appendVdelete(key, namespace) catch return error.IoError;
+    }
+
     /// Lock two keys atomically in stable shard order to avoid deadlocks.
     pub fn lockKeyPair(self: *Store, key_a: []const u8, key_b: []const u8) LockPair {
         const a = shardIndex(key_a);
@@ -949,6 +983,21 @@ pub const Store = struct {
                     }
                     self.allocator.free(key);
                 },
+                .vinsert => |vinsert| {
+                    self.replayVectorInsert(vinsert) catch |err| {
+                        std.log.warn("WAL vector insert replay skipped '{s}': {s}", .{ vinsert.key, @errorName(err) });
+                    };
+                    self.allocator.free(vinsert.key);
+                    self.allocator.free(vinsert.namespace);
+                    self.allocator.free(vinsert.metric);
+                },
+                .vdelete => |vdelete| {
+                    self.replayVectorDelete(vdelete) catch |err| {
+                        std.log.warn("WAL vector delete replay skipped '{s}': {s}", .{ vdelete.key, @errorName(err) });
+                    };
+                    self.allocator.free(vdelete.key);
+                    self.allocator.free(vdelete.namespace);
+                },
             }
             record_count += 1;
         }
@@ -956,6 +1005,37 @@ pub const Store = struct {
         if (record_count > 0) {
             std.log.info("WAL replay complete. Processed {d} records.", .{record_count});
         }
+    }
+
+    fn replayVectorInsert(self: *Store, record: WalRecord.VinsertRecord) !void {
+        const reg = self.vector_registry orelse return;
+        if (record.namespace.len == 0 or !std.mem.startsWith(u8, record.key, record.namespace)) return;
+
+        const metric = Metric.fromStr(record.metric) orelse return;
+        const value = try self.getValueDupe(record.key, self.allocator) orelse return;
+        defer self.allocator.free(value);
+        const vec = distance.bytesToF32(value) orelse return;
+
+        const ns_idx = try reg.getOrCreate(record.namespace, metric);
+        if (record.isAsync() and !ns_idx.async_mode) {
+            ns_idx.enableAsyncMode() catch |err| {
+                std.log.warn("WAL vector insert replay: async mode '{s}': {s}", .{ record.namespace, @errorName(err) });
+            };
+        }
+
+        ns_idx.lock.lock();
+        defer ns_idx.lock.unlock();
+        _ = try ns_idx.insertLocked(record.key, vec, record.timestamp);
+    }
+
+    fn replayVectorDelete(self: *Store, record: WalRecord.VdeleteRecord) !void {
+        const reg = self.vector_registry orelse return;
+        if (record.namespace.len == 0 or !std.mem.startsWith(u8, record.key, record.namespace)) return;
+
+        const ns_idx = reg.get(record.namespace) orelse return;
+        ns_idx.lock.lock();
+        defer ns_idx.lock.unlock();
+        _ = ns_idx.markTombstoneLocked(record.key);
     }
 
     const VectorRebuildCtx = struct {
@@ -1762,6 +1842,77 @@ test "raw vector HNSW rebuilds from persisted namespace config" {
         try testing.expect(idx.nodeIdFor("vec:raw:doc-b") != null);
         try testing.expectEqual(@as(u64, 111), idx.timestamps.items[idx.nodeIdFor("vec:raw:doc-a").?]);
         try testing.expectEqual(@as(u64, 222), idx.timestamps.items[idx.nodeIdFor("vec:raw:doc-b").?]);
+    }
+}
+
+test "vector WAL metadata replays HNSW without namespace config" {
+    const testing = std.testing;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_vector_wal_metadata.wal", .{tmp_path});
+    defer testing.allocator.free(wal_path);
+
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_vector_wal_metadata.snapshot", .{tmp_path});
+    defer testing.allocator.free(snapshot_path);
+
+    const wal_file = try compat.Dir.createFile(tmp_dir.dir, "test_vector_wal_metadata.wal", .{});
+    compat.File.close(wal_file);
+
+    const config = Config{
+        .wal_path = wal_path,
+        .snapshot_path = snapshot_path,
+        .sync_writes = false,
+    };
+
+    const vec_a = [_]f32{ 1, 0, 0, 0 };
+    const vec_b = [_]f32{ 0, 1, 0, 0 };
+    const vec_a_bytes_ptr: [*]const u8 = @ptrCast(&vec_a);
+    const vec_b_bytes_ptr: [*]const u8 = @ptrCast(&vec_b);
+    const vec_a_bytes = vec_a_bytes_ptr[0 .. 4 * @sizeOf(f32)];
+    const vec_b_bytes = vec_b_bytes_ptr[0 .. 4 * @sizeOf(f32)];
+
+    {
+        var registry = NamespaceRegistry.init(testing.allocator, .{});
+        defer registry.deinit();
+
+        var store = try Store.initWithRegistry(testing.allocator, config, &registry);
+        defer store.deinit();
+
+        try store.setWithTimestamp("vec:wal:doc-a", vec_a_bytes, false, 111);
+        try store.appendVectorInsertWal("vec:wal:doc-a", "vec:wal:", "dot", false, false, 111);
+        try store.setWithTimestamp("vec:wal:doc-b", vec_b_bytes, false, 222);
+        try store.appendVectorInsertWal("vec:wal:doc-b", "vec:wal:", "dot", false, false, 222);
+        try store.delete("vec:wal:doc-b");
+        try store.appendVectorDeleteWal("vec:wal:doc-b", "vec:wal:");
+
+        try testing.expect(registry.get("vec:wal:") == null);
+        try testing.expect(store.get("__meta:vecns:vec:wal:") == null);
+    }
+
+    {
+        var registry = NamespaceRegistry.init(testing.allocator, .{});
+        defer registry.deinit();
+
+        var reloaded = try Store.initWithRegistry(testing.allocator, config, &registry);
+        defer reloaded.deinit();
+
+        try testing.expect(reloaded.get("__meta:vecns:vec:wal:") == null);
+        try testing.expect(reloaded.get("vec:wal:doc-a") != null);
+        try testing.expect(reloaded.get("vec:wal:doc-b") == null);
+
+        const idx = registry.get("vec:wal:").?;
+        idx.lock.lockShared();
+        defer idx.lock.unlockShared();
+
+        try testing.expectEqual(Metric.dot, idx.metric);
+        try testing.expectEqual(@as(usize, 2), idx.len());
+        try testing.expectEqual(@as(u64, 111), idx.timestamps.items[idx.nodeIdFor("vec:wal:doc-a").?]);
+        const deleted_id = idx.nodeIdFor("vec:wal:doc-b").?;
+        try testing.expect(idx.isTombstoned(deleted_id));
     }
 }
 

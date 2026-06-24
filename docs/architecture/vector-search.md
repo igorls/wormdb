@@ -62,7 +62,7 @@ See [Command Reference](/protocol/commands) for the payload layouts.
 
 ## Recovery And Rebuilds
 
-Snapshot format v2 appends a `WDBHNSW2` trailer with HNSW graph state, tombstones, timestamps, and RaBitQ parameters. WAL replay after the latest snapshot restores durable `vec:*` keys. Namespaces written through `VINSERT`, `VBULKINSERT`, or the `vinsert` procedure also persist `__meta:vecns:<namespace>`, so startup can rebuild their HNSW graphs from recovered KV using the original metric.
+Snapshot format v2 appends a `WDBHNSW2` trailer with HNSW graph state, tombstones, timestamps, and RaBitQ parameters. WAL replay after the latest snapshot restores durable `vec:*` keys. Vector APIs (`VINSERT`, `VBULKINSERT`, `VDELETE`, and their procedure wrappers) also append vector mutation metadata records, so post-snapshot WAL replay can apply inserts/deletes back into HNSW with the original namespace, metric, timestamp, and flags. Namespaces written through `VINSERT`, `VBULKINSERT`, or the `vinsert` procedure also persist `__meta:vecns:<namespace>`, giving startup a KV rebuild fallback from recovered vector keys.
 
 Run:
 
@@ -70,7 +70,7 @@ Run:
 bun run apps/bun/src/bin/client.ts EXEC vreindex vec:articles:
 ```
 
-Use `vreindex` after raw `SET` ingest, manual recovery from old data that lacks `__meta:vecns:*`, or suspected index corruption.
+Use `vreindex` after raw `SET` ingest, manual recovery from old data that lacks vector WAL metadata or `__meta:vecns:*`, or suspected index corruption.
 
 ## Current Limits
 

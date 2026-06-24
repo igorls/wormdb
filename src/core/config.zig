@@ -133,6 +133,13 @@ pub const AuthConfig = struct {
 
     /// Maximum token age in seconds. Tokens older than this are rejected.
     token_max_age_s: u64 = 3600,
+
+    /// Optional base64 Ed25519 secret key used by auth_mint_scoped.
+    /// When null, server-side minting is disabled and offline token minting still works.
+    mint_secret_key: ?[]const u8 = null,
+
+    /// Default namespace token lifetime for auth_mint_scoped.
+    namespace_token_ttl_s: u64 = 3600,
 };
 
 /// One frozen segment mount: a `.wseg` file mmap'd at startup and attached to the

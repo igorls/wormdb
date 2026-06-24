@@ -17,6 +17,7 @@ const Response = core.types.Response;
 const Cluster = cluster_mod.Cluster;
 const vector_ops = @import("../procedures/vector_ops.zig");
 const Metric = @import("../vector/metric.zig").Metric;
+const AuthMintConfig = @import("../procedures/context.zig").AuthMintConfig;
 
 pub const ServerConfig = struct {
     bind_address: []const u8 = "0.0.0.0",
@@ -32,6 +33,8 @@ pub const ServerConfig = struct {
     /// gateways for authenticated access, or disable auth on a trusted network). Default false
     /// keeps unit tests (which never authenticate) working; the composition root sets the secure value.
     auth_enforce: bool = false,
+    /// Optional server-side SCT minting config.
+    auth_mint: ?AuthMintConfig = null,
 };
 
 pub const Server = struct {
@@ -763,6 +766,7 @@ pub const Server = struct {
                 .cluster = self.cluster,
                 .vector_registry = self.config.vector_registry,
                 .auth = if (self.config.auth_enforce) .{ .enforce = null } else .disabled,
+                .auth_mint = self.config.auth_mint,
             }, cmd),
         };
     }

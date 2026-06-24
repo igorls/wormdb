@@ -17,6 +17,7 @@ const NamespaceRegistry = @import("../vector/index.zig").NamespaceRegistry;
 const vector_ops = @import("../procedures/vector_ops.zig");
 const Metric = @import("../vector/metric.zig").Metric;
 const auth = @import("auth.zig");
+const AuthMintConfig = procedures.context.AuthMintConfig;
 
 /// Execute context — bundles the dependencies needed for command execution.
 pub const ExecContext = struct {
@@ -31,6 +32,8 @@ pub const ExecContext = struct {
     /// internal/replicated callers and existing tests bypass checks; every CLIENT-facing
     /// transport MUST set a non-trusted value (`.enforce`/`.disabled`) explicitly.
     auth: auth.AuthContext = .trusted,
+    /// Optional server-side SCT minting config for auth_mint_scoped.
+    auth_mint: ?AuthMintConfig = null,
 };
 
 /// Execute a command, returning the response.
@@ -165,11 +168,12 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
             const proc_fn = procedures.registry.lookup(params.procedure) orelse {
                 break :blk Response{ .err = try ctx.allocator.dupe(u8, "unknown procedure") };
             };
-            var proc_ctx = procedures.context.Ctx.init(
+            var proc_ctx = procedures.context.Ctx.initWithAuth(
                 ctx.store,
                 params.args,
                 ctx.allocator,
-                ctx.auth.identity(),
+                ctx.auth,
+                ctx.auth_mint,
                 ctx.cluster,
                 ctx.event_bus,
                 ctx.vector_registry,

@@ -13,6 +13,7 @@ export type Capabilities = {
   version: string;
   retrieval_unit: "chunk" | "turn" | "session";
   temporal_decay: boolean;
+  bulk_add?: boolean;
   verbatim: boolean;
   local: boolean;
   structured_facts: boolean;
@@ -63,6 +64,12 @@ export type DropResult = {
 export type AddOptions = {
   meta?: unknown;
   worm?: boolean;
+};
+
+export type BulkAddRow = {
+  id: string;
+  embedding: Uint8Array;
+  meta?: unknown;
 };
 
 export type QueryOptions = {
@@ -150,6 +157,19 @@ export class MemClient {
       args,
     });
     unwrapOk(resp as WormResp, "mem_add");
+  }
+
+  async bulkAdd(ns: string, rows: BulkAddRow[]): Promise<void> {
+    const args: (string | Uint8Array)[] = [ns, String(rows.length)];
+    for (const row of rows) {
+      args.push(row.id, row.embedding, row.meta === undefined ? "" : JSON.stringify(row.meta));
+    }
+    const resp = await this.wire.sendCommand({
+      kind: "EXEC",
+      procedure: "mem_bulk_add",
+      args,
+    });
+    unwrapOk(resp as WormResp, "mem_bulk_add");
   }
 
   async get(ns: string, docId: string): Promise<DocRecord> {

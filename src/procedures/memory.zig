@@ -17,6 +17,7 @@
 //!   mem_init         <ns> <embedder_id> <metric>
 //!   mem_add          <ns> <doc_id> <text> <embedding> [<meta_json>] [<worm>] [<embedder_id>]
 //!   mem_meta_set     <ns> <doc_id> <meta_json>
+//!   mem_bulk_add     <ns> <count> [<id> <embedding> <meta_json>]×N
 //!   mem_get          <ns> <doc_id>
 //!   mem_query        <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>]
 //!   mem_range        <ns> <since_ms> <until_ms> [<limit>] [<filter>]
@@ -51,6 +52,7 @@ const hnsw_mod = @import("../vector/hnsw.zig");
 const metric_mod = @import("../vector/metric.zig");
 const IndexModule = @import("../vector/index.zig");
 const Store = @import("../storage/store.zig").Store;
+const Command = @import("../core/types.zig").Command;
 
 const Metric = metric_mod.Metric;
 
@@ -64,6 +66,7 @@ const MAX_EMBEDDER_ID_LEN: usize = 128;
 const MAX_TOP_K: usize = 100;
 const DEFAULT_RANGE_LIMIT: usize = 100;
 const MAX_RANGE_LIMIT: usize = 10_000;
+const MAX_BULK_ADD: usize = 10_000;
 const DEFAULT_SNIPPET_CHARS: i64 = 512;
 const DECAY_TIME_CONSTANT_HOURS: f32 = 168.0;
 const HNSW_EF_SEARCH_FACTOR: usize = 10;
@@ -191,6 +194,7 @@ pub fn memCapabilities(ctx: *Ctx) anyerror!Ctx.Result {
         \\{"name":"wormdb-agent-memory","version":"1",
         \\"retrieval_unit":"chunk",
         \\"temporal_decay":true,
+        \\"bulk_add":true,
         \\"verbatim":true,
         \\"local":true,
         \\"structured_facts":false,
@@ -417,6 +421,149 @@ pub fn memMetaSet(ctx: *Ctx) anyerror!Ctx.Result {
     ctx.setDurable(meta_key, meta_json) catch |err| {
         return ctx.err(ctx.fmt("mem_meta_set: meta write failed: {s}", .{@errorName(err)}));
     };
+    return ctx.ok();
+}
+
+// ╔═══════════════════════════════════════════════════╗
+// ║  mem_bulk_add                                      ║
+// ╚═══════════════════════════════════════════════════╝
+
+const BulkMetaWrite = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+pub fn memBulkAdd(ctx: *Ctx) anyerror!Ctx.Result {
+    const usage = "mem_bulk_add requires: <ns> <count> [<id> <embedding> <meta_json>]×N";
+    const ns = ctx.arg(0) orelse return ctx.err(usage);
+    const count = ctx.argInt(usize, 1) orelse return ctx.err("mem_bulk_add: count must be an integer");
+
+    if (!validateNs(ns)) return ctx.err("mem_bulk_add: invalid ns");
+    if (count > MAX_BULK_ADD)
+        return ctx.err(ctx.fmt("mem_bulk_add: count must be <= {d}", .{MAX_BULK_ADD}));
+
+    const expected_args = 2 + count * 3;
+    if (ctx.argCount() != expected_args)
+        return ctx.err(usage);
+    if (count == 0) return ctx.ok();
+
+    const cfg_bytes: ?[]const u8 = blk: {
+        const cfg_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
+        defer ctx.allocator.free(cfg_key);
+        break :blk try ctx.getCopy(cfg_key);
+    };
+
+    const metric: Metric = blk: {
+        if (cfg_bytes) |cfg| {
+            if (extractConfigField(cfg, "metric")) |m_str| {
+                if (Metric.fromStr(m_str)) |m| break :blk m;
+            }
+        }
+        break :blk .cosine;
+    };
+
+    const vec_namespace = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
+    defer ctx.allocator.free(vec_namespace);
+    const channel = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:added.bulk", .{ns});
+    defer ctx.allocator.free(channel);
+
+    if (ctx.vector_registry) |reg| {
+        if (reg.get(vec_namespace)) |ns_idx| {
+            if (ns_idx.metric != metric)
+                return ctx.err("mem_bulk_add: metric differs from existing vector namespace");
+        }
+    }
+
+    const items = try ctx.allocator.alloc(Command.VbulkinsertParams.BulkItem, count);
+    const metas = try ctx.allocator.alloc(BulkMetaWrite, count);
+    const ids = try ctx.allocator.alloc([]const u8, count);
+
+    var seen = std.StringHashMap(void).init(ctx.allocator);
+    defer seen.deinit();
+
+    var expected_dim: ?usize = null;
+    if (ctx.vector_registry) |reg| {
+        if (reg.get(vec_namespace)) |ns_idx| {
+            expected_dim = ns_idx.expectedDim();
+        }
+    }
+
+    var batch_dim: ?usize = null;
+    const now_ms = ctx.timestamp();
+
+    for (0..count) |i| {
+        const base = 2 + i * 3;
+        const doc_id = ctx.arg(base).?;
+        const embedding = ctx.arg(base + 1).?;
+        const meta_json = ctx.arg(base + 2).?;
+
+        if (!validateDocId(doc_id))
+            return ctx.err("mem_bulk_add: invalid doc_id");
+        const seen_gop = try seen.getOrPut(doc_id);
+        if (seen_gop.found_existing)
+            return ctx.err("mem_bulk_add: duplicate doc_id in batch");
+
+        const vec = distance.bytesToF32(embedding) orelse
+            return ctx.err("mem_bulk_add: embedding must be non-empty f32 bytes (len multiple of 4)");
+        if (batch_dim) |d| {
+            if (vec.len != d) return ctx.err("mem_bulk_add: all embeddings in a batch must have the same dimension");
+        } else {
+            batch_dim = vec.len;
+        }
+        if (expected_dim) |d| {
+            if (vec.len != d) return ctx.err("mem_bulk_add: embedding dim does not match the namespace");
+        }
+
+        const vec_key = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:{s}", .{ ns, doc_id });
+        const bq_key = try std.fmt.allocPrint(ctx.allocator, "bq:vec:mem:{s}:{s}", .{ ns, doc_id });
+        defer ctx.allocator.free(bq_key);
+        if ((try ctx.getCopy(vec_key)) != null or (try ctx.getCopy(bq_key)) != null)
+            return ctx.err("mem_bulk_add: doc_id already has vector state");
+
+        const meta_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}:meta", .{ ns, doc_id });
+        items[i] = .{ .key = vec_key, .vector = embedding, .timestamp = now_ms };
+        metas[i] = .{ .key = meta_key, .value = meta_json };
+        ids[i] = doc_id;
+    }
+
+    vector_ops.applyVbulkinsert(
+        ctx.store,
+        ctx.cluster,
+        ctx.event_bus,
+        ctx.vector_registry,
+        ctx.allocator,
+        vec_namespace,
+        metric,
+        true,
+        false,
+        items,
+        true,
+    ) catch |err| {
+        return switch (err) {
+            error.KeyMissingNamespace => ctx.err("mem_bulk_add: internal vector key outside namespace"),
+        };
+    };
+
+    for (metas) |m| {
+        if (m.value.len > 0) {
+            ctx.setDurable(m.key, m.value) catch |err| {
+                return ctx.err(ctx.fmt("mem_bulk_add: meta write failed: {s}", .{@errorName(err)}));
+            };
+        }
+    }
+
+    var event_json: std.ArrayListUnmanaged(u8) = .empty;
+    defer event_json.deinit(ctx.allocator);
+    try event_json.append(ctx.allocator, '[');
+    for (ids, 0..) |id, i| {
+        if (i > 0) try event_json.append(ctx.allocator, ',');
+        try event_json.append(ctx.allocator, '"');
+        try appendJsonEscaped(&event_json, ctx.allocator, id);
+        try event_json.append(ctx.allocator, '"');
+    }
+    try event_json.append(ctx.allocator, ']');
+    ctx.publish(channel, event_json.items);
+
     return ctx.ok();
 }
 
@@ -1430,6 +1577,7 @@ test "applyDecay: lambda=1 returns pure recency in [0,1]" {
 
 const compat = @import("../core/compat.zig");
 const StoreModule = @import("../storage/store.zig");
+const EventBus = @import("../event/bus.zig").EventBus;
 
 /// Pack a slice of f32s as little-endian bytes — what mem_add expects on
 /// the wire. Lifetime: caller owns the returned slice.
@@ -1495,6 +1643,18 @@ fn runProc(
     arena: std.mem.Allocator,
 ) !Ctx.Result {
     var ctx = Ctx.init(store, args, arena, null, null, null, null);
+    defer ctx.deinit();
+    return try proc(&ctx);
+}
+
+fn runProcWithBus(
+    store: *StoreModule.Store,
+    proc: *const fn (ctx: *Ctx) anyerror!Ctx.Result,
+    args: []const []const u8,
+    arena: std.mem.Allocator,
+    bus: *EventBus,
+) !Ctx.Result {
+    var ctx = Ctx.init(store, args, arena, null, null, bus, null);
     defer ctx.deinit();
     return try proc(&ctx);
 }
@@ -1772,6 +1932,102 @@ test "mem_range: rejects filter until shared predicate parser lands" {
     );
     try testing.expect(result == .err);
     try testing.expect(std.mem.indexOf(u8, result.err, "filter") != null);
+}
+
+test "mem_bulk_add: stores vectors and meta, then publishes one bulk memory event" {
+    var fx = try TestStoreFixture.init("membulk_success");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    const Capture = struct {
+        buf: []u8,
+        len: usize = 0,
+
+        fn write(raw: *anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const n = @min(self.buf.len, data.len);
+            @memcpy(self.buf[0..n], data[0..n]);
+            self.len = n;
+        }
+    };
+
+    var capture = Capture{ .buf = try testing.allocator.alloc(u8, 1024) };
+    defer testing.allocator.free(capture.buf);
+    _ = try bus.subscribe("mem:demo:added.bulk", Capture.write, @ptrCast(&capture));
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena);
+
+    const emb1 = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const emb2 = try packF32(arena, &[_]f32{ 0.0, 1.0, 0.0, 0.0 });
+    const result = try runProcWithBus(
+        &fx.store,
+        memBulkAdd,
+        &.{ "demo", "2", "doc-1", emb1, "{\"k\":1}", "doc-2", emb2, "{\"k\":2}" },
+        arena,
+        &bus,
+    );
+    try testing.expect(result == .ok);
+
+    try testing.expect(fx.store.get("vec:mem:demo:doc-1") != null);
+    try testing.expect(fx.store.get("vec:mem:demo:doc-2") != null);
+    try testing.expect(fx.store.get("bq:vec:mem:demo:doc-1") != null);
+    try testing.expect(fx.store.get("mem:demo:doc-1:meta") != null);
+    try testing.expect(fx.store.get("mem:demo:doc-1") == null);
+
+    const event = capture.buf[0..capture.len];
+    try testing.expect(std.mem.indexOf(u8, event, "mem:demo:added.bulk") != null);
+    try testing.expect(std.mem.indexOf(u8, event, "[\"doc-1\",\"doc-2\"]") != null);
+}
+
+test "mem_bulk_add: dimension mismatch rejects whole batch before writes" {
+    var fx = try TestStoreFixture.init("membulk_dim_mismatch");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena);
+
+    const emb1 = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const emb_bad = try packF32(arena, &[_]f32{ 1.0, 0.0 });
+    const result = try runProc(
+        &fx.store,
+        memBulkAdd,
+        &.{ "demo", "2", "doc-1", emb1, "{}", "doc-2", emb_bad, "{}" },
+        arena,
+    );
+    try testing.expect(result == .err);
+    try testing.expect(std.mem.indexOf(u8, result.err, "same dimension") != null);
+    try testing.expect(fx.store.get("vec:mem:demo:doc-1") == null);
+    try testing.expect(fx.store.get("mem:demo:doc-1:meta") == null);
+}
+
+test "mem_bulk_add: duplicate ids reject whole batch before writes" {
+    var fx = try TestStoreFixture.init("membulk_duplicate");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const emb1 = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const emb2 = try packF32(arena, &[_]f32{ 0.0, 1.0, 0.0, 0.0 });
+    const result = try runProc(
+        &fx.store,
+        memBulkAdd,
+        &.{ "demo", "2", "doc-1", emb1, "{}", "doc-1", emb2, "{}" },
+        arena,
+    );
+    try testing.expect(result == .err);
+    try testing.expect(std.mem.indexOf(u8, result.err, "duplicate") != null);
+    try testing.expect(fx.store.get("vec:mem:demo:doc-1") == null);
 }
 
 test "mem_reset_index: drops vectors, preserves docs, rewrites config" {

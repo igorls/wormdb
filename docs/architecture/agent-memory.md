@@ -11,6 +11,7 @@ For the end-to-end demo notes, see [Agent Memory Demo](/AGENT_MEMORY_DEMO).
 | `mem_init <ns> <embedder_id> <metric>` | Predeclare a memory namespace, embedder, and metric |
 | `mem_add <ns> <doc_id> <text> <embedding> [meta_json] [worm] [embedder_id]` | Add one memory chunk plus embedding |
 | `mem_meta_set <ns> <doc_id> <meta_json>` | Update metadata for an existing memory without re-embedding |
+| `mem_bulk_add <ns> <count> [id embedding meta_json]×N` | Add many memory embeddings and metadata rows in one vector batch |
 | `mem_get <ns> <doc_id>` | Fetch document text joined with metadata |
 | `mem_query <ns> <embedding> <k> [lambda] [min_score] [snippet_chars]` | Search and return enriched memories |
 | `mem_range <ns> <since_ms> <until_ms> [limit] [filter]` | Scan memories by document timestamp |
@@ -36,6 +37,8 @@ Metadata is a mutable passthrough side key. Applications may update it directly
 with `SET mem:<ns>:<id>:meta <json>`, or use `mem_meta_set` to first validate
 that the document exists. The metadata bytes are stored raw and returned raw in
 `mem_get`/`mem_query`, matching the existing `mem_add` contract.
+
+`mem_bulk_add` is the sidecar/backfill path for already-chunked and already-embedded memory rows. It prevalidates the whole batch for id safety, duplicate ids, vector byte shape, uniform dimensions, existing namespace dim/metric compatibility, and existing vector state before writing. Vector/BQ/HNSW work uses the native bulk vector apply path; metadata rows are written durably afterward. A successful batch publishes one `mem:<ns>:added.bulk` event whose payload is the JSON id list.
 
 ## Embedder Enforcement
 

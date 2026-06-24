@@ -16,6 +16,7 @@
 //! ── Procedure surface ───────────────────────────────────────────────
 //!   mem_init         <ns> <embedder_id> <metric>
 //!   mem_add          <ns> <doc_id> <text> <embedding> [<meta_json>] [<worm>] [<embedder_id>]
+//!   mem_meta_set     <ns> <doc_id> <meta_json>
 //!   mem_get          <ns> <doc_id>
 //!   mem_query        <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>]
 //!   mem_stats        <ns>
@@ -184,6 +185,7 @@ pub fn memCapabilities(ctx: *Ctx) anyerror!Ctx.Result {
         \\"verbatim":true,
         \\"local":true,
         \\"structured_facts":false,
+        \\"metadata_update":true,
         \\"metrics":["cosine","dot","l2"]}
     ;
     return ctx.value(json);
@@ -377,6 +379,34 @@ pub fn memAdd(ctx: *Ctx) anyerror!Ctx.Result {
 
     // ── Publish to namespace channel ────────────────────────────
     ctx.publish(channel, doc_id);
+    return ctx.ok();
+}
+
+// ╔═══════════════════════════════════════════════════╗
+// ║  mem_meta_set                                      ║
+// ╚═══════════════════════════════════════════════════╝
+
+pub fn memMetaSet(ctx: *Ctx) anyerror!Ctx.Result {
+    const usage = "mem_meta_set requires: <ns> <doc_id> <meta_json>";
+    const ns = ctx.arg(0) orelse return ctx.err(usage);
+    const doc_id = ctx.arg(1) orelse return ctx.err(usage);
+    const meta_json = ctx.arg(2) orelse return ctx.err(usage);
+
+    if (!validateNs(ns)) return ctx.err("mem_meta_set: invalid ns");
+    if (!validateDocId(doc_id)) return ctx.err("mem_meta_set: invalid doc_id");
+
+    const doc_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}", .{ ns, doc_id });
+    defer ctx.allocator.free(doc_key);
+    const meta_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}:meta", .{ ns, doc_id });
+    defer ctx.allocator.free(meta_key);
+
+    if ((try ctx.getCopy(doc_key)) == null) {
+        return ctx.err("mem_meta_set: doc_id not found");
+    }
+
+    ctx.setDurable(meta_key, meta_json) catch |err| {
+        return ctx.err(ctx.fmt("mem_meta_set: meta write failed: {s}", .{@errorName(err)}));
+    };
     return ctx.ok();
 }
 
@@ -1210,6 +1240,58 @@ test "mem_add: accepts matching embedder_id" {
     );
     try testing.expect(result == .ok);
     try testing.expect(fx.store.get("mem:demo:doc-1") != null);
+}
+
+test "mem_meta_set: updates metadata returned by mem_get" {
+    var fx = try TestStoreFixture.init("mem_meta_set");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena);
+
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const add = try runProc(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-1", "hello", emb, "{\"recall_count\":0}", "0", "bge-m3" },
+        arena,
+    );
+    try testing.expect(add == .ok);
+
+    const update = try runProc(
+        &fx.store,
+        memMetaSet,
+        &.{ "demo", "doc-1", "{\"recall_count\":1,\"accessed_at\":42}" },
+        arena,
+    );
+    try testing.expect(update == .ok);
+
+    const got = try runProc(&fx.store, memGet, &.{ "demo", "doc-1" }, arena);
+    try testing.expect(got == .value);
+    try testing.expect(std.mem.indexOf(u8, got.value.?, "\"recall_count\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, got.value.?, "\"accessed_at\":42") != null);
+}
+
+test "mem_meta_set: rejects missing doc_id" {
+    var fx = try TestStoreFixture.init("mem_meta_set_missing");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const update = try runProc(
+        &fx.store,
+        memMetaSet,
+        &.{ "demo", "missing", "{\"recall_count\":1}" },
+        arena,
+    );
+    try testing.expect(update == .err);
+    try testing.expectEqualStrings("mem_meta_set: doc_id not found", update.err);
+    try testing.expect(fx.store.get("mem:demo:missing:meta") == null);
 }
 
 test "mem_add: invalid embedder_id arg rejected before state changes" {

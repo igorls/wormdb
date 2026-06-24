@@ -133,6 +133,7 @@ int wormdb_scan_prefix(wormdb_Db *db,
 /* Append a payload to a named WORM append log. attachment_hashes is optional
  * contiguous SHA-256 hashes: attachment_hash_count * WORMDB_HASH_LEN bytes.
  * ingest_time_ms == 0 lets WormDB assign the local receipt time.
+ * out_receipt may be NULL when the caller does not need receipt metadata.
  */
 int wormdb_append_log(wormdb_Db *db,
                       const unsigned char *log_id, size_t log_id_len,
@@ -142,7 +143,9 @@ int wormdb_append_log(wormdb_Db *db,
                       uint64_t ingest_time_ms,
                       wormdb_AppendReceipt *out_receipt);
 
-/* Verify the stored WORM append-log chain for a log id. */
+/* Verify the stored WORM append-log chain for a log id.
+ * out_report may be NULL when the caller only needs success/failure.
+ */
 int wormdb_append_log_verify(wormdb_Db *db,
                              const unsigned char *log_id, size_t log_id_len,
                              wormdb_AppendLogReport *out_report);
@@ -155,6 +158,7 @@ int wormdb_append_log_verify(wormdb_Db *db,
  *
  * On WORMDB_OK, out_bundle/out_bundle_len receives a library-owned byte buffer
  * that must be released with wormdb_free.
+ * out_info may be NULL when the caller does not need bundle metadata.
  */
 int wormdb_proof_build_mmr_bundle(
     wormdb_Db *db,
@@ -169,7 +173,9 @@ int wormdb_proof_build_mmr_bundle(
     unsigned char **out_bundle, size_t *out_bundle_len,
     wormdb_ProofBundleInfo *out_info);
 
-/* Verify an encoded append-log MMR proof bundle without a database. */
+/* Verify an encoded append-log MMR proof bundle without a database.
+ * out_info may be NULL when the caller only needs success/failure.
+ */
 int wormdb_proof_verify_bundle(const unsigned char *bundle, size_t bundle_len,
                                wormdb_ProofBundleInfo *out_info);
 

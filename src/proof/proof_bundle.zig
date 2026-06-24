@@ -265,6 +265,15 @@ pub const AppendLogMmrBundleOptions = struct {
     bundle_extension_bytes: []const u8 = &.{},
 };
 
+fn freeScanResult(allocator: std.mem.Allocator, result: Store.ScanResult) void {
+    allocator.free(result.key);
+    allocator.free(result.value);
+}
+
+fn freeScanResultsFrom(allocator: std.mem.Allocator, results: []Store.ScanResult, start: usize) void {
+    for (results[start..]) |result| freeScanResult(allocator, result);
+}
+
 /// Encode a proof bundle into canonical self-contained bytes for FFI and
 /// transport. The encoded form is verifier-friendly; all variable fields are
 /// length-prefixed and all integers are big-endian.
@@ -444,19 +453,20 @@ pub fn buildAppendLogMmrBundle(
     defer allocator.free(prefix);
 
     const results = try store.scanPrefix(prefix, 0, allocator);
-    defer {
-        for (results) |result| {
-            allocator.free(result.key);
-            allocator.free(result.value);
-        }
-        allocator.free(results);
-    }
+    defer allocator.free(results);
 
     var expected_seq: u64 = 1;
     var previous_hash = append_log.ZERO_HASH;
-    for (results) |result| {
+    var result_index: usize = 0;
+    errdefer freeScanResultsFrom(allocator, results, result_index);
+    while (result_index < results.len) : (result_index += 1) {
+        const result = results[result_index];
         const key_seq = try append_log.seqFromEventKey(prefix, result.key);
-        if (key_seq > options.to_seq) break;
+        if (key_seq > options.to_seq) {
+            freeScanResultsFrom(allocator, results, result_index);
+            result_index = results.len;
+            break;
+        }
         if (!result.is_worm) return error.NonWormEvent;
 
         const view = try append_log.decodeEnvelope(result.value);
@@ -479,6 +489,7 @@ pub fn buildAppendLogMmrBundle(
 
         previous_hash = view.event_hash;
         if (expected_seq != std.math.maxInt(u64)) expected_seq += 1;
+        freeScanResult(allocator, result);
     }
 
     if (expected_seq <= options.to_seq) return error.SequenceGap;

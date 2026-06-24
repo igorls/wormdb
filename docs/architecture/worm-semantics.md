@@ -90,6 +90,6 @@ WORM also applies to vector and memory records. Native vector inserts and `mem_a
 
 ## Replicated WORM Proofs
 
-WORM prevents stored records from being rewritten, but replicated deployments also need compact ways to prove that peers saw the same immutable history. The planned replication proof layer stores checkpoint and witness records as WORM data, then uses Merkle/MMR roots to compare peer histories and repair missing ranges without a full dump when possible.
+WORM prevents stored records from being rewritten, but replicated deployments also need compact ways to prove that peers saw the same immutable history. WormDB now stores checkpoint and witness records as WORM data; the remaining replication-proof work is to use Merkle/MMR roots to compare peer histories and repair missing ranges without a full dump when possible.
 
 See [Replication Proofs](/architecture/replication-proofs) for the checkpoint witness and anti-entropy design.

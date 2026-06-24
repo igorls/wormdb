@@ -9,12 +9,14 @@ pub const checkpoint = @import("checkpoint.zig");
 pub const proof_bundle = @import("proof_bundle.zig");
 pub const append_log = @import("append_log.zig");
 pub const mmr = @import("mmr.zig");
+pub const witness = @import("witness.zig");
 
 pub const AccumulatorKind = checkpoint.AccumulatorKind;
 pub const CheckpointRecord = checkpoint.CheckpointRecord;
 pub const Hash = checkpoint.Hash;
 pub const Signature = checkpoint.Signature;
 pub const SignatureScheme = checkpoint.SignatureScheme;
+pub const WitnessRecord = witness.WitnessRecord;
 pub const BundleKind = proof_bundle.BundleKind;
 pub const ProofBundle = proof_bundle.ProofBundle;
 pub const BundleRecord = proof_bundle.BundleRecord;

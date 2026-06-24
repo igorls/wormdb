@@ -7,6 +7,9 @@
 //! EXEC append_log_checkpoint <log_id> <from_seq> <to_seq> <creator_pubkey_hex> sk=<secret_key_hex>|sig=<signature_hex> [created_at_ms=<ms>] [ingested_at_ms=<ms>] [prev=<checkpoint_hash_hex>] [ext=<hex>]
 //! EXEC append_log_proof_bundle <log_id> <from_seq> <to_seq> <checkpoint_hash_hex>
 //! EXEC append_log_proof_verify <log_id> <seq> <record_hash_hex> <checkpoint_hash_hex> <proof_hex>
+//! EXEC append_log_witness <log_id> <checkpoint_hash_hex> [witness_pubkey_hex] [sk=<secret_key_hex>|sig=<signature_hex>] [observed_at_ms=<ms>] [ext=<hex>]
+//! EXEC append_log_witness_import <log_id> <checkpoint_hash_hex> <canonical_witness_hex>
+//! EXEC append_log_witness_verify <log_id> <checkpoint_hash_hex> <witness_pubkey_hex>
 //!
 //! Events are stored through the proof append-log primitive as WORM records
 //! with canonical binary envelopes. Optional attachment hashes are 64-char
@@ -18,10 +21,12 @@ const Response = @import("../core/types.zig").Response;
 const append_log = @import("../proof/append_log.zig");
 const checkpoint = @import("../proof/checkpoint.zig");
 const mmr = @import("../proof/mmr.zig");
+const witness = @import("../proof/witness.zig");
 const Store = @import("../storage/store.zig").Store;
 const Config = @import("../core/config.zig").Config;
 
 const CHECKPOINT_PREFIX = "proof:append-log-checkpoint:v1:";
+const WITNESS_PREFIX = "proof:append-log-witness:v1:";
 
 pub fn appendExecute(ctx: *Ctx) anyerror!Ctx.Result {
     const log_id = ctx.arg(0) orelse
@@ -241,7 +246,7 @@ pub fn checkpointExecute(ctx: *Ctx) anyerror!Ctx.Result {
     const key = try checkpointKey(ctx.allocator, log_id, record_hash);
     defer ctx.allocator.free(key);
 
-    ctx.store.setWithTimestamp(key, canonical, true, ingested) catch |err| switch (err) {
+    ctx.setDurableWormWithTimestamp(key, canonical, ingested) catch |err| switch (err) {
         error.WormViolation => return ctx.err("append_log_checkpoint: checkpoint already exists"),
         else => return ctx.err("append_log_checkpoint: checkpoint store failed"),
     };
@@ -323,6 +328,183 @@ pub fn proofVerifyExecute(ctx: *Ctx) anyerror!Ctx.Result {
 
     const valid = mmr.verifyInclusion(proof, record_hash[0..], loaded.record.accumulator_root);
     return ctx.value(if (valid) "{\"valid\":true}" else "{\"valid\":false}");
+}
+
+pub fn witnessExecute(ctx: *Ctx) anyerror!Ctx.Result {
+    const usage = "append_log_witness requires: <log_id> <checkpoint_hash_hex> [witness_pubkey_hex] [sk=<secret_key_hex>|sig=<signature_hex>] [observed_at_ms=<ms>] [ext=<hex>]";
+    const log_id = ctx.arg(0) orelse return ctx.err(usage);
+    const checkpoint_hash = parseHashHex(ctx.arg(1) orelse return ctx.err(usage)) catch
+        return ctx.err("append_log_witness: checkpoint hash must be 64 hex chars");
+
+    var witness_identity: ?checkpoint.PublicKey = null;
+    var signature: ?checkpoint.Signature = null;
+    var secret_key: ?[checkpoint.SIGNATURE_LEN]u8 = null;
+    var observed_at_ms: ?u64 = null;
+    var extension_bytes: []u8 = &.{};
+    var owns_extension = false;
+    defer if (owns_extension) ctx.allocator.free(extension_bytes);
+
+    var i: usize = 2;
+    if (i < ctx.argCount()) {
+        const maybe_identity = ctx.arg(i).?;
+        if (!isWitnessOption(maybe_identity)) {
+            witness_identity = parsePublicKeyHex(maybe_identity) catch
+                return ctx.err("append_log_witness: witness public key must be 64 hex chars");
+            i += 1;
+        }
+    }
+
+    while (i < ctx.argCount()) : (i += 1) {
+        const arg = ctx.arg(i).?;
+        if (std.mem.startsWith(u8, arg, "observed_at_ms=")) {
+            observed_at_ms = std.fmt.parseUnsigned(u64, arg["observed_at_ms=".len..], 10) catch
+                return ctx.err("append_log_witness: invalid observed_at_ms=<ms>");
+        } else if (std.mem.startsWith(u8, arg, "sig=")) {
+            signature = parseSignatureHex(arg["sig=".len..]) catch
+                return ctx.err("append_log_witness: sig must be 128 hex chars");
+        } else if (std.mem.startsWith(u8, arg, "sk=")) {
+            secret_key = parseSignatureHex(arg["sk=".len..]) catch
+                return ctx.err("append_log_witness: sk must be 128 hex chars");
+        } else if (std.mem.startsWith(u8, arg, "ext=")) {
+            if (owns_extension) ctx.allocator.free(extension_bytes);
+            extension_bytes = parseHexBytes(ctx.allocator, arg["ext=".len..]) catch
+                return ctx.err("append_log_witness: ext must be even-length hex");
+            owns_extension = true;
+        } else {
+            return ctx.err("append_log_witness: unknown option");
+        }
+    }
+
+    if (signature != null and secret_key != null)
+        return ctx.err("append_log_witness: pass either sig=<signature_hex> or sk=<secret_key_hex>, not both");
+
+    const cluster_identity = if (ctx.cluster) |cluster| cluster.identityPublicKey() else null;
+    const identity = witness_identity orelse cluster_identity orelse
+        return ctx.err("append_log_witness: missing witness public key (or cluster identity)");
+
+    const loaded = loadCheckpoint(ctx.allocator, ctx.store, log_id, checkpoint_hash) catch |err| {
+        return ctx.err(switch (err) {
+            error.CheckpointNotFound => "append_log_witness: checkpoint not found",
+            else => "append_log_witness: checkpoint load failed",
+        });
+    };
+    defer loaded.deinit(ctx.allocator);
+    if (!try loaded.record.verifySignature(ctx.allocator))
+        return ctx.err("append_log_witness: checkpoint signature invalid");
+    if (!std.mem.eql(u8, loaded.record.log_id, log_id))
+        return ctx.err("append_log_witness: checkpoint log id mismatch");
+
+    var record = witness.WitnessRecord.fromCheckpoint(
+        loaded.record,
+        loaded.record_hash,
+        identity[0..],
+        observed_at_ms orelse ctx.timestamp(),
+        extension_bytes,
+    );
+
+    if (secret_key) |*sk| {
+        record.signature = record.signEd25519(ctx.allocator, sk) catch
+            return ctx.err("append_log_witness: signing failed");
+    } else if (signature) |sig| {
+        record.signature = sig;
+    } else if (ctx.cluster) |cluster| {
+        const cluster_pub = cluster.identityPublicKey();
+        if (!std.mem.eql(u8, identity[0..], cluster_pub[0..]))
+            return ctx.err("append_log_witness: missing sig=<signature_hex> or sk=<secret_key_hex>");
+        const payload = try record.encodeSigningPayload(ctx.allocator);
+        defer ctx.allocator.free(payload);
+        record.signature = cluster.signWithIdentity(payload) catch
+            return ctx.err("append_log_witness: cluster identity signing failed");
+    } else {
+        return ctx.err("append_log_witness: missing sig=<signature_hex> or sk=<secret_key_hex>");
+    }
+
+    if (!try record.verifySignature(ctx.allocator))
+        return ctx.err("append_log_witness: signature verification failed");
+
+    const canonical = try record.encodeCanonical(ctx.allocator);
+    defer ctx.allocator.free(canonical);
+    _ = try storeWitnessCanonical(ctx, log_id, record, canonical);
+    const record_hash = try record.recordHash(ctx.allocator);
+    return ctx.value(try witnessJson(ctx.allocator, record, record_hash, canonical));
+}
+
+pub fn witnessImportExecute(ctx: *Ctx) anyerror!Ctx.Result {
+    const log_id = ctx.arg(0) orelse
+        return ctx.err("append_log_witness_import requires: <log_id> <checkpoint_hash_hex> <canonical_witness_hex>");
+    const checkpoint_hash = parseHashHex(ctx.arg(1) orelse
+        return ctx.err("append_log_witness_import requires: <log_id> <checkpoint_hash_hex> <canonical_witness_hex>")) catch
+        return ctx.err("append_log_witness_import: checkpoint hash must be 64 hex chars");
+    const canonical_hex = ctx.arg(2) orelse
+        return ctx.err("append_log_witness_import requires: <log_id> <checkpoint_hash_hex> <canonical_witness_hex>");
+    if (ctx.argCount() != 3)
+        return ctx.err("append_log_witness_import requires: <log_id> <checkpoint_hash_hex> <canonical_witness_hex>");
+
+    const canonical = parseHexBytes(ctx.allocator, canonical_hex) catch
+        return ctx.err("append_log_witness_import: canonical witness must be even-length hex");
+    defer ctx.allocator.free(canonical);
+
+    const loaded = loadCheckpoint(ctx.allocator, ctx.store, log_id, checkpoint_hash) catch |err| {
+        return ctx.err(switch (err) {
+            error.CheckpointNotFound => "append_log_witness_import: checkpoint not found",
+            else => "append_log_witness_import: checkpoint load failed",
+        });
+    };
+    defer loaded.deinit(ctx.allocator);
+    if (!try loaded.record.verifySignature(ctx.allocator))
+        return ctx.err("append_log_witness_import: checkpoint signature invalid");
+
+    const record = witness.decodeCanonical(canonical) catch
+        return ctx.err("append_log_witness_import: invalid canonical witness");
+    if (!record.matchesCheckpoint(loaded.record, loaded.record_hash))
+        return ctx.err("append_log_witness_import: witness checkpoint mismatch");
+    if (!try record.verifySignature(ctx.allocator))
+        return ctx.err("append_log_witness_import: signature verification failed");
+
+    _ = try storeWitnessCanonical(ctx, log_id, record, canonical);
+    const record_hash = try record.recordHash(ctx.allocator);
+    return ctx.value(try witnessJson(ctx.allocator, record, record_hash, canonical));
+}
+
+pub fn witnessVerifyExecute(ctx: *Ctx) anyerror!Ctx.Result {
+    const log_id = ctx.arg(0) orelse
+        return ctx.err("append_log_witness_verify requires: <log_id> <checkpoint_hash_hex> <witness_pubkey_hex>");
+    const checkpoint_hash = parseHashHex(ctx.arg(1) orelse
+        return ctx.err("append_log_witness_verify requires: <log_id> <checkpoint_hash_hex> <witness_pubkey_hex>")) catch
+        return ctx.err("append_log_witness_verify: checkpoint hash must be 64 hex chars");
+    const witness_identity = parsePublicKeyHex(ctx.arg(2) orelse
+        return ctx.err("append_log_witness_verify requires: <log_id> <checkpoint_hash_hex> <witness_pubkey_hex>")) catch
+        return ctx.err("append_log_witness_verify: witness public key must be 64 hex chars");
+    if (ctx.argCount() != 3)
+        return ctx.err("append_log_witness_verify requires: <log_id> <checkpoint_hash_hex> <witness_pubkey_hex>");
+
+    const loaded = loadCheckpoint(ctx.allocator, ctx.store, log_id, checkpoint_hash) catch {
+        return ctx.value("{\"valid\":false}");
+    };
+    defer loaded.deinit(ctx.allocator);
+    if (!try loaded.record.verifySignature(ctx.allocator)) return ctx.value("{\"valid\":false}");
+
+    const key = try witnessKey(ctx.allocator, log_id, checkpoint_hash, witness_identity[0..]);
+    defer ctx.allocator.free(key);
+    const canonical = try ctx.store.getValueDupe(key, ctx.allocator) orelse {
+        return ctx.value("{\"valid\":false}");
+    };
+    defer ctx.allocator.free(canonical);
+
+    const record = witness.decodeCanonical(canonical) catch {
+        return ctx.value("{\"valid\":false}");
+    };
+    if (!record.matchesCheckpoint(loaded.record, loaded.record_hash)) return ctx.value("{\"valid\":false}");
+    if (!std.mem.eql(u8, record.witness_identity, witness_identity[0..])) return ctx.value("{\"valid\":false}");
+    if (!try record.verifySignature(ctx.allocator)) return ctx.value("{\"valid\":false}");
+
+    const record_hash = try record.recordHash(ctx.allocator);
+    var json: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer json.deinit(ctx.allocator);
+    try json.appendSlice(ctx.allocator, "{\"valid\":true,\"witness\":");
+    try appendWitnessJsonObject(&json, ctx.allocator, record, record_hash, canonical);
+    try json.appendSlice(ctx.allocator, "}");
+    return ctx.value(try json.toOwnedSlice(ctx.allocator));
 }
 
 const MmrProofData = struct {
@@ -662,6 +844,104 @@ fn checkpointKey(allocator: std.mem.Allocator, log_id: []const u8, record_hash: 
     return std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, hex[0..] });
 }
 
+fn witnessKeyPrefix(allocator: std.mem.Allocator, log_id: []const u8, checkpoint_hash: checkpoint.Hash) ![]u8 {
+    const log_hash = append_log.hashBytes(log_id);
+    var log_hex: [append_log.HASH_LEN * 2]u8 = undefined;
+    _ = append_log.hashToHex(log_hash, &log_hex);
+    var cp_hex: [checkpoint.HASH_LEN * 2]u8 = undefined;
+    _ = append_log.hashToHex(checkpoint_hash, &cp_hex);
+    return std.fmt.allocPrint(allocator, "{s}{s}:{s}:", .{ WITNESS_PREFIX, log_hex[0..], cp_hex[0..] });
+}
+
+fn witnessKey(
+    allocator: std.mem.Allocator,
+    log_id: []const u8,
+    checkpoint_hash: checkpoint.Hash,
+    witness_identity: []const u8,
+) ![]u8 {
+    const prefix = try witnessKeyPrefix(allocator, log_id, checkpoint_hash);
+    defer allocator.free(prefix);
+
+    const identity_hash = checkpoint.hashBytes(witness_identity);
+    var identity_hex: [checkpoint.HASH_LEN * 2]u8 = undefined;
+    _ = append_log.hashToHex(identity_hash, &identity_hex);
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, identity_hex[0..] });
+}
+
+fn storeWitnessCanonical(ctx: *Ctx, log_id: []const u8, record: witness.WitnessRecord, canonical: []const u8) !bool {
+    const key = try witnessKey(ctx.allocator, log_id, record.checkpoint_hash, record.witness_identity);
+    defer ctx.allocator.free(key);
+
+    if (try ctx.store.getValueDupe(key, ctx.allocator)) |existing| {
+        defer ctx.allocator.free(existing);
+        if (std.mem.eql(u8, existing, canonical)) return false;
+        return error.WormViolation;
+    }
+
+    ctx.setDurableWormWithTimestamp(key, canonical, record.observed_at_ms) catch |err| switch (err) {
+        error.WormViolation => return error.WormViolation,
+        else => return error.WitnessStoreFailed,
+    };
+    return true;
+}
+
+fn isWitnessOption(arg: []const u8) bool {
+    return std.mem.startsWith(u8, arg, "sk=") or
+        std.mem.startsWith(u8, arg, "sig=") or
+        std.mem.startsWith(u8, arg, "observed_at_ms=") or
+        std.mem.startsWith(u8, arg, "ext=");
+}
+
+fn witnessJson(
+    allocator: std.mem.Allocator,
+    record: witness.WitnessRecord,
+    record_hash: witness.Hash,
+    canonical: []const u8,
+) ![]u8 {
+    var json: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer json.deinit(allocator);
+    try appendWitnessJsonObject(&json, allocator, record, record_hash, canonical);
+    return json.toOwnedSlice(allocator);
+}
+
+fn appendWitnessJsonObject(
+    json: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    record: witness.WitnessRecord,
+    record_hash: witness.Hash,
+    canonical: []const u8,
+) !void {
+    try json.appendSlice(allocator, "{\"log_id\":");
+    try appendJsonString(json, allocator, record.log_id);
+    try json.appendSlice(allocator, ",\"from_seq\":");
+    try appendU64(json, allocator, record.from_seq);
+    try json.appendSlice(allocator, ",\"to_seq\":");
+    try appendU64(json, allocator, record.to_seq);
+    try json.appendSlice(allocator, ",\"accumulator_kind\":\"");
+    try json.appendSlice(allocator, switch (record.accumulator_kind) {
+        .opaque_root => "opaque_root",
+        .merkle_sha256_v1 => "merkle_sha256_v1",
+        .mmr_sha256_v1 => "mmr_sha256_v1",
+    });
+    try json.appendSlice(allocator, "\",\"accumulator_root\":\"");
+    try appendHashHex(json, allocator, record.accumulator_root);
+    try json.appendSlice(allocator, "\",\"checkpoint_hash\":\"");
+    try appendHashHex(json, allocator, record.checkpoint_hash);
+    try json.appendSlice(allocator, "\",\"witness_identity\":\"");
+    try appendHexBytes(json, allocator, record.witness_identity);
+    try json.appendSlice(allocator, "\",\"signature\":\"");
+    try appendHexBytes(json, allocator, record.signature[0..]);
+    try json.appendSlice(allocator, "\",\"observed_at_ms\":");
+    try appendU64(json, allocator, record.observed_at_ms);
+    try json.appendSlice(allocator, ",\"extension_hex\":\"");
+    try appendHexBytes(json, allocator, record.extension_bytes);
+    try json.appendSlice(allocator, "\",\"witness_record_hash\":\"");
+    try appendHashHex(json, allocator, record_hash);
+    try json.appendSlice(allocator, "\",\"canonical_record_hex\":\"");
+    try appendHexBytes(json, allocator, canonical);
+    try json.appendSlice(allocator, "\"}");
+}
+
 fn parseHexBytes(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
     if (hex.len % 2 != 0) return error.InvalidHex;
     const out = try allocator.alloc(u8, hex.len / 2);
@@ -899,6 +1179,25 @@ test "append_log checkpoint, bundle, and proof verify procedures round trip" {
     try testing.expect(std.mem.containsAtLeast(u8, checkpoint_value, 1, "\"to_seq\":2"));
     try testing.expect(std.mem.containsAtLeast(u8, checkpoint_value, 1, "\"accumulator_kind\":\"mmr_sha256_v1\""));
     const checkpoint_hash = try extractJsonStringField(allocator, checkpoint_value, "checkpoint_hash");
+
+    const witness_response = try runProc(&store, witnessExecute, &.{
+        "audit-log",
+        checkpoint_hash,
+        public_key_hex,
+        signing_arg,
+        "observed_at_ms=300",
+        "ext=7769746e657373",
+    }, allocator);
+    const witness_value = witness_response.value.?;
+    try testing.expect(std.mem.containsAtLeast(u8, witness_value, 1, "\"witness_identity\""));
+    try testing.expect(std.mem.containsAtLeast(u8, witness_value, 1, "\"observed_at_ms\":300"));
+    const canonical_witness = try extractJsonStringField(allocator, witness_value, "canonical_record_hex");
+
+    const imported_witness = try runProc(&store, witnessImportExecute, &.{ "audit-log", checkpoint_hash, canonical_witness }, allocator);
+    try testing.expect(std.mem.containsAtLeast(u8, imported_witness.value.?, 1, "\"witness_record_hash\""));
+
+    const witness_verified = try runProc(&store, witnessVerifyExecute, &.{ "audit-log", checkpoint_hash, public_key_hex }, allocator);
+    try testing.expect(std.mem.containsAtLeast(u8, witness_verified.value.?, 1, "\"valid\":true"));
 
     const bundle_response = try runProc(&store, proofBundleExecute, &.{ "audit-log", "2", "2", checkpoint_hash }, allocator);
     const bundle_value = bundle_response.value.?;

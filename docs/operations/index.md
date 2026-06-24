@@ -44,7 +44,7 @@ bun run apps/bun/src/bin/client.ts SAVE
 bun run apps/bun/src/bin/client.ts EXEC vstats vec:
 ```
 
-Run `EXEC vreindex <namespace>` after raw vector ingest, raw/custom vector recovery where metric metadata is unavailable, or suspected HNSW corruption. Memory namespaces are rebuilt from recovered `vec:mem:<ns>:` keys on startup when their config key is present.
+Run `EXEC vreindex <namespace>` after raw `SET` vector ingest, old vector data without metric metadata, or suspected HNSW corruption. Namespaces written through vector commands/procedures and memory namespaces are rebuilt from recovered `vec:*` keys on startup.
 
 ## Admin UI
 

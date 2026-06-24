@@ -24,6 +24,7 @@ const distance = @import("../vector/distance.zig");
 const rabitq = @import("../vector/rabitq.zig");
 const Metric = @import("../vector/metric.zig").Metric;
 const core = @import("../core/mod.zig");
+const VEC_NS_META_PREFIX: []const u8 = "__meta:vecns:";
 
 /// Encode a vector's BQ companion into a newly-allocated, caller-owned
 /// buffer. Chooses the RaBitQ path (24-byte format on 128-dim) when the
@@ -119,6 +120,33 @@ fn keyBelongsToNamespace(key: []const u8, namespace: []const u8) bool {
     return namespace.len > 0 and std.mem.startsWith(u8, key, namespace);
 }
 
+fn persistNamespaceConfig(
+    store: *Store,
+    allocator: std.mem.Allocator,
+    namespace: []const u8,
+    metric: Metric,
+    timestamp: u64,
+) void {
+    const key = std.fmt.allocPrint(allocator, "{s}{s}", .{ VEC_NS_META_PREFIX, namespace }) catch return;
+    defer allocator.free(key);
+
+    if (store.getValueDupe(key, allocator) catch return) |existing| {
+        allocator.free(existing);
+        return;
+    }
+
+    const value = std.fmt.allocPrint(
+        allocator,
+        "{{\"metric\":\"{s}\",\"created_at\":{d}}}",
+        .{ metric.name(), timestamp },
+    ) catch return;
+    defer allocator.free(value);
+
+    store.setWithTimestamp(key, value, false, timestamp) catch |err| {
+        std.log.warn("persistNamespaceConfig: '{s}': {s}", .{ namespace, @errorName(err) });
+    };
+}
+
 /// Apply a VINSERT locally: write vec + BQ to the store, update HNSW,
 /// emit event, optionally replicate. Metric mismatches on the registry
 /// are logged and skipped (store + BQ still succeed — peers remain
@@ -151,13 +179,14 @@ pub fn applyVinsert(
     }
 
     // ── Store the vec entry ──────────────────────────────────────
-    store.set(args.key, args.vector, args.worm) catch |e| {
+    store.setWithTimestamp(args.key, args.vector, args.worm, args.timestamp) catch |e| {
         return switch (e) {
             error.WormViolation => error.WormViolation,
             error.OutOfMemory => error.OutOfMemory,
             else => error.IoError,
         };
     };
+    persistNamespaceConfig(store, allocator, args.namespace, args.metric, args.timestamp);
 
     // ── Compute + store BQ companion ─────────────────────────────
     // bq:<full_key> — always alloc the bq key; small and transient.
@@ -169,7 +198,7 @@ pub fn applyVinsert(
     const bq_buf = try encodeBqOwned(allocator, vec_f32, ns_idx_for_bq);
     defer allocator.free(bq_buf);
 
-    store.set(bq_key, bq_buf, args.worm) catch |e| {
+    store.setWithTimestamp(bq_key, bq_buf, args.worm, args.timestamp) catch |e| {
         std.log.warn("applyVinsert: BQ store failed for '{s}': {s}", .{ bq_key, @errorName(e) });
     };
 
@@ -287,6 +316,8 @@ pub fn applyVbulkinsert(
     // These use per-key shard locks; parallel shards don't block each
     // other. No namespace lock held here.
     const ns_idx_for_bq: ?*NamespaceIndex = if (registry) |reg| reg.get(namespace) else null;
+    persistNamespaceConfig(store, allocator, namespace, metric, items[0].timestamp);
+
     var dim_check: ?usize = null;
     for (items) |item| {
         if (item.vector.len == 0 or item.vector.len % 4 != 0) {
@@ -300,7 +331,7 @@ pub fn applyVbulkinsert(
             }
         } else dim_check = item.vector.len;
 
-        store.set(item.key, item.vector, worm) catch |e| {
+        store.setWithTimestamp(item.key, item.vector, worm, item.timestamp) catch |e| {
             std.log.warn("applyVbulkinsert: store vec '{s}' failed: {s}", .{ item.key, @errorName(e) });
             continue;
         };
@@ -310,7 +341,7 @@ pub fn applyVbulkinsert(
         const vec_f32 = distance.bytesToF32(item.vector).?;
         const bq_buf = encodeBqOwned(allocator, vec_f32, ns_idx_for_bq) catch continue;
         defer allocator.free(bq_buf);
-        store.set(bq_key, bq_buf, worm) catch |e| {
+        store.setWithTimestamp(bq_key, bq_buf, worm, item.timestamp) catch |e| {
             std.log.warn("applyVbulkinsert: store bq '{s}' failed: {s}", .{ bq_key, @errorName(e) });
         };
     }

@@ -1162,9 +1162,13 @@ pub fn memRange(ctx: *Ctx) anyerror!Ctx.Result {
         }
     }
 
-    if (ctx.arg(4) != null) {
-        return ctx.err("mem_range: filter predicates are not implemented yet; blocked on shared predicate parser (#2)");
-    }
+    var parsed_filter: ?predicate.Predicate = null;
+    defer if (parsed_filter) |*p| p.deinit();
+    const filter: ?*const predicate.Predicate = if (ctx.arg(4)) |raw| blk: {
+        parsed_filter = predicate.parse(ctx.allocator, raw) catch
+            return ctx.err("mem_range: invalid filter predicate");
+        break :blk &parsed_filter.?;
+    } else null;
 
     const doc_prefix = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:", .{ns});
     defer ctx.allocator.free(doc_prefix);
@@ -1187,29 +1191,35 @@ pub fn memRange(ctx: *Ctx) anyerror!Ctx.Result {
 
     std.sort.heap(RangeItem, scan_ctx.items.items, {}, rangeItemLessThan);
 
-    const emit_count = if (limit == 0) scan_ctx.items.items.len else @min(limit, scan_ctx.items.items.len);
-
     var json: std.ArrayListUnmanaged(u8) = .empty;
     errdefer json.deinit(ctx.allocator);
     try json.append(ctx.allocator, '[');
 
-    for (scan_ctx.items.items[0..emit_count], 0..) |item, i| {
-        if (i > 0) try json.append(ctx.allocator, ',');
+    var emitted: usize = 0;
+    for (scan_ctx.items.items) |item| {
+        if (limit > 0 and emitted >= limit) break;
+        const meta_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}:meta", .{ ns, item.id });
+        defer ctx.allocator.free(meta_key);
+        const meta = try ctx.getCopy(meta_key);
+        if (filter) |pred| {
+            if (!pred.matches(meta, item.timestamp)) continue;
+        }
+
+        if (emitted > 0) try json.append(ctx.allocator, ',');
         try json.appendSlice(ctx.allocator, "{\"id\":\"");
         try appendJsonEscaped(&json, ctx.allocator, item.id);
         try json.appendSlice(ctx.allocator, "\",\"ts\":");
         try writeU64(&json, ctx.allocator, item.timestamp);
         try json.appendSlice(ctx.allocator, ",\"meta\":");
 
-        const meta_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}:meta", .{ ns, item.id });
-        defer ctx.allocator.free(meta_key);
-        if (try ctx.getCopy(meta_key)) |meta| {
-            try json.appendSlice(ctx.allocator, meta);
+        if (meta) |bytes| {
+            try json.appendSlice(ctx.allocator, bytes);
         } else {
             try json.appendSlice(ctx.allocator, "null");
         }
 
         try json.append(ctx.allocator, '}');
+        emitted += 1;
     }
     try json.append(ctx.allocator, ']');
 
@@ -2406,8 +2416,37 @@ test "mem_range: returns docs in timestamp order with meta and limit" {
     );
 }
 
-test "mem_range: rejects filter until shared predicate parser lands" {
+test "mem_range: applies metadata and ts filters before limit" {
     var fx = try TestStoreFixture.init("memrange_filter");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try fx.store.setWithTimestamp("mem:demo:old", "old", false, 1_000);
+    try fx.store.setWithTimestamp("mem:demo:match-a", "a", false, 2_000);
+    try fx.store.setWithTimestamp("mem:demo:miss", "miss", false, 3_000);
+    try fx.store.setWithTimestamp("mem:demo:match-b", "b", false, 4_000);
+    try fx.store.setWithTimestamp("mem:demo:match-a:meta", "{\"category\":\"semantic\",\"privacy_level\":1}", false, 2_000);
+    try fx.store.setWithTimestamp("mem:demo:miss:meta", "{\"category\":\"episodic\",\"privacy_level\":1}", false, 3_000);
+    try fx.store.setWithTimestamp("mem:demo:match-b:meta", "{\"category\":\"semantic\",\"privacy_level\":2}", false, 4_000);
+
+    const result = try runProc(
+        &fx.store,
+        memRange,
+        &.{ "demo", "0", "5000", "1", "filter=category=\"semantic\" AND privacy_level<=1 AND ts>=1500" },
+        arena,
+    );
+    try testing.expect(result == .value);
+    try testing.expectEqualStrings(
+        "[{\"id\":\"match-a\",\"ts\":2000,\"meta\":{\"category\":\"semantic\",\"privacy_level\":1}}]",
+        result.value.?,
+    );
+}
+
+test "mem_range: rejects invalid filter predicates" {
+    var fx = try TestStoreFixture.init("memrange_filter_invalid");
     defer fx.deinit();
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2417,11 +2456,11 @@ test "mem_range: rejects filter until shared predicate parser lands" {
     const result = try runProc(
         &fx.store,
         memRange,
-        &.{ "demo", "0", "1000", "10", "category=\"semantic\"" },
+        &.{ "demo", "0", "1000", "10", "meta.user.name=\"x\"" },
         arena,
     );
     try testing.expect(result == .err);
-    try testing.expect(std.mem.indexOf(u8, result.err, "filter") != null);
+    try testing.expectEqualStrings("mem_range: invalid filter predicate", result.err);
 }
 
 test "mem_bulk_add: stores vectors and meta, then publishes one bulk memory event" {

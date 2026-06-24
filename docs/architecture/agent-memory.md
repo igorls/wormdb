@@ -70,7 +70,7 @@ document, vector, BQ, and HNSW counts plus bounded `orphan_vectors`,
 `orphan_docs`, and `missing_bq` lists so clients can decide whether to reconcile
 from their canonical row store or run `mem_reset_index`.
 
-`mem_range` is a timestamp-window workaround for timeline views. It scans `mem:<ns>:` document keys, skips `:meta` companions, sorts by document timestamp ascending, and returns `[{id, ts, meta}]`. `limit` defaults to 100; `0` means no response cap. The optional filter slot is reserved for the shared predicate parser tracked in #2.
+`mem_range` is a timestamp-window workaround for timeline views. It scans `mem:<ns>:` document keys, skips `:meta` companions, sorts by document timestamp ascending, and returns `[{id, ts, meta}]`. `limit` defaults to 100; `0` means no response cap. The optional `filter` argument uses the same predicate grammar as `mem_query` and is applied before the response limit.
 
 `filter` narrows candidates before top-K admission. It applies during brute-force scan and during HNSW stage-2 exact refine. The predicate grammar is intentionally small: `=`, `<`, `<=`, `>=`, `>`, `AND`, and `IN (...)` over string or numeric literals. Fields are top-level metadata keys, `meta.<field>` aliases, or the synthetic `ts` field.
 

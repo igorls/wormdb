@@ -67,6 +67,10 @@ pub const ClusterStatus = struct {
     connected_peers: usize,
     mesh_ip: [4]u8,
     enabled: bool,
+    proof_checkpoint_records: usize,
+    proof_witness_records: usize,
+    proof_last_verified_ms: u64,
+    anti_entropy_mode: []const u8,
 };
 
 /// A persistent WormWire TCP connection to a peer WormDB node.
@@ -624,6 +628,10 @@ pub const Cluster = struct {
             .connected_peers = self.peers.count(),
             .mesh_ip = self.mesh_ip,
             .enabled = true,
+            .proof_checkpoint_records = self.store.countPrefix("proof:append-log-checkpoint:v1:"),
+            .proof_witness_records = self.store.countPrefix("proof:append-log-witness:v1:"),
+            .proof_last_verified_ms = 0,
+            .anti_entropy_mode = "full",
         };
     }
 
@@ -680,6 +688,9 @@ pub const Cluster = struct {
             else
                 false;
             try buf.print(allocator, "wormwire={s}\n", .{if (has_conn) "connected" else "disconnected"});
+            try buf.appendSlice(allocator, "root_sync=unknown\n");
+            try buf.appendSlice(allocator, "root_sync_last_ms=0\n");
+            try buf.appendSlice(allocator, "root_sync_missing_ranges=0\n");
 
             try buf.appendSlice(allocator, "---\n");
         }

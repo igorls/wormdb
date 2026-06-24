@@ -30,17 +30,25 @@ cluster_alive=3
 cluster_suspected=0
 cluster_dead=0
 replication_factor=0
+proof_checkpoint_records=4
+proof_witness_records=9
+proof_last_verified_ms=0
+anti_entropy_mode=full
 ```
 
-| Field                | Type    | Description                                     |
-| -------------------- | ------- | ----------------------------------------------- |
-| `keys`               | integer | Total number of keys in the store               |
-| `wal_size`           | integer | WAL file size in bytes                          |
-| `cluster_nodes`      | integer | Total known nodes in the cluster                |
-| `cluster_alive`      | integer | Nodes responding to health checks               |
-| `cluster_suspected`  | integer | Nodes under suspicion (missed health checks)    |
-| `cluster_dead`       | integer | Nodes confirmed unreachable                     |
-| `replication_factor` | integer | Configured replication factor (`0` = all peers) |
+| Field                      | Type    | Description                                                  |
+| -------------------------- | ------- | ------------------------------------------------------------ |
+| `keys`                     | integer | Total number of keys in the store                            |
+| `wal_size`                 | integer | WAL file size in bytes                                       |
+| `cluster_nodes`            | integer | Total known nodes in the cluster                             |
+| `cluster_alive`            | integer | Nodes responding to health checks                            |
+| `cluster_suspected`        | integer | Nodes under suspicion (missed health checks)                 |
+| `cluster_dead`             | integer | Nodes confirmed unreachable                                  |
+| `replication_factor`       | integer | Configured replication factor (`0` = all peers)              |
+| `proof_checkpoint_records` | integer | Stored append-log checkpoint records                         |
+| `proof_witness_records`    | integer | Stored append-log witness records                            |
+| `proof_last_verified_ms`   | integer | Last root verification timestamp; `0` until root sync exists |
+| `anti_entropy_mode`        | string  | Current anti-entropy mode; `full` means full-state fallback  |
 
 ## `CLUSTER STATUS`
 
@@ -55,6 +63,10 @@ cluster_alive=3
 cluster_suspected=0
 cluster_dead=0
 replication_factor=0
+proof_checkpoint_records=4
+proof_witness_records=9
+proof_last_verified_ms=0
+anti_entropy_mode=full
 ```
 
 ### Disabled
@@ -65,6 +77,10 @@ cluster_nodes=0
 cluster_alive=0
 cluster_suspected=0
 cluster_dead=0
+proof_checkpoint_records=0
+proof_witness_records=0
+proof_last_verified_ms=0
+anti_entropy_mode=disabled
 ```
 
 ## `CLUSTER PEERS`
@@ -81,11 +97,17 @@ mesh_ip=10.0.0.2
 state=alive
 gossip_endpoint=10.0.0.2:51821
 wormwire=connected
+root_sync=unknown
+root_sync_last_ms=0
+root_sync_missing_ranges=0
 ---
 mesh_ip=10.0.0.3
 state=alive
 gossip_endpoint=10.0.0.3:51821
 wormwire=connected
+root_sync=unknown
+root_sync_last_ms=0
+root_sync_missing_ranges=0
 ```
 
 ### Header Fields
@@ -103,6 +125,9 @@ wormwire=connected
 | `state`           | SWIM state: `alive`, `suspected`, `dead`, or `left`       |
 | `gossip_endpoint` | Peer's gossip address (host:port)                         |
 | `wormwire`        | Replication channel status: `connected` or `disconnected` |
+| `root_sync`       | Root anti-entropy status; `unknown` until root sync lands  |
+| `root_sync_last_ms` | Last per-peer root verification timestamp; `0` when unknown |
+| `root_sync_missing_ranges` | Missing ranges found by root sync; `0` until implemented |
 
 ## Parsing Tips
 

@@ -585,7 +585,7 @@ pub const Server = struct {
                     wire.writeResponse(stream, .ok) catch return;
                 },
                 .exec => |params| {
-                    if (!std.mem.eql(u8, params.procedure, "append_log_witness")) {
+                    if (!isAllowedReplicationProcedure(params.procedure)) {
                         wire.writeResponse(stream, .{ .err = "unsupported replication command" }) catch return;
                         continue;
                     }
@@ -601,8 +601,8 @@ pub const Server = struct {
                         .auth_mint = self.config.auth_mint,
                         .vector_registry = self.config.vector_registry,
                     }, cmd) catch |e| {
-                        std.log.warn("replication: append_log_witness failed: {s}", .{@errorName(e)});
-                        wire.writeResponse(stream, .{ .err = "append_log_witness failed" }) catch return;
+                        std.log.warn("replication: EXEC {s} failed: {s}", .{ params.procedure, @errorName(e) });
+                        wire.writeResponse(stream, .{ .err = "replication EXEC failed" }) catch return;
                         continue;
                     };
                     wire.writeResponse(stream, response) catch return;
@@ -612,6 +612,11 @@ pub const Server = struct {
                 },
             }
         }
+    }
+
+    fn isAllowedReplicationProcedure(name: []const u8) bool {
+        return std.mem.eql(u8, name, "append_log_witness") or
+            std.mem.eql(u8, name, "proof_prefix_root");
     }
 
     fn handleTextConnection(self: *Server, stream: *core.compat.net.Stream, conn_ctx: *ConnectionContext, initial: [2]u8) void {

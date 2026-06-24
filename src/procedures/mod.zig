@@ -22,6 +22,7 @@ pub const vinsert = @import("vinsert.zig");
 pub const vstats = @import("vstats.zig");
 pub const memory = @import("memory.zig");
 pub const append_log = @import("append_log.zig");
+pub const proof_prefix_root = @import("proof_prefix_root.zig");
 // Light-API + AtomicAssets procedures are NOT here — they live in their own packages
 // (wormdb-domain-lightapi, wormdb-domain-atomicassets) and register via the manifest at startup.
 

@@ -32,8 +32,8 @@ cluster_dead=0
 replication_factor=0
 proof_checkpoint_records=4
 proof_witness_records=9
-proof_last_verified_ms=0
-anti_entropy_mode=full
+proof_last_verified_ms=1780957400000
+anti_entropy_mode=root
 ```
 
 | Field                      | Type    | Description                                                  |
@@ -47,8 +47,8 @@ anti_entropy_mode=full
 | `replication_factor`       | integer | Configured replication factor (`0` = all peers)              |
 | `proof_checkpoint_records` | integer | Stored append-log checkpoint records                         |
 | `proof_witness_records`    | integer | Stored append-log witness records                            |
-| `proof_last_verified_ms`   | integer | Last root verification timestamp; `0` until root sync exists |
-| `anti_entropy_mode`        | string  | Current anti-entropy mode; `full` means full-state fallback  |
+| `proof_last_verified_ms`   | integer | Last successful per-peer root verification timestamp; `0` until a root probe succeeds |
+| `anti_entropy_mode`        | string  | Current anti-entropy mode; `root` probes compact roots before falling back to full sync |
 
 ## `CLUSTER STATUS`
 
@@ -65,8 +65,8 @@ cluster_dead=0
 replication_factor=0
 proof_checkpoint_records=4
 proof_witness_records=9
-proof_last_verified_ms=0
-anti_entropy_mode=full
+proof_last_verified_ms=1780957400000
+anti_entropy_mode=root
 ```
 
 ### Disabled
@@ -97,8 +97,8 @@ mesh_ip=10.0.0.2
 state=alive
 gossip_endpoint=10.0.0.2:51821
 wormwire=connected
-root_sync=unknown
-root_sync_last_ms=0
+root_sync=healthy
+root_sync_last_ms=1780957400000
 root_sync_missing_ranges=0
 ---
 mesh_ip=10.0.0.3
@@ -125,9 +125,9 @@ root_sync_missing_ranges=0
 | `state`           | SWIM state: `alive`, `suspected`, `dead`, or `left`       |
 | `gossip_endpoint` | Peer's gossip address (host:port)                         |
 | `wormwire`        | Replication channel status: `connected` or `disconnected` |
-| `root_sync`       | Root anti-entropy status; `unknown` until root sync lands  |
+| `root_sync`       | Root anti-entropy status: `healthy`, `behind`, `ahead`, `diverged`, or `unknown` |
 | `root_sync_last_ms` | Last per-peer root verification timestamp; `0` when unknown |
-| `root_sync_missing_ranges` | Missing ranges found by root sync; `0` until implemented |
+| `root_sync_missing_ranges` | Missing sorted-prefix tail ranges repaired or detected by root sync |
 
 ## Parsing Tips
 

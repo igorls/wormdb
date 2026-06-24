@@ -11,12 +11,15 @@ const builtin = @import("builtin");
 const meshguard = @import("meshguard");
 const storage = @import("../storage/mod.zig");
 const event = @import("../event/mod.zig");
+const protocol = @import("../protocol/mod.zig");
 const wire = @import("../protocol/wire.zig");
 const core = @import("../core/mod.zig");
 const Command = core.types.Command;
 
 const Store = storage.Store;
 const EventBus = event.EventBus;
+const NamespaceIndex = @import("../vector/index.zig").NamespaceIndex;
+const prefix_root = @import("../proof/prefix_root.zig");
 
 const Keys = meshguard.identity.Keys;
 const Membership = meshguard.discovery.Membership;
@@ -73,6 +76,35 @@ pub const ClusterStatus = struct {
     anti_entropy_mode: []const u8,
 };
 
+const RootSyncState = enum {
+    healthy,
+    behind,
+    ahead,
+    diverged,
+    unknown,
+
+    fn name(self: RootSyncState) []const u8 {
+        return switch (self) {
+            .healthy => "healthy",
+            .behind => "behind",
+            .ahead => "ahead",
+            .diverged => "diverged",
+            .unknown => "unknown",
+        };
+    }
+};
+
+const RegSnap = struct {
+    prefix: []const u8,
+    idx: *NamespaceIndex,
+};
+
+const SyncStats = struct {
+    synced_set: usize = 0,
+    synced_vinsert: usize = 0,
+    skipped_bq: usize = 0,
+};
+
 /// A persistent WormWire TCP connection to a peer WormDB node.
 const PeerConnection = struct {
     mesh_ip: [4]u8,
@@ -88,6 +120,9 @@ const PeerConnection = struct {
     /// Set by onPeerDead, cleared by onPeerJoin. Prevents blocking TCP connect
     /// attempts to unreachable peers.
     is_dead: bool,
+    root_sync: RootSyncState,
+    root_sync_last_ms: u64,
+    root_sync_missing_ranges: usize,
 
     fn connect(self: *PeerConnection, port: u16) void {
         if (self.stream != null) return;
@@ -378,6 +413,9 @@ pub const Cluster = struct {
                     .last_connect_attempt_ns = 0,
                     .needs_sync = true,
                     .is_dead = false,
+                    .root_sync = .unknown,
+                    .root_sync_last_ms = 0,
+                    .root_sync_missing_ranges = 0,
                 }) catch {};
                 var ip_buf: [15]u8 = undefined;
                 const ip_str = WgIp.formatIp(swim_peer.mesh_ip, &ip_buf);
@@ -397,102 +435,278 @@ pub const Cluster = struct {
                 const ip_str = WgIp.formatIp(peer.mesh_ip, &ip_buf);
                 std.log.info("cluster: anti-entropy sync starting for {s}", .{ip_str});
 
-                // Snapshot the registry's namespaces once so the per-key
-                // callback can do cheap prefix checks. The registry's own
-                // read-lock stays brief; NamespaceIndex pointers remain
-                // valid because nothing removes namespaces during this sync.
-                const RegSnap = struct {
-                    prefix: []const u8,
-                    idx: *@import("../vector/index.zig").NamespaceIndex,
-                };
-                var reg_snap: std.ArrayListUnmanaged(RegSnap) = .empty;
+                var reg_snap = self.snapshotVectorRegistry();
                 defer reg_snap.deinit(self.allocator);
-                if (self.vector_registry) |reg| {
-                    reg.lock.lockShared();
-                    defer reg.lock.unlockShared();
-                    var ri = reg.map.iterator();
-                    while (ri.next()) |e| {
-                        reg_snap.append(self.allocator, .{
-                            .prefix = e.key_ptr.*,
-                            .idx = e.value_ptr.*,
-                        }) catch break;
+
+                if (self.tryRootAntiEntropy(peer, reg_snap.items)) |result| {
+                    switch (result) {
+                        .healthy => {
+                            std.log.info("cluster: root sync healthy for {s}; full sync skipped", .{ip_str});
+                            continue;
+                        },
+                        .repaired => |stats| {
+                            std.log.info("cluster: root sync repaired {s} — {d} SET, {d} VINSERT, {d} bq-skipped", .{
+                                ip_str,
+                                stats.synced_set,
+                                stats.synced_vinsert,
+                                stats.skipped_bq,
+                            });
+                            continue;
+                        },
+                        .fallback => {},
                     }
+                } else |err| {
+                    std.log.debug("cluster: root sync probe failed for {s}: {s}", .{ ip_str, @errorName(err) });
                 }
 
-                const SyncCtx = struct {
-                    p: *PeerConnection,
-                    synced_set: usize = 0,
-                    synced_vinsert: usize = 0,
-                    skipped_bq: usize = 0,
-                    reg_snap: []const RegSnap,
-                    /// Find which registered namespace (if any) owns this key.
-                    fn matchNamespace(ctx: @This(), key: []const u8) ?*RegSnap {
-                        for (ctx.reg_snap) |*r| {
-                            if (std.mem.startsWith(u8, key, r.prefix)) return @constCast(r);
-                        }
-                        return null;
-                    }
+                var sync_ctx = FullSyncCtx{
+                    .cluster = self,
+                    .peer = peer,
+                    .reg_snap = reg_snap.items,
                 };
-                var sync_ctx = SyncCtx{ .p = peer, .reg_snap = reg_snap.items };
-
-                self.store.iterateAll(@ptrCast(&sync_ctx), &struct {
-                    fn cb(raw_ctx: *anyopaque, k: []const u8, v: []const u8, w: bool) void {
-                        const sctx: *SyncCtx = @ptrCast(@alignCast(raw_ctx));
-
-                        // `bq:<ns><id>` companions: skip when the namespace
-                        // is registered — the peer regenerates them from
-                        // VINSERT. Otherwise, SET replicates them.
-                        const BQ_PREFIX = "bq:";
-                        if (std.mem.startsWith(u8, k, BQ_PREFIX)) {
-                            const stripped = k[BQ_PREFIX.len..];
-                            if (sctx.matchNamespace(stripped) != null) {
-                                sctx.skipped_bq += 1;
-                                return;
-                            }
-                        }
-
-                        // Registered-namespace vector keys: emit VINSERT.
-                        if (sctx.matchNamespace(k)) |r| {
-                            r.idx.lock.lockShared();
-                            defer r.idx.lock.unlockShared();
-
-                            if (r.idx.nodeIdFor(k)) |node_id| {
-                                const ts = r.idx.timestamps.items[node_id];
-                                if (sctx.p.sendCommand(.{ .vinsert = .{
-                                    .key = k,
-                                    .vector = v,
-                                    .worm = w,
-                                    .namespace = r.prefix,
-                                    .metric = r.idx.metric.name(),
-                                    .timestamp = ts,
-                                } })) {
-                                    sctx.synced_vinsert += 1;
-                                }
-                                return;
-                            }
-                            // Registered namespace but no HNSW node — this
-                            // key was SET directly. Fall through to SET.
-                        }
-
-                        // Default path: replicate as a raw SET.
-                        if (sctx.p.sendCommand(.{ .set = .{
-                            .key = k,
-                            .value = v,
-                            .worm = w,
-                        } })) {
-                            sctx.synced_set += 1;
-                        }
-                    }
-                }.cb);
+                self.store.iterateAll(@ptrCast(&sync_ctx), fullSyncCallback);
 
                 std.log.info("cluster: sync to {s} — {d} SET, {d} VINSERT, {d} bq-skipped", .{
                     ip_str,
-                    sync_ctx.synced_set,
-                    sync_ctx.synced_vinsert,
-                    sync_ctx.skipped_bq,
+                    sync_ctx.stats.synced_set,
+                    sync_ctx.stats.synced_vinsert,
+                    sync_ctx.stats.skipped_bq,
                 });
             }
         }
+    }
+
+    fn snapshotVectorRegistry(self: *Cluster) std.ArrayListUnmanaged(RegSnap) {
+        var reg_snap: std.ArrayListUnmanaged(RegSnap) = .empty;
+        if (self.vector_registry) |reg| {
+            reg.lock.lockShared();
+            defer reg.lock.unlockShared();
+            var ri = reg.map.iterator();
+            while (ri.next()) |e| {
+                reg_snap.append(self.allocator, .{
+                    .prefix = e.key_ptr.*,
+                    .idx = e.value_ptr.*,
+                }) catch break;
+            }
+        }
+        return reg_snap;
+    }
+
+    const FullSyncCtx = struct {
+        cluster: *Cluster,
+        peer: *PeerConnection,
+        reg_snap: []const RegSnap,
+        stats: SyncStats = .{},
+    };
+
+    fn fullSyncCallback(raw_ctx: *anyopaque, key: []const u8, value: []const u8, is_worm: bool) void {
+        const ctx: *FullSyncCtx = @ptrCast(@alignCast(raw_ctx));
+        ctx.cluster.sendStoreEntryToPeer(ctx.peer, ctx.reg_snap, key, value, is_worm, &ctx.stats);
+    }
+
+    fn matchNamespace(reg_snap: []const RegSnap, key: []const u8) ?*const RegSnap {
+        for (reg_snap) |*r| {
+            if (std.mem.startsWith(u8, key, r.prefix)) return r;
+        }
+        return null;
+    }
+
+    fn sendStoreEntryToPeer(
+        self: *Cluster,
+        peer: *PeerConnection,
+        reg_snap: []const RegSnap,
+        key: []const u8,
+        value: []const u8,
+        is_worm: bool,
+        stats: *SyncStats,
+    ) void {
+        _ = self;
+        const BQ_PREFIX = "bq:";
+        if (std.mem.startsWith(u8, key, BQ_PREFIX)) {
+            const stripped = key[BQ_PREFIX.len..];
+            if (matchNamespace(reg_snap, stripped) != null) {
+                stats.skipped_bq += 1;
+                return;
+            }
+        }
+
+        if (matchNamespace(reg_snap, key)) |r| {
+            r.idx.lock.lockShared();
+            defer r.idx.lock.unlockShared();
+
+            if (r.idx.nodeIdFor(key)) |node_id| {
+                const ts = r.idx.timestamps.items[node_id];
+                if (peer.sendCommand(.{ .vinsert = .{
+                    .key = key,
+                    .vector = value,
+                    .worm = is_worm,
+                    .namespace = r.prefix,
+                    .metric = r.idx.metric.name(),
+                    .timestamp = ts,
+                } })) {
+                    stats.synced_vinsert += 1;
+                }
+                return;
+            }
+        }
+
+        if (peer.sendCommand(.{ .set = .{
+            .key = key,
+            .value = value,
+            .worm = is_worm,
+        } })) {
+            stats.synced_set += 1;
+        }
+    }
+
+    const RootAntiEntropyResult = union(enum) {
+        healthy,
+        repaired: SyncStats,
+        fallback,
+    };
+
+    fn tryRootAntiEntropy(
+        self: *Cluster,
+        peer: *PeerConnection,
+        reg_snap: []const RegSnap,
+    ) !RootAntiEntropyResult {
+        const prefix = "";
+        const local = try prefix_root.compute(self.allocator, self.store, prefix, 0);
+        const remote = try self.requestPeerPrefixRoot(peer, prefix, 0);
+        const now_ms: u64 = @intCast(core.compat.nowMs());
+
+        if (local.entry_count == remote.entry_count and std.mem.eql(u8, local.root[0..], remote.root[0..])) {
+            peer.root_sync = .healthy;
+            peer.root_sync_last_ms = now_ms;
+            peer.root_sync_missing_ranges = 0;
+            return .healthy;
+        }
+
+        if (remote.entry_count < local.entry_count) {
+            const local_prefix = try prefix_root.computeFirstN(self.allocator, self.store, prefix, remote.entry_count);
+            if (std.mem.eql(u8, local_prefix.root[0..], remote.root[0..])) {
+                const results = try self.store.scanPrefixFirst(prefix, 0, self.allocator);
+                defer freeScanResults(self.allocator, results);
+                if (remote.entry_count > results.len) {
+                    peer.root_sync = .unknown;
+                    peer.root_sync_last_ms = now_ms;
+                    peer.root_sync_missing_ranges = 0;
+                    return .fallback;
+                }
+
+                var stats: SyncStats = .{};
+                for (results[remote.entry_count..]) |r| {
+                    self.sendStoreEntryToPeer(peer, reg_snap, r.key, r.value, r.is_worm, &stats);
+                }
+
+                peer.root_sync = .behind;
+                peer.root_sync_last_ms = now_ms;
+                peer.root_sync_missing_ranges = 1;
+                return RootAntiEntropyResult{ .repaired = stats };
+            }
+        }
+
+        peer.root_sync = if (remote.entry_count > local.entry_count) .ahead else .diverged;
+        peer.root_sync_last_ms = now_ms;
+        peer.root_sync_missing_ranges = if (peer.root_sync == .diverged) 1 else 0;
+        return .fallback;
+    }
+
+    const PeerRootSummary = struct {
+        entry_count: usize,
+        root: prefix_root.Hash,
+    };
+
+    fn requestPeerPrefixRoot(
+        self: *Cluster,
+        peer: *PeerConnection,
+        prefix: []const u8,
+        first_limit: usize,
+    ) !PeerRootSummary {
+        const ip = peer.real_addr orelse peer.mesh_ip;
+        const addr = core.compat.net.Address.initIp4(ip, self.config.peer_port);
+        var stream = try core.compat.net.tcpConnectToAddress(addr);
+        defer stream.close();
+
+        if (comptime builtin.os.tag == .linux) {
+            const timeval = std.posix.timeval{ .sec = 2, .usec = 0 };
+            std.posix.setsockopt(stream.getHandle(), std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeval)) catch {};
+            std.posix.setsockopt(stream.getHandle(), std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
+        }
+
+        try stream.writeAll(&wire.REPL_MAGIC);
+
+        var limit_buf: [48]u8 = undefined;
+        const limit_arg = try std.fmt.bufPrint(&limit_buf, "limit={d}", .{first_limit});
+        var args = [_][]const u8{ prefix, limit_arg };
+        try wire.writeCommand(&stream, .{ .exec = .{
+            .procedure = "proof_prefix_root",
+            .args = args[0..],
+        } });
+
+        const ReadAdapter = struct {
+            stream: *core.compat.net.Stream,
+
+            pub fn read(adapter: *@This(), dest: []u8) !usize {
+                return adapter.stream.read(dest);
+            }
+        };
+        var reader = ReadAdapter{ .stream = &stream };
+        const response = try wire.readResponseAlloc(&reader, self.allocator);
+        defer protocol.deinitResponse(self.allocator, response);
+
+        return switch (response) {
+            .value => |maybe_value| parsePeerRootSummary(self.allocator, maybe_value orelse return error.Corruption),
+            .err => error.Corruption,
+            else => error.Corruption,
+        };
+    }
+
+    fn parsePeerRootSummary(allocator: std.mem.Allocator, payload: []const u8) !PeerRootSummary {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+
+        const obj = parsed.value.object;
+        const alg = obj.get("root_alg") orelse return error.Corruption;
+        if (alg != .string or !std.mem.eql(u8, alg.string, prefix_root.ROOT_ALG)) return error.Corruption;
+
+        const count_value = obj.get("entry_count") orelse return error.Corruption;
+        if (count_value != .integer or count_value.integer < 0) return error.Corruption;
+
+        const root_value = obj.get("root") orelse return error.Corruption;
+        if (root_value != .string) return error.Corruption;
+        return .{
+            .entry_count = @intCast(count_value.integer),
+            .root = try parseRootHex(root_value.string),
+        };
+    }
+
+    fn parseRootHex(hex: []const u8) !prefix_root.Hash {
+        if (hex.len != prefix_root.HASH_LEN * 2) return error.Corruption;
+        var out: prefix_root.Hash = undefined;
+        for (&out, 0..) |*byte, i| {
+            const hi = try hexNibble(hex[i * 2]);
+            const lo = try hexNibble(hex[i * 2 + 1]);
+            byte.* = (hi << 4) | lo;
+        }
+        return out;
+    }
+
+    fn hexNibble(c: u8) !u8 {
+        return switch (c) {
+            '0'...'9' => c - '0',
+            'a'...'f' => c - 'a' + 10,
+            'A'...'F' => c - 'A' + 10,
+            else => error.Corruption,
+        };
+    }
+
+    fn freeScanResults(allocator: std.mem.Allocator, results: []Store.ScanResult) void {
+        for (results) |r| {
+            allocator.free(r.key);
+            allocator.free(r.value);
+        }
+        allocator.free(results);
     }
 
     /// Replicate a SET to all alive peers via WormWire.
@@ -647,6 +861,12 @@ pub const Cluster = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        var proof_last_verified_ms: u64 = 0;
+        var peer_iter = self.peers.iterator();
+        while (peer_iter.next()) |entry| {
+            proof_last_verified_ms = @max(proof_last_verified_ms, entry.value_ptr.root_sync_last_ms);
+        }
+
         return .{
             .total_nodes = self.membership.count(),
             .alive_nodes = self.membership.countByState(.alive),
@@ -658,8 +878,8 @@ pub const Cluster = struct {
             .enabled = true,
             .proof_checkpoint_records = self.store.countPrefix("proof:append-log-checkpoint:v1:"),
             .proof_witness_records = self.store.countPrefix("proof:append-log-witness:v1:"),
-            .proof_last_verified_ms = 0,
-            .anti_entropy_mode = "full",
+            .proof_last_verified_ms = proof_last_verified_ms,
+            .anti_entropy_mode = "root",
         };
     }
 
@@ -716,9 +936,15 @@ pub const Cluster = struct {
             else
                 false;
             try buf.print(allocator, "wormwire={s}\n", .{if (has_conn) "connected" else "disconnected"});
-            try buf.appendSlice(allocator, "root_sync=unknown\n");
-            try buf.appendSlice(allocator, "root_sync_last_ms=0\n");
-            try buf.appendSlice(allocator, "root_sync_missing_ranges=0\n");
+            if (self.peers.getPtr(peer.mesh_ip)) |pc| {
+                try buf.print(allocator, "root_sync={s}\n", .{pc.root_sync.name()});
+                try buf.print(allocator, "root_sync_last_ms={d}\n", .{pc.root_sync_last_ms});
+                try buf.print(allocator, "root_sync_missing_ranges={d}\n", .{pc.root_sync_missing_ranges});
+            } else {
+                try buf.appendSlice(allocator, "root_sync=unknown\n");
+                try buf.appendSlice(allocator, "root_sync_last_ms=0\n");
+                try buf.appendSlice(allocator, "root_sync_missing_ranges=0\n");
+            }
 
             try buf.appendSlice(allocator, "---\n");
         }
@@ -755,12 +981,16 @@ pub const Cluster = struct {
                 .last_connect_attempt_ns = 0,
                 .needs_sync = true,
                 .is_dead = false,
+                .root_sync = .unknown,
+                .root_sync_last_ms = 0,
+                .root_sync_missing_ranges = 0,
             }) catch {};
         } else {
             // Peer returning after death — clear dead flag and update address
             if (self.peers.getPtr(peer_mesh_ip)) |conn| {
                 conn.is_dead = false;
                 conn.needs_sync = true;
+                conn.root_sync = .unknown;
                 if (real_addr != null) conn.real_addr = real_addr;
             }
         }

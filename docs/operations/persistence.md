@@ -84,7 +84,7 @@ No disk IO at all. No snapshot, no WAL. Data exists only in process memory and i
 - WAL truncation happens only in `full` mode, after a successful snapshot write.
 - The `wal_size` field in `STATUS` output tracks the current WAL file size in bytes — use this for monitoring growth.
 - Snapshot v2 persists HNSW graphs, tombstones, timestamps, and RaBitQ parameters in an `WDBHNSW2` trailer after the KV snapshot.
-- WAL replay restores durable vector keys after the latest snapshot. Vector namespaces written through `VINSERT`, `VBULKINSERT`, `vinsert`, or `mem_add` persist metric metadata and are automatically rebuilt from recovered `vec:*` keys on startup. Run `EXEC vreindex <namespace>` after raw `SET` ingest, old data without metric metadata, or suspected index corruption.
+- WAL replay restores durable vector keys after the latest snapshot. Vector APIs also append `vinsert`/`vdelete` metadata records so replay can apply post-snapshot mutations back into HNSW with the original namespace, metric, timestamp, and flags. Configured vector and memory namespaces still have a KV rebuild fallback from recovered `vec:*` keys. Run `EXEC vreindex <namespace>` after raw `SET` ingest, old data without vector metadata, or suspected index corruption.
 
 ```bash
 bun run apps/bun/src/bin/client.ts STATUS

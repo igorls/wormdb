@@ -187,6 +187,9 @@ pub fn applyVinsert(
         };
     };
     persistNamespaceConfig(store, allocator, args.namespace, args.metric, args.timestamp);
+    store.appendVectorInsertWal(args.key, args.namespace, args.metric.name(), args.worm, args.is_async, args.timestamp) catch |e| {
+        std.log.warn("applyVinsert: vector WAL metadata '{s}': {s}", .{ args.key, @errorName(e) });
+    };
 
     // ── Compute + store BQ companion ─────────────────────────────
     // bq:<full_key> — always alloc the bq key; small and transient.
@@ -335,6 +338,9 @@ pub fn applyVbulkinsert(
             std.log.warn("applyVbulkinsert: store vec '{s}' failed: {s}", .{ item.key, @errorName(e) });
             continue;
         };
+        store.appendVectorInsertWal(item.key, namespace, metric.name(), worm, is_async, item.timestamp) catch |e| {
+            std.log.warn("applyVbulkinsert: vector WAL metadata '{s}': {s}", .{ item.key, @errorName(e) });
+        };
 
         const bq_key = std.fmt.allocPrint(allocator, "bq:{s}", .{item.key}) catch continue;
         defer allocator.free(bq_key);
@@ -477,6 +483,9 @@ pub fn applyVdelete(
 
     // ── Delete vec entry (WAL + WORM check) ──────────────────────
     try store.delete(key);
+    store.appendVectorDeleteWal(key, namespace) catch |e| {
+        std.log.warn("applyVdelete: vector WAL metadata '{s}': {s}", .{ key, @errorName(e) });
+    };
 
     // ── Delete BQ companion (best-effort) ────────────────────────
     const bq_key = try std.fmt.allocPrint(allocator, "bq:{s}", .{key});

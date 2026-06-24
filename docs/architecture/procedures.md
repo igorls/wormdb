@@ -93,7 +93,7 @@ The registry currently includes several procedure families:
 | Atomic KV | `increment`, `transfer`, `kv_put`, `kv_get`, `kv_stats`, `scan` |
 | Collaboration demos | `chat_send`, `chat_history` |
 | Vector search | `vinsert`, `vsearch`, `vsim`, `vstats`, `vreindex`, `vrabitq`, `vdelete`, `vnsdrop` |
-| Agent memory | `mem_init`, `mem_add`, `mem_get`, `mem_query`, `mem_stats`, `mem_drop`, `mem_reset_index`, `mem_capabilities` |
+| Agent memory | `mem_init`, `mem_add`, `mem_get`, `mem_query`, `mem_range`, `mem_stats`, `mem_drop`, `mem_reset_index`, `mem_capabilities` |
 | Light-API | `lightapi_*` procedures served through the gateway's HTTP and JSON-RPC routes |
 
 ### `increment`

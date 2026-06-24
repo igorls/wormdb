@@ -22,6 +22,7 @@ goes through the same WAL + replication path the rest of the server uses.
 | `mem_meta_set`     | Update metadata for an existing memory without re-embedding     |
 | `mem_get`          | Single-doc fetch with metadata join                            |
 | `mem_query`        | HNSW → brute-force fallback, joined with doc + metadata        |
+| `mem_range`        | Timestamp-window scan returning ids, timestamps, and metadata  |
 | `mem_stats`        | Counts, dim, HNSW state, config                                 |
 | `mem_verify`       | Drift report for docs, vectors, BQ, and HNSW                    |
 | `mem_drop`         | Scan-delete everything under a namespace (doc, meta, vec, BQ)   |
@@ -46,8 +47,9 @@ Two consequences worth noticing:
   vectors without touching other `vec:*` namespaces used outside the
   memory subsystem.
 - `mem:<ns>:` covers *both* docs and `:meta` entries in a single prefix
-  scan — handy for `mem_stats` and `mem_drop`, which is why `doc_keys`
-  in the stats output is labelled as a raw count rather than "docs".
+  scan — handy for `mem_range`, `mem_stats`, and `mem_drop`, which is
+  why `doc_keys` in the stats output is labelled as a raw count rather
+  than "docs".
 
 Metadata can be updated without touching the vector. The stable low-level
 contract is a direct mutable `SET mem:<ns>:<id>:meta <json>`; the ergonomic
@@ -181,6 +183,7 @@ class MemoryAdapter {
   ingest(doc_id, text, embedding, meta)  → mem_add
   get(doc_id)                            → mem_get
   retrieve(query_emb, k, opts)           → mem_query
+  range(since_ms, until_ms, limit)        → mem_range
   stats()                                → mem_stats
   reset()                                → mem_drop
   capabilities()                         → mem_capabilities

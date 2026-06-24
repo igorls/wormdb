@@ -13,6 +13,7 @@ For the end-to-end demo notes, see [Agent Memory Demo](/AGENT_MEMORY_DEMO).
 | `mem_meta_set <ns> <doc_id> <meta_json>` | Update metadata for an existing memory without re-embedding |
 | `mem_get <ns> <doc_id>` | Fetch document text joined with metadata |
 | `mem_query <ns> <embedding> <k> [lambda] [min_score] [snippet_chars]` | Search and return enriched memories |
+| `mem_range <ns> <since_ms> <until_ms> [limit] [filter]` | Scan memories by document timestamp |
 | `mem_stats <ns>` | Return count, dimension, HNSW, and config state |
 | `mem_verify <ns>` | Report structural drift between docs, vectors, BQ, and HNSW |
 | `mem_drop <ns>` | Delete memory namespace data |
@@ -58,6 +59,8 @@ The optional `lambda` argument applies temporal decay with the same one-week tim
 document, vector, BQ, and HNSW counts plus bounded `orphan_vectors`,
 `orphan_docs`, and `missing_bq` lists so clients can decide whether to reconcile
 from their canonical row store or run `mem_reset_index`.
+
+`mem_range` is a timestamp-window workaround for timeline views. It scans `mem:<ns>:` document keys, skips `:meta` companions, sorts by document timestamp ascending, and returns `[{id, ts, meta}]`. `limit` defaults to 100; `0` means no response cap. The optional filter slot is reserved for the shared predicate parser tracked in #2.
 
 ## Events
 

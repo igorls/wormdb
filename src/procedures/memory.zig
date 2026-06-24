@@ -19,6 +19,7 @@
 //!   mem_meta_set     <ns> <doc_id> <meta_json>
 //!   mem_get          <ns> <doc_id>
 //!   mem_query        <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>]
+//!   mem_range        <ns> <since_ms> <until_ms> [<limit>] [<filter>]
 //!   mem_stats        <ns>
 //!   mem_verify       <ns>
 //!   mem_drop         <ns>
@@ -61,6 +62,8 @@ const MAX_NS_LEN: usize = 64;
 const MAX_DOC_ID_LEN: usize = 256;
 const MAX_EMBEDDER_ID_LEN: usize = 128;
 const MAX_TOP_K: usize = 100;
+const DEFAULT_RANGE_LIMIT: usize = 100;
+const MAX_RANGE_LIMIT: usize = 10_000;
 const DEFAULT_SNIPPET_CHARS: i64 = 512;
 const DECAY_TIME_CONSTANT_HOURS: f32 = 168.0;
 const HNSW_EF_SEARCH_FACTOR: usize = 10;
@@ -710,6 +713,131 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
 
         try json.append(ctx.allocator, '}');
         emitted += 1;
+    }
+    try json.append(ctx.allocator, ']');
+
+    return ctx.value(try json.toOwnedSlice(ctx.allocator));
+}
+
+// ╔═══════════════════════════════════════════════════╗
+// ║  mem_range                                         ║
+// ╚═══════════════════════════════════════════════════╝
+
+const RangeItem = struct {
+    id: []u8,
+    timestamp: u64,
+};
+
+const RangeScanCtx = struct {
+    prefix_len: usize,
+    since_ms: u64,
+    until_ms: u64,
+    items: std.ArrayListUnmanaged(RangeItem),
+    allocator: std.mem.Allocator,
+    oom: bool,
+};
+
+fn rangeItemLessThan(_: void, a: RangeItem, b: RangeItem) bool {
+    if (a.timestamp == b.timestamp) return std.mem.lessThan(u8, a.id, b.id);
+    return a.timestamp < b.timestamp;
+}
+
+fn onRangeDoc(
+    raw_ctx: *anyopaque,
+    key: []const u8,
+    value: []const u8,
+    timestamp: u64,
+    is_worm: bool,
+) Store.ScanAction {
+    _ = value;
+    _ = is_worm;
+    const sc: *RangeScanCtx = @ptrCast(@alignCast(raw_ctx));
+    if (timestamp < sc.since_ms or timestamp > sc.until_ms) return .cont;
+    if (key.len <= sc.prefix_len) return .cont;
+
+    const id = key[sc.prefix_len..];
+    // `mem:<ns>:` also contains metadata keys (`<id>:meta`). Stored memory
+    // doc ids cannot contain ':', so any colon-bearing suffix is not a doc.
+    if (std.mem.indexOfScalar(u8, id, ':') != null) return .cont;
+
+    const id_copy = sc.allocator.dupe(u8, id) catch {
+        sc.oom = true;
+        return .stop;
+    };
+    sc.items.append(sc.allocator, .{ .id = id_copy, .timestamp = timestamp }) catch {
+        sc.allocator.free(id_copy);
+        sc.oom = true;
+        return .stop;
+    };
+    return .cont;
+}
+
+pub fn memRange(ctx: *Ctx) anyerror!Ctx.Result {
+    const usage = "mem_range requires: <ns> <since_ms> <until_ms> [<limit>] [<filter>]";
+    const ns = ctx.arg(0) orelse return ctx.err(usage);
+    const since_ms = ctx.argInt(u64, 1) orelse return ctx.err("mem_range: since_ms must be an integer");
+    const until_ms = ctx.argInt(u64, 2) orelse return ctx.err("mem_range: until_ms must be an integer");
+
+    if (!validateNs(ns)) return ctx.err("mem_range: invalid ns");
+    if (since_ms > until_ms) return ctx.err("mem_range: since_ms must be <= until_ms");
+
+    var limit: usize = DEFAULT_RANGE_LIMIT;
+    if (ctx.arg(3)) |raw_limit| {
+        limit = std.fmt.parseInt(usize, raw_limit, 10) catch
+            return ctx.err("mem_range: limit must be a non-negative integer");
+        if (limit > MAX_RANGE_LIMIT) {
+            return ctx.err(ctx.fmt("mem_range: limit must be <= {d}", .{MAX_RANGE_LIMIT}));
+        }
+    }
+
+    if (ctx.arg(4) != null) {
+        return ctx.err("mem_range: filter predicates are not implemented yet; blocked on shared predicate parser (#2)");
+    }
+
+    const doc_prefix = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:", .{ns});
+    defer ctx.allocator.free(doc_prefix);
+
+    var scan_ctx = RangeScanCtx{
+        .prefix_len = doc_prefix.len,
+        .since_ms = since_ms,
+        .until_ms = until_ms,
+        .items = .empty,
+        .allocator = ctx.allocator,
+        .oom = false,
+    };
+    defer {
+        for (scan_ctx.items.items) |item| scan_ctx.allocator.free(item.id);
+        scan_ctx.items.deinit(scan_ctx.allocator);
+    }
+
+    ctx.scanCallback(doc_prefix, @ptrCast(&scan_ctx), onRangeDoc);
+    if (scan_ctx.oom) return ctx.err("mem_range: out of memory during scan");
+
+    std.sort.heap(RangeItem, scan_ctx.items.items, {}, rangeItemLessThan);
+
+    const emit_count = if (limit == 0) scan_ctx.items.items.len else @min(limit, scan_ctx.items.items.len);
+
+    var json: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer json.deinit(ctx.allocator);
+    try json.append(ctx.allocator, '[');
+
+    for (scan_ctx.items.items[0..emit_count], 0..) |item, i| {
+        if (i > 0) try json.append(ctx.allocator, ',');
+        try json.appendSlice(ctx.allocator, "{\"id\":\"");
+        try appendJsonEscaped(&json, ctx.allocator, item.id);
+        try json.appendSlice(ctx.allocator, "\",\"ts\":");
+        try writeU64(&json, ctx.allocator, item.timestamp);
+        try json.appendSlice(ctx.allocator, ",\"meta\":");
+
+        const meta_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}:meta", .{ ns, item.id });
+        defer ctx.allocator.free(meta_key);
+        if (try ctx.getCopy(meta_key)) |meta| {
+            try json.appendSlice(ctx.allocator, meta);
+        } else {
+            try json.appendSlice(ctx.allocator, "null");
+        }
+
+        try json.append(ctx.allocator, '}');
     }
     try json.append(ctx.allocator, ']');
 
@@ -1587,6 +1715,63 @@ test "mem_add: invalid embedder_id arg rejected before state changes" {
     try testing.expect(result == .err);
     try testing.expect(fx.store.get("mem:demo:doc-1") == null);
     try testing.expect(fx.store.get("vec:mem:demo:doc-1") == null);
+}
+
+test "mem_range: returns docs in timestamp order with meta and limit" {
+    var fx = try TestStoreFixture.init("memrange_order");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try fx.store.setWithTimestamp("mem:demo:old", "old", false, 1_000);
+    try fx.store.setWithTimestamp("mem:demo:in-b", "second", false, 3_000);
+    try fx.store.setWithTimestamp("mem:demo:in-a", "first", false, 2_000);
+    try fx.store.setWithTimestamp("mem:demo:new", "new", false, 4_000);
+    try fx.store.setWithTimestamp("mem:demo:in-a:meta", "{\"kind\":\"a\"}", false, 2_100);
+
+    const limited = try runProc(
+        &fx.store,
+        memRange,
+        &.{ "demo", "1500", "3500", "1" },
+        arena,
+    );
+    try testing.expect(limited == .value);
+    try testing.expectEqualStrings(
+        "[{\"id\":\"in-a\",\"ts\":2000,\"meta\":{\"kind\":\"a\"}}]",
+        limited.value.?,
+    );
+
+    const all = try runProc(
+        &fx.store,
+        memRange,
+        &.{ "demo", "1500", "3500", "0" },
+        arena,
+    );
+    try testing.expect(all == .value);
+    try testing.expectEqualStrings(
+        "[{\"id\":\"in-a\",\"ts\":2000,\"meta\":{\"kind\":\"a\"}},{\"id\":\"in-b\",\"ts\":3000,\"meta\":null}]",
+        all.value.?,
+    );
+}
+
+test "mem_range: rejects filter until shared predicate parser lands" {
+    var fx = try TestStoreFixture.init("memrange_filter");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const result = try runProc(
+        &fx.store,
+        memRange,
+        &.{ "demo", "0", "1000", "10", "category=\"semantic\"" },
+        arena,
+    );
+    try testing.expect(result == .err);
+    try testing.expect(std.mem.indexOf(u8, result.err, "filter") != null);
 }
 
 test "mem_reset_index: drops vectors, preserves docs, rewrites config" {

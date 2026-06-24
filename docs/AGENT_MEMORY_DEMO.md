@@ -70,7 +70,7 @@ metadata key. The JSON is stored as caller-supplied bytes, matching `mem_add`.
    emission + cluster replication.
 3. **Doc body** (WORM if requested).
 4. **Metadata** (always mutable).
-5. **Publish** to `mem:<ns>:added`.
+5. **Publish** a compact JSON event to `mem:<ns>:added`.
 
 `mem_bulk_add <ns> <count> [id embedding meta_json]×N` is the backfill
 variant for sidecar-style migrations. It validates the entire batch

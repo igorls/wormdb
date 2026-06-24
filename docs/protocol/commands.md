@@ -25,7 +25,7 @@ Every WormDB command has a 1-byte integer ID and a defined payload layout. All v
 
 ## Payload Layouts
 
-### Single-Field Commands — `GET`, `DEL`, `SUB`, `UNSUB`
+### Single-Field Commands — `GET`, `DEL`, `UNSUB`
 
 ```text
 [4B field_len][field bytes]
@@ -34,6 +34,14 @@ Every WormDB command has a 1-byte integer ID and a defined payload layout. All v
 **GET** returns `value` (0x01) with the data, or `null_value` (0x02) if the key doesn't exist.
 
 **DEL** returns `ok` (0x00) on success, or `err` (0x03) if the key is WORM-protected.
+
+### SUB
+
+```text
+[4B channel_len][channel][optional: 4B filter_len][filter]
+```
+
+The optional filter uses the same predicate grammar as `mem_query` filters, for example `filter='meta.about="user-x"'`. Servers reject malformed filters at subscribe time with an error response. Frames that only include the channel are still accepted.
 
 ### SET
 

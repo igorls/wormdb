@@ -55,6 +55,7 @@ WormDB includes a lightweight publish/subscribe system for real-time event distr
 
 ```bash
 bun run apps/bun/src/bin/client.ts SUB events
+bun run apps/bun/src/bin/client.ts SUB mem:demo:added filter='meta.about="user-x"'
 ```
 
 The client stays connected and prints messages as they arrive on the `events` channel.

@@ -273,19 +273,22 @@ pub const Gateway = struct {
                     auth_state = state;
                     break :blk Response.ok;
                 },
-                .subscribe => |channel| blk: {
+                .subscribe => |params| blk: {
                     // Check capability for subscribe
                     if (self.auth_required) {
                         if (auth_state) |*state| {
-                            if (!state.permits(.subscribe, channel)) {
+                            if (!state.permits(.subscribe, params.channel)) {
                                 break :blk Response{ .err = "permission denied" };
                             }
                         } else {
                             break :blk Response{ .err = "auth required" };
                         }
                     }
-                    conn_ctx.subscribe(channel) catch {
-                        break :blk Response{ .err = "subscription failed" };
+                    conn_ctx.subscribe(params.channel, params.filter) catch |err| {
+                        break :blk Response{ .err = switch (err) {
+                            error.InvalidPredicate => "invalid filter",
+                            else => "subscription failed",
+                        } };
                     };
                     break :blk Response.ok;
                 },
@@ -745,14 +748,15 @@ pub const Gateway = struct {
             self.subscriptions.deinit();
         }
 
-        fn subscribe(self: *ConnContext, channel: []const u8) !void {
+        fn subscribe(self: *ConnContext, channel: []const u8, filter: ?[]const u8) !void {
             if (self.subscriptions.contains(channel)) return;
 
             const channel_copy = try self.allocator.dupe(u8, channel);
             errdefer self.allocator.free(channel_copy);
 
-            const sub_id = try self.event_bus.subscribe(
+            const sub_id = try self.event_bus.subscribeFiltered(
                 channel_copy,
+                filter,
                 ConnContext.writeEvent,
                 @ptrCast(self),
             );

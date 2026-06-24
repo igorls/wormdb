@@ -135,7 +135,7 @@ pub const Server = struct {
             self.subscriptions.deinit();
         }
 
-        fn subscribe(self: *ConnectionContext, channel: []const u8) !void {
+        fn subscribe(self: *ConnectionContext, channel: []const u8, filter: ?[]const u8) !void {
             if (self.subscriptions.contains(channel)) {
                 return;
             }
@@ -143,7 +143,7 @@ pub const Server = struct {
             const channel_copy = try self.allocator.dupe(u8, channel);
             errdefer self.allocator.free(channel_copy);
 
-            const sub_id = try self.event_bus.subscribe(channel_copy, ConnectionContext.writeEvent, @ptrCast(self));
+            const sub_id = try self.event_bus.subscribeFiltered(channel_copy, filter, ConnectionContext.writeEvent, @ptrCast(self));
             errdefer self.event_bus.unsubscribe(channel_copy, sub_id);
 
             try self.subscriptions.put(channel_copy, sub_id);
@@ -689,9 +689,13 @@ pub const Server = struct {
         defer protocol.deinitCommand(self.allocator, cmd);
 
         switch (cmd) {
-            .subscribe => |channel| {
-                conn_ctx.subscribe(channel) catch {
-                    conn_ctx.writeAllLocked("-ERR out of memory\r\n");
+            .subscribe => |params| {
+                conn_ctx.subscribe(params.channel, params.filter) catch |err| {
+                    const err_msg = switch (err) {
+                        error.InvalidPredicate => "-ERR invalid filter\r\n",
+                        else => "-ERR out of memory\r\n",
+                    };
+                    conn_ctx.writeAllLocked(err_msg);
                     return;
                 };
                 conn_ctx.writeAllLocked("+OK\r\n");
@@ -713,6 +717,7 @@ pub const Server = struct {
                 error.IoError => "I/O error",
                 error.KeyNotFound => "key not found",
                 error.Corruption => "data corruption",
+                error.InvalidPredicate => "invalid filter",
             };
             const msg = std.fmt.bufPrint(&buf, "-ERR {s}\r\n", .{err_msg}) catch "-ERR internal\r\n";
             conn_ctx.writeAllLocked(msg);
@@ -751,8 +756,8 @@ pub const Server = struct {
             }
         }
         return switch (cmd) {
-            .subscribe => |channel| blk: {
-                try conn_ctx.subscribe(channel);
+            .subscribe => |params| blk: {
+                try conn_ctx.subscribe(params.channel, params.filter);
                 break :blk .ok;
             },
             .unsubscribe => |channel| blk: {
@@ -812,6 +817,15 @@ test "Server SUB/UNSUB command wiring updates subscriber count" {
 
     try server.processLine("UNSUB updates", &conn_ctx);
     try testing.expectEqual(@as(u64, 0), bus.subscriberCount());
+
+    var capture: std.ArrayListUnmanaged(u8) = .empty;
+    defer capture.deinit(testing.allocator);
+    var bad_ctx = Server.ConnectionContext.initWithCapture(testing.allocator, &bus, null, &capture);
+    defer bad_ctx.deinit();
+
+    try server.processLine("SUB updates filter='meta.user.name=\"x\"'", &bad_ctx);
+    try testing.expectEqual(@as(u64, 0), bus.subscriberCount());
+    try testing.expect(std.mem.containsAtLeast(u8, capture.items, 1, "-ERR invalid filter"));
 }
 
 test "Server connection cleanup auto-unsubscribes remaining subscriptions" {

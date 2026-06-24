@@ -152,8 +152,8 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
             const payload = try ctx.allocator.dupe(u8, "self_mesh_ip=0.0.0.0\nself_port=0\n---\n");
             break :blk Response{ .value = payload };
         },
-        .subscribe => |channel| blk: {
-            _ = channel;
+        .subscribe => |params| blk: {
+            _ = params;
             break :blk .ok;
         },
         .unsubscribe => |channel| blk: {

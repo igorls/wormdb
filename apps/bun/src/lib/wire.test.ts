@@ -70,6 +70,20 @@ describe("encodeCommandFrame", () => {
     expect(new TextDecoder().decode(frame.subarray(frame.length - 5))).toBe("hello");
   });
 
+  test("encodes SUB filter as optional second field", () => {
+    const frame = encodeCommandFrame({ kind: "SUB", channel: "mem:demo:added", filter: "filter='meta.about=\"user-x\"'" });
+    const payload = frame.subarray(5);
+    const channelLen = new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint32(0);
+    const channel = new TextDecoder().decode(payload.subarray(4, 4 + channelLen));
+    const filterLenPos = 4 + channelLen;
+    const filterLen = new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint32(filterLenPos);
+    const filter = new TextDecoder().decode(payload.subarray(filterLenPos + 4, filterLenPos + 4 + filterLen));
+
+    expect(frame[0]).toBe(0x06);
+    expect(channel).toBe("mem:demo:added");
+    expect(filter).toBe("filter='meta.about=\"user-x\"'");
+  });
+
   test("covers all parsed command variants", () => {
     const cmds: ParsedCommand[] = [
       { kind: "GET", key: "a" },

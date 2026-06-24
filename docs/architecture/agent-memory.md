@@ -80,11 +80,13 @@ filter='ts>=1780000000 AND category="semantic" AND privacy_level<=1 AND sourceTy
 
 ## Events
 
-Successful `mem_add` publishes the document ID to:
+Successful `mem_add` publishes a compact JSON event to:
 
 ```text
 mem:<ns>:added
 ```
+
+The event includes `id`, `ts`, and top-level metadata fields from `meta_json`, so subscribers can use filtered `SUB`, for example `SUB mem:demo:added filter='meta.about="user-x"'`.
 
 Pub/sub is best-effort and not replayed. Durable event logs should also be written as WORM keys if replay matters.
 

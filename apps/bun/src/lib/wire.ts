@@ -45,7 +45,16 @@ export function encodeCommandFrame(command: ParsedCommand): Bytes {
       return writeFrame(CommandCode.Del, payload);
     }
     case "SUB": {
-      const payload = encodeLenPrefixedUtf8(command.channel);
+      const channel = encodeUtf8(command.channel);
+      const filter = command.filter ? encodeUtf8(command.filter) : undefined;
+      const payload = new Uint8Array(4 + channel.length + (filter ? 4 + filter.length : 0));
+      writeUint32BE(payload, 0, channel.length);
+      payload.set(channel, 4);
+      if (filter) {
+        const filterLenPos = 4 + channel.length;
+        writeUint32BE(payload, filterLenPos, filter.length);
+        payload.set(filter, filterLenPos + 4);
+      }
       return writeFrame(CommandCode.Sub, payload);
     }
     case "UNSUB": {

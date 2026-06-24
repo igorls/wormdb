@@ -12,6 +12,11 @@ describe("parseCommand", () => {
 
   test("parses SUB/UNSUB", () => {
     expect(parseCommand("SUB updates")).toEqual({ kind: "SUB", channel: "updates" });
+    expect(parseCommand("SUB updates filter='meta.about=\"user-x\"'")).toEqual({
+      kind: "SUB",
+      channel: "updates",
+      filter: "filter='meta.about=\"user-x\"'",
+    });
     expect(parseCommand("UNSUB updates")).toEqual({ kind: "UNSUB", channel: "updates" });
   });
 

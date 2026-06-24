@@ -149,6 +149,31 @@ fn writeU64(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, n: u64)
     try list.appendSlice(alloc, s);
 }
 
+fn appendFlatMetaFields(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, meta_json: []const u8) !void {
+    const trimmed = std.mem.trim(u8, meta_json, " \t\r\n");
+    if (trimmed.len < 2 or trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}') return;
+
+    const inner = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+    if (inner.len == 0) return;
+
+    try list.append(alloc, ',');
+    try list.appendSlice(alloc, inner);
+}
+
+fn buildMemAddedEvent(ctx: *Ctx, doc_id: []const u8, meta_json: []const u8, timestamp: u64) ![]u8 {
+    var json: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer json.deinit(ctx.allocator);
+
+    try json.appendSlice(ctx.allocator, "{\"id\":\"");
+    try appendJsonEscaped(&json, ctx.allocator, doc_id);
+    try json.appendSlice(ctx.allocator, "\",\"ts\":");
+    try writeU64(&json, ctx.allocator, timestamp);
+    try appendFlatMetaFields(&json, ctx.allocator, meta_json);
+    try json.append(ctx.allocator, '}');
+
+    return json.toOwnedSlice(ctx.allocator);
+}
+
 /// Extract a string field value from our own config JSON. Relies on the
 /// format we generate: `"<field>":"<value>"` with values that passed
 /// validateEmbedderId / known metric names, so no escape handling needed.
@@ -450,6 +475,7 @@ pub fn memAdd(ctx: *Ctx) anyerror!Ctx.Result {
     defer ctx.allocator.free(vec_namespace);
     const channel = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:added", .{ns});
     defer ctx.allocator.free(channel);
+    const now_ms = ctx.timestamp();
 
     // ── Vector first: applyVinsert runs all pre-checks (dim +
     //    metric freeze). A failure here writes nothing; the doc
@@ -469,7 +495,7 @@ pub fn memAdd(ctx: *Ctx) anyerror!Ctx.Result {
             .worm = is_worm,
             .namespace = vec_namespace,
             .metric = metric,
-            .timestamp = ctx.timestamp(),
+            .timestamp = now_ms,
             .replicate = true,
         },
     ) catch |err| {
@@ -507,7 +533,9 @@ pub fn memAdd(ctx: *Ctx) anyerror!Ctx.Result {
     }
 
     // ── Publish to namespace channel ────────────────────────────
-    ctx.publish(channel, doc_id);
+    const event_payload = try buildMemAddedEvent(ctx, doc_id, meta_json, now_ms);
+    defer ctx.allocator.free(event_payload);
+    ctx.publish(channel, event_payload);
     return ctx.ok();
 }
 

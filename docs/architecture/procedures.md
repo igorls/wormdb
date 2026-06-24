@@ -94,7 +94,7 @@ The registry currently includes several procedure families:
 | Collaboration demos | `chat_send`, `chat_history` |
 | Vector search | `vinsert`, `vsearch`, `vsim`, `vstats`, `vreindex`, `vrabitq`, `vdelete`, `vnsdrop` |
 | Agent memory | `mem_init`, `mem_add`, `mem_get`, `mem_query`, `mem_stats`, `mem_drop`, `mem_reset_index`, `mem_capabilities` |
-| Verifiable logs | `append_log_append`, `append_log_verify`, `append_log_mmr_proof`, `append_log_mmr_verify` |
+| Verifiable logs | `append_log_append`, `append_log_verify`, `append_log_mmr_proof`, `append_log_mmr_verify`, `append_log_checkpoint`, `append_log_proof_bundle`, `append_log_proof_verify` |
 | Light-API | `lightapi_*` procedures served through the gateway's HTTP and JSON-RPC routes |
 
 ### `increment`
@@ -161,6 +161,9 @@ See [Verifiable Append Log](/protocol/append-log) for the canonical envelope and
 - `append_log_verify` — scan a log and verify contiguous sequences, WORM protection, payload hashes, event hashes, and hash-chain links.
 - `append_log_mmr_proof` — return hex-encoded MMR inclusion proof bytes for a stored log sequence.
 - `append_log_mmr_verify` — verify record hash/root/proof bytes without reading the database.
+- `append_log_checkpoint` — create and WORM-store a signed checkpoint over an append-log sequence range.
+- `append_log_proof_bundle` — export canonical record bytes, hashes, inclusion paths, and checkpoint metadata as stable JSON.
+- `append_log_proof_verify` — verify a record hash and MMR proof against a stored signed checkpoint.
 
 ### Light-API Procedures
 

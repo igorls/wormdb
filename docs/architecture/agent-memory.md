@@ -11,7 +11,7 @@ For the end-to-end demo notes, see [Agent Memory Demo](/AGENT_MEMORY_DEMO).
 | `mem_init <ns> <embedder_id> <metric>` | Predeclare a memory namespace, embedder, and metric |
 | `mem_add <ns> <doc_id> <text> <embedding> [meta_json] [worm] [embedder_id]` | Add one memory chunk plus embedding |
 | `mem_get <ns> <doc_id>` | Fetch document text joined with metadata |
-| `mem_query <ns> <embedding> <k> [lambda] [min_score] [snippet_chars]` | Search and return enriched memories |
+| `mem_query <ns> <embedding> <k> [lambda] [min_score] [snippet_chars] [filter]` | Search and return enriched memories |
 | `mem_stats <ns>` | Return count, dimension, HNSW, and config state |
 | `mem_drop <ns>` | Delete memory namespace data |
 | `mem_reset_index <ns> <new_embedder_id>` | Drop vector/BQ/HNSW state while preserving document bodies |
@@ -46,6 +46,12 @@ bun run apps/bun/src/bin/client.ts EXEC mem_reset_index notes openai/text-embedd
 `mem_query` uses HNSW when the memory namespace has an index and falls back to brute-force when the index is absent. It intentionally skips the general BQ prefilter because `mem_init` eagerly prepares HNSW and the memory query result must be joined with document text and metadata.
 
 The optional `lambda` argument applies temporal decay with the same one-week time constant used by vector search. `min_score` filters weak matches, and `snippet_chars` controls how much document text is returned per hit.
+
+`filter` narrows candidates before top-K admission. It applies during brute-force scan and during HNSW stage-2 exact refine. The predicate grammar is intentionally small: `=`, `<`, `<=`, `>=`, `>`, `AND`, and `IN (...)` over string or numeric literals. Fields are top-level metadata keys, `meta.<field>` aliases, or the synthetic `ts` field.
+
+```text
+filter='ts>=1780000000 AND category="semantic" AND privacy_level<=1 AND sourceType IN ("chat","note")'
+```
 
 ## Events
 

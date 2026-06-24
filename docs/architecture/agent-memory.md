@@ -10,6 +10,7 @@ For the end-to-end demo notes, see [Agent Memory Demo](/AGENT_MEMORY_DEMO).
 | --------- | ------- |
 | `mem_init <ns> <embedder_id> <metric>` | Predeclare a memory namespace, embedder, and metric |
 | `mem_add <ns> <doc_id> <text> <embedding> [meta_json] [worm] [embedder_id]` | Add one memory chunk plus embedding |
+| `mem_bulk_add <ns> <count> [id embedding meta_json]×N` | Add many memory embeddings and metadata rows in one vector batch |
 | `mem_get <ns> <doc_id>` | Fetch document text joined with metadata |
 | `mem_query <ns> <embedding> <k> [lambda] [min_score] [snippet_chars]` | Search and return enriched memories |
 | `mem_stats <ns>` | Return count, dimension, HNSW, and config state |
@@ -28,6 +29,8 @@ __meta:mem:<ns>:config     {"embedder_id":"...","metric":"...","created_at":...}
 ```
 
 Chunking lives on the client. `mem_add` indexes one chunk; applications that have long documents or conversations should split them and call `mem_add` with derived IDs.
+
+`mem_bulk_add` is the sidecar/backfill path for already-chunked and already-embedded memory rows. It prevalidates the whole batch for id safety, duplicate ids, vector byte shape, uniform dimensions, existing namespace dim/metric compatibility, and existing vector state before writing. Vector/BQ/HNSW work uses the native bulk vector apply path; metadata rows are written durably afterward. A successful batch publishes one `mem:<ns>:added.bulk` event whose payload is the JSON id list.
 
 ## Embedder Enforcement
 

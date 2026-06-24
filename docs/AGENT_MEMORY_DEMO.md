@@ -19,6 +19,7 @@ goes through the same WAL + replication path the rest of the server uses.
 | ------------------ | -------------------------------------------------------------- |
 | `mem_init`         | Optionally pre-declare a namespace's embedder and metric       |
 | `mem_add`          | Atomic: doc + metadata + embedding + event, in one EXEC        |
+| `mem_bulk_add`     | Backfill embeddings + metadata through one vector batch        |
 | `mem_get`          | Single-doc fetch with metadata join                            |
 | `mem_query`        | HNSW → brute-force fallback, joined with doc + metadata        |
 | `mem_stats`        | Counts, dim, HNSW state, config                                 |
@@ -60,6 +61,12 @@ Two consequences worth noticing:
 3. **Doc body** (WORM if requested).
 4. **Metadata** (always mutable).
 5. **Publish** to `mem:<ns>:added`.
+
+`mem_bulk_add <ns> <count> [id embedding meta_json]×N` is the backfill
+variant for sidecar-style migrations. It validates the entire batch
+before writing, uses WormDB's native bulk vector path for vector/BQ/HNSW
+work, writes metadata durably, and emits one `mem:<ns>:added.bulk`
+event with the JSON id list.
 
 Steps 2–5 are not transactional. If the vector lands but the doc write
 fails (WORM violation on the doc key, say), the vector is an orphan
@@ -166,6 +173,7 @@ The shape of a thin adapter:
 class MemoryAdapter {
   initialize(embedder_id, metric)        → mem_init
   ingest(doc_id, text, embedding, meta)  → mem_add
+  ingestMany(rows)                       → mem_bulk_add
   get(doc_id)                            → mem_get
   retrieve(query_emb, k, opts)           → mem_query
   stats()                                → mem_stats

@@ -23,6 +23,7 @@
 //!   mem_query        <ns> <embedding> <k> [<lambda>] [<min_score>] [<snippet_chars>] [<decay_tau_hours>] [<filter>]
 //!   mem_range        <ns> <since_ms> <until_ms> [<limit>] [<filter>]
 //!   mem_stats        <ns>
+//!   mem_health       <ns>
 //!   mem_verify       <ns>
 //!   mem_drop         <ns>
 //!   mem_reset_index  <ns> <new_embedder_id>
@@ -294,6 +295,7 @@ pub fn memCapabilities(ctx: *Ctx) anyerror!Ctx.Result {
         \\"structured_facts":false,
         \\"metadata_update":true,
         \\"health_verify":true,
+        \\"index_health":true,
         \\"metrics":["cosine","dot","l2"]}
     ;
     return ctx.value(json);
@@ -1323,6 +1325,71 @@ pub fn memStats(ctx: *Ctx) anyerror!Ctx.Result {
         }
     }
 
+    try json.append(ctx.allocator, '}');
+    return ctx.value(try json.toOwnedSlice(ctx.allocator));
+}
+
+// ╔═══════════════════════════════════════════════════╗
+// ║  mem_health                                       ║
+// ╚═══════════════════════════════════════════════════╝
+
+pub fn memHealth(ctx: *Ctx) anyerror!Ctx.Result {
+    const ns = ctx.arg(0) orelse return ctx.err("mem_health requires: <ns>");
+    if (!validateNs(ns)) return ctx.err("mem_health: invalid ns");
+    ctx.requireNamespace(ns, .read) catch return ctx.err("permission denied");
+
+    const vec_prefix = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
+    defer ctx.allocator.free(vec_prefix);
+    const bq_prefix = try std.fmt.allocPrint(ctx.allocator, "bq:vec:mem:{s}:", .{ns});
+    defer ctx.allocator.free(bq_prefix);
+
+    const vector_count = ctx.countKeys(vec_prefix);
+    const bq_count = ctx.countKeys(bq_prefix);
+
+    var has_index = false;
+    var hnsw_nodes: usize = 0;
+    var hnsw_live: usize = 0;
+    var hnsw_tombstones: usize = 0;
+    var hnsw_pending_async: usize = 0;
+
+    if (ctx.vector_registry) |reg| {
+        if (reg.get(vec_prefix)) |ns_idx| {
+            has_index = true;
+            ns_idx.lock.lockShared();
+            defer ns_idx.lock.unlockShared();
+            hnsw_nodes = ns_idx.len();
+            hnsw_live = ns_idx.liveCount();
+            hnsw_tombstones = ns_idx.tombstone_count;
+            hnsw_pending_async = ns_idx.pendingAsyncCount();
+        }
+    }
+
+    const missing_live = if (vector_count > hnsw_live) vector_count - hnsw_live else 0;
+    const pending_vectors = @max(missing_live, hnsw_pending_async);
+    const index_caught_up = pending_vectors == 0 and bq_count >= vector_count and (has_index or vector_count == 0);
+
+    var json: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer json.deinit(ctx.allocator);
+    try json.appendSlice(ctx.allocator, "{\"namespace\":\"");
+    try appendJsonEscaped(&json, ctx.allocator, ns);
+    try json.appendSlice(ctx.allocator, "\",\"index_caught_up\":");
+    try json.appendSlice(ctx.allocator, if (index_caught_up) "true" else "false");
+    try json.appendSlice(ctx.allocator, ",\"pending_vectors\":");
+    try writeUsize(&json, ctx.allocator, pending_vectors);
+    try json.appendSlice(ctx.allocator, ",\"vector_count\":");
+    try writeUsize(&json, ctx.allocator, vector_count);
+    try json.appendSlice(ctx.allocator, ",\"bq_count\":");
+    try writeUsize(&json, ctx.allocator, bq_count);
+    try json.appendSlice(ctx.allocator, ",\"has_index\":");
+    try json.appendSlice(ctx.allocator, if (has_index) "true" else "false");
+    try json.appendSlice(ctx.allocator, ",\"hnsw_nodes\":");
+    try writeUsize(&json, ctx.allocator, hnsw_nodes);
+    try json.appendSlice(ctx.allocator, ",\"hnsw_live\":");
+    try writeUsize(&json, ctx.allocator, hnsw_live);
+    try json.appendSlice(ctx.allocator, ",\"hnsw_tombstones\":");
+    try writeUsize(&json, ctx.allocator, hnsw_tombstones);
+    try json.appendSlice(ctx.allocator, ",\"hnsw_pending_async\":");
+    try writeUsize(&json, ctx.allocator, hnsw_pending_async);
     try json.append(ctx.allocator, '}');
     return ctx.value(try json.toOwnedSlice(ctx.allocator));
 }
@@ -2381,6 +2448,61 @@ test "mem_verify: vector-only config suppresses orphan docs" {
     try testing.expect(result == .value);
     try testing.expect(std.mem.indexOf(u8, result.value.?, "\"doc_count\":1") != null);
     try testing.expect(std.mem.indexOf(u8, result.value.?, "\"orphan_docs\":[]") != null);
+}
+
+test "mem_health: reports caught-up HNSW index" {
+    var fx = try TestStoreFixture.init("mem_health_caught_up");
+    defer fx.deinit();
+
+    var registry = IndexModule.NamespaceRegistry.init(testing.allocator, .{});
+    defer registry.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProcWithRegistry(&fx.store, memInit, &.{ "demo", "bge-m3", "cosine" }, arena, &registry);
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    const added = try runProcWithRegistry(
+        &fx.store,
+        memAdd,
+        &.{ "demo", "doc-1", "hello", emb, "{\"kind\":\"note\"}", "0", "bge-m3" },
+        arena,
+        &registry,
+    );
+    try testing.expect(added == .ok);
+
+    const result = try runProcWithRegistry(&fx.store, memHealth, &.{"demo"}, arena, &registry);
+    const value = result.value.?;
+    try testing.expect(std.mem.indexOf(u8, value, "\"index_caught_up\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, value, "\"pending_vectors\":0") != null);
+    try testing.expect(std.mem.indexOf(u8, value, "\"vector_count\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, value, "\"bq_count\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, value, "\"hnsw_live\":1") != null);
+}
+
+test "mem_health: reports durable vectors pending when index is absent" {
+    var fx = try TestStoreFixture.init("mem_health_missing_index");
+    defer fx.deinit();
+
+    var registry = IndexModule.NamespaceRegistry.init(testing.allocator, .{});
+    defer registry.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    try fx.store.setWithTimestamp("vec:mem:demo:doc-1", emb, false, 123);
+    try fx.store.setWithTimestamp("bq:vec:mem:demo:doc-1", "bits", false, 123);
+
+    const result = try runProcWithRegistry(&fx.store, memHealth, &.{"demo"}, arena, &registry);
+    const value = result.value.?;
+    try testing.expect(std.mem.indexOf(u8, value, "\"index_caught_up\":false") != null);
+    try testing.expect(std.mem.indexOf(u8, value, "\"pending_vectors\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, value, "\"vector_count\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, value, "\"bq_count\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, value, "\"has_index\":false") != null);
 }
 
 test "mem_add: invalid embedder_id arg rejected before state changes" {

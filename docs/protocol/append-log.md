@@ -38,6 +38,26 @@ The response is JSON:
 {"count":3,"last_seq":3,"head_hash":"..."}
 ```
 
+Generate an MMR inclusion proof for a stored event:
+
+```bash
+bun run apps/bun/src/bin/client.ts EXEC append_log_mmr_proof <log_id> <seq>
+```
+
+The response carries hex-encoded proof bytes that can be verified without a live database:
+
+```json
+{"seq":2,"leaf_index":1,"leaf_count":3,"root":"...","record_hash":"...","proof_hex":"..."}
+```
+
+Verify proof bytes directly:
+
+```bash
+bun run apps/bun/src/bin/client.ts EXEC append_log_mmr_verify <record_hash_hex> <root_hex> <proof_hex>
+```
+
+The response is `{"valid":true}` or `{"valid":false}`. This procedure uses the canonical `mmr_sha256_v1` proof-byte format from [Verifiable Proof Bundles](/protocol/proofs). Current MMR proof generation rebuilds the accumulator from stored append-log envelopes on demand; durable root/checkpoint persistence is covered by the checkpoint/proof-bundle layer.
+
 ## Envelope Format
 
 All integer fields are unsigned big-endian. The `event_hash` is the linear chain hash: `SHA-256` over every byte before the final `event_hash` field.

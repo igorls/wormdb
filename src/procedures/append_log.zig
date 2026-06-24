@@ -2,6 +2,8 @@
 //!
 //! EXEC append_log_append <log_id> <payload> [ts=<ms>] [attachment_hash_hex...]
 //! EXEC append_log_verify <log_id>
+//! EXEC append_log_mmr_proof <log_id> <seq>
+//! EXEC append_log_mmr_verify <record_hash_hex> <root_hex> <proof_hex>
 //!
 //! Events are stored through the proof append-log primitive as WORM records
 //! with canonical binary envelopes. Optional attachment hashes are 64-char
@@ -11,6 +13,7 @@ const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
 const Response = @import("../core/types.zig").Response;
 const append_log = @import("../proof/append_log.zig");
+const mmr = @import("../proof/mmr.zig");
 const Store = @import("../storage/store.zig").Store;
 const Config = @import("../core/config.zig").Config;
 
@@ -80,6 +83,115 @@ pub fn verifyExecute(ctx: *Ctx) anyerror!Ctx.Result {
     return ctx.value(try verifyReportJson(ctx.allocator, report));
 }
 
+pub fn mmrProofExecute(ctx: *Ctx) anyerror!Ctx.Result {
+    const log_id = ctx.arg(0) orelse
+        return ctx.err("append_log_mmr_proof requires: <log_id> <seq>");
+    const seq = ctx.argInt(u64, 1) orelse
+        return ctx.err("append_log_mmr_proof requires: <log_id> <seq>");
+    if (seq == 0) return ctx.err("append_log_mmr_proof: seq must be >= 1");
+    if (ctx.argCount() != 2) return ctx.err("append_log_mmr_proof requires: <log_id> <seq>");
+
+    _ = append_log.verifyStore(ctx.allocator, ctx.store, log_id) catch |err| {
+        return ctx.err(switch (err) {
+            error.NonWormEvent => "append_log_mmr_proof: non-WORM event",
+            error.SequenceGap => "append_log_mmr_proof: sequence gap",
+            error.PrevHashMismatch => "append_log_mmr_proof: previous hash mismatch",
+            error.PayloadHashMismatch => "append_log_mmr_proof: payload hash mismatch",
+            error.EventHashMismatch => "append_log_mmr_proof: event hash mismatch",
+            else => "append_log_mmr_proof: log verification failed",
+        });
+    };
+
+    var proof_data = buildMmrProof(ctx.allocator, ctx.store, log_id, seq) catch |err| {
+        return ctx.err(switch (err) {
+            error.SequenceNotFound => "append_log_mmr_proof: seq not found",
+            else => "append_log_mmr_proof: proof build failed",
+        });
+    };
+    defer proof_data.deinit(ctx.allocator);
+
+    return ctx.value(try mmrProofJson(ctx.allocator, proof_data));
+}
+
+pub fn mmrVerifyExecute(ctx: *Ctx) anyerror!Ctx.Result {
+    const record_hash = parseHashHex(ctx.arg(0) orelse
+        return ctx.err("append_log_mmr_verify requires: <record_hash_hex> <root_hex> <proof_hex>")) catch
+        return ctx.err("append_log_mmr_verify: record hash must be 64 hex chars");
+    const root = parseHashHex(ctx.arg(1) orelse
+        return ctx.err("append_log_mmr_verify requires: <record_hash_hex> <root_hex> <proof_hex>")) catch
+        return ctx.err("append_log_mmr_verify: root must be 64 hex chars");
+    const proof_hex = ctx.arg(2) orelse
+        return ctx.err("append_log_mmr_verify requires: <record_hash_hex> <root_hex> <proof_hex>");
+    if (ctx.argCount() != 3)
+        return ctx.err("append_log_mmr_verify requires: <record_hash_hex> <root_hex> <proof_hex>");
+
+    const proof_bytes = parseHexBytes(ctx.allocator, proof_hex) catch
+        return ctx.err("append_log_mmr_verify: proof must be even-length hex");
+    defer ctx.allocator.free(proof_bytes);
+
+    var proof = mmr.decodeInclusionProof(ctx.allocator, proof_bytes) catch {
+        return ctx.value("{\"valid\":false}");
+    };
+    defer proof.deinit();
+
+    const valid = mmr.verifyInclusion(proof, record_hash[0..], root);
+    return ctx.value(if (valid) "{\"valid\":true}" else "{\"valid\":false}");
+}
+
+const MmrProofData = struct {
+    seq: u64,
+    leaf_index: u64,
+    leaf_count: u64,
+    root: mmr.Hash,
+    record_hash: append_log.Hash,
+    proof_bytes: []u8,
+
+    fn deinit(self: *MmrProofData, allocator: std.mem.Allocator) void {
+        allocator.free(self.proof_bytes);
+        self.* = undefined;
+    }
+};
+
+fn buildMmrProof(allocator: std.mem.Allocator, store: *Store, log_id: []const u8, seq: u64) !MmrProofData {
+    const prefix = try append_log.eventKeyPrefix(allocator, log_id);
+    defer allocator.free(prefix);
+
+    const results = try store.scanPrefix(prefix, 0, allocator);
+    defer {
+        for (results) |r| {
+            allocator.free(r.key);
+            allocator.free(r.value);
+        }
+        allocator.free(results);
+    }
+
+    var acc = mmr.Accumulator.init(allocator);
+    defer acc.deinit();
+
+    var record_hash: ?append_log.Hash = null;
+    for (results) |r| {
+        const view = try append_log.decodeEnvelope(r.value);
+        const leaf = append_log.hashBytes(r.value);
+        _ = try acc.append(leaf[0..]);
+        if (view.seq == seq) record_hash = leaf;
+    }
+    const target_hash = record_hash orelse return error.SequenceNotFound;
+    const leaf_index = seq - 1;
+    var proof = try acc.prove(leaf_index, allocator);
+    defer proof.deinit();
+    const proof_bytes = try mmr.encodeInclusionProof(allocator, proof);
+    errdefer allocator.free(proof_bytes);
+
+    return .{
+        .seq = seq,
+        .leaf_index = leaf_index,
+        .leaf_count = acc.len(),
+        .root = acc.root(),
+        .record_hash = target_hash,
+        .proof_bytes = proof_bytes,
+    };
+}
+
 fn appendResultJson(allocator: std.mem.Allocator, result: append_log.AppendResult) ![]u8 {
     var json: std.ArrayListUnmanaged(u8) = .empty;
     errdefer json.deinit(allocator);
@@ -100,6 +212,26 @@ fn appendResultJson(allocator: std.mem.Allocator, result: append_log.AppendResul
     return json.toOwnedSlice(allocator);
 }
 
+fn mmrProofJson(allocator: std.mem.Allocator, proof: MmrProofData) ![]u8 {
+    var json: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer json.deinit(allocator);
+
+    try json.appendSlice(allocator, "{\"seq\":");
+    try appendU64(&json, allocator, proof.seq);
+    try json.appendSlice(allocator, ",\"leaf_index\":");
+    try appendU64(&json, allocator, proof.leaf_index);
+    try json.appendSlice(allocator, ",\"leaf_count\":");
+    try appendU64(&json, allocator, proof.leaf_count);
+    try json.appendSlice(allocator, ",\"root\":\"");
+    try appendHashHex(&json, allocator, proof.root);
+    try json.appendSlice(allocator, "\",\"record_hash\":\"");
+    try appendHashHex(&json, allocator, proof.record_hash);
+    try json.appendSlice(allocator, "\",\"proof_hex\":\"");
+    try appendHexBytes(&json, allocator, proof.proof_bytes);
+    try json.appendSlice(allocator, "\"}");
+    return json.toOwnedSlice(allocator);
+}
+
 fn verifyReportJson(allocator: std.mem.Allocator, report: append_log.VerifyReport) ![]u8 {
     var json: std.ArrayListUnmanaged(u8) = .empty;
     errdefer json.deinit(allocator);
@@ -112,6 +244,18 @@ fn verifyReportJson(allocator: std.mem.Allocator, report: append_log.VerifyRepor
     try appendHashHex(&json, allocator, report.head_hash);
     try json.appendSlice(allocator, "\"}");
     return json.toOwnedSlice(allocator);
+}
+
+fn parseHexBytes(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
+    if (hex.len % 2 != 0) return error.InvalidHex;
+    const out = try allocator.alloc(u8, hex.len / 2);
+    errdefer allocator.free(out);
+    for (out, 0..) |*byte, i| {
+        const hi = try hexNibble(hex[i * 2]);
+        const lo = try hexNibble(hex[i * 2 + 1]);
+        byte.* = (hi << 4) | lo;
+    }
+    return out;
 }
 
 fn parseHashHex(hex: []const u8) !append_log.Hash {
@@ -199,4 +343,57 @@ test "append_log append rejects malformed attachment hash" {
 
     const response = try runProc(&store, appendExecute, &.{ "audit-log", "payload-one", "not-hex" }, allocator);
     try testing.expectEqualStrings("append_log_append: attachment hash must be 64 hex chars", response.err);
+}
+
+test "append_log MMR proof procedure returns verifier-friendly proof" {
+    const testing = std.testing;
+
+    var store = try Store.init(testing.allocator, Config{ .persistence = .none });
+    defer store.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    _ = try runProc(&store, appendExecute, &.{ "audit-log", "payload-one", "ts=100" }, allocator);
+    _ = try runProc(&store, appendExecute, &.{ "audit-log", "payload-two", "ts=101" }, allocator);
+    const response = try runProc(&store, mmrProofExecute, &.{ "audit-log", "2" }, allocator);
+    const value = response.value.?;
+
+    try testing.expect(std.mem.containsAtLeast(u8, value, 1, "\"seq\":2"));
+    try testing.expect(std.mem.containsAtLeast(u8, value, 1, "\"leaf_index\":1"));
+    try testing.expect(std.mem.containsAtLeast(u8, value, 1, "\"root\""));
+    try testing.expect(std.mem.containsAtLeast(u8, value, 1, "\"record_hash\""));
+    try testing.expect(std.mem.containsAtLeast(u8, value, 1, "\"proof_hex\""));
+}
+
+test "append_log MMR verify procedure accepts generated proof" {
+    const testing = std.testing;
+
+    var store = try Store.init(testing.allocator, Config{ .persistence = .none });
+    defer store.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    _ = try runProc(&store, appendExecute, &.{ "audit-log", "payload-one", "ts=100" }, allocator);
+    _ = try runProc(&store, appendExecute, &.{ "audit-log", "payload-two", "ts=101" }, allocator);
+    var proof_data = try buildMmrProof(allocator, &store, "audit-log", 2);
+    defer proof_data.deinit(allocator);
+
+    var root_hex: std.ArrayListUnmanaged(u8) = .empty;
+    try appendHashHex(&root_hex, allocator, proof_data.root);
+    const root = try root_hex.toOwnedSlice(allocator);
+
+    var record_hash_hex: std.ArrayListUnmanaged(u8) = .empty;
+    try appendHashHex(&record_hash_hex, allocator, proof_data.record_hash);
+    const record_hash = try record_hash_hex.toOwnedSlice(allocator);
+
+    var proof_hex_buf: std.ArrayListUnmanaged(u8) = .empty;
+    try appendHexBytes(&proof_hex_buf, allocator, proof_data.proof_bytes);
+    const proof_hex = try proof_hex_buf.toOwnedSlice(allocator);
+
+    const response = try runProc(&store, mmrVerifyExecute, &.{ record_hash, root, proof_hex }, allocator);
+    try testing.expectEqualStrings("{\"valid\":true}", response.value.?);
 }

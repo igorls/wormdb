@@ -65,6 +65,8 @@ const PROCEDURES = [_]Entry{
     .{ .name = "vnsdrop", .func = vnsdrop.execute },
     .{ .name = "append_log_append", .func = append_log.appendExecute },
     .{ .name = "append_log_verify", .func = append_log.verifyExecute },
+    .{ .name = "append_log_mmr_proof", .func = append_log.mmrProofExecute },
+    .{ .name = "append_log_mmr_verify", .func = append_log.mmrVerifyExecute },
     .{ .name = "mem_init", .func = memory.memInit },
     .{ .name = "mem_add", .func = memory.memAdd },
     .{ .name = "mem_get", .func = memory.memGet },

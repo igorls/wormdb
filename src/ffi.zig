@@ -6,10 +6,10 @@
 //! Build: `zig build` produces zig-out/lib/libwormdb_ffi.{dylib,so,a}.
 //! Header: ffi/wormdb.h.
 //!
-//! Memory: values returned by wormdb_get and wormdb_proof_build_mmr_bundle are
-//! owned by the library and must be released with wormdb_free. Scan callback
-//! key/value pointers are borrowed and valid only until the callback returns.
-//! All other buffers are caller-owned.
+//! Memory: values returned by wormdb_get, wormdb_exec, and
+//! wormdb_proof_build_mmr_bundle are owned by the library and must be released
+//! with wormdb_free. Scan callback key/value pointers are borrowed and valid
+//! only until the callback returns. All other buffers are caller-owned.
 //!
 //! Threading: the store is internally sharded with per-shard locks, so calls
 //! from multiple threads are safe. A single Db handle may be shared freely.
@@ -23,6 +23,8 @@ const proof = wormdb.proof;
 const append_log = proof.append_log;
 const checkpoint = proof.checkpoint;
 const mmr = proof.mmr;
+const Ctx = wormdb.procedures.context.Ctx;
+const registry = wormdb.procedures.registry;
 
 // libc malloc/free — so values handed across the boundary can be released by
 // the caller (wormdb_free, or plain free()) without allocator bookkeeping.
@@ -42,6 +44,7 @@ pub const Db = struct {
 // ─── Result / persistence codes (mirror ffi/wormdb.h) ───
 const OK: c_int = 0;
 const NOT_FOUND: c_int = 1;
+const PROC_ERR: c_int = 2;
 const ERR: c_int = -1;
 
 const PERSIST_FULL: c_int = 0; // WAL on every write + snapshots (durable)
@@ -80,6 +83,11 @@ pub const ProofBundleInfo = extern struct {
     accumulator_kind: c_int,
     accumulator_root: [32]u8,
     checkpoint_hash: [32]u8,
+};
+
+pub const ExecArg = extern struct {
+    ptr: [*]const u8,
+    len: usize,
 };
 
 const ScanCallback = *const fn (
@@ -146,6 +154,22 @@ fn attachmentHashSlice(ptr: ?[*]const u8, count: usize) ?[]const append_log.Hash
     const p = ptr orelse return null;
     const hashes: [*]const append_log.Hash = @ptrCast(p);
     return hashes[0..count];
+}
+
+fn clearOut(out_val: *?[*]u8, out_len: *usize) void {
+    out_val.* = null;
+    out_len.* = 0;
+}
+
+fn putOwnedOut(bytes: []const u8, out_val: *?[*]u8, out_len: *usize) c_int {
+    const copy = gpa.dupe(u8, bytes) catch return ERR;
+    out_val.* = copy.ptr;
+    out_len.* = copy.len;
+    return OK;
+}
+
+fn putProcErr(bytes: []const u8, out_val: *?[*]u8, out_len: *usize) c_int {
+    return if (putOwnedOut(bytes, out_val, out_len) == OK) PROC_ERR else ERR;
 }
 
 /// Open (or create) a database rooted at `dir`. WAL + snapshot live under it.
@@ -400,13 +424,59 @@ export fn wormdb_mmr_proof_verify(
     return if (mmr.verifyInclusion(decoded, leaf[0..], root)) OK else ERR;
 }
 
+/// Execute a stored procedure in-process. On WORMDB_OK with a value, or
+/// WORMDB_PROC_ERR with an error string, out_val/out_len receive a
+/// library-owned buffer released with wormdb_free. OK without a value leaves
+/// out_val null and out_len 0.
+export fn wormdb_exec(
+    db: *Db,
+    name: [*]const u8,
+    name_len: usize,
+    args: ?[*]const ExecArg,
+    argc: usize,
+    out_val: *?[*]u8,
+    out_len: *usize,
+) c_int {
+    clearOut(out_val, out_len);
+    if (argc > 0 and args == null) return ERR;
+
+    const func = registry.lookup(name[0..name_len]) orelse
+        return putProcErr("unknown procedure", out_val, out_len);
+
+    const proc_args = gpa.alloc([]const u8, argc) catch return ERR;
+    defer gpa.free(proc_args);
+    if (args) |raw_args| {
+        for (proc_args, 0..) |*slot, i| {
+            const arg = raw_args[i];
+            slot.* = arg.ptr[0..arg.len];
+        }
+    }
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    var ctx = Ctx.init(&db.store, proc_args, arena.allocator(), null, null, null, null);
+    defer ctx.deinit();
+
+    const response = func(&ctx) catch return ERR;
+    return switch (response) {
+        .ok => OK,
+        .value => |maybe| blk: {
+            const bytes = maybe orelse break :blk OK;
+            break :blk putOwnedOut(bytes, out_val, out_len);
+        },
+        .err => |msg| putProcErr(msg, out_val, out_len),
+        .event => ERR,
+    };
+}
+
 /// Delete key. Missing keys succeed; deleting a WORM key returns WORMDB_ERR.
 export fn wormdb_delete(db: *Db, key: [*]const u8, key_len: usize) c_int {
     db.store.delete(key[0..key_len]) catch return ERR;
     return OK;
 }
 
-/// Release a buffer returned by wormdb_get or wormdb_proof_build_mmr_bundle.
+/// Release a buffer returned by wormdb_get, wormdb_exec, or proof builders.
 export fn wormdb_free(ptr: ?[*]u8, len: usize) void {
     if (ptr) |p| gpa.free(p[0..len]);
 }
@@ -535,4 +605,47 @@ test "ffi verifies canonical MMR proof bytes" {
         leaf_hash[0..].ptr,
         root[0..].ptr,
     ));
+}
+
+test "ffi exec runs stored procedures and returns owned values" {
+    const testing = std.testing;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try wormdb.core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+    const zpath = try testing.allocator.dupeZ(u8, tmp_path);
+    defer testing.allocator.free(zpath);
+
+    const db = wormdb_open(zpath.ptr, PERSIST_NONE) orelse return error.OpenFailed;
+    defer wormdb_close(db);
+
+    const append_name = "append_log_append";
+    const append_args = [_]ExecArg{
+        .{ .ptr = "ffi:exec".ptr, .len = "ffi:exec".len },
+        .{ .ptr = "payload-one".ptr, .len = "payload-one".len },
+        .{ .ptr = "ts=100".ptr, .len = "ts=100".len },
+    };
+    var out: ?[*]u8 = null;
+    var out_len: usize = 0;
+    try testing.expectEqual(OK, wormdb_exec(db, append_name.ptr, append_name.len, &append_args, append_args.len, &out, &out_len));
+    defer wormdb_free(out, out_len);
+    try testing.expect(out != null);
+    try testing.expect(std.mem.containsAtLeast(u8, out.?[0..out_len], 1, "\"seq\":1"));
+
+    const verify_name = "append_log_verify";
+    const verify_args = [_]ExecArg{.{ .ptr = "ffi:exec".ptr, .len = "ffi:exec".len }};
+    var verify_out: ?[*]u8 = null;
+    var verify_len: usize = 0;
+    try testing.expectEqual(OK, wormdb_exec(db, verify_name.ptr, verify_name.len, &verify_args, verify_args.len, &verify_out, &verify_len));
+    defer wormdb_free(verify_out, verify_len);
+    try testing.expect(std.mem.containsAtLeast(u8, verify_out.?[0..verify_len], 1, "\"count\":1"));
+
+    const missing_name = "does_not_exist";
+    var err_out: ?[*]u8 = null;
+    var err_len: usize = 0;
+    try testing.expectEqual(PROC_ERR, wormdb_exec(db, missing_name.ptr, missing_name.len, null, 0, &err_out, &err_len));
+    defer wormdb_free(err_out, err_len);
+    try testing.expectEqualStrings("unknown procedure", err_out.?[0..err_len]);
 }

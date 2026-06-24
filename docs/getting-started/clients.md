@@ -113,6 +113,27 @@ bun run apps/bun/src/bin/client.ts EXEC transfer acct:alice acct:bob 999999
 
 See [Stored Procedures](/architecture/procedures) for the full procedure model and how to write your own.
 
+## Embedded FFI
+
+Native apps can link `libwormdb_ffi` and use the engine in-process without a socket server. The C header is `ffi/wormdb.h`.
+
+The embedded API includes KV operations, prefix scans, and a generic procedure bridge:
+
+```c
+wormdb_ExecArg args[] = {
+    {(const unsigned char *)"audit-log", 9},
+    {(const unsigned char *)"payload", 7},
+};
+unsigned char *out = NULL;
+size_t out_len = 0;
+int rc = wormdb_exec(db,
+    (const unsigned char *)"append_log_append", 17,
+    args, 2,
+    &out, &out_len);
+```
+
+`WORMDB_OK` with a value and `WORMDB_PROC_ERR` with an error string both return a library-owned buffer in `out`; release it with `wormdb_free(out, out_len)`.
+
 ## Vector Procedures
 
 Vector operations can be called through `EXEC` procedures or through native vector wire commands in custom clients.

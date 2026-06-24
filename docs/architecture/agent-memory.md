@@ -8,8 +8,9 @@ For the end-to-end demo notes, see [Agent Memory Demo](/AGENT_MEMORY_DEMO).
 
 | Procedure | Purpose |
 | --------- | ------- |
-| `mem_init <ns> <embedder_id> <metric>` | Predeclare a memory namespace, embedder, and metric |
+| `mem_init <ns> <embedder_id> <metric> [vector_only=true]` | Predeclare a memory namespace, embedder, metric, and optional vector-only mode |
 | `mem_add <ns> <doc_id> <text> <embedding> [meta_json] [worm] [embedder_id]` | Add one memory chunk plus embedding |
+| `mem_add <ns> <doc_id> <embedding> [meta_json] [worm] [embedder_id]` | Add one vector-only memory row |
 | `mem_get <ns> <doc_id>` | Fetch document text joined with metadata |
 | `mem_query <ns> <embedding> <k> [lambda] [min_score] [snippet_chars]` | Search and return enriched memories |
 | `mem_stats <ns>` | Return count, dimension, HNSW, and config state |
@@ -24,10 +25,16 @@ mem:<ns>:<id>              document body, WORM by default
 mem:<ns>:<id>:meta         metadata JSON
 vec:mem:<ns>:<id>          raw embedding bytes
 bq:vec:mem:<ns>:<id>       quantized companion
-__meta:mem:<ns>:config     {"embedder_id":"...","metric":"...","created_at":...}
+__meta:mem:<ns>:config     {"embedder_id":"...","metric":"...","vector_only":false,"created_at":...}
 ```
 
 Chunking lives on the client. `mem_add` indexes one chunk; applications that have long documents or conversations should split them and call `mem_add` with derived IDs.
+
+## Vector-Only Mode
+
+`mem_init <ns> <embedder_id> <metric> vector_only=true` creates a namespace for sidecar layouts where document bodies live outside WormDB. In this mode, `mem_add` uses the shorter form `<ns> <doc_id> <embedding> [meta_json] [worm] [embedder_id]`, writes `vec:*`, `bq:*`, and optional metadata, and intentionally skips `mem:<ns>:<id>` document bodies.
+
+`mem_query` returns hits as `[{id, score, ts, meta}]` with no `doc` field, and `mem_get` rejects with a deterministic `vector_only` error. Dim and metric freezing still happen through the normal vector namespace.
 
 ## Embedder Enforcement
 

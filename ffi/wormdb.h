@@ -18,6 +18,7 @@ extern "C" {
 /* Result codes. */
 #define WORMDB_OK         0
 #define WORMDB_NOT_FOUND  1
+#define WORMDB_PROC_ERR   2
 #define WORMDB_ERR       (-1)
 
 #define WORMDB_HASH_LEN       32
@@ -78,6 +79,11 @@ typedef struct wormdb_ProofBundleInfo {
     unsigned char accumulator_root[WORMDB_HASH_LEN];
     unsigned char checkpoint_hash[WORMDB_HASH_LEN];
 } wormdb_ProofBundleInfo;
+
+typedef struct wormdb_ExecArg {
+    const unsigned char *ptr;
+    size_t len;
+} wormdb_ExecArg;
 
 /* Prefix-scan callback.
  *
@@ -187,10 +193,25 @@ int wormdb_mmr_proof_verify(const unsigned char *proof_bytes, size_t proof_len,
                             const unsigned char leaf_hash[WORMDB_HASH_LEN],
                             const unsigned char expected_root[WORMDB_HASH_LEN]);
 
+/* Execute a stored procedure in-process, without starting a socket server.
+ *
+ * args is an array of argc borrowed byte slices. On WORMDB_OK with a value,
+ * out_val/out_len receives a library-owned byte buffer that must be released
+ * with wormdb_free. WORMDB_OK with no value leaves out_val NULL and out_len 0.
+ *
+ * On WORMDB_PROC_ERR, out_val/out_len contains the procedure error string and
+ * must also be released with wormdb_free. WORMDB_ERR means FFI misuse or an
+ * internal failure before a procedure response was produced.
+ */
+int wormdb_exec(wormdb_Db *db,
+                const unsigned char *name, size_t name_len,
+                const wormdb_ExecArg *args, size_t argc,
+                unsigned char **out_val, size_t *out_len);
+
 /* Delete key (missing keys succeed; WORM keys return WORMDB_ERR). */
 int wormdb_delete(wormdb_Db *db, const unsigned char *key, size_t key_len);
 
-/* Release a buffer returned by wormdb_get or wormdb_proof_build_mmr_bundle. */
+/* Release a buffer returned by wormdb_get, wormdb_exec, or proof builders. */
 void wormdb_free(unsigned char *ptr, size_t len);
 
 /* Static version string (do not free). */

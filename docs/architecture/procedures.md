@@ -94,6 +94,7 @@ The registry currently includes several procedure families:
 | Collaboration demos | `chat_send`, `chat_history` |
 | Vector search | `vinsert`, `vsearch`, `vsim`, `vstats`, `vreindex`, `vrabitq`, `vdelete`, `vnsdrop` |
 | Agent memory | `mem_init`, `mem_add`, `mem_get`, `mem_query`, `mem_stats`, `mem_drop`, `mem_reset_index`, `mem_capabilities` |
+| Verifiable logs | `append_log_append`, `append_log_verify` |
 | Light-API | `lightapi_*` procedures served through the gateway's HTTP and JSON-RPC routes |
 
 ### `increment`
@@ -151,6 +152,13 @@ See [Vector Search](/architecture/vector-search) for the full vector procedure s
 ### Agent Memory Procedures
 
 See [Agent Memory](/architecture/agent-memory) for the `mem_*` surface. These procedures compose WORM docs, metadata, vector inserts, pub/sub, and embedder-id enforcement for AI memory stores.
+
+### Verifiable Log Procedures
+
+See [Verifiable Append Log](/protocol/append-log) for the canonical envelope and procedure response formats.
+
+- `append_log_append` — append opaque payload bytes to a named WORM log and return sequence/hash metadata.
+- `append_log_verify` — scan a log and verify contiguous sequences, WORM protection, payload hashes, event hashes, and hash-chain links.
 
 ### Light-API Procedures
 

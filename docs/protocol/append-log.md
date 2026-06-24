@@ -12,6 +12,32 @@ proof:append-log:v1:<sha256(log_id) hex>:event:<8B seq BE>
 
 The binary big-endian sequence suffix keeps prefix scans sorted by sequence. Sequence reuse is prevented by the WORM key write: two appenders racing for the same next sequence cannot both commit.
 
+## Procedure Surface
+
+Append a canonical event envelope to a named log:
+
+```bash
+bun run apps/bun/src/bin/client.ts EXEC append_log_append <log_id> <payload> [ts=<ms>] [attachment_hash_hex...]
+```
+
+`ts=<ms>` is optional; when omitted WormDB records the current local receipt timestamp. Each attachment hash is a 64-character hex SHA-256 digest. The response is JSON:
+
+```json
+{"seq":1,"ingest_time_ms":1700000000000,"key_hex":"...","prev_event_hash":"...","payload_hash":"...","event_hash":"..."}
+```
+
+Verify the stored chain for a log:
+
+```bash
+bun run apps/bun/src/bin/client.ts EXEC append_log_verify <log_id>
+```
+
+The response is JSON:
+
+```json
+{"count":3,"last_seq":3,"head_hash":"..."}
+```
+
 ## Envelope Format
 
 All integer fields are unsigned big-endian. The `event_hash` is the linear chain hash: `SHA-256` over every byte before the final `event_hash` field.

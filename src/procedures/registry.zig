@@ -24,6 +24,7 @@ pub const vrabitq = @import("vrabitq.zig");
 pub const vdelete = @import("vdelete.zig");
 pub const vnsdrop = @import("vnsdrop.zig");
 pub const memory = @import("memory.zig");
+pub const append_log = @import("append_log.zig");
 // Light-API + AtomicAssets procedures are NOT imported here — they live in their own packages
 // (wormdb-domain-lightapi, wormdb-domain-atomicassets) and are registered at startup via
 // registerDomains() from each package's manifest.
@@ -62,6 +63,8 @@ const PROCEDURES = [_]Entry{
     .{ .name = "vrabitq", .func = vrabitq.execute },
     .{ .name = "vdelete", .func = vdelete.execute },
     .{ .name = "vnsdrop", .func = vnsdrop.execute },
+    .{ .name = "append_log_append", .func = append_log.appendExecute },
+    .{ .name = "append_log_verify", .func = append_log.verifyExecute },
     .{ .name = "mem_init", .func = memory.memInit },
     .{ .name = "mem_add", .func = memory.memAdd },
     .{ .name = "mem_get", .func = memory.memGet },

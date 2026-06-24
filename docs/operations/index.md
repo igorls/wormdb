@@ -44,7 +44,7 @@ bun run apps/bun/src/bin/client.ts SAVE
 bun run apps/bun/src/bin/client.ts EXEC vstats vec:
 ```
 
-Run `EXEC vreindex <namespace>` after raw vector ingest or recovery from an old snapshot when HNSW needs to be immediately current.
+Run `EXEC vreindex <namespace>` after raw vector ingest, raw/custom vector recovery where metric metadata is unavailable, or suspected HNSW corruption. Memory namespaces are rebuilt from recovered `vec:mem:<ns>:` keys on startup when their config key is present.
 
 ## Admin UI
 

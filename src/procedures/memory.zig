@@ -57,6 +57,7 @@ const metric_mod = @import("../vector/metric.zig");
 const IndexModule = @import("../vector/index.zig");
 const Store = @import("../storage/store.zig").Store;
 const Command = @import("../core/types.zig").Command;
+const auth = @import("../server/auth.zig");
 
 const Metric = metric_mod.Metric;
 
@@ -287,6 +288,7 @@ pub fn memInit(ctx: *Ctx) anyerror!Ctx.Result {
 
     if (!validateNs(ns))
         return ctx.err("mem_init: ns must be 1..64 bytes, chars in [A-Za-z0-9._/-]");
+    ctx.requireNamespace(ns, .write) catch return ctx.err("permission denied");
     if (!validateEmbedderId(embedder_id))
         return ctx.err("mem_init: embedder_id must be 1..128 bytes, chars in [A-Za-z0-9._/-]");
     const metric = Metric.fromStr(metric_str) orelse
@@ -376,6 +378,7 @@ pub fn memAdd(ctx: *Ctx) anyerror!Ctx.Result {
 
     if (!validateNs(ns))
         return ctx.err("mem_add: invalid ns");
+    ctx.requireNamespace(ns, .write) catch return ctx.err("permission denied");
     if (!validateDocId(doc_id))
         return ctx.err("mem_add: invalid doc_id");
 
@@ -520,6 +523,7 @@ pub fn memMetaSet(ctx: *Ctx) anyerror!Ctx.Result {
 
     if (!validateNs(ns)) return ctx.err("mem_meta_set: invalid ns");
     if (!validateDocId(doc_id)) return ctx.err("mem_meta_set: invalid doc_id");
+    ctx.requireNamespace(ns, .write) catch return ctx.err("permission denied");
 
     const doc_key = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:{s}", .{ ns, doc_id });
     defer ctx.allocator.free(doc_key);
@@ -551,6 +555,7 @@ pub fn memBulkAdd(ctx: *Ctx) anyerror!Ctx.Result {
     const count = ctx.argInt(usize, 1) orelse return ctx.err("mem_bulk_add: count must be an integer");
 
     if (!validateNs(ns)) return ctx.err("mem_bulk_add: invalid ns");
+    ctx.requireNamespace(ns, .write) catch return ctx.err("permission denied");
     if (count > MAX_BULK_ADD)
         return ctx.err(ctx.fmt("mem_bulk_add: count must be <= {d}", .{MAX_BULK_ADD}));
 
@@ -688,6 +693,7 @@ pub fn memGet(ctx: *Ctx) anyerror!Ctx.Result {
     const doc_id = ctx.arg(1) orelse return ctx.err("mem_get requires: <ns> <doc_id>");
 
     if (!validateNs(ns)) return ctx.err("mem_get: invalid ns");
+    ctx.requireNamespace(ns, .read) catch return ctx.err("permission denied");
     if (!validateDocId(doc_id)) return ctx.err("mem_get: invalid doc_id");
 
     const config_key = try std.fmt.allocPrint(ctx.allocator, "__meta:mem:{s}:config", .{ns});
@@ -899,6 +905,7 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
         return ctx.err("mem_query: k must be a positive integer");
 
     if (!validateNs(ns)) return ctx.err("mem_query: invalid ns");
+    ctx.requireNamespace(ns, .read) catch return ctx.err("permission denied");
 
     const top_k = @min(if (top_k_raw == 0) @as(usize, 10) else top_k_raw, MAX_TOP_K);
 
@@ -1143,6 +1150,7 @@ pub fn memRange(ctx: *Ctx) anyerror!Ctx.Result {
     const until_ms = ctx.argInt(u64, 2) orelse return ctx.err("mem_range: until_ms must be an integer");
 
     if (!validateNs(ns)) return ctx.err("mem_range: invalid ns");
+    ctx.requireNamespace(ns, .read) catch return ctx.err("permission denied");
     if (since_ms > until_ms) return ctx.err("mem_range: since_ms must be <= until_ms");
 
     var limit: usize = DEFAULT_RANGE_LIMIT;
@@ -1215,6 +1223,7 @@ pub fn memRange(ctx: *Ctx) anyerror!Ctx.Result {
 pub fn memStats(ctx: *Ctx) anyerror!Ctx.Result {
     const ns = ctx.arg(0) orelse return ctx.err("mem_stats requires: <ns>");
     if (!validateNs(ns)) return ctx.err("mem_stats: invalid ns");
+    ctx.requireNamespace(ns, .read) catch return ctx.err("permission denied");
 
     const vec_namespace = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
     defer ctx.allocator.free(vec_namespace);
@@ -1391,6 +1400,7 @@ fn collectVerifySet(ctx: *Ctx, prefix: []const u8, kind: VerifyKind, ids: *Verif
 pub fn memVerify(ctx: *Ctx) anyerror!Ctx.Result {
     const ns = ctx.arg(0) orelse return ctx.err("mem_verify requires: <ns>");
     if (!validateNs(ns)) return ctx.err("mem_verify: invalid ns");
+    ctx.requireNamespace(ns, .read) catch return ctx.err("permission denied");
 
     const doc_prefix = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:", .{ns});
     defer ctx.allocator.free(doc_prefix);
@@ -1504,6 +1514,7 @@ fn collectDropKey(
 pub fn memDrop(ctx: *Ctx) anyerror!Ctx.Result {
     const ns = ctx.arg(0) orelse return ctx.err("mem_drop requires: <ns>");
     if (!validateNs(ns)) return ctx.err("mem_drop: invalid ns");
+    ctx.requireNamespace(ns, .delete) catch return ctx.err("permission denied");
 
     const mem_prefix = try std.fmt.allocPrint(ctx.allocator, "mem:{s}:", .{ns});
     defer ctx.allocator.free(mem_prefix);
@@ -1593,6 +1604,7 @@ pub fn memResetIndex(ctx: *Ctx) anyerror!Ctx.Result {
         return ctx.err("mem_reset_index requires: <ns> <new_embedder_id>");
 
     if (!validateNs(ns)) return ctx.err("mem_reset_index: invalid ns");
+    ctx.requireNamespace(ns, .delete) catch return ctx.err("permission denied");
     if (!validateEmbedderId(new_embedder_id))
         return ctx.err("mem_reset_index: invalid embedder_id");
 
@@ -1911,6 +1923,18 @@ fn runProcWithBus(
     return try proc(&ctx);
 }
 
+fn runProcWithAuth(
+    store: *StoreModule.Store,
+    proc: *const fn (ctx: *Ctx) anyerror!Ctx.Result,
+    args: []const []const u8,
+    arena: std.mem.Allocator,
+    auth_context: auth.AuthContext,
+) !Ctx.Result {
+    var ctx = Ctx.initWithAuth(store, args, arena, auth_context, null, null, null, null);
+    defer ctx.deinit();
+    return try proc(&ctx);
+}
+
 fn runProcWithRegistry(
     store: *StoreModule.Store,
     proc: *const fn (ctx: *Ctx) anyerror!Ctx.Result,
@@ -2053,6 +2077,55 @@ test "mem_query: filters HNSW refine candidates by metadata before top-k" {
     try testing.expect(result == .value);
     try testing.expect(std.mem.indexOf(u8, result.value.?, "\"id\":\"doc-public\"") != null);
     try testing.expect(std.mem.indexOf(u8, result.value.?, "\"id\":\"doc-private\"") == null);
+}
+
+test "mem_get: enforces namespace-scoped read capability" {
+    var fx = try TestStoreFixture.init("memget_auth_scope");
+    defer fx.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try runProc(&fx.store, memInit, &.{ "astrid", "bge-m3", "cosine" }, arena);
+    _ = try runProc(&fx.store, memInit, &.{ "raven", "bge-m3", "cosine" }, arena);
+
+    const emb = try packF32(arena, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+    _ = try runProc(&fx.store, memAdd, &.{ "astrid", "doc-1", "allowed", emb, "{}", "0" }, arena);
+    _ = try runProc(&fx.store, memAdd, &.{ "raven", "doc-1", "denied", emb, "{}", "0" }, arena);
+
+    const caps = [_]auth.Capability{
+        .{ .op = .get, .match_type = .prefix, .pattern = "mem:astrid:" },
+        .{ .op = .get, .match_type = .prefix, .pattern = "vec:mem:astrid:" },
+        .{ .op = .get, .match_type = .prefix, .pattern = "bq:vec:mem:astrid:" },
+        .{ .op = .get, .match_type = .prefix, .pattern = "__meta:mem:astrid:" },
+    };
+    const state = auth.TokenState{
+        .subject = "mem:astrid",
+        .iat = 0,
+        .exp = 0,
+        .jti = 0,
+        .capabilities = &caps,
+    };
+
+    const allowed = try runProcWithAuth(
+        &fx.store,
+        memGet,
+        &.{ "astrid", "doc-1" },
+        arena,
+        .{ .enforce = &state },
+    );
+    try testing.expect(allowed == .value);
+
+    const denied = try runProcWithAuth(
+        &fx.store,
+        memGet,
+        &.{ "raven", "doc-1" },
+        arena,
+        .{ .enforce = &state },
+    );
+    try testing.expect(denied == .err);
+    try testing.expectEqualStrings("permission denied", denied.err);
 }
 
 test "mem_add: accepts call without embedder_id arg (backward compat)" {

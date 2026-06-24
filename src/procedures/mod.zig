@@ -7,6 +7,7 @@ pub const context = @import("context.zig");
 pub const registry = @import("registry.zig");
 pub const domain = @import("domain.zig");
 pub const predicate = @import("predicate.zig");
+pub const auth_mint_scoped = @import("auth_mint_scoped.zig");
 pub const transfer = @import("transfer.zig");
 pub const increment = @import("increment.zig");
 pub const kv_put = @import("kv_put.zig");

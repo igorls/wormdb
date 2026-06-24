@@ -35,12 +35,18 @@ Authentication is via signed capability tokens (SCT). Configure Ed25519 public k
   "auth": {
     "public_keys": ["BASE64_ED25519_PUBLIC_KEY"],
     "require_auth": true,
-    "token_max_age_s": 3600
+    "token_max_age_s": 3600,
+    "mint_secret_key": "BASE64_ED25519_SECRET_KEY",
+    "namespace_token_ttl_s": 3600
   }
 }
 ```
 
 The `AUTH` command is connection-level. If it reaches the generic executor, the response is an error because auth must be enforced by the gateway.
+
+`mint_secret_key` is optional. When present and paired with its public key in `auth.public_keys`, `EXEC auth_mint_scoped <namespace> [ttl_s] [subject] [read|write|readwrite]` can mint least-privilege namespace SCTs. Minting requires wildcard admin authority or both `exec auth_mint_scoped` and `exec auth:mint:<namespace>` capability.
+
+Namespace tokens expand to concrete capabilities for `mem:<ns>:`, `vec:mem:<ns>:`, `bq:vec:mem:<ns>:`, `__meta:mem:<ns>:`, `EXEC mem_*`, and `mem:<ns>:` pub/sub channels. Each `mem_*` procedure also checks the namespace argument server-side, so a token for `astrid` cannot call `mem_query raven ...`.
 
 ## QUIC / WebTransport
 

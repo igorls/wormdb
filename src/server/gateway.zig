@@ -40,6 +40,7 @@ pub fn registerWsMethods(methods: []const domain.WsMethod) void {
 }
 
 const auth = @import("auth.zig");
+const AuthMintConfig = @import("../procedures/context.zig").AuthMintConfig;
 
 const Store = storage.Store;
 const EventBus = event_mod.EventBus;
@@ -64,6 +65,8 @@ pub const Gateway = struct {
     /// Whether this listener enforces auth (= `cfg.auth.require_auth && cfg.gateway.auth_enabled`).
     /// True ⇒ executor rejects unauthenticated protected commands; false ⇒ listener opted out.
     auth_required: bool,
+    /// Optional server-side SCT minting config.
+    auth_mint: ?AuthMintConfig,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -82,6 +85,7 @@ pub const Gateway = struct {
             .public_keys = &.{},
             .max_token_age = 0,
             .auth_required = false,
+            .auth_mint = null,
         };
     }
 
@@ -302,6 +306,7 @@ pub const Gateway = struct {
                             .{ .enforce = if (auth_state) |*s| s else null }
                         else
                             .disabled,
+                        .auth_mint = self.auth_mint,
                     }, cmd) catch |err| {
                         const err_msg: []const u8 = switch (err) {
                             error.WormViolation => "WORM violation",
@@ -413,6 +418,7 @@ pub const Gateway = struct {
             .event_bus = self.event_bus,
             .cluster = self.cluster,
             .auth = if (self.auth_required) .{ .enforce = null } else .disabled,
+            .auth_mint = self.auth_mint,
         }, .{ .exec = .{ .procedure = proc, .args = args } }) catch return null;
         return switch (resp) {
             .value => |v| v orelse "null",

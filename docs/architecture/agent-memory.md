@@ -10,6 +10,7 @@ For the end-to-end demo notes, see [Agent Memory Demo](/AGENT_MEMORY_DEMO).
 | --------- | ------- |
 | `mem_init <ns> <embedder_id> <metric>` | Predeclare a memory namespace, embedder, and metric |
 | `mem_add <ns> <doc_id> <text> <embedding> [meta_json] [worm] [embedder_id]` | Add one memory chunk plus embedding |
+| `mem_meta_set <ns> <doc_id> <meta_json>` | Update metadata for an existing memory without re-embedding |
 | `mem_get <ns> <doc_id>` | Fetch document text joined with metadata |
 | `mem_query <ns> <embedding> <k> [lambda] [min_score] [snippet_chars]` | Search and return enriched memories |
 | `mem_stats <ns>` | Return count, dimension, HNSW, and config state |
@@ -28,6 +29,11 @@ __meta:mem:<ns>:config     {"embedder_id":"...","metric":"...","created_at":...}
 ```
 
 Chunking lives on the client. `mem_add` indexes one chunk; applications that have long documents or conversations should split them and call `mem_add` with derived IDs.
+
+Metadata is a mutable passthrough side key. Applications may update it directly
+with `SET mem:<ns>:<id>:meta <json>`, or use `mem_meta_set` to first validate
+that the document exists. The metadata bytes are stored raw and returned raw in
+`mem_get`/`mem_query`, matching the existing `mem_add` contract.
 
 ## Embedder Enforcement
 

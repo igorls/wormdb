@@ -64,6 +64,7 @@ const PROCEDURES = [_]Entry{
     .{ .name = "vnsdrop", .func = vnsdrop.execute },
     .{ .name = "mem_init", .func = memory.memInit },
     .{ .name = "mem_add", .func = memory.memAdd },
+    .{ .name = "mem_meta_set", .func = memory.memMetaSet },
     .{ .name = "mem_get", .func = memory.memGet },
     .{ .name = "mem_query", .func = memory.memQuery },
     .{ .name = "mem_stats", .func = memory.memStats },

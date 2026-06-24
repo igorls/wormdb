@@ -19,6 +19,7 @@ goes through the same WAL + replication path the rest of the server uses.
 | ------------------ | -------------------------------------------------------------- |
 | `mem_init`         | Optionally pre-declare a namespace's embedder and metric       |
 | `mem_add`          | Atomic: doc + metadata + embedding + event, in one EXEC        |
+| `mem_meta_set`     | Update metadata for an existing memory without re-embedding     |
 | `mem_get`          | Single-doc fetch with metadata join                            |
 | `mem_query`        | HNSW → brute-force fallback, joined with doc + metadata        |
 | `mem_stats`        | Counts, dim, HNSW state, config                                 |
@@ -46,6 +47,12 @@ Two consequences worth noticing:
 - `mem:<ns>:` covers *both* docs and `:meta` entries in a single prefix
   scan — handy for `mem_stats` and `mem_drop`, which is why `doc_keys`
   in the stats output is labelled as a raw count rather than "docs".
+
+Metadata can be updated without touching the vector. The stable low-level
+contract is a direct mutable `SET mem:<ns>:<id>:meta <json>`; the ergonomic
+stored-procedure wrapper is `EXEC mem_meta_set <ns> <id> <json>`.
+`mem_meta_set` validates that `mem:<ns>:<id>` exists, then durably writes the
+metadata key. The JSON is stored as caller-supplied bytes, matching `mem_add`.
 
 ## What counts as atomic
 

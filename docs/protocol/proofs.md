@@ -93,6 +93,55 @@ Each inclusion proof carries:
 
 For `mmr_sha256_v1`, `leaf_hash` is the proof-bundle `record_hash`, where `record_hash = SHA-256(full canonical append-log envelope bytes)`. The append-log `event_hash` remains the linear chain hash over the envelope preimage before the trailing `event_hash` field.
 
+## Proof Bundle Bytes
+
+Encoded proof bundles use canonical bytes for FFI and packet transfer:
+
+```text
+[8B magic = "WDBPBND1"]
+[2B codec_version = 1]
+[1B proof_bundle_version = 1]
+[1B kind]
+[4B log_id_len][log_id bytes]
+[4B bundle_extension_len][bundle_extension bytes]
+[4B record_count]
+  repeated record_count times:
+  [8B seq]
+  [32B record_hash]
+  [4B canonical_record_len][canonical_record bytes]
+  [1B has_value]
+    if has_value:
+    [32B value_hash]
+    [4B value_len][value bytes]
+  [4B record_extension_len][record_extension bytes]
+[4B inclusion_proof_count]
+  repeated inclusion_proof_count times:
+  [8B seq]
+  [32B leaf_hash]
+  [32B checkpoint_hash]
+  [4B path_len][path bytes]
+  [4B proof_extension_len][proof_extension bytes]
+[4B checkpoint_count]
+  repeated checkpoint_count times:
+  [1B version]
+  [4B log_id_len][log_id bytes]
+  [8B from_seq]
+  [8B to_seq]
+  [1B accumulator_kind]
+  [32B accumulator_root]
+  [1B has_previous_checkpoint_hash]
+    if has_previous_checkpoint_hash:
+    [32B previous_checkpoint_hash]
+  [4B creator_identity_len][creator_identity bytes]
+  [1B signature_scheme]
+  [64B signature]
+  [8B created_at_ms]
+  [8B ingested_at_ms]
+  [4B checkpoint_extension_len][checkpoint_extension bytes]
+```
+
+The append-log MMR builder scans and verifies the stored log prefix through `to_seq`, builds the MMR with absolute leaf indexes (`seq - 1`), carries only the requested `from_seq..to_seq` records, signs one `mmr_sha256_v1` checkpoint, encodes the bundle, and verifies it before returning bytes.
+
 ## MMR Proof Bytes
 
 `mmr_sha256_v1` inclusion proofs use canonical path bytes so bundles can be verified without a live database. The append-log MMR leaf index is `seq - 1`.

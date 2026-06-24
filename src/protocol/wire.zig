@@ -577,6 +577,54 @@ pub fn writeResponse(writer: anytype, response: Response) !void {
     }
 }
 
+pub fn readResponseAlloc(reader: anytype, allocator: std.mem.Allocator) !Response {
+    var header: [5]u8 = undefined;
+    readExact(reader, &header) catch |err| {
+        if (err == error.EndOfStream) return error.EndOfStream;
+        return err;
+    };
+
+    const code_byte = header[0];
+    const payload_len = std.mem.readInt(u32, header[1..5], .big);
+    if (payload_len > MAX_PAYLOAD_LENGTH) return error.PayloadTooLarge;
+
+    const code = compat.intToEnum(ResponseCode, code_byte) catch return error.Corruption;
+    switch (code) {
+        .ok => {
+            if (payload_len != 0) return error.Corruption;
+            return .ok;
+        },
+        .null_value => {
+            if (payload_len != 0) return error.Corruption;
+            return Response{ .value = null };
+        },
+        .value => {
+            const payload = try allocator.alloc(u8, payload_len);
+            errdefer allocator.free(payload);
+            if (payload_len > 0) try readExact(reader, payload);
+            return Response{ .value = payload };
+        },
+        .err => {
+            const payload = try allocator.alloc(u8, payload_len);
+            errdefer allocator.free(payload);
+            if (payload_len > 0) try readExact(reader, payload);
+            return Response{ .err = payload };
+        },
+        .event => {
+            const payload = try allocator.alloc(u8, payload_len);
+            defer allocator.free(payload);
+            if (payload_len > 0) try readExact(reader, payload);
+            var pos: usize = 0;
+            const channel = try readBytesField(payload, &pos, allocator);
+            errdefer allocator.free(channel);
+            const message = try readBytesField(payload, &pos, allocator);
+            errdefer allocator.free(message);
+            if (pos != payload.len) return error.Corruption;
+            return Response{ .event = .{ .channel = channel, .message = message } };
+        },
+    }
+}
+
 pub fn writeCommand(writer: anytype, cmd: Command) !void {
     var w = writer;
     switch (cmd) {

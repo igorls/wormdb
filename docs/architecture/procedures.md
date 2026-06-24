@@ -98,6 +98,7 @@ The registry currently includes several procedure families:
 | Agent memory | `mem_init`, `mem_add`, `mem_meta_set`, `mem_bulk_add`, `mem_get`, `mem_query`, `mem_range`, `mem_stats`, `mem_verify`, `mem_drop`, `mem_reset_index`, `mem_capabilities` |
 | Auth | `auth_mint_scoped` |
 | Verifiable logs | `append_log_append`, `append_log_verify`, `append_log_mmr_proof`, `append_log_mmr_verify`, `append_log_checkpoint`, `append_log_proof_bundle`, `append_log_proof_verify`, `append_log_witness`, `append_log_witness_request`, `append_log_witness_import`, `append_log_witness_verify` |
+| Proof diagnostics | `proof_prefix_root` |
 | Light-API | `lightapi_*` procedures served through the gateway's HTTP and JSON-RPC routes |
 
 ### `increment`
@@ -168,6 +169,7 @@ See [Verifiable Append Log](/protocol/append-log) for the canonical envelope and
 - `append_log_witness` / `append_log_witness_request` / `append_log_witness_import` / `append_log_witness_verify` — countersign, request live peer countersignatures, import, and verify WORM witness records for checkpoint roots.
 - `append_log_proof_bundle` — export canonical record bytes, hashes, inclusion paths, and checkpoint metadata as stable JSON.
 - `append_log_proof_verify` — verify a record hash and MMR proof against a stored signed checkpoint.
+- `proof_prefix_root` — compute a deterministic `prefix-sha256-v1` root over sorted key/value/timestamp entries for diagnostics and cluster anti-entropy.
 
 ### Light-API Procedures
 

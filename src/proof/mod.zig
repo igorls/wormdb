@@ -10,6 +10,7 @@ pub const proof_bundle = @import("proof_bundle.zig");
 pub const append_log = @import("append_log.zig");
 pub const mmr = @import("mmr.zig");
 pub const witness = @import("witness.zig");
+pub const prefix_root = @import("prefix_root.zig");
 
 pub const AccumulatorKind = checkpoint.AccumulatorKind;
 pub const CheckpointRecord = checkpoint.CheckpointRecord;
@@ -36,6 +37,7 @@ pub const verifyEncodedAppendLogMmrBundle = proof_bundle.verifyEncodedAppendLogM
 pub const MmrAccumulator = mmr.Accumulator;
 pub const MmrInclusionProof = mmr.InclusionProof;
 pub const MmrPeak = mmr.Peak;
+pub const PrefixRootSummary = prefix_root.Summary;
 pub const encodeMmrInclusionProof = mmr.encodeInclusionProof;
 pub const decodeMmrInclusionProof = mmr.decodeInclusionProof;
 

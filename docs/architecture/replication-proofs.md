@@ -193,13 +193,13 @@ only; they do not need to be trusted to validate the payload.
 
 ## Anti-Entropy
 
-Current cluster reconnect anti-entropy sends a full state scan to a returning
-peer. Root anti-entropy should keep that path as the fallback, but try compact
-checks first.
+Cluster reconnect anti-entropy probes a compact deterministic prefix root before
+it sends a full state scan to a returning peer. The full scan remains the
+fallback when roots diverge or the compact proof cannot establish a safe repair.
 
 ### Root Exchange
 
-Each peer advertises a small summary per WORM log or key prefix:
+Each peer can advertise a small summary per WORM log or key prefix:
 
 ```json
 {
@@ -218,30 +218,32 @@ Each peer advertises a small summary per WORM log or key prefix:
 }
 ```
 
-For append logs, compare `(log_id, to_seq, root)`. For ordinary WORM prefixes
-without sequence numbers, compare deterministic prefix roots over sorted
-`(key_hash, value_hash, is_worm, timestamp)` leaves. Prefix roots are useful for
-diagnostics and repair, but checkpointed append logs should be preferred when
-available because they give range-aware proofs.
+For append logs, compare `(log_id, to_seq, root)`. For ordinary prefixes without
+sequence numbers, WormDB currently computes `prefix-sha256-v1` over sorted
+`(key, value, is_worm, timestamp)` leaves via `EXEC proof_prefix_root [prefix]
+[limit=<first_n>]`. Prefix roots are useful for diagnostics and sorted-tail
+repair, but checkpointed append logs should still be preferred for future
+range-aware proofs.
 
 ### Divergence Detection
 
 On reconnect or periodic audit:
 
-1. Exchange root summaries for the configured WORM logs/prefixes.
-2. If `root` and `to_seq` match, mark the log healthy and update
-   `last_verified_at_ms`.
-3. If local `to_seq` is behind and the peer's prefix/root chain links to a known
-   checkpoint, request the missing range.
-4. If both sides have the same `to_seq` but different roots, request bisection
-   roots over subranges to find the first divergent range.
-5. If the peer cannot provide range proofs, if the prefix has no append-log
-   structure, or if divergence cannot be narrowed cheaply, fall back to the
-   existing full-state sync.
+1. Exchange a root summary for the full keyspace over a transient replication
+   connection.
+2. If `root` and `entry_count` match, mark the peer `healthy`, update
+   `proof_last_verified_ms`, and skip full sync.
+3. If the peer has fewer entries, compute the local root for the peer's first
+   `entry_count` sorted entries. If that root matches the peer's root, send only
+   the missing tail entries.
+4. If the peer has more entries, mark it `ahead` and leave repair to the peer's
+   own outbound sync.
+5. If counts match but roots differ, or the prefix proof cannot establish a
+   safe tail repair, mark the peer `diverged` and fall back to full sync.
 
 ### Range Repair
 
-Missing range repair requests should be explicit:
+Future checkpointed append-log missing range repair requests should be explicit:
 
 ```json
 {
@@ -303,9 +305,10 @@ claims such as GPS coordinates or supervisor names in generic cluster status.
    implementation uses a restricted peer-side `EXEC append_log_witness` request
    so peers countersign with local meshguard/WormDB identity material while
    ordinary SET/VINSERT replication remains unchanged.
-5. Replace reconnect full-sync first with root exchange first. Use full-sync
-   only when proofs are unavailable, ranges are too large, or roots cannot be
-   narrowed.
+5. Replace reconnect full-sync first with root exchange first. The current
+   implementation compares full-keyspace prefix roots, skips full sync when
+   healthy, and sends only a verified sorted-prefix missing tail when safe.
+   Full sync remains the fallback for divergence and unverifiable roots.
 6. Add status counters and timestamps to `ClusterStatus` and `CLUSTER PEERS`.
 7. Add tests for signature verification, witness storage immutability, root
    comparison outcomes, missing-range repair, same-sequence divergence, and

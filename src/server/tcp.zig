@@ -761,8 +761,13 @@ pub const Server = struct {
     }
 
     fn isAllowedReplicationProcedure(name: []const u8) bool {
+        // NOTE: vsearch_cluster is deliberately NOT allowed here — peers may
+        // only be asked for the local sub-query (vsearch_local_raw), which
+        // never re-scatters, so replication-channel fan-out loops are
+        // impossible by construction.
         return std.mem.eql(u8, name, "append_log_witness") or
-            std.mem.eql(u8, name, "proof_prefix_root");
+            std.mem.eql(u8, name, "proof_prefix_root") or
+            std.mem.eql(u8, name, "vsearch_local_raw");
     }
 
     /// Read exactly `buf.len` bytes from a raw stream (pre-framing handshake I/O).

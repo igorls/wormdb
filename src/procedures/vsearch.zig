@@ -328,6 +328,7 @@ const IndexModule = @import("../vector/index.zig");
 /// with store shards.
 fn runHnswDispatch(
     ctx: *Ctx,
+    query_key: []const u8,
     ns_idx: *IndexModule.NamespaceIndex,
     query_vec: []align(1) const f32,
     top_k: usize,
@@ -371,6 +372,9 @@ fn runHnswDispatch(
 
     // Stage 2: exact refine (no index lock held).
     for (0..n_stage1) |i| {
+        // The query's own stored entry is never a result — mirrors the
+        // BQ/RaBitQ/brute-force scan paths and the runSearch contract.
+        if (std.mem.eql(u8, stage1_keys[i], query_key)) continue;
         const vec_bytes = (try ctx.getCopy(stage1_keys[i])) orelse continue;
         const vec = distance.bytesToF32(vec_bytes) orelse continue;
         if (vec.len != query_vec.len) continue;
@@ -525,6 +529,7 @@ pub fn runSearch(
                 if (ns_idx.metric == metric) {
                     if (try runHnswDispatch(
                         ctx,
+                        query_key,
                         ns_idx,
                         query_vec,
                         top_k,
@@ -913,4 +918,66 @@ test "vsearch_local_raw: rejects invalid base64 and bad vector lengths" {
     // Missing top_k.
     const no_topk = try testRunProc(&store, executeLocalRaw, &.{"QUFBQQ=="}, arena);
     try testing.expect(no_topk == .err);
+}
+
+fn testRunProcWithRegistry(
+    store: *Store,
+    proc: *const fn (ctx: *Ctx) anyerror!Ctx.Result,
+    args: []const []const u8,
+    arena: std.mem.Allocator,
+    registry: *IndexModule.NamespaceRegistry,
+) !Ctx.Result {
+    var ctx = Ctx.init(store, args, arena, null, null, null, registry);
+    defer ctx.deinit();
+    return try proc(&ctx);
+}
+
+test "vsearch: HNSW path excludes the query's own key" {
+    var store = try Store.init(testing.allocator, Config{ .persistence = .none });
+    defer store.deinit();
+
+    var registry = IndexModule.NamespaceRegistry.init(testing.allocator, .{});
+    defer registry.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Store + HNSW index in lockstep, with the query key INSIDE the searched
+    // namespace — the shape the parity tests above deliberately avoid.
+    const q = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+    const near = [_]f32{ 0.9, 0.1, 0.0, 0.0 };
+    const far = [_]f32{ 0.0, 1.0, 0.0, 0.0 };
+    const ns_idx = try registry.getOrCreate("vec:t:", .cosine);
+    inline for (.{
+        .{ "vec:t:q", &q },
+        .{ "vec:t:near", &near },
+        .{ "vec:t:far", &far },
+    }) |entry| {
+        try store.set(entry[0], try testPackF32(arena, entry[1]), false);
+        ns_idx.lock.lock();
+        defer ns_idx.lock.unlock();
+        _ = try ns_idx.insertLocked(entry[0], entry[1], 1_700_000_000_000);
+    }
+
+    // Guard: auto mode must serve this query from the HNSW index — a silent
+    // fall-through to BQ/brute-force (which already exclude) would mask a
+    // regression here. Fall-through only happens on a missing index, empty
+    // index, or metric mismatch; pin all three.
+    try testing.expect(registry.get("vec:t:") == ns_idx);
+    try testing.expectEqual(@as(usize, 3), ns_idx.len());
+    try testing.expectEqual(Metric.cosine, ns_idx.metric);
+
+    // top_k=1 is the sharpest failure: pre-fix the self-hit (score 1.0) was
+    // the single result, so "nearest neighbor" always answered the query key.
+    const top1 = try testRunProcWithRegistry(&store, execute, &.{ "vec:t:q", "1", "vec:t:" }, arena, &registry);
+    try testing.expect(top1 == .value);
+    try testing.expect(std.mem.startsWith(u8, top1.value.?, "[{\"k\":\"vec:t:near\""));
+
+    // Full result set: neighbors present, self absent.
+    const top3 = try testRunProcWithRegistry(&store, execute, &.{ "vec:t:q", "3", "vec:t:" }, arena, &registry);
+    try testing.expect(top3 == .value);
+    try testing.expect(std.mem.indexOf(u8, top3.value.?, "\"k\":\"vec:t:q\"") == null);
+    try testing.expect(std.mem.indexOf(u8, top3.value.?, "\"k\":\"vec:t:near\"") != null);
+    try testing.expect(std.mem.indexOf(u8, top3.value.?, "\"k\":\"vec:t:far\"") != null);
 }

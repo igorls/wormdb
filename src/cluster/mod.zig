@@ -7,6 +7,7 @@
 const std = @import("std");
 pub const node = @import("node.zig");
 pub const org_trust = @import("org_trust.zig");
+pub const presence = @import("presence.zig");
 
 pub const Cluster = node.Cluster;
 pub const ClusterNode = node.ClusterNode;

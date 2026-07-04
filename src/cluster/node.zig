@@ -21,6 +21,7 @@ const EventBus = event.EventBus;
 const NamespaceIndex = @import("../vector/index.zig").NamespaceIndex;
 const prefix_root = @import("../proof/prefix_root.zig");
 const org_trust = @import("org_trust.zig");
+const presence = @import("presence.zig");
 
 const Keys = meshguard.identity.Keys;
 const Membership = meshguard.discovery.Membership;
@@ -217,6 +218,15 @@ pub const Cluster = struct {
     discovery_thread: ?std.Thread,
     running: std.atomic.Value(bool),
 
+    // ── Presence deltas (#65) ──
+    /// pubkey → last published SWIM state, diffed by the discovery loop's
+    /// ~1s presence poll to detect transitions that have no SWIM callback
+    /// (alive→suspected, recovery, graceful leave). Guarded by `mutex`
+    /// (written by the discovery thread's poll and the SWIM callbacks).
+    presence_cache: std.AutoHashMap([32]u8, Membership.PeerState),
+    /// Monotonic ns of the last presence poll. Discovery-thread-only.
+    last_presence_poll_ns: i128,
+
     pub fn init(
         allocator: std.mem.Allocator,
         store: *Store,
@@ -254,6 +264,8 @@ pub const Cluster = struct {
             .mutex = .{},
             .discovery_thread = null,
             .running = std.atomic.Value(bool).init(false),
+            .presence_cache = std.AutoHashMap([32]u8, Membership.PeerState).init(allocator),
+            .last_presence_poll_ns = 0,
         };
     }
 
@@ -264,6 +276,7 @@ pub const Cluster = struct {
             entry.value_ptr.disconnect();
         }
         self.peers.deinit();
+        self.presence_cache.deinit();
         self.membership.deinit();
         if (self.gossip_socket) |*s| s.close();
     }
@@ -1045,6 +1058,17 @@ pub const Cluster = struct {
             const ra_str = WgIp.formatIp(ra, &ra_buf);
             std.log.info("cluster: peer real addr = {s}", .{ra_str});
         }
+
+        // Presence delta: seed the state-diff cache (so the ~1s poll doesn't
+        // re-emit this transition) and push the join event.
+        self.presence_cache.put(peer.pubkey, .alive) catch {};
+        self.publishPresence(presence.joinJson(
+            self.allocator,
+            peer.pubkey,
+            peer.name,
+            peer_mesh_ip,
+            core.compat.nowMs(),
+        ));
     }
 
     fn onPeerDead(ctx: *anyopaque, pubkey: [32]u8) void {
@@ -1068,6 +1092,16 @@ pub const Cluster = struct {
             // Reset connect backoff so we retry promptly when peer returns
             p.last_connect_attempt_ns = 0;
         }
+
+        // Presence delta: record dead in the diff cache (no duplicate emit
+        // from the poll) and push the event.
+        self.presence_cache.put(pubkey, .dead) catch {};
+        self.publishPresence(presence.stateEventJson(
+            self.allocator,
+            .dead,
+            pubkey,
+            core.compat.nowMs(),
+        ));
     }
 
     fn onPeerPunched(ctx: *anyopaque, peer: *const Membership.Peer, endpoint: messages.Endpoint) void {
@@ -1088,6 +1122,72 @@ pub const Cluster = struct {
             const ip_str = WgIp.formatIp(endpoint.addr, &ip_buf);
             std.log.info("cluster: peer punched, real IP = {s}:{d}", .{ ip_str, endpoint.port });
         }
+
+        // Presence delta: NAT hole punched — publish the discovered endpoint.
+        self.publishPresence(presence.punchedJson(
+            self.allocator,
+            peer.pubkey,
+            endpoint.addr,
+            endpoint.port,
+            core.compat.nowMs(),
+        ));
+    }
+
+    // ── Presence deltas (#65) ──
+
+    /// Publish a presence delta built by one of the presence.zig JSON
+    /// builders. Best-effort: build/publish failures are swallowed (the bus
+    /// copies the message, so the slice is freed immediately after).
+    fn publishPresence(self: *Cluster, msg_or_err: anyerror![]u8) void {
+        const msg = msg_or_err catch return;
+        defer self.allocator.free(msg);
+        self.event_bus.publish(presence.CHANNEL, msg) catch {};
+    }
+
+    /// Minimum interval between membership state-diff polls (~1s).
+    const PRESENCE_POLL_INTERVAL_NS: i128 = 1_000_000_000;
+
+    /// Poll SWIM membership and publish presence deltas for state transitions
+    /// that have no SWIM callback (alive→suspected, suspected→alive recovery,
+    /// dead→alive rejoin, graceful leave). Time-gated so the tick loop's hot
+    /// path stays cheap; the snapshot is taken under the membership table's
+    /// shared lock (required for readers outside the SWIM thread's writes),
+    /// and the diff cache is updated under the cluster mutex.
+    fn pollPresenceTransitions(self: *Cluster) void {
+        const now = core.compat.nowNs();
+        if (now - self.last_presence_poll_ns < PRESENCE_POLL_INTERVAL_NS) return;
+        self.last_presence_poll_ns = now;
+
+        // Snapshot (pubkey, state) pairs under the membership read lock.
+        var snapshot: std.ArrayListUnmanaged(presence.PeerSnapshot) = .empty;
+        defer snapshot.deinit(self.allocator);
+        {
+            const zio = core.compat.io();
+            self.membership.lock.lockSharedUncancelable(zio);
+            defer self.membership.lock.unlockShared(zio);
+            snapshot.ensureTotalCapacity(self.allocator, self.membership.peers.count()) catch return;
+            var iter = self.membership.peers.iterator();
+            while (iter.next()) |entry| {
+                snapshot.appendAssumeCapacity(.{
+                    .pubkey = entry.key_ptr.*,
+                    .state = entry.value_ptr.state,
+                });
+            }
+        }
+
+        // Diff against the cached states under the cluster mutex.
+        var events: [64]presence.StateEvent = undefined;
+        var count: usize = 0;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            count = presence.diffStates(&self.presence_cache, snapshot.items, &events);
+        }
+
+        const ts = core.compat.nowMs();
+        for (events[0..count]) |ev| {
+            self.publishPresence(presence.stateEventJson(self.allocator, ev.kind, ev.pubkey, ts));
+        }
     }
 
     // ── Discovery loop (background thread) ──
@@ -1099,6 +1199,7 @@ pub const Cluster = struct {
                     std.log.warn("cluster: swim tick error: {s}", .{@errorName(err)});
                 };
             }
+            self.pollPresenceTransitions();
         }
     }
 };

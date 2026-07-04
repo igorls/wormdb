@@ -26,6 +26,7 @@ pub const vnsdrop = @import("vnsdrop.zig");
 pub const memory = @import("memory.zig");
 pub const auth_mint_scoped = @import("auth_mint_scoped.zig");
 pub const append_log = @import("append_log.zig");
+pub const coordination = @import("coordination.zig");
 pub const proof_prefix_root = @import("proof_prefix_root.zig");
 // Light-API + AtomicAssets procedures are NOT imported here — they live in their own packages
 // (wormdb-domain-lightapi, wormdb-domain-atomicassets) and are registered at startup via
@@ -77,6 +78,10 @@ const PROCEDURES = [_]Entry{
     .{ .name = "append_log_witness_request", .func = append_log.witnessRequestExecute },
     .{ .name = "append_log_witness_import", .func = append_log.witnessImportExecute },
     .{ .name = "append_log_witness_verify", .func = append_log.witnessVerifyExecute },
+    .{ .name = "append_log_claim", .func = coordination.claimExecute },
+    .{ .name = "append_log_claim_status", .func = coordination.statusExecute },
+    .{ .name = "append_log_claim_release", .func = coordination.releaseExecute },
+    .{ .name = "append_log_claim_supersede", .func = coordination.supersedeExecute },
     .{ .name = "proof_prefix_root", .func = proof_prefix_root.execute },
     .{ .name = "mem_init", .func = memory.memInit },
     .{ .name = "mem_add", .func = memory.memAdd },

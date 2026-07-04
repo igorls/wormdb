@@ -82,6 +82,36 @@ pub const ClusterStatus = struct {
     anti_entropy_mode: []const u8,
 };
 
+/// Parameters for a scatter-gather vector search (#67). Namespace/metric/
+/// mode travel as strings — they are forwarded verbatim as
+/// `vsearch_local_raw` args, whose parsing matches `vsearch` exactly.
+pub const ScatterParams = struct {
+    top_k: usize,
+    namespace: []const u8,
+    metric: []const u8,
+    decay: f32,
+    mode: []const u8,
+    decay_tau_hours: f32,
+    /// Bounded fan-out — at most this many alive peers are queried.
+    max_peers: usize = 16,
+};
+
+/// One remote candidate gathered from a peer's `vsearch_local_raw` reply.
+pub const ScatterItem = struct {
+    key: []const u8,
+    score: f32,
+    timestamp: u64,
+};
+
+/// Result of `Cluster.scatterVsearch`. `items` is deduplicated by key
+/// (max score wins), sorted by descending score and capped at `top_k`;
+/// all memory is owned by the allocator passed to scatterVsearch.
+pub const ScatterResult = struct {
+    items: []ScatterItem,
+    peers_queried: usize,
+    peers_failed: usize,
+};
+
 const RootSyncState = enum {
     healthy,
     behind,
@@ -765,6 +795,214 @@ pub const Cluster = struct {
             allocator.free(r.value);
         }
         allocator.free(results);
+    }
+
+    // ── Scatter-gather vector search (#67) ──
+
+    /// Scatter a vector search to alive peers as `EXEC vsearch_local_raw`
+    /// sub-queries over one-shot replication connections, and gather the
+    /// per-peer top-K lists into a deduplicated global candidate set.
+    ///
+    /// v1 queries peers SEQUENTIALLY (same shape as requestPeerPrefixRoot);
+    /// parallel fan-out is a later optimization. Each connection is bounded
+    /// by 2s send/receive timeouts (Linux; other platforms rely on the OS
+    /// defaults — clustering is Linux-only in practice), so worst case is
+    /// ~2s × peers, capped by `max_peers`.
+    ///
+    /// Per-peer failures (connect, timeout, error response, malformed JSON)
+    /// are counted in `peers_failed` and never fail the whole scatter —
+    /// callers surface partial results.
+    ///
+    /// All returned memory (item keys, items slice) is owned by `allocator`
+    /// (the calling procedure's arena in practice).
+    pub fn scatterVsearch(
+        self: *Cluster,
+        allocator: std.mem.Allocator,
+        query: []align(1) const f32,
+        params: ScatterParams,
+    ) !ScatterResult {
+        // 1. Snapshot up to max_peers ALIVE peers under the membership
+        //    read lock (#65 convention — SWIM thread owns the writes).
+        var mesh_ips: std.ArrayListUnmanaged([4]u8) = .empty;
+        defer mesh_ips.deinit(allocator);
+        {
+            const zio = core.compat.io();
+            self.membership.lock.lockSharedUncancelable(zio);
+            defer self.membership.lock.unlockShared(zio);
+            var iter = self.membership.peers.iterator();
+            while (iter.next()) |entry| {
+                if (mesh_ips.items.len >= params.max_peers) break;
+                if (entry.value_ptr.state != .alive) continue;
+                try mesh_ips.append(allocator, entry.value_ptr.mesh_ip);
+            }
+        }
+
+        // 2. Resolve each mesh IP to the best route — the SWIM-discovered
+        //    real address when known (WG tunnels may not be functional,
+        //    e.g. Docker), falling back to the mesh IP. Same chain as
+        //    requestPeerPrefixRoot / PeerConnection.connect.
+        var targets: std.ArrayListUnmanaged([4]u8) = .empty;
+        defer targets.deinit(allocator);
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            for (mesh_ips.items) |mip| {
+                if (self.peers.getPtr(mip)) |pc| {
+                    if (pc.is_dead) continue;
+                    try targets.append(allocator, pc.real_addr orelse mip);
+                } else {
+                    try targets.append(allocator, mip);
+                }
+            }
+        }
+
+        // 3. Encode the query once: standard base64 of the raw f32 bytes
+        //    (little-endian on every supported target).
+        const query_bytes = std.mem.sliceAsBytes(query);
+        const b64_len = std.base64.standard.Encoder.calcSize(query_bytes.len);
+        const query_b64 = try allocator.alloc(u8, b64_len);
+        _ = std.base64.standard.Encoder.encode(query_b64, query_bytes);
+
+        // 4. Sequential fan-out; merge with dedup-by-key keeping the max
+        //    score. Keys are globally replicated, so most collide — the
+        //    dedup is what turns N per-node top-Ks into one global top-K.
+        var index = std.StringHashMap(usize).init(allocator);
+        defer index.deinit();
+        var items: std.ArrayListUnmanaged(ScatterItem) = .empty;
+        defer items.deinit(allocator);
+
+        var failed: usize = 0;
+        for (targets.items) |ip| {
+            const payload = self.queryPeerVsearchLocalRaw(allocator, ip, query_b64, params) catch {
+                failed += 1;
+                continue;
+            };
+            mergeScatterPayload(allocator, payload, &index, &items) catch {
+                failed += 1;
+                continue;
+            };
+        }
+
+        // 5. Global order + cap. Per-peer k == global k is provably
+        //    sufficient: the global top-K is a subset of the union of
+        //    per-node top-Ks.
+        std.sort.heap(ScatterItem, items.items, {}, struct {
+            fn greater(_: void, a: ScatterItem, b: ScatterItem) bool {
+                return a.score > b.score;
+            }
+        }.greater);
+        const n = @min(items.items.len, params.top_k);
+        const out = try allocator.dupe(ScatterItem, items.items[0..n]);
+
+        return .{
+            .items = out,
+            .peers_queried = targets.items.len,
+            .peers_failed = failed,
+        };
+    }
+
+    /// One-shot `EXEC vsearch_local_raw` against a single peer. Mirrors
+    /// requestPeerPrefixRoot exactly: fresh TCP connection, 2s SND/RCV
+    /// timeouts (Linux), the #63 outbound handshake (W2 org challenge when
+    /// a node cert is configured, legacy WR otherwise), one WormWire exec
+    /// frame, one response. Returns the peer's JSON payload (owned by
+    /// `allocator`).
+    fn queryPeerVsearchLocalRaw(
+        self: *Cluster,
+        allocator: std.mem.Allocator,
+        ip: [4]u8,
+        query_b64: []const u8,
+        params: ScatterParams,
+    ) ![]const u8 {
+        const addr = core.compat.net.Address.initIp4(ip, self.config.peer_port);
+        var stream = try core.compat.net.tcpConnectToAddress(addr);
+        defer stream.close();
+
+        if (comptime builtin.os.tag == .linux) {
+            const timeval = std.posix.timeval{ .sec = 2, .usec = 0 };
+            std.posix.setsockopt(stream.getHandle(), std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeval)) catch {};
+            std.posix.setsockopt(stream.getHandle(), std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
+        }
+
+        // Same protocol negotiation as persistent peer connections: W2 org
+        // handshake when we can authenticate, legacy WR otherwise.
+        try self.replOutboundHandshake(&stream);
+
+        var topk_buf: [24]u8 = undefined;
+        var decay_buf: [48]u8 = undefined;
+        var tau_buf: [48]u8 = undefined;
+        const topk_arg = try std.fmt.bufPrint(&topk_buf, "{d}", .{params.top_k});
+        const decay_arg = try std.fmt.bufPrint(&decay_buf, "{d}", .{params.decay});
+        const tau_arg = try std.fmt.bufPrint(&tau_buf, "{d}", .{params.decay_tau_hours});
+        var args = [_][]const u8{
+            query_b64, topk_arg, params.namespace, params.metric, decay_arg, params.mode, tau_arg,
+        };
+        try wire.writeCommand(&stream, .{ .exec = .{
+            .procedure = "vsearch_local_raw",
+            .args = args[0..],
+        } });
+
+        const ReadAdapter = struct {
+            stream: *core.compat.net.Stream,
+
+            pub fn read(adapter: *@This(), dest: []u8) !usize {
+                return adapter.stream.read(dest);
+            }
+        };
+        var reader = ReadAdapter{ .stream = &stream };
+        const response = try wire.readResponseAlloc(&reader, allocator);
+
+        return switch (response) {
+            .value => |maybe_value| maybe_value orelse error.Corruption,
+            else => blk: {
+                protocol.deinitResponse(allocator, response);
+                break :blk error.Corruption;
+            },
+        };
+    }
+
+    /// Parse one peer's `[{"k","s","ts"},...]` payload and merge it into
+    /// the running dedup set: unknown keys append, known keys keep the
+    /// higher score (strict `>`, so the first-seen entry wins ties).
+    fn mergeScatterPayload(
+        allocator: std.mem.Allocator,
+        payload: []const u8,
+        index: *std.StringHashMap(usize),
+        items: *std.ArrayListUnmanaged(ScatterItem),
+    ) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+        if (parsed.value != .array) return error.Corruption;
+
+        for (parsed.value.array.items) |it| {
+            if (it != .object) return error.Corruption;
+
+            const k = it.object.get("k") orelse return error.Corruption;
+            if (k != .string) return error.Corruption;
+
+            const s = it.object.get("s") orelse return error.Corruption;
+            const score: f32 = switch (s) {
+                .float => @floatCast(s.float),
+                .integer => @floatFromInt(s.integer),
+                else => return error.Corruption,
+            };
+
+            const ts_value = it.object.get("ts") orelse return error.Corruption;
+            if (ts_value != .integer) return error.Corruption;
+            const ts: u64 = if (ts_value.integer < 0) 0 else @intCast(ts_value.integer);
+
+            if (index.get(k.string)) |i| {
+                if (score > items.items[i].score) {
+                    items.items[i].score = score;
+                    items.items[i].timestamp = ts;
+                }
+            } else {
+                // Dupe the key out of the JSON parse tree before it is freed.
+                const key_copy = try allocator.dupe(u8, k.string);
+                try items.append(allocator, .{ .key = key_copy, .score = score, .timestamp = ts });
+                try index.put(key_copy, items.items.len - 1);
+            }
+        }
     }
 
     /// Replicate a SET to all alive peers via WormWire.

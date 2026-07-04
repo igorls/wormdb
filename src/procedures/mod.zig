@@ -17,6 +17,7 @@ pub const scan = @import("scan.zig");
 pub const chat_send = @import("chat_send.zig");
 pub const chat_history = @import("chat_history.zig");
 pub const vsearch = @import("vsearch.zig");
+pub const vsearch_cluster = @import("vsearch_cluster.zig");
 pub const vsim = @import("vsim.zig");
 pub const vinsert = @import("vinsert.zig");
 pub const vstats = @import("vstats.zig");

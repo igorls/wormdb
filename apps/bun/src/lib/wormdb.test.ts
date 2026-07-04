@@ -519,7 +519,7 @@ describe("WormDB appendLog wrappers", () => {
 });
 
 describe("WormDB vsearch wrapper", () => {
-  test("encodes positional + kv args and parses hits", async () => {
+  test("encodes positional args (padding skipped slots) and parses hits", async () => {
     const { conns } = installConnectMock();
     const db = newDb();
 
@@ -527,11 +527,36 @@ describe("WormDB vsearch wrapper", () => {
     await tick();
     expect(decodeExecFrame(conns[0].writes[conns[0].writes.length - 1])).toEqual({
       procedure: "vsearch",
-      args: ["vec:mem:q1", "5", "namespace=vec:mem:", "metric=cosine", "decay_tau_hours=12"],
+      args: ["vec:mem:q1", "5", "vec:mem:", "cosine", "0", "auto", "12"],
     });
 
     feed(conns[0], responseFrame(0x01, utf8('[{"k":"vec:mem:a","s":0.91,"ts":1700000000000}]')));
     await expect(p).resolves.toEqual([{ k: "vec:mem:a", s: 0.91, ts: 1700000000000 }]);
+
+    await db.close();
+  });
+
+  test("no opts sends only query_key + top_k; a lone later opt pads earlier defaults", async () => {
+    const { conns } = installConnectMock();
+    const db = newDb();
+
+    const bare = db.vsearch("vec:mem:q1", 3);
+    await tick();
+    expect(decodeExecFrame(conns[0].writes[conns[0].writes.length - 1])).toEqual({
+      procedure: "vsearch",
+      args: ["vec:mem:q1", "3"],
+    });
+    feed(conns[0], responseFrame(0x01, utf8("[]")));
+    await expect(bare).resolves.toEqual([]);
+
+    const sparse = db.vsearch("vec:mem:q1", 3, { mode: "exact" });
+    await tick();
+    expect(decodeExecFrame(conns[0].writes[conns[0].writes.length - 1])).toEqual({
+      procedure: "vsearch",
+      args: ["vec:mem:q1", "3", "vec:", "cosine", "0", "exact"],
+    });
+    feed(conns[0], responseFrame(0x01, utf8("[]")));
+    await expect(sparse).resolves.toEqual([]);
 
     await db.close();
   });

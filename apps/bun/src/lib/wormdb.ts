@@ -548,12 +548,15 @@ export class WormDB {
   }
 
   async vsearch(queryKey: string, topK: number, opts: VsearchOptions = {}): Promise<VsearchHit[]> {
+    // Args are positional: <query_key> <top_k> [namespace] [metric] [decay]
+    // [mode] [decay_tau_hours] — a later option requires every earlier slot
+    // on the wire, so skipped slots are padded with the server's defaults.
+    const values = [opts.namespace, opts.metric, opts.decay, opts.mode, opts.decayTauHours];
+    const defaults = ["vec:", "cosine", "0", "auto", "168"];
+    let count = 0;
+    for (let i = 0; i < values.length; i++) if (values[i] != null) count = i + 1;
     const args: string[] = [queryKey, String(topK)];
-    if (opts.namespace != null) args.push(`namespace=${opts.namespace}`);
-    if (opts.metric != null) args.push(`metric=${opts.metric}`);
-    if (opts.decay != null) args.push(`decay=${opts.decay}`);
-    if (opts.mode != null) args.push(`mode=${opts.mode}`);
-    if (opts.decayTauHours != null) args.push(`decay_tau_hours=${opts.decayTauHours}`);
+    for (let i = 0; i < count; i++) args.push(values[i] != null ? String(values[i]) : defaults[i]);
     return this.execJson<VsearchHit[]>("vsearch", args);
   }
 

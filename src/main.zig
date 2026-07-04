@@ -118,7 +118,7 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
     // Build runtime org trust once; shared read-only by the cluster (outbound
     // handshake) and the TCP server (inbound handshake + per-frame checks).
     // Lives on this frame, which outlives both.
-    const org_trust = wormdb.cluster.OrgTrust.fromConfig(allocator, file_cfg.org_trust) catch |err| {
+    var org_trust = wormdb.cluster.OrgTrust.fromConfig(allocator, file_cfg.org_trust) catch |err| {
         std.log.err("invalid org_trust config in '{s}': {s}", .{ args.config_path, @errorName(err) });
         std.process.exit(1);
     };
@@ -151,6 +151,22 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
     defer store.deinit();
 
     if (args.persistence == .full) try store.startBackgroundTasks();
+
+    // Dynamic delegated-org authorization (#66): only when enforcement is on
+    // AND this node has a cert (so "our org" is known). Folds this org's own
+    // trust log ("trust:<our_org_hex>") to authorize DELEGATED orgs' writes
+    // on granted prefixes; cached ≤5s + invalidated by local trust_revoke.
+    // Lives on this frame (outlives the server); deregistered before store
+    // teardown by defer ordering.
+    var dynamic_trust: wormdb.cluster.org_trust.DynamicTrust = undefined;
+    if (org_trust.enforce) {
+        if (org_trust.node_cert) |cert| {
+            dynamic_trust = wormdb.cluster.org_trust.DynamicTrust.init(allocator, &store, cert.org_pubkey);
+            org_trust.dynamic = &dynamic_trust;
+            std.log.info("Org trust: dynamic delegation fold active (trust:<our-org> log, cache ttl {d} ms)", .{dynamic_trust.ttl_ms});
+        }
+    }
+    defer if (org_trust.dynamic) |dynamic| dynamic.deinit();
 
     var event_bus = EventBus.init(allocator);
     defer event_bus.deinit();

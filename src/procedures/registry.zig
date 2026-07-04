@@ -29,6 +29,7 @@ pub const append_log = @import("append_log.zig");
 pub const coordination = @import("coordination.zig");
 pub const cluster_presence = @import("cluster_presence.zig");
 pub const proof_prefix_root = @import("proof_prefix_root.zig");
+pub const trust_log = @import("trust_log.zig");
 // Light-API + AtomicAssets procedures are NOT imported here — they live in their own packages
 // (wormdb-domain-lightapi, wormdb-domain-atomicassets) and are registered at startup via
 // registerDomains() from each package's manifest.
@@ -85,6 +86,9 @@ const PROCEDURES = [_]Entry{
     .{ .name = "append_log_claim_supersede", .func = coordination.supersedeExecute },
     .{ .name = "cluster_presence", .func = cluster_presence.execute },
     .{ .name = "proof_prefix_root", .func = proof_prefix_root.execute },
+    .{ .name = "trust_grant", .func = trust_log.grantExecute },
+    .{ .name = "trust_revoke", .func = trust_log.revokeExecute },
+    .{ .name = "trust_fold", .func = trust_log.foldExecute },
     .{ .name = "mem_init", .func = memory.memInit },
     .{ .name = "mem_add", .func = memory.memAdd },
     .{ .name = "mem_meta_set", .func = memory.memMetaSet },

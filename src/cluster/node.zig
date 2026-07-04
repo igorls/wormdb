@@ -20,6 +20,7 @@ const Store = storage.Store;
 const EventBus = event.EventBus;
 const NamespaceIndex = @import("../vector/index.zig").NamespaceIndex;
 const prefix_root = @import("../proof/prefix_root.zig");
+const org_trust = @import("org_trust.zig");
 
 const Keys = meshguard.identity.Keys;
 const Membership = meshguard.discovery.Membership;
@@ -59,6 +60,10 @@ pub const ClusterConfig = struct {
     gossip_port: u16 = 51821,
     /// WireGuard listen port
     wg_port: u16 = 51830,
+    /// Org trust for replication (#63). When set with a node cert, outbound
+    /// replication connections use the "W2" org handshake (challenge signed
+    /// with the cluster identity key); otherwise legacy "WR" is spoken.
+    org_trust: ?*const org_trust.OrgTrust = null,
 };
 
 pub const ClusterStatus = struct {
@@ -124,10 +129,11 @@ const PeerConnection = struct {
     root_sync_last_ms: u64,
     root_sync_missing_ranges: usize,
 
-    fn connect(self: *PeerConnection, port: u16) void {
+    fn connect(self: *PeerConnection, cluster: *const Cluster) void {
         if (self.stream != null) return;
         if (self.is_dead) return;
 
+        const port = cluster.config.peer_port;
         const now = core.compat.nowNs();
         if (now - self.last_connect_attempt_ns < 2_000_000_000) return;
         self.last_connect_attempt_ns = now;
@@ -145,10 +151,15 @@ const PeerConnection = struct {
         if (comptime builtin.os.tag == .linux) {
             const timeval = std.posix.timeval{ .sec = 2, .usec = 0 };
             std.posix.setsockopt(stream.getHandle(), std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeval)) catch {};
+            // The W2 handshake reads the server's challenge — bound that read too.
+            std.posix.setsockopt(stream.getHandle(), std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
         }
 
         var stream_mut = stream;
-        stream_mut.writeAll(&.{ 0x57, 0x52 }) catch {
+        cluster.replOutboundHandshake(&stream_mut) catch |err| {
+            std.log.warn("cluster: replication handshake to {d}.{d}.{d}.{d}:{d} failed: {s}", .{
+                ip[0], ip[1], ip[2], ip[3], port, @errorName(err),
+            });
             stream_mut.close();
             return;
         };
@@ -270,6 +281,38 @@ pub const Cluster = struct {
 
     pub fn signWithIdentity(self: *const Cluster, message: []const u8) ![64]u8 {
         return try Keys.sign(message, self.identity.secret_key);
+    }
+
+    /// Open a replication stream's protocol: write the magic and, when org
+    /// trust + our node cert are configured, complete the "W2" org handshake
+    /// (read the server's 32B challenge, reply [186B cert][64B Ed25519 sig
+    /// over challenge++cert] signed with the cluster identity key — the same
+    /// std Ed25519 detached form as signWithIdentity, which the server-side
+    /// verify expects). Without a cert we speak legacy "WR"; an enforcing
+    /// peer will reject that loudly, which is the intended fail-closed
+    /// behavior rather than a silent identity-less write path.
+    fn replOutboundHandshake(self: *const Cluster, stream: *core.compat.net.Stream) !void {
+        const trust = self.config.org_trust orelse {
+            try stream.writeAll(&wire.REPL_MAGIC);
+            return;
+        };
+        const cert_wire = trust.node_cert_wire orelse {
+            if (trust.enforce) {
+                std.log.warn("cluster: org trust enforced but no node_cert_path configured — speaking legacy replication (enforcing peers will reject)", .{});
+            }
+            try stream.writeAll(&wire.REPL_MAGIC);
+            return;
+        };
+
+        try stream.writeAll(&wire.REPL_MAGIC_V2);
+
+        var challenge: [org_trust.CHALLENGE_LEN]u8 = undefined;
+        try readExactFromStream(stream, &challenge);
+
+        const msg = org_trust.handshakeMessage(&challenge, &cert_wire);
+        const sig = try Keys.sign(&msg, self.identity.secret_key);
+        try stream.writeAll(&cert_wire);
+        try stream.writeAll(&sig);
     }
 
     /// Start the mesh network: bind gossip socket, init SWIM, seed peers, start discovery thread.
@@ -427,7 +470,7 @@ pub const Cluster = struct {
         var iter = self.peers.iterator();
         while (iter.next()) |entry| {
             var peer = entry.value_ptr;
-            peer.connect(self.config.peer_port);
+            peer.connect(self);
 
             if (peer.needs_sync and peer.stream != null) {
                 peer.needs_sync = false;
@@ -634,7 +677,9 @@ pub const Cluster = struct {
             std.posix.setsockopt(stream.getHandle(), std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
         }
 
-        try stream.writeAll(&wire.REPL_MAGIC);
+        // Same protocol negotiation as persistent peer connections: W2 org
+        // handshake when we can authenticate, legacy WR otherwise.
+        try self.replOutboundHandshake(&stream);
 
         var limit_buf: [48]u8 = undefined;
         const limit_arg = try std.fmt.bufPrint(&limit_buf, "limit={d}", .{first_limit});
@@ -845,7 +890,7 @@ pub const Cluster = struct {
         var iter = self.peers.iterator();
         while (iter.next()) |entry| {
             var peer = entry.value_ptr;
-            peer.connect(self.config.peer_port);
+            peer.connect(self);
             _ = peer.sendCommand(.{ .delete = key });
         }
     }
@@ -1057,6 +1102,16 @@ pub const Cluster = struct {
         }
     }
 };
+
+/// Read exactly `buf.len` bytes from a raw stream (pre-framing handshake I/O).
+fn readExactFromStream(stream: *core.compat.net.Stream, buf: []u8) !void {
+    var done: usize = 0;
+    while (done < buf.len) {
+        const n = try stream.read(buf[done..]);
+        if (n == 0) return error.EndOfStream;
+        done += n;
+    }
+}
 
 /// Resolve a "host:port" seed string into a meshguard Endpoint.
 /// Tries IP parsing first, then falls back to libc getaddrinfo for hostname resolution.

@@ -18,6 +18,7 @@ const Cluster = cluster_mod.Cluster;
 const vector_ops = @import("../procedures/vector_ops.zig");
 const Metric = @import("../vector/metric.zig").Metric;
 const AuthMintConfig = @import("../procedures/context.zig").AuthMintConfig;
+const auth = @import("auth.zig");
 
 pub const ServerConfig = struct {
     bind_address: []const u8 = "0.0.0.0",
@@ -28,11 +29,17 @@ pub const ServerConfig = struct {
     /// Number of worker threads. 0 = auto (cpu_count * 2, capped at 64).
     worker_count: usize = 0,
     /// Whether this binary listener enforces auth. Set by the composition root to
-    /// `cfg.auth.require_auth && cfg.server.auth_enabled`. Phase 1 has no AUTH-frame handling on
-    /// the binary path, so enforce ⇒ every protected command fails closed (use the WS/QUIC
-    /// gateways for authenticated access, or disable auth on a trusted network). Default false
-    /// keeps unit tests (which never authenticate) working; the composition root sets the secure value.
+    /// `cfg.auth.require_auth && cfg.server.auth_enabled`. Binary connections authenticate with
+    /// an AUTH frame (verified against `auth_public_keys`); enforce ⇒ protected commands fail
+    /// closed until a valid token is presented. Default false keeps unit tests (which never
+    /// authenticate) working; the composition root sets the secure value.
     auth_enforce: bool = false,
+    /// Ed25519 public keys for SCT verification on the binary path. Empty means AUTH cannot
+    /// succeed ("auth not configured", mirroring the WS gateway); it does NOT disable
+    /// enforcement — commands are still rejected while `auth_enforce` is true (fail closed).
+    auth_public_keys: []const auth.PublicKey = &.{},
+    /// Maximum token lifetime in seconds (0 = no limit).
+    auth_max_token_age: u64 = 0,
     /// Optional server-side SCT minting config.
     auth_mint: ?AuthMintConfig = null,
 };
@@ -94,6 +101,9 @@ pub const Server = struct {
         write_mutex: core.compat.Mutex,
         subscriptions: std.StringHashMap(u64),
         binary_mode: bool,
+        /// Verified SCT token state, set by an AUTH frame. Heap-allocated from
+        /// `allocator` (NOT the per-command arena — it must outlive commands).
+        auth_state: ?auth.TokenState,
 
         fn init(allocator: std.mem.Allocator, event_bus: *EventBus, stream: ?*core.compat.net.Stream) ConnectionContext {
             return .{
@@ -104,6 +114,7 @@ pub const Server = struct {
                 .write_mutex = .{},
                 .subscriptions = std.StringHashMap(u64).init(allocator),
                 .binary_mode = false,
+                .auth_state = null,
             };
         }
 
@@ -121,6 +132,7 @@ pub const Server = struct {
                 .write_mutex = .{},
                 .subscriptions = std.StringHashMap(u64).init(allocator),
                 .binary_mode = false,
+                .auth_state = null,
             };
         }
 
@@ -133,6 +145,14 @@ pub const Server = struct {
                 self.allocator.free(channel);
             }
             self.subscriptions.deinit();
+            self.clearAuthState();
+        }
+
+        fn clearAuthState(self: *ConnectionContext) void {
+            if (self.auth_state) |*state| {
+                auth.freeTokenState(self.allocator, state);
+                self.auth_state = null;
+            }
         }
 
         fn subscribe(self: *ConnectionContext, channel: []const u8, filter: ?[]const u8) !void {
@@ -773,23 +793,63 @@ pub const Server = struct {
     }
 
     fn executeForConnectionWithAlloc(self: *Server, cmd: Command, conn_ctx: *ConnectionContext, alloc: std.mem.Allocator) !Response {
-        // Secure-by-default: when this binary listener enforces auth it has no way to carry a
-        // token in Phase 1, so every protected command fails closed. SUBSCRIBE/UNSUBSCRIBE are
-        // handled locally (they need conn_ctx) and so bypass the executor gate — reject them here
-        // too. Note: peer replication uses REPL_MAGIC → handleReplicationConnection, which never
-        // reaches this client path, so it is unaffected.
-        if (self.config.auth_enforce) {
-            switch (cmd) {
-                .subscribe, .unsubscribe => return Response{ .err = "auth required" },
-                else => {},
-            }
+        // Revoke expired tokens mid-session — forces re-AUTH instead of letting a
+        // long-lived connection outlive its token (mirrors the WS gateway).
+        if (conn_ctx.auth_state) |*state| {
+            if (state.isExpired()) conn_ctx.clearAuthState();
         }
+
+        // AUTH is handled at the connection level (the executor has no per-connection
+        // state to attach the token to). Semantics mirror gateway.zig: verify regardless
+        // of `auth_enforce`, fail with "auth not configured" when no keys are set.
+        // Note: peer replication uses REPL_MAGIC → handleReplicationConnection, which
+        // never reaches this client path, so it is unaffected.
         return switch (cmd) {
+            .auth => |token| blk: {
+                if (self.config.auth_public_keys.len == 0) {
+                    break :blk Response{ .err = "auth not configured" };
+                }
+                // Token state must outlive this command: allocate from the server
+                // allocator, NOT the per-command arena `alloc`.
+                const state = auth.verifyAndParse(
+                    token,
+                    self.config.auth_public_keys,
+                    self.allocator,
+                    self.config.auth_max_token_age,
+                ) catch |err| {
+                    const msg: []const u8 = switch (err) {
+                        error.InvalidSignature => "invalid signature",
+                        error.TokenExpired => "token expired",
+                        error.TokenNotYetValid => "token not yet valid",
+                        error.TokenTooLongLived => "token lifetime exceeds max",
+                        error.TokenTooShort, error.MalformedToken => "malformed token",
+                        else => "auth failed",
+                    };
+                    break :blk Response{ .err = msg };
+                };
+                // Replace previous auth state (re-AUTH refreshes the token).
+                conn_ctx.clearAuthState();
+                conn_ctx.auth_state = state;
+                break :blk .ok;
+            },
             .subscribe => |params| blk: {
+                // SUBSCRIBE is handled locally (it needs conn_ctx) and so bypasses the
+                // executor's capability gate — enforce it here, like the gateway does.
+                if (self.config.auth_enforce) {
+                    if (conn_ctx.auth_state) |*state| {
+                        if (!state.permits(.subscribe, params.channel)) {
+                            break :blk Response{ .err = "permission denied" };
+                        }
+                    } else {
+                        break :blk Response{ .err = "auth required" };
+                    }
+                }
                 try conn_ctx.subscribe(params.channel, params.filter);
                 break :blk .ok;
             },
             .unsubscribe => |channel| blk: {
+                // Dropping your own subscription is harmless — no capability required
+                // (matches the gateway).
                 conn_ctx.unsubscribe(channel);
                 break :blk .ok;
             },
@@ -799,7 +859,10 @@ pub const Server = struct {
                 .event_bus = self.event_bus,
                 .cluster = self.cluster,
                 .vector_registry = self.config.vector_registry,
-                .auth = if (self.config.auth_enforce) .{ .enforce = null } else .disabled,
+                .auth = if (self.config.auth_enforce)
+                    .{ .enforce = if (conn_ctx.auth_state) |*s| s else null }
+                else
+                    .disabled,
                 .auth_mint = self.config.auth_mint,
             }, cmd),
         };
@@ -1053,6 +1116,155 @@ test "TCP framing preserves buffered tail across mixed full and partial reads" {
 
     const e4 = store.get("k4") orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("v4", e4.value);
+}
+
+test "binary AUTH: verify, enforce capabilities, replace and free token state" {
+    const testing = std.testing;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_tcp_auth.wal", .{tmp_path});
+    defer testing.allocator.free(wal_path);
+
+    const wal_file = try core.compat.Dir.createFile(tmp_dir.dir, "test_tcp_auth.wal", .{});
+    core.compat.File.close(wal_file);
+
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_tcp_auth.snapshot", .{tmp_path});
+    defer testing.allocator.free(snapshot_path);
+
+    var store = try Store.init(testing.allocator, .{
+        .wal_path = wal_path,
+        .snapshot_path = snapshot_path,
+        .sync_writes = false,
+    });
+    defer store.deinit();
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    const kp = auth.generateKeypair();
+    const pks = [_]auth.PublicKey{kp.public_key};
+
+    var server = Server.init(testing.allocator, &store, &bus, .{
+        .auth_enforce = true,
+        .auth_public_keys = &pks,
+        .auth_max_token_age = 7200,
+    });
+
+    var conn_ctx = Server.ConnectionContext.init(testing.allocator, &bus, null);
+    defer conn_ctx.deinit();
+
+    // Unauthenticated: protected command fails closed.
+    {
+        const resp = try server.executeForConnectionWithAlloc(
+            .{ .set = .{ .key = "ok:1", .value = "v" } },
+            &conn_ctx,
+            testing.allocator,
+        );
+        try testing.expect(resp == .err);
+        try testing.expectEqualStrings("auth required", resp.err);
+    }
+
+    // Garbage token: rejected, no state stored.
+    {
+        const resp = try server.executeForConnectionWithAlloc(.{ .auth = "junk" }, &conn_ctx, testing.allocator);
+        try testing.expect(resp == .err);
+        try testing.expect(conn_ctx.auth_state == null);
+    }
+
+    // Valid token scoped to "ok:" set access.
+    const now: u64 = @intCast(@divFloor(core.compat.nowMs(), 1000));
+    const caps = &[_]auth.Capability{
+        .{ .op = .set, .match_type = .prefix, .pattern = "ok:" },
+        .{ .op = .subscribe, .match_type = .prefix, .pattern = "ok:" },
+    };
+    const token = try auth.encode("alice", now, now + 3600, 7, caps, &kp.secret_key, testing.allocator);
+    defer testing.allocator.free(token);
+
+    {
+        const resp = try server.executeForConnectionWithAlloc(.{ .auth = token }, &conn_ctx, testing.allocator);
+        try testing.expect(resp == .ok);
+        try testing.expect(conn_ctx.auth_state != null);
+        try testing.expectEqualStrings("alice", conn_ctx.auth_state.?.subject);
+    }
+
+    // Authenticated: in-scope write permitted, out-of-scope denied.
+    {
+        const ok_resp = try server.executeForConnectionWithAlloc(
+            .{ .set = .{ .key = "ok:1", .value = "v" } },
+            &conn_ctx,
+            testing.allocator,
+        );
+        try testing.expect(ok_resp == .ok);
+
+        const denied = try server.executeForConnectionWithAlloc(
+            .{ .set = .{ .key = "no:1", .value = "v" } },
+            &conn_ctx,
+            testing.allocator,
+        );
+        try testing.expect(denied == .err);
+        try testing.expectEqualStrings("permission denied", denied.err);
+    }
+
+    // SUBSCRIBE is capability-gated at the connection layer.
+    {
+        const ok_sub = try server.executeForConnectionWithAlloc(.{ .subscribe = .{ .channel = "ok:events" } }, &conn_ctx, testing.allocator);
+        try testing.expect(ok_sub == .ok);
+        try testing.expectEqual(@as(u64, 1), bus.subscriberCount());
+
+        const denied_sub = try server.executeForConnectionWithAlloc(.{ .subscribe = .{ .channel = "no:events" } }, &conn_ctx, testing.allocator);
+        try testing.expect(denied_sub == .err);
+        try testing.expectEqualStrings("permission denied", denied_sub.err);
+    }
+
+    // Re-AUTH replaces the previous state without leaking it (leak check via testing allocator).
+    {
+        const token2 = try auth.encode("bob", now, now + 3600, 8, caps, &kp.secret_key, testing.allocator);
+        defer testing.allocator.free(token2);
+        const resp = try server.executeForConnectionWithAlloc(.{ .auth = token2 }, &conn_ctx, testing.allocator);
+        try testing.expect(resp == .ok);
+        try testing.expectEqualStrings("bob", conn_ctx.auth_state.?.subject);
+    }
+}
+
+test "binary AUTH without configured keys reports auth not configured" {
+    const testing = std.testing;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_tcp_auth_nokeys.wal", .{tmp_path});
+    defer testing.allocator.free(wal_path);
+
+    const wal_file = try core.compat.Dir.createFile(tmp_dir.dir, "test_tcp_auth_nokeys.wal", .{});
+    core.compat.File.close(wal_file);
+
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_tcp_auth_nokeys.snapshot", .{tmp_path});
+    defer testing.allocator.free(snapshot_path);
+
+    var store = try Store.init(testing.allocator, .{
+        .wal_path = wal_path,
+        .snapshot_path = snapshot_path,
+        .sync_writes = false,
+    });
+    defer store.deinit();
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    var server = Server.init(testing.allocator, &store, &bus, .{});
+
+    var conn_ctx = Server.ConnectionContext.init(testing.allocator, &bus, null);
+    defer conn_ctx.deinit();
+
+    const resp = try server.executeForConnectionWithAlloc(.{ .auth = "whatever" }, &conn_ctx, testing.allocator);
+    try testing.expect(resp == .err);
+    try testing.expectEqualStrings("auth not configured", resp.err);
 }
 
 test "TCP framing rejects oversized line and recovers for next valid command" {

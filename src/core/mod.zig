@@ -12,6 +12,7 @@ pub const types = @import("types.zig");
 pub const config = @import("config.zig");
 pub const compat = @import("compat.zig");
 pub const predicate = @import("predicate.zig");
+pub const hlc = @import("hlc.zig");
 
 // Re-export commonly used types
 pub const Entry = types.Entry;

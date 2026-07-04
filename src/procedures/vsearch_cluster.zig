@@ -152,7 +152,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     }
 
     const lists = [_][]const MergedItem{ local_merged, remote_merged };
-    const merged = try mergeCandidates(ctx.allocator, lists[0..], top_k);
+    const merged = try mergeCandidates(ctx.allocator, lists[0..], top_k, query_key);
 
     const partial = scatter_errored or peers_failed > 0;
     return emitClusterJson(ctx, merged, peers_queried, peers_failed, partial);
@@ -167,6 +167,13 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
 /// earliest list wins — local is passed first, so local wins ties), sort
 /// by descending score, cap at `top_k`.
 ///
+/// `exclude_key` drops the coordinator's query key from EVERY list ("" drops
+/// nothing). The local search already excludes it, but peers search by inline
+/// vector (`vsearch_local_raw`, query_key="") and on a replicated namespace
+/// every peer holds the query's stored copy — an exact-match self-hit that
+/// only the coordinator can recognize. This merge is the one place that
+/// knows the key.
+///
 /// Pure function over its inputs; the returned slice is allocated with
 /// `allocator` (caller frees; arena in the procedure path). Keys are
 /// borrowed from the input items.
@@ -174,6 +181,7 @@ pub fn mergeCandidates(
     allocator: std.mem.Allocator,
     lists: []const []const MergedItem,
     top_k: usize,
+    exclude_key: []const u8,
 ) ![]MergedItem {
     var index = std.StringHashMap(usize).init(allocator);
     defer index.deinit();
@@ -182,6 +190,7 @@ pub fn mergeCandidates(
 
     for (lists) |list| {
         for (list) |item| {
+            if (exclude_key.len != 0 and std.mem.eql(u8, item.key, exclude_key)) continue;
             if (index.get(item.key)) |i| {
                 if (item.score > acc.items[i].score) acc.items[i] = item;
             } else {
@@ -267,7 +276,7 @@ test "mergeCandidates: dedup keeps max score across lists" {
         .{ .key = "k3", .score = 0.1, .timestamp = 4, .local = false },
     };
     const lists = [_][]const MergedItem{ a[0..], b[0..] };
-    const merged = try mergeCandidates(testing.allocator, lists[0..], 10);
+    const merged = try mergeCandidates(testing.allocator, lists[0..], 10, "");
     defer testing.allocator.free(merged);
 
     try testing.expectEqual(@as(usize, 3), merged.len);
@@ -288,7 +297,7 @@ test "mergeCandidates: tie keeps the first-seen (local) entry" {
         .{ .key = "k1", .score = 0.7, .timestamp = 99, .local = false },
     };
     const lists = [_][]const MergedItem{ a[0..], b[0..] };
-    const merged = try mergeCandidates(testing.allocator, lists[0..], 10);
+    const merged = try mergeCandidates(testing.allocator, lists[0..], 10, "");
     defer testing.allocator.free(merged);
 
     try testing.expectEqual(@as(usize, 1), merged.len);
@@ -303,7 +312,7 @@ test "mergeCandidates: caps at top_k after dedup" {
         .{ .key = "k3", .score = 0.6, .timestamp = 3, .local = true },
     };
     const lists = [_][]const MergedItem{a[0..]};
-    const merged = try mergeCandidates(testing.allocator, lists[0..], 2);
+    const merged = try mergeCandidates(testing.allocator, lists[0..], 2, "");
     defer testing.allocator.free(merged);
 
     try testing.expectEqual(@as(usize, 2), merged.len);
@@ -313,9 +322,29 @@ test "mergeCandidates: caps at top_k after dedup" {
 
 test "mergeCandidates: empty input yields empty output" {
     const lists = [_][]const MergedItem{};
-    const merged = try mergeCandidates(testing.allocator, lists[0..], 5);
+    const merged = try mergeCandidates(testing.allocator, lists[0..], 5, "");
     defer testing.allocator.free(merged);
     try testing.expectEqual(@as(usize, 0), merged.len);
+}
+
+test "mergeCandidates: excludes the coordinator's query key from peer lists" {
+    // Replicated-namespace shape: the local list already excludes the query
+    // key (HNSW/BQ/exact paths all filter it), but every peer returns its
+    // stored copy of the query as an exact-match self-hit at score 1.0.
+    const local = [_]MergedItem{
+        .{ .key = "vec:s:near", .score = 0.99, .timestamp = 1, .local = true },
+    };
+    const peer = [_]MergedItem{
+        .{ .key = "vec:s:q", .score = 1.0, .timestamp = 2, .local = false }, // self-hit
+        .{ .key = "vec:s:far", .score = 0.1, .timestamp = 3, .local = false },
+    };
+    const lists = [_][]const MergedItem{ local[0..], peer[0..] };
+    const merged = try mergeCandidates(testing.allocator, lists[0..], 10, "vec:s:q");
+    defer testing.allocator.free(merged);
+
+    try testing.expectEqual(@as(usize, 2), merged.len);
+    try testing.expectEqualStrings("vec:s:near", merged[0].key);
+    try testing.expectEqualStrings("vec:s:far", merged[1].key);
 }
 
 fn testPackF32(allocator: std.mem.Allocator, vals: []const f32) ![]u8 {

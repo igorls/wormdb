@@ -19,6 +19,11 @@ const vector_ops = @import("../procedures/vector_ops.zig");
 const Metric = @import("../vector/metric.zig").Metric;
 const AuthMintConfig = @import("../procedures/context.zig").AuthMintConfig;
 const auth = @import("auth.zig");
+const org_trust_mod = @import("../cluster/org_trust.zig");
+
+/// Fallback trust when no org_trust is configured: enforce=false, zero grants.
+/// A W2 handshake verified against it always fails OrgNotTrusted (deny-by-default).
+const EMPTY_ORG_TRUST = org_trust_mod.OrgTrust{};
 
 pub const ServerConfig = struct {
     bind_address: []const u8 = "0.0.0.0",
@@ -42,6 +47,12 @@ pub const ServerConfig = struct {
     auth_max_token_age: u64 = 0,
     /// Optional server-side SCT minting config.
     auth_mint: ?AuthMintConfig = null,
+    /// Org trust for the replication channel (#63). Null or `enforce=false`
+    /// keeps legacy behavior: unauthenticated "WR" connections are accepted.
+    /// When enforcing: "WR" is rejected loudly, "W2" requires the org-cert
+    /// challenge handshake, and every replicated key is checked against the
+    /// peer org's granted prefixes.
+    org_trust: ?*const org_trust_mod.OrgTrust = null,
 };
 
 pub const Server = struct {
@@ -351,10 +362,30 @@ pub const Server = struct {
             return;
         }
 
-        // Replication connections: same binary protocol but skip re-replication (anti-echo)
+        // Replication connections: same binary protocol but skip re-replication (anti-echo).
+        // Legacy "WR" carries no peer identity, so it is only acceptable while org
+        // trust is NOT enforced — an enforcing node must fail closed and loudly.
         if (std.mem.eql(u8, &handshake, &wire.REPL_MAGIC)) {
+            if (self.config.org_trust) |trust| {
+                if (trust.enforce) {
+                    std.log.warn("replication: legacy replication rejected: org trust enforced (peer must use W2 handshake)", .{});
+                    wire.writeResponse(&stream, .{ .err = "unauthorized: legacy replication rejected (org trust enforced)" }) catch {};
+                    return;
+                }
+            }
             conn_ctx.binary_mode = true;
-            self.handleReplicationConnection(&stream);
+            self.handleReplicationConnection(&stream, null);
+            return;
+        }
+
+        // Org-authenticated replication ("W2", #63): challenge/response handshake
+        // before any frame is accepted. Verified against the configured org trust;
+        // with no trust configured this always rejects (deny-by-default) — an open
+        // node's peers speak legacy "WR", so a W2 arrival means misconfiguration.
+        if (std.mem.eql(u8, &handshake, &wire.REPL_MAGIC_V2)) {
+            conn_ctx.binary_mode = true;
+            const peer_org = self.replicationOrgHandshake(&stream) orelse return;
+            self.handleReplicationConnection(&stream, peer_org);
             return;
         }
 
@@ -452,11 +483,56 @@ pub const Server = struct {
         }
     }
 
+    /// Server side of the W2 org handshake: send a fresh 32-byte challenge,
+    /// read the peer's [186B cert][64B signature] reply, verify it against the
+    /// configured org trust. Returns the proven org pubkey, or null after
+    /// writing an err response and logging the reason (caller closes).
+    fn replicationOrgHandshake(self: *Server, stream: *core.compat.net.Stream) ?[32]u8 {
+        var challenge: [org_trust_mod.CHALLENGE_LEN]u8 = undefined;
+        core.compat.randomBytes(&challenge);
+        stream.writeAll(&challenge) catch return null;
+
+        var reply: [org_trust_mod.HANDSHAKE_REPLY_LEN]u8 = undefined;
+        readExactFromStream(stream, &reply) catch {
+            std.log.warn("replication: org handshake failed: peer closed before sending cert+signature", .{});
+            return null;
+        };
+
+        const trust = self.config.org_trust orelse &EMPTY_ORG_TRUST;
+        const peer = org_trust_mod.verifyPeerHandshake(
+            trust,
+            &challenge,
+            reply[0..org_trust_mod.CERT_WIRE_LEN],
+            reply[org_trust_mod.CERT_WIRE_LEN..][0..org_trust_mod.SIG_LEN],
+        ) catch |err| {
+            std.log.warn("replication: org handshake rejected: {s}", .{@errorName(err)});
+            wire.writeResponse(stream, .{ .err = "unauthorized: replication handshake rejected" }) catch {};
+            return null;
+        };
+        return peer.org_pubkey;
+    }
+
+    /// True when the replicated key is allowed for this connection. Only
+    /// meaningful while org trust is enforced; open mode allows everything.
+    fn replicationKeyAuthorized(self: *Server, peer_org: ?[32]u8, key: []const u8) bool {
+        const trust = self.config.org_trust orelse return true;
+        if (!trust.enforce) return true;
+        const org = peer_org orelse return false; // enforcing ⇒ only W2 connections reach the loop
+        return trust.keyAuthorized(org, key);
+    }
+
     /// Handle a replication connection from another WormDB node.
     /// Applies SET/DEL directly to the store without re-replicating (anti-echo).
     /// Emits local PUB/SUB events for replicated writes so local subscribers
     /// (e.g. WebSocket-connected clients) get real-time notifications.
-    fn handleReplicationConnection(self: *Server, stream: *core.compat.net.Stream) void {
+    ///
+    /// `peer_org` is the org pubkey proven by the W2 handshake (null on a
+    /// legacy "WR" connection, which only exists while enforcement is off).
+    /// When org trust is enforced, every mutating frame's key must fall in a
+    /// prefix granted to `peer_org`; violations get an err response and the
+    /// frame is skipped (connection stays up — one bad key must not sever an
+    /// otherwise healthy replication stream).
+    fn handleReplicationConnection(self: *Server, stream: *core.compat.net.Stream, peer_org: ?[32]u8) void {
         const ReadAdapter = struct {
             stream: *core.compat.net.Stream,
 
@@ -473,6 +549,10 @@ pub const Server = struct {
 
             switch (cmd) {
                 .set => |params| {
+                    if (!self.replicationKeyAuthorized(peer_org, params.key)) {
+                        wire.writeResponse(stream, .{ .err = "unauthorized: namespace" }) catch return;
+                        continue;
+                    }
                     self.store.set(params.key, params.value, params.worm) catch {};
                     // No replication — this IS the replication
 
@@ -521,6 +601,10 @@ pub const Server = struct {
                     wire.writeResponse(stream, .ok) catch return;
                 },
                 .delete => |key| {
+                    if (!self.replicationKeyAuthorized(peer_org, key)) {
+                        wire.writeResponse(stream, .{ .err = "unauthorized: namespace" }) catch return;
+                        continue;
+                    }
                     self.store.delete(key) catch {};
 
                     // Emit local PUB/SUB event for note deletions
@@ -542,6 +626,10 @@ pub const Server = struct {
                     wire.writeResponse(stream, .ok) catch return;
                 },
                 .vinsert => |params| {
+                    if (!self.replicationKeyAuthorized(peer_org, params.key)) {
+                        wire.writeResponse(stream, .{ .err = "unauthorized: namespace" }) catch return;
+                        continue;
+                    }
                     const metric_enum = Metric.fromStr(params.metric) orelse {
                         wire.writeResponse(stream, .{ .err = "vinsert: unknown metric" }) catch return;
                         continue;
@@ -568,6 +656,10 @@ pub const Server = struct {
                     wire.writeResponse(stream, .ok) catch return;
                 },
                 .vdelete => |params| {
+                    if (!self.replicationKeyAuthorized(peer_org, params.key)) {
+                        wire.writeResponse(stream, .{ .err = "unauthorized: namespace" }) catch return;
+                        continue;
+                    }
                     vector_ops.applyVdelete(
                         self.store,
                         null,
@@ -583,6 +675,18 @@ pub const Server = struct {
                     wire.writeResponse(stream, .ok) catch return;
                 },
                 .vbulkinsert => |params| {
+                    // Every item key must be authorized — reject the whole frame
+                    // atomically rather than half-applying a bulk insert.
+                    const bulk_authorized = blk: {
+                        for (params.items) |item| {
+                            if (!self.replicationKeyAuthorized(peer_org, item.key)) break :blk false;
+                        }
+                        break :blk true;
+                    };
+                    if (!bulk_authorized) {
+                        wire.writeResponse(stream, .{ .err = "unauthorized: namespace" }) catch return;
+                        continue;
+                    }
                     const metric_enum = Metric.fromStr(params.metric) orelse {
                         wire.writeResponse(stream, .{ .err = "vbulkinsert: unknown metric" }) catch return;
                         continue;
@@ -608,6 +712,15 @@ pub const Server = struct {
                     if (!isAllowedReplicationProcedure(params.procedure)) {
                         wire.writeResponse(stream, .{ .err = "unsupported replication command" }) catch return;
                         continue;
+                    }
+                    // Proof-layer procedures (witness/prefix-root) take no per-key
+                    // grant check, but under enforcement they still require an
+                    // org-authenticated connection (proven by the W2 handshake).
+                    if (self.config.org_trust) |trust| {
+                        if (trust.enforce and peer_org == null) {
+                            wire.writeResponse(stream, .{ .err = "unauthorized: org handshake required" }) catch return;
+                            continue;
+                        }
                     }
 
                     var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -637,6 +750,16 @@ pub const Server = struct {
     fn isAllowedReplicationProcedure(name: []const u8) bool {
         return std.mem.eql(u8, name, "append_log_witness") or
             std.mem.eql(u8, name, "proof_prefix_root");
+    }
+
+    /// Read exactly `buf.len` bytes from a raw stream (pre-framing handshake I/O).
+    fn readExactFromStream(stream: *core.compat.net.Stream, buf: []u8) !void {
+        var done: usize = 0;
+        while (done < buf.len) {
+            const n = try stream.read(buf[done..]);
+            if (n == 0) return error.EndOfStream;
+            done += n;
+        }
     }
 
     fn handleTextConnection(self: *Server, stream: *core.compat.net.Stream, conn_ctx: *ConnectionContext, initial: [2]u8) void {

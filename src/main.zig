@@ -25,6 +25,13 @@ const Args = struct {
     replicas: usize = 0,
     gossip_port: u16 = 51821,
     wg_port: u16 = 51830,
+    /// JSON config file (currently consumed for the `org_trust` section;
+    /// CLI flags keep overriding everything else).
+    config_path: []const u8 = "./wormdb.json",
+    /// Explicit acknowledgement that cluster replication runs unauthenticated.
+    /// Without org_trust configured, a cluster refuses to start unless this
+    /// flag is passed (deny-by-default, mirroring meshguard's open-mode gate).
+    cluster_open: bool = false,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -80,6 +87,12 @@ fn parseArgs(args: []const []const u8) !Args {
             i += 1;
             if (i >= args.len) return error.InvalidArgs;
             out.wg_port = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--config")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgs;
+            out.config_path = args[i];
+        } else if (std.mem.eql(u8, args[i], "--cluster-open")) {
+            out.cluster_open = true;
         } else if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
             try printHelp();
             std.process.exit(0);
@@ -94,6 +107,35 @@ fn parseArgs(args: []const []const u8) !Args {
 fn runServer(allocator: std.mem.Allocator, args: Args) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     try std.Io.Dir.cwd().createDirPath(io, args.data);
+
+    // Load the JSON config file (missing file ⇒ all defaults). Currently only
+    // the org_trust section is consumed here; CLI flags own everything else.
+    const file_cfg = wormdb.core.config.loadFromFile(args.config_path, allocator) catch |err| {
+        std.log.err("failed to load config '{s}': {s}", .{ args.config_path, @errorName(err) });
+        std.process.exit(1);
+    };
+
+    // Build runtime org trust once; shared read-only by the cluster (outbound
+    // handshake) and the TCP server (inbound handshake + per-frame checks).
+    // Lives on this frame, which outlives both.
+    const org_trust = wormdb.cluster.OrgTrust.fromConfig(allocator, file_cfg.org_trust) catch |err| {
+        std.log.err("invalid org_trust config in '{s}': {s}", .{ args.config_path, @errorName(err) });
+        std.process.exit(1);
+    };
+
+    // Deny-by-default gate (#63): a cluster with no org trust serves an
+    // unauthenticated replication endpoint. That must be an explicit,
+    // acknowledged choice — never a silent default.
+    if (args.cluster_name != null and !org_trust.enforce) {
+        if (!args.cluster_open) {
+            std.log.err("cluster replication is OPEN (unauthenticated) — configure org_trust in {s} or pass --cluster-open to acknowledge", .{args.config_path});
+            std.process.exit(1);
+        }
+        std.log.warn("cluster replication is OPEN (unauthenticated) — --cluster-open acknowledged; any peer can replicate arbitrary keys", .{});
+    }
+    if (org_trust.enforce and args.cluster_name != null and org_trust.node_cert == null) {
+        std.log.warn("org_trust enforced but no node_cert_path set — this node cannot authenticate its own outbound replication (enforcing peers will reject it)", .{});
+    }
 
     const wal_path = try std.fmt.allocPrint(allocator, "{s}/wormdb.wal", .{args.data});
     defer allocator.free(wal_path);
@@ -129,6 +171,7 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
                 .config_dir = args.data,
                 .gossip_port = args.gossip_port,
                 .wg_port = args.wg_port,
+                .org_trust = &org_trust,
             });
             cluster.?.attachVectorRegistry(&vector_registry);
         } else {
@@ -141,6 +184,7 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
         .port = args.port,
         .cluster = if (cluster) |*c| c else null,
         .vector_registry = &vector_registry,
+        .org_trust = &org_trust,
     });
 
     if (cluster) |*c| c.start();
@@ -150,6 +194,12 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
     std.log.info("Persistence: {s}", .{@tagName(args.persistence)});
     if (args.cluster_name) |name| {
         std.log.info("Cluster: {s} (replication: {d})", .{ name, args.replicas });
+        if (org_trust.enforce) {
+            std.log.info("Org trust: ENFORCED ({d} grant(s), node cert: {s})", .{
+                org_trust.grants.len,
+                if (org_trust.node_cert != null) "yes" else "no",
+            });
+        }
     }
 
     try server.run();
@@ -172,6 +222,11 @@ fn printHelp() !void {
         \\  --replicas <n>            Replication factor (default: 0 = all peers)
         \\  --gossip-port <port>      SWIM gossip UDP port (default: 51821)
         \\  --wg-port <port>          WireGuard listen port (default: 51830)
+        \\  --config <path>           JSON config file (default: ./wormdb.json;
+        \\                            consumed for the org_trust section)
+        \\  --cluster-open            Acknowledge running cluster replication OPEN
+        \\                            (unauthenticated). Required to start a cluster
+        \\                            without org_trust configured.
         \\  --help, -h                Show this help
         \\
         \\Examples:

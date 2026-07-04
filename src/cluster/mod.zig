@@ -6,11 +6,13 @@
 
 const std = @import("std");
 pub const node = @import("node.zig");
+pub const org_trust = @import("org_trust.zig");
 
 pub const Cluster = node.Cluster;
 pub const ClusterNode = node.ClusterNode;
 pub const ClusterStatus = node.ClusterStatus;
 pub const ClusterConfig = node.ClusterConfig;
+pub const OrgTrust = org_trust.OrgTrust;
 
 test {
     @import("std").testing.refAllDecls(@This());

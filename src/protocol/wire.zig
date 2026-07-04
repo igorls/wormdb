@@ -13,7 +13,14 @@ const Response = core.types.Response;
 const MAX_PAYLOAD_LENGTH = core.types.MAX_PAYLOAD_LENGTH;
 
 pub const WIRE_MAGIC = [2]u8{ 0x57, 0x57 }; // "WW" — WormWire client
-pub const REPL_MAGIC = [2]u8{ 0x57, 0x52 }; // "WR" — WormWire replication
+pub const REPL_MAGIC = [2]u8{ 0x57, 0x52 }; // "WR" — WormWire replication (legacy, unauthenticated)
+/// "W2" — org-authenticated replication (#63). Versioning lives in the magic
+/// itself (not a post-magic mode byte) so legacy clusters stay byte-identical:
+/// a "WR" peer never has to read bytes it doesn't expect, and an enforcing
+/// server can loudly reject "WR" while requiring the challenge handshake on
+/// "W2". Handshake: server sends a 32-byte random challenge; peer replies with
+/// [186B org NodeCertificate][64B Ed25519 signature over challenge++cert].
+pub const REPL_MAGIC_V2 = [2]u8{ 0x57, 0x32 }; // "W2" — WormWire replication + org handshake
 
 pub const WireError = error{
     EndOfStream,

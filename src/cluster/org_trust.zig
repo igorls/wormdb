@@ -12,9 +12,16 @@
 const std = @import("std");
 const meshguard = @import("meshguard");
 const core = @import("../core/mod.zig");
+const trust_log = @import("../proof/trust_log.zig");
+const Store = @import("../storage/store.zig").Store;
 
 pub const Org = meshguard.identity.Org;
 const Ed25519 = std.crypto.sign.Ed25519;
+
+/// Capability bits shared with the trust-log fold (#66).
+pub const CAP_READ = trust_log.CAP_READ;
+pub const CAP_WRITE = trust_log.CAP_WRITE;
+pub const CAP_APPEND = trust_log.CAP_APPEND;
 
 /// Server-generated nonce length for the W2 handshake.
 pub const CHALLENGE_LEN = 32;
@@ -65,6 +72,12 @@ pub const OrgTrust = struct {
     node_cert: ?Org.NodeCertificate = null,
     /// `node_cert` pre-serialized, sent verbatim in the handshake reply.
     node_cert_wire: ?[CERT_WIRE_LEN]u8 = null,
+    /// Dynamic delegated-org authorization (#66): a cached fold of OUR org's
+    /// outbound trust log ("trust:<our_org_hex>"). Consulted by the WR frame
+    /// loop only after the static `keyAuthorized` fails. Wired by the
+    /// composition root only when enforcement is on AND this node has a cert
+    /// (so "our org" is known); null everywhere else keeps #63 semantics.
+    dynamic: ?*DynamicTrust = null,
 
     pub fn orgTrusted(self: *const OrgTrust, org_pubkey: [32]u8) bool {
         for (self.grants) |g| {
@@ -122,6 +135,111 @@ pub const OrgTrust = struct {
         }
 
         return out;
+    }
+};
+
+/// Dynamic delegated-org authorization from the trust log (#66).
+///
+/// The enforcement node folds its OWN org's trust log
+/// ("trust:<our_org_hex>"): our org's outbound grants say which OTHER
+/// (delegated) orgs may touch which key prefixes with which capability.
+/// Static grants (#63 config) authorize member orgs; this authorizes
+/// delegated orgs. The fold is cached:
+///
+///   - TTL: a fold older than `ttl_ms` (default 5000) is recomputed lazily
+///     on the next check — a revocation replicated from a peer is therefore
+///     effective within ≤5s + next op.
+///   - Generation: the local `trust_revoke` EXEC bumps
+///     `trust_log.fold_generation`; a cached fold from an older generation
+///     is discarded immediately, so a locally-appended revocation fails the
+///     very next op regardless of TTL.
+///
+/// Thread-safe: replication connections are separate threads; all cache
+/// state is guarded by `mutex` and the generation is an atomic. Fold errors
+/// fail closed (deny).
+pub const DynamicTrust = struct {
+    allocator: std.mem.Allocator,
+    store: *Store,
+    /// Our org pubkey (from this node's certificate) — the granting org.
+    our_org: [32]u8,
+    /// Max cache age before a lazy re-fold, in milliseconds.
+    ttl_ms: u64 = 5000,
+    mutex: core.compat.Mutex = .{},
+    cache: ?Cache = null,
+
+    const Cache = struct {
+        /// Owns every slice in `caps` (events, prefixes, capabilities).
+        arena: *std.heap.ArenaAllocator,
+        caps: []trust_log.Capability,
+        folded_at_ms: u64,
+        generation: u64,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, store: *Store, our_org: [32]u8) DynamicTrust {
+        return .{ .allocator = allocator, .store = store, .our_org = our_org };
+    }
+
+    pub fn deinit(self: *DynamicTrust) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.dropCacheLocked();
+    }
+
+    /// True when `to_org` holds an active delegated capability covering
+    /// `key` with ALL of `cap_bits` (replication write ops pass CAP_WRITE).
+    /// The caller must hold NO store shard locks (a re-fold scans the log).
+    pub fn authorized(self: *DynamicTrust, to_org: [32]u8, key: []const u8, cap_bits: u8) bool {
+        const now: u64 = @intCast(core.compat.nowMs());
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.refreshLocked(now) catch |err| {
+            std.log.warn("org trust: dynamic fold failed (deny): {s}", .{@errorName(err)});
+            return false;
+        };
+        const cache = self.cache orelse return false;
+        for (cache.caps) |cap| {
+            if (!std.mem.eql(u8, cap.to_org[0..], to_org[0..])) continue;
+            if ((cap.cap_bits & cap_bits) != cap_bits) continue;
+            // Re-check expiry at op time — the fold may be up to ttl_ms old.
+            if (cap.expires_at_ms != 0 and cap.expires_at_ms <= now) continue;
+            for (cap.prefixes) |prefix| {
+                if (prefix.len > 0 and std.mem.startsWith(u8, key, prefix)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn refreshLocked(self: *DynamicTrust, now: u64) !void {
+        const generation = trust_log.foldGeneration();
+        if (self.cache) |c| {
+            if (c.generation == generation and now < c.folded_at_ms + self.ttl_ms) return;
+        }
+
+        const arena = try self.allocator.create(std.heap.ArenaAllocator);
+        errdefer self.allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+
+        const log_id = try trust_log.logIdForOrg(a, self.our_org);
+        const loaded = try trust_log.loadTrustEvents(a, self.store, log_id);
+        const fold = try trust_log.foldTrust(a, self.our_org, loaded.events, now);
+
+        self.dropCacheLocked();
+        self.cache = .{
+            .arena = arena,
+            .caps = fold.capabilities,
+            .folded_at_ms = now,
+            .generation = generation,
+        };
+    }
+
+    fn dropCacheLocked(self: *DynamicTrust) void {
+        if (self.cache) |c| {
+            c.arena.deinit();
+            self.allocator.destroy(c.arena);
+            self.cache = null;
+        }
     }
 };
 

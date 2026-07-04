@@ -11,6 +11,7 @@ pub const append_log = @import("append_log.zig");
 pub const mmr = @import("mmr.zig");
 pub const witness = @import("witness.zig");
 pub const prefix_root = @import("prefix_root.zig");
+pub const trust_log = @import("trust_log.zig");
 
 pub const AccumulatorKind = checkpoint.AccumulatorKind;
 pub const CheckpointRecord = checkpoint.CheckpointRecord;

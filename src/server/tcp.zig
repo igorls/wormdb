@@ -514,11 +514,24 @@ pub const Server = struct {
 
     /// True when the replicated key is allowed for this connection. Only
     /// meaningful while org trust is enforced; open mode allows everything.
+    ///
+    /// Two layers, both deny-by-default:
+    ///   1. static grants from config (#63) — member orgs;
+    ///   2. dynamic delegated-org authorization (#66) — a cached fold of OUR
+    ///      org's trust log ("trust:<our_org_hex>"). Consulted only after the
+    ///      static check fails, and only when the composition root wired
+    ///      `trust.dynamic` (enforcement on AND this node has a cert). Every
+    ///      mutating replication frame (set/delete/vinsert/vdelete/
+    ///      vbulkinsert) requires the WRITE capability; revocation lands via
+    ///      the trust log within the cache TTL (≤5s) — or immediately, when
+    ///      the revoke was appended locally (generation bump).
     fn replicationKeyAuthorized(self: *Server, peer_org: ?[32]u8, key: []const u8) bool {
         const trust = self.config.org_trust orelse return true;
         if (!trust.enforce) return true;
         const org = peer_org orelse return false; // enforcing ⇒ only W2 connections reach the loop
-        return trust.keyAuthorized(org, key);
+        if (trust.keyAuthorized(org, key)) return true;
+        const dynamic = trust.dynamic orelse return false;
+        return dynamic.authorized(org, key, org_trust_mod.CAP_WRITE);
     }
 
     /// Handle a replication connection from another WormDB node.

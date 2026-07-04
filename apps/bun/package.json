@@ -1,8 +1,11 @@
 {
   "name": "wormdb-bun-tools",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
+  "exports": {
+    ".": "./src/lib/index.ts"
+  },
   "scripts": {
     "client": "bun run src/bin/client.ts",
     "bench": "bun run src/bin/bench.ts",

@@ -1,10 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import type { ParsedCommand } from "./command";
 import {
+  MAX_PAYLOAD,
+  PayloadTooLargeError,
   WIRE_MAGIC,
   concatBytes,
   decodeResponse,
+  encodeAuth,
   encodeCommandFrame,
+  encodeSave,
+  encodeVdelete,
   isEventCode,
   toBytes,
   tryConsumeFrame,
@@ -183,6 +188,35 @@ describe("encodeCommandFrame", () => {
     const flagsOffset = 5 + 4 + 1 + 4 + vec.length;
     expect(asyncFrame[flagsOffset]).toBe(0x02);
     expect(syncFrame[flagsOffset]).toBe(0x00);
+  });
+
+  test("encodes AUTH as 0x0C with a length-prefixed raw token", () => {
+    const frame = encodeAuth(Uint8Array.of(0xaa, 0xbb, 0xcc));
+    expect(Array.from(frame)).toEqual([0x0c, 0, 0, 0, 7, 0, 0, 0, 3, 0xaa, 0xbb, 0xcc]);
+  });
+
+  test("encodes VDELETE as 0x0E with [len][key][len][namespace]", () => {
+    const frame = encodeVdelete("vec:a:1", "vec:a:");
+    expect(frame[0]).toBe(0x0e);
+    const payload = frame.subarray(5);
+    const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+    const keyLen = view.getUint32(0, false);
+    expect(new TextDecoder().decode(payload.subarray(4, 4 + keyLen))).toBe("vec:a:1");
+    const nsLen = view.getUint32(4 + keyLen, false);
+    expect(new TextDecoder().decode(payload.subarray(8 + keyLen, 8 + keyLen + nsLen))).toBe("vec:a:");
+    expect(payload.length).toBe(8 + keyLen + nsLen);
+  });
+
+  test("encodes SAVE as 0x0B with empty payload", () => {
+    expect(asHex(encodeSave())).toBe("0b00000000");
+  });
+
+  test("rejects payloads above the 16 MiB wire cap with a typed error", () => {
+    // Token of MAX_PAYLOAD bytes -> payload is MAX_PAYLOAD + 4 (length prefix).
+    expect(() => encodeAuth(new Uint8Array(MAX_PAYLOAD))).toThrow(PayloadTooLargeError);
+    // At the cap exactly, the frame encodes fine.
+    const frame = encodeAuth(new Uint8Array(MAX_PAYLOAD - 4));
+    expect(frame.length).toBe(5 + MAX_PAYLOAD);
   });
 
   test("throws for unsupported command variant at runtime", () => {

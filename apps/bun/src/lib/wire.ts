@@ -5,6 +5,18 @@ export type Bytes = Uint8Array<ArrayBufferLike>;
 
 export const WIRE_MAGIC: Bytes = Uint8Array.of(0x57, 0x57);
 
+/** Server-enforced frame payload cap (16 MiB). Checked client-side before writing. */
+export const MAX_PAYLOAD = 16 * 1024 * 1024;
+
+export class PayloadTooLargeError extends Error {
+  code = "EPAYLOADTOOLARGE" as const;
+
+  constructor(size: number) {
+    super(`Frame payload of ${size} bytes exceeds the ${MAX_PAYLOAD} byte wire limit`);
+    this.name = "PayloadTooLargeError";
+  }
+}
+
 const enum CommandCode {
   Get = 0x01,
   Set = 0x02,
@@ -16,7 +28,10 @@ const enum CommandCode {
   Pub = 0x08,
   Exec = 0x09,
   ClusterPeers = 0x0A,
+  Save = 0x0B,
+  Auth = 0x0C,
   Vinsert = 0x0D,
+  Vdelete = 0x0E,
   Vbulkinsert = 0x0F,
 }
 
@@ -170,6 +185,32 @@ export function encodeCommandFrame(command: ParsedCommand): Bytes {
   }
 }
 
+/** AUTH frame: payload is a single length-prefixed raw binary SCT token. */
+export function encodeAuth(token: Uint8Array): Bytes {
+  const payload = new Uint8Array(4 + token.length);
+  writeUint32BE(payload, 0, token.length);
+  payload.set(token, 4);
+  return writeFrame(CommandCode.Auth, payload);
+}
+
+/** VDELETE frame: [len][key][len][namespace]. */
+export function encodeVdelete(key: string, namespace: string): Bytes {
+  const keyBytes = encodeUtf8(key);
+  const nsBytes = encodeUtf8(namespace);
+  const payload = new Uint8Array(4 + keyBytes.length + 4 + nsBytes.length);
+  writeUint32BE(payload, 0, keyBytes.length);
+  payload.set(keyBytes, 4);
+  const nsLenPos = 4 + keyBytes.length;
+  writeUint32BE(payload, nsLenPos, nsBytes.length);
+  payload.set(nsBytes, nsLenPos + 4);
+  return writeFrame(CommandCode.Vdelete, payload);
+}
+
+/** SAVE frame: manual snapshot request, empty payload. */
+export function encodeSave(): Bytes {
+  return writeFrame(CommandCode.Save, new Uint8Array(0));
+}
+
 export function tryConsumeFrame(buffer: Bytes): ParsedFrame | null {
   if (buffer.length < 5) return null;
 
@@ -258,6 +299,9 @@ export function toBytes(data: string | ArrayBuffer | SharedArrayBuffer | ArrayBu
 }
 
 function writeFrame(code: CommandCode, payload: Bytes): Bytes {
+  if (payload.length > MAX_PAYLOAD) {
+    throw new PayloadTooLargeError(payload.length);
+  }
   const out: Bytes = new Uint8Array(5 + payload.length);
   out[0] = code;
   writeUint32BE(out, 1, payload.length);

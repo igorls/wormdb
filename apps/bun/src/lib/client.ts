@@ -39,7 +39,7 @@ type BunGlobal = {
 
 declare const Bun: BunGlobal;
 
-class ClientTimeoutError extends Error {
+export class ClientTimeoutError extends Error {
   code = "ETIMEDOUT" as const;
 
   constructor(timeoutMs: number) {
@@ -48,7 +48,7 @@ class ClientTimeoutError extends Error {
   }
 }
 
-class ClientConnectionClosedError extends Error {
+export class ClientConnectionClosedError extends Error {
   code = "ECONNCLOSED" as const;
 
   constructor() {

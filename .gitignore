@@ -62,3 +62,6 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Generated TLS certs for benchmark QUIC gateway
 bench/certs/
 apps/browser/demo/fingerprint.txt
+
+# Playwright MCP screenshot/console scratch artifacts
+.playwright-mcp/

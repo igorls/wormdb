@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<style>
+@font-face { font-family: "Workbench"; src: url("assets/fonts/workbench.woff2") format("woff2"); }
+@font-face { font-family: "IBM Plex Mono"; src: url("assets/fonts/plex-mono-500.woff2") format("woff2"); font-weight: 500; }
+* { margin: 0; box-sizing: border-box; }
+body {
+  width: 1200px; height: 630px; overflow: hidden;
+  background: repeating-linear-gradient(180deg, #E9F1E3 0 42px, #FAF9F3 42px 84px);
+  color: #20241C;
+  position: relative;
+  font-family: "IBM Plex Mono", monospace;
+}
+.rail { position: absolute; top: 0; bottom: 0; width: 56px; background: #F1EFE5; }
+.rail.l { left: 0; border-right: 2px dashed #D8D5C6; }
+.rail.r { right: 0; border-left: 2px dashed #D8D5C6; }
+.rail i { position: absolute; left: 50%; transform: translateX(-50%); width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 0 0 2px #C9C6B6; }
+.in { position: absolute; left: 110px; right: 110px; top: 74px; bottom: 64px; display: flex; flex-direction: column; }
+.tof { display: flex; gap: 20px; align-items: baseline; font-size: 21px; font-weight: 500; letter-spacing: 0.08em; color: #6E7563; }
+.tof .ok { color: #2E7D4F; font-weight: 500; }
+.tof .fill { flex: 1; border-bottom: 2px dotted #B9BDA9; }
+h1 { font-family: "Workbench", monospace; font-weight: 400; font-size: 108px; line-height: 1.04; margin-top: 64px; letter-spacing: 0.01em; }
+h1 span { display: block; color: #C9372C; }
+.foot { margin-top: auto; display: flex; justify-content: space-between; align-items: baseline; font-size: 25px; letter-spacing: 0.04em; color: #555C4E; }
+.foot .url { color: #20241C; font-weight: 500; }
+</style>
+</head>
+<body>
+  <div class="rail l"><i style="top:34px"></i><i style="top:118px"></i><i style="top:202px"></i><i style="top:286px"></i><i style="top:370px"></i><i style="top:454px"></i><i style="top:538px"></i></div>
+  <div class="rail r"><i style="top:34px"></i><i style="top:118px"></i><i style="top:202px"></i><i style="top:286px"></i><i style="top:370px"></i><i style="top:454px"></i><i style="top:538px"></i></div>
+  <div class="in">
+    <div class="tof"><span>TOP OF FORM</span><span class="fill"></span><span>0x57 0x57 HANDSHAKE <span class="ok">OK</span></span><span class="fill"></span><span>PAGE 001</span></div>
+    <h1>WRITE ONCE.<span>READ MANY.</span></h1>
+    <div class="foot">
+      <span class="url">wormdb.dev</span>
+      <span>A 45 KB DISTRIBUTED KV STORE, IN ZIG</span>
+    </div>
+  </div>
+</body>
+</html>

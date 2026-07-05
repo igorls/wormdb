@@ -1,10 +1,10 @@
-name: Deploy teaser site to Pages
+name: Deploy wormdb.dev to Pages
 
 on:
   push:
     branches: [main]
     paths:
-      - 'landing/**'
+      - 'website/**'
       - '.github/workflows/deploy.yml'
   # Allow running manually from the Actions tab
   workflow_dispatch:
@@ -20,9 +20,9 @@ concurrency:
   group: pages
   cancel-in-progress: true
 
-# WormDB is private and not open-source at launch. GitHub Pages serves ONLY the
-# static teaser in landing/ — the docs/ VitePress site is intentionally NOT built
-# or published here, so internal documentation never leaves the repo.
+# GitHub Pages serves ONLY the static public site in website/ (wormdb.dev) —
+# the docs/ VitePress site is intentionally NOT built or published here, so
+# internal documentation never leaves the repo.
 jobs:
   deploy:
     environment:
@@ -33,10 +33,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Upload teaser artifact
+      - name: Upload site artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: landing
+          path: website
 
       - name: Deploy to GitHub Pages
         id: deployment

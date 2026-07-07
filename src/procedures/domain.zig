@@ -42,12 +42,13 @@ pub const Captures = struct {
     }
 };
 
-/// The procedure call a Route resolves to: which proc, with which args, JSON-vs-text, and the HTTP
-/// status — either fixed, or derived from the response body (e.g. cc32d9's 503 on "OUT_OF_SYNC").
+/// The procedure call a Route resolves to: which proc, with which args, response content type, and
+/// the HTTP status — either fixed, or derived from the response body (e.g. cc32d9's 503 on
+/// "OUT_OF_SYNC"). Routes default to JSON to preserve the original gateway behavior.
 pub const ExecCall = struct {
     proc: []const u8,
     args: []const []const u8,
-    json: bool = true,
+    content_type: ?[]const u8 = null,
     status: u16 = 200,
     status_from_body: ?*const fn (body: []const u8) u16 = null,
 };

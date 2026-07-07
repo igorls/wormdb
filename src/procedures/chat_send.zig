@@ -13,6 +13,9 @@
 
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
+const Config = @import("../core/config.zig").Config;
+const EventBus = @import("../event/mod.zig").EventBus;
+const Store = @import("../storage/store.zig").Store;
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const room = ctx.arg(0) orelse return ctx.err("chat_send: missing room arg");
@@ -56,6 +59,9 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     ctx.lockKey(key_dupe);
     try ctx.setDurable(key_dupe, value);
 
+    const channel = try std.fmt.allocPrint(ctx.allocator, "chat:{s}", .{room});
+    ctx.publish(channel, value);
+
     // Return the key so the client has a reference
     return ctx.value(key_dupe);
 }
@@ -81,4 +87,46 @@ fn appendJsonEscaped(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator
             },
         }
     }
+}
+
+test "chat_send publishes stored message to room channel" {
+    const testing = std.testing;
+
+    var store = try Store.init(testing.allocator, Config{ .persistence = .none });
+    defer store.deinit();
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const Capture = struct {
+        buf: []u8,
+        len: usize = 0,
+
+        fn write(raw: *anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const n = @min(self.buf.len, data.len);
+            @memcpy(self.buf[0..n], data[0..n]);
+            self.len = n;
+        }
+    };
+
+    var capture = Capture{ .buf = try testing.allocator.alloc(u8, 1024) };
+    defer testing.allocator.free(capture.buf);
+    _ = try bus.subscribe("chat:lobby", Capture.write, @ptrCast(&capture));
+
+    var ctx = Ctx.init(&store, &.{ "lobby", "ada", "hello" }, arena, null, null, &bus, null);
+    defer ctx.deinit();
+
+    const result = try execute(&ctx);
+    try testing.expect(result == .value);
+    try testing.expect(capture.len > 0);
+
+    const event = capture.buf[0..capture.len];
+    try testing.expect(std.mem.startsWith(u8, event, ">EVENT chat:lobby\r\n"));
+    try testing.expect(std.mem.containsAtLeast(u8, event, 1, "\"user\":\"ada\""));
+    try testing.expect(std.mem.containsAtLeast(u8, event, 1, "\"text\":\"hello\""));
 }

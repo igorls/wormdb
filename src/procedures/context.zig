@@ -195,6 +195,15 @@ pub const Ctx = struct {
         self.lock_count += 1;
     }
 
+    fn assertNoHeldShardLocks(self: *const Ctx, op: []const u8) void {
+        if (std.debug.runtime_safety and self.lock_count != 0) {
+            std.debug.panic(
+                "Ctx.{s} cannot be called while holding shard locks; call scan/getCopy/countKeys before lockKey/lockKeys2",
+                .{op},
+            );
+        }
+    }
+
     /// Internal: release a specific shard lock. Used by setDurable/setDurableWorm.
     fn releaseShard(self: *Ctx, si: usize) void {
         for (0..self.lock_count) |i| {
@@ -272,7 +281,9 @@ pub const Ctx = struct {
     /// internally — safe to call without holding any locks, and the returned
     /// slice remains valid after subsequent scans/writes. Use this when the
     /// value must outlive operations that re-lock shards (e.g. scanPrefix).
+    /// Must be called before acquiring any Ctx shard locks.
     pub fn getCopy(self: *Ctx, key: []const u8) !?[]const u8 {
+        self.assertNoHeldShardLocks("getCopy");
         return self.store.getValueDupe(key, self.allocator);
     }
 
@@ -508,16 +519,19 @@ pub const Ctx = struct {
     // ╚═══════════════════════════════════════════════╝
 
     /// Scan for keys matching a prefix. Returns arena-allocated copies sorted by key (ascending).
-    /// Locks each shard independently — does NOT require the caller to hold any locks.
+    /// Locks each shard independently — caller MUST NOT hold any Ctx shard locks.
     /// O(log n) seek per shard via the ordered key index + O(matches) copying;
     /// `limit` keeps the LAST N in ascending order and bounds the copies.
     pub fn scan(self: *Ctx, prefix: []const u8, limit: usize) ![]Store.ScanResult {
+        self.assertNoHeldShardLocks("scan");
         return self.store.scanPrefix(prefix, limit, self.allocator);
     }
 
     /// Like `scan`, but the limit keeps the FIRST N matches in ascending order
-    /// — the natural cut for autocomplete and forward pagination.
+    /// — the natural cut for autocomplete and forward pagination. Caller MUST
+    /// NOT hold any Ctx shard locks.
     pub fn scanFirst(self: *Ctx, prefix: []const u8, limit: usize) ![]Store.ScanResult {
+        self.assertNoHeldShardLocks("scanFirst");
         return self.store.scanPrefixFirst(prefix, limit, self.allocator);
     }
 
@@ -538,11 +552,14 @@ pub const Ctx = struct {
             is_worm: bool,
         ) Store.ScanAction,
     ) void {
+        self.assertNoHeldShardLocks("scanCallback");
         self.store.scanPrefixCallback(prefix, context, callback);
     }
 
-    /// Count keys matching a prefix. Lightweight — no allocation.
+    /// Count keys matching a prefix. Lightweight — no allocation. Caller MUST
+    /// NOT hold any Ctx shard locks.
     pub fn countKeys(self: *Ctx, prefix: []const u8) usize {
+        self.assertNoHeldShardLocks("countKeys");
         return self.store.countPrefix(prefix);
     }
 };

@@ -50,11 +50,15 @@ pub const RwLock = struct {
 /// Futex compatibility wrapper.
 /// In 0.16, std.Thread.Futex moved to std.Io.futexWait/futexWake.
 pub const Futex = struct {
-    pub fn timedWait(ptr: *std.atomic.Value(u32), expected: u32, _timeout_ns: anytype) void {
-        _ = _timeout_ns;
-        // Use uncancelable futex wait (non-blocking / no io param needed for cancel)
+    pub fn timedWait(ptr: *std.atomic.Value(u32), expected: u32, timeout_ns: anytype) void {
         const zio = io();
-        zio.futexWaitUncancelable(u32, &ptr.raw, expected);
+        const timeout = std.Io.Timeout{
+            .duration = .{
+                .raw = .fromNanoseconds(@intCast(timeout_ns)),
+                .clock = .awake,
+            },
+        };
+        zio.futexWaitTimeout(u32, &ptr.raw, expected, timeout) catch {};
     }
 
     pub fn wake(ptr: *std.atomic.Value(u32), count: u32) void {
@@ -362,4 +366,3 @@ pub const net = struct {
         return .{ .inner = stream };
     }
 };
-

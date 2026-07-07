@@ -324,14 +324,7 @@ pub const Gateway = struct {
             };
 
             // Step 6: Encode WormWire response and send as WebSocket binary frame
-            var resp_buf: [65536]u8 = undefined;
-            var fbw = wire.FixedBufWriter.init(&resp_buf);
-            wire.writeResponse(&fbw, resp) catch {
-                const err_resp = wireEncodeError("response too large");
-                sendWsFrame(&stream, 0x02, err_resp) catch return;
-                continue;
-            };
-            sendWsFrame(&stream, 0x02, fbw.getWritten()) catch return;
+            sendWireResponseFrame(&stream, self.allocator, resp) catch return;
         }
     }
 
@@ -369,13 +362,16 @@ pub const Gateway = struct {
         }
 
         if (self.route(alloc, path, query)) |r| {
-            const ct: []const u8 = if (r.json) "application/json" else "text/plain; charset=utf-8";
-            return writeHttp(stream, r.status, ct, r.body);
+            return writeHttp(stream, r.status, r.content_type, r.body);
         }
         return writeHttp(stream, 404, "text/plain", "not found");
     }
 
-    const RouteResult = struct { body: []const u8, json: bool, status: u16 = 200 };
+    const RouteResult = struct {
+        body: []const u8,
+        content_type: []const u8,
+        status: u16 = 200,
+    };
 
     /// Match the request path against the registered domain routes (manifest-contributed). The first
     /// route whose `prefix` segments match wins; its builder maps the remaining path segments + query
@@ -398,7 +394,11 @@ pub const Gateway = struct {
             const call = r.build(alloc, &caps) orelse return null;
             const body = self.execProc(alloc, call.proc, call.args) orelse return null;
             const status = if (call.status_from_body) |f| f(body) else call.status;
-            return .{ .body = body, .json = call.json, .status = status };
+            return .{
+                .body = body,
+                .content_type = call.content_type orelse "application/json",
+                .status = status,
+            };
         }
         return null;
     }
@@ -642,6 +642,37 @@ pub const Gateway = struct {
         }
     }
 
+    const WireListWriter = struct {
+        list: *std.ArrayListUnmanaged(u8),
+        allocator: std.mem.Allocator,
+
+        pub fn writeAll(self: *WireListWriter, data: []const u8) !void {
+            try self.list.appendSlice(self.allocator, data);
+        }
+    };
+
+    fn encodeWireResponseAlloc(allocator: std.mem.Allocator, response: Response) ![]u8 {
+        var encoded: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer encoded.deinit(allocator);
+
+        var writer = WireListWriter{ .list = &encoded, .allocator = allocator };
+        try wire.writeResponse(&writer, response);
+        return try encoded.toOwnedSlice(allocator);
+    }
+
+    fn sendWireResponseFrame(stream: *core.compat.net.Stream, allocator: std.mem.Allocator, response: Response) !void {
+        var resp_buf: [65536]u8 = undefined;
+        var fbw = wire.FixedBufWriter.init(&resp_buf);
+        wire.writeResponse(&fbw, response) catch |err| {
+            if (err != error.NoSpaceLeft) return err;
+            const encoded = try encodeWireResponseAlloc(allocator, response);
+            defer allocator.free(encoded);
+            try sendWsFrame(stream, 0x02, encoded);
+            return;
+        };
+        try sendWsFrame(stream, 0x02, fbw.getWritten());
+    }
+
     fn sendWsCloseWithCode(stream: *core.compat.net.Stream, code: u16) !void {
         var buf: [2]u8 = undefined;
         std.mem.writeInt(u16, &buf, code, .big);
@@ -780,18 +811,12 @@ pub const Gateway = struct {
             // Parse the text event payload to extract channel/message
             const parsed = parseTextEvent(data) orelse return;
 
-            // Encode as WormWire event response
-            var resp_buf: [65536]u8 = undefined;
-            var fbw = wire.FixedBufWriter.init(&resp_buf);
-            wire.writeResponse(&fbw, .{ .event = .{
-                .channel = parsed.channel,
-                .message = parsed.message,
-            } }) catch return;
-
-            // Wrap in WebSocket binary frame and send
             self.write_mutex.lock();
             defer self.write_mutex.unlock();
-            sendWsFrame(self.stream, 0x02, fbw.getWritten()) catch {};
+            sendWireResponseFrame(self.stream, self.allocator, .{ .event = .{
+                .channel = parsed.channel,
+                .message = parsed.message,
+            } }) catch {};
         }
 
         fn parseTextEvent(data: []const u8) ?struct { channel: []const u8, message: []const u8 } {
@@ -809,3 +834,19 @@ pub const Gateway = struct {
         }
     };
 };
+
+test "gateway allocator-backed response encoder handles payloads over 64 KiB" {
+    const testing = std.testing;
+
+    const payload = try testing.allocator.alloc(u8, 70 * 1024);
+    defer testing.allocator.free(payload);
+    @memset(payload, 'x');
+
+    const encoded = try Gateway.encodeWireResponseAlloc(testing.allocator, .{ .value = payload });
+    defer testing.allocator.free(encoded);
+
+    try testing.expectEqual(@as(usize, payload.len + 5), encoded.len);
+    try testing.expectEqual(@as(u8, @intFromEnum(wire.ResponseCode.value)), encoded[0]);
+    try testing.expectEqual(@as(u32, @intCast(payload.len)), std.mem.readInt(u32, encoded[1..5], .big));
+    try testing.expectEqualSlices(u8, payload, encoded[5..]);
+}

@@ -286,6 +286,10 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
 
 Always call `lockKey`/`lockKeys2` BEFORE any `get`/`getInt`/`exists`/`del`. Reading without the lock is a data race.
 
+### ⚠️ Scans and getCopy Before Locks
+
+Always call `ctx.scan`/`ctx.scanFirst`/`ctx.scanCallback`/`ctx.getCopy`/`ctx.countKeys` BEFORE the first `lockKey`/`lockKeys2`. These helpers acquire shard locks internally; calling them while holding a Ctx shard lock can deadlock the procedure against itself.
+
 ### ⚠️ Deterministic Lock Order
 
 When locking multiple keys, ALWAYS use `lockKeys2` for two keys. For 3+ keys, lock by ascending shard index to avoid deadlocks. The simplest approach: lock all keys before any reads.

@@ -293,10 +293,15 @@ pub const net = struct {
             } } };
         }
 
-        pub fn listen(self: Address, _opts: struct { reuse_address: bool = false }) !ServerCompat {
-            _ = _opts;
+        pub fn listen(self: Address, opts: struct {
+            reuse_address: bool = true,
+            /// Kernel accept queue depth. Join storms under multiplayer load
+            /// need more than the Zig default (128) or clients see connect drops.
+            kernel_backlog: u31 = 1024,
+        }) !ServerCompat {
             const server = try std.Io.net.IpAddress.listen(&self.inner, io(), .{
-                .reuse_address = true,
+                .reuse_address = opts.reuse_address,
+                .kernel_backlog = opts.kernel_backlog,
             });
             return .{ .inner = server };
         }

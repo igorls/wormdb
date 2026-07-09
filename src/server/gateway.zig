@@ -120,13 +120,14 @@ pub const Gateway = struct {
             std.log.err("Gateway: invalid bind address: {}", .{err});
             return;
         };
-        var listener = addr.listen(.{ .reuse_address = true }) catch |err| {
+        // Large kernel backlog: multiplayer join storms open many WS sockets at once.
+        var listener = addr.listen(.{ .reuse_address = true, .kernel_backlog = 1024 }) catch |err| {
             std.log.err("Gateway: listen failed on port {d}: {}", .{ self.port, err });
             return;
         };
         defer listener.deinit();
 
-        std.log.info("Gateway listening on 0.0.0.0:{d} (WebSocket{s})", .{
+        std.log.info("Gateway listening on 0.0.0.0:{d} (WebSocket{s}, backlog=1024)", .{
             self.port,
             if (self.auth_required) @as([]const u8, ", auth required") else @as([]const u8, ""),
         });
@@ -844,6 +845,7 @@ pub const Gateway = struct {
         }
 
         fn deinit(self: *ConnContext) void {
+            // Mark closed first so writeEvent fail-softs without new socket work.
             self.closed.store(true, .release);
             var iter = self.subscriptions.iterator();
             while (iter.next()) |entry| {
@@ -852,8 +854,19 @@ pub const Gateway = struct {
             }
             self.subscriptions.deinit();
             // Wait for publishers that already snapshotted us under retain.
+            // Bounded: socket send timeout is 2s; do not spin forever (that wedged
+            // the process after multiplayer disconnect storms under capacity load).
+            var spins: u32 = 0;
             while (self.in_flight.load(.acquire) != 0) {
+                spins += 1;
+                if (spins > 20_000) {
+                    std.log.warn("Gateway: connection teardown timed out with in_flight={d}", .{self.in_flight.load(.monotonic)});
+                    break;
+                }
                 std.Thread.yield() catch {};
+                if (spins % 200 == 0) {
+                    std.Thread.sleep(100 * std.time.ns_per_us);
+                }
             }
         }
 

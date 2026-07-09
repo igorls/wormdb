@@ -209,6 +209,12 @@ pub const EventBus = struct {
     /// (exclusive bus lock), or wedge unsubscribe. Callers that free `ctx`
     /// on disconnect must provide retain/release hooks.
     ///
+    /// Throughput notes:
+    /// - Full JSON parse for `ts` is skipped when no subscriber has a filter
+    ///   (the common game-feed path). When filters exist, a cheap scan for
+    ///   `"ts":` is used instead of `std.json` tree allocation.
+    /// - Delivery list is pre-sized to subscriber count to avoid realloc churn.
+    ///
     /// Channel pointers remain valid for the process lifetime of the bus
     /// (channels are only destroyed in `EventBus.deinit`).
     pub fn publish(self: *EventBus, channel_name: []const u8, message: []const u8) !void {
@@ -220,7 +226,6 @@ pub const EventBus = struct {
 
         const event_msg = try std.fmt.allocPrint(self.allocator, ">EVENT {s}\r\n{s}\r\n", .{ channel_name, message });
         defer self.allocator.free(event_msg);
-        const ts_ms = eventTimestamp(self.allocator, message);
 
         var deliveries: std.ArrayListUnmanaged(Delivery) = .empty;
         defer {
@@ -236,6 +241,26 @@ pub const EventBus = struct {
             channel.mutex.lock();
             defer channel.mutex.unlock();
 
+            const n_subs = channel.subscribers.count();
+            if (n_subs == 0) {
+                _ = self.stats.publish_count.fetchAdd(1, .monotonic);
+                return;
+            }
+            try deliveries.ensureTotalCapacity(self.allocator, n_subs);
+
+            // Only pay filter/ts cost when at least one subscriber needs it.
+            var any_filter = false;
+            {
+                var scan = channel.subscribers.iterator();
+                while (scan.next()) |entry| {
+                    if (entry.value_ptr.filter != null) {
+                        any_filter = true;
+                        break;
+                    }
+                }
+            }
+            const ts_ms: u64 = if (any_filter) eventTimestamp(message) else 0;
+
             var iter = channel.subscribers.iterator();
             while (iter.next()) |entry| {
                 const sub = entry.value_ptr.*;
@@ -246,7 +271,7 @@ pub const EventBus = struct {
                 if (sub.retain_fn) |retain| retain(sub.ctx);
                 errdefer if (sub.release_fn) |rel| rel(sub.ctx);
 
-                try deliveries.append(self.allocator, .{
+                deliveries.appendAssumeCapacity(.{
                     .write_fn = sub.write_fn,
                     .ctx = sub.ctx,
                     .release_fn = sub.release_fn,
@@ -293,18 +318,25 @@ pub const EventBus = struct {
     }
 };
 
-fn eventTimestamp(allocator: std.mem.Allocator, message: []const u8) u64 {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, message, .{}) catch return 0;
-    defer parsed.deinit();
-
-    if (parsed.value != .object) return 0;
-    const ts = parsed.value.object.get("ts") orelse return 0;
-    return switch (ts) {
-        .integer => |n| if (n >= 0) @intCast(n) else 0,
-        .float => |n| if (n >= 0) @intFromFloat(n) else 0,
-        .number_string => |s| std.fmt.parseUnsigned(u64, s, 10) catch 0,
-        else => 0,
-    };
+/// Extract a top-level numeric `"ts"` field without allocating a full JSON tree.
+/// Used only for filtered subscriptions. Unfiltered feed paths skip this entirely.
+fn eventTimestamp(message: []const u8) u64 {
+    const needle = "\"ts\":";
+    const start = std.mem.indexOf(u8, message, needle) orelse return 0;
+    var i = start + needle.len;
+    while (i < message.len and (message[i] == ' ' or message[i] == '\t')) : (i += 1) {}
+    if (i >= message.len or message[i] == '-') return 0;
+    var val: u64 = 0;
+    var digits: usize = 0;
+    while (i < message.len) : (i += 1) {
+        const c = message[i];
+        if (c < '0' or c > '9') break;
+        // Saturating multiply/add keeps pathological inputs from wrapping oddly.
+        val = val *| 10 +| (c - '0');
+        digits += 1;
+        if (digits > 20) return 0;
+    }
+    return if (digits > 0) val else 0;
 }
 
 test "EventBus subscribe and publish" {

@@ -864,8 +864,11 @@ pub const Gateway = struct {
                     break;
                 }
                 std.Thread.yield() catch {};
+                // Every 200 yields, yield an extra time — avoids busy-spinning
+                // without std.Thread.sleep (removed in Zig 0.16, nanosleep is
+                // Linux-only).  Bounded at 20k iterations (~2s socket timeout).
                 if (spins % 200 == 0) {
-                    std.Thread.sleep(100 * std.time.ns_per_us);
+                    std.Thread.yield() catch {};
                 }
             }
         }

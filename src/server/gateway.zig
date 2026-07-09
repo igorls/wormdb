@@ -187,8 +187,11 @@ pub const Gateway = struct {
         defer if (self.metrics) |metrics| metrics.endGatewayWebSocket();
 
         // Step 2: WebSocket session — command loop
-        var conn_ctx = ConnContext.init(self.allocator, self.event_bus, &stream);
-        defer conn_ctx.deinit();
+        // Heap-allocate ConnContext so EventBus retain/release can outlive this
+        // stack frame if publishers are mid-deliver during teardown (#91 UAF).
+        const conn_ctx = self.allocator.create(ConnContext) catch return;
+        conn_ctx.* = ConnContext.init(self.allocator, self.event_bus, &stream);
+        defer conn_ctx.connectionDone();
 
         var cmd_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer cmd_arena.deinit();
@@ -225,7 +228,7 @@ pub const Gateway = struct {
                     // Text frame — the cc32d9 Light-API WebSocket dialect (JSON-RPC 2.0). Reuses the
                     // same store/segment; streams notifications back as text frames.
                     _ = cmd_arena.reset(.retain_capacity);
-                    self.handleJsonRpc(&conn_ctx, cmd_arena.allocator(), ws_frame.payload);
+                    self.handleJsonRpc(conn_ctx, cmd_arena.allocator(), ws_frame.payload);
                     continue;
                 },
                 else => {
@@ -831,8 +834,9 @@ pub const Gateway = struct {
         write_mutex: core.compat.Mutex,
         /// Set before unsub/teardown; event writers check this under write_mutex.
         closed: std.atomic.Value(bool) = .init(false),
-        /// In-flight EventBus deliveries that retained this connection.
-        in_flight: std.atomic.Value(u32) = .init(0),
+        /// Ownership refs: 1 for the connection thread + 1 per EventBus retain.
+        /// Freed only when the last ref drops (safe mid-deliver teardown — #91).
+        refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
 
         fn init(allocator: std.mem.Allocator, event_bus: *EventBus, stream: *core.compat.net.Stream) ConnContext {
             return .{
@@ -844,8 +848,10 @@ pub const Gateway = struct {
             };
         }
 
-        fn deinit(self: *ConnContext) void {
-            // Mark closed first so writeEvent fail-softs without new socket work.
+        /// Connection thread teardown: close for writes, drop subscriptions, drop
+        /// the connection's ownership ref. Heap free happens in `release` when
+        /// in-flight EventBus delivers finish (no UAF if publishers still hold us).
+        fn connectionDone(self: *ConnContext) void {
             self.closed.store(true, .release);
             var iter = self.subscriptions.iterator();
             while (iter.next()) |entry| {
@@ -853,31 +859,24 @@ pub const Gateway = struct {
                 self.allocator.free(entry.key_ptr.*);
             }
             self.subscriptions.deinit();
-            // Wait for publishers that already snapshotted us under retain.
-            // Bounded: socket send timeout is 2s; do not spin forever (that wedged
-            // the process after multiplayer disconnect storms under capacity load).
-            var spins: u32 = 0;
-            while (self.in_flight.load(.acquire) != 0) {
-                spins += 1;
-                if (spins > 20_000) {
-                    std.log.warn("Gateway: connection teardown timed out with in_flight={d}", .{self.in_flight.load(.monotonic)});
-                    break;
-                }
-                std.Thread.yield() catch {};
-                if (spins % 200 == 0) {
-                    std.Thread.sleep(100 * std.time.ns_per_us);
-                }
-            }
+            self.releaseRef();
         }
 
         fn retain(ctx: *anyopaque) void {
             const self: *ConnContext = @ptrCast(@alignCast(ctx));
-            _ = self.in_flight.fetchAdd(1, .acquire);
+            _ = self.refs.fetchAdd(1, .acquire);
         }
 
         fn release(ctx: *anyopaque) void {
             const self: *ConnContext = @ptrCast(@alignCast(ctx));
-            _ = self.in_flight.fetchSub(1, .release);
+            self.releaseRef();
+        }
+
+        fn releaseRef(self: *ConnContext) void {
+            if (self.refs.fetchSub(1, .release) == 1) {
+                const a = self.allocator;
+                a.destroy(self);
+            }
         }
 
         fn subscribe(self: *ConnContext, channel: []const u8, filter: ?[]const u8) !void {

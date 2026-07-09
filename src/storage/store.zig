@@ -105,7 +105,7 @@ fn prefixRange(items: []const *Entry, prefix: []const u8) PrefixRange {
 
 /// Remove `key` from a shard's hashmap + ordered index. Caller must hold the
 /// shard lock and owns destroying the returned entry.
-fn shardRemoveLocked(shard: *Shard, key: []const u8) ?*Entry {
+fn shardRemoveLocked(store: *Store, shard: *Shard, key: []const u8) ?*Entry {
     const removed = shard.data.fetchRemove(key) orelse return null;
     const idx = lowerBoundKey(shard.sorted.items, key);
     if (idx < shard.sorted.items.len and shard.sorted.items[idx] == removed.value) {
@@ -130,6 +130,7 @@ fn shardRemoveLocked(shard: *Shard, key: []const u8) ?*Entry {
             std.log.err("store: ordered index missing entry on remove of '{s}'", .{key});
         }
     }
+    _ = store.live_keys.fetchSub(1, .monotonic);
     return removed.value;
 }
 
@@ -141,6 +142,9 @@ pub const LockPair = struct {
 pub const Store = struct {
     allocator: std.mem.Allocator,
     shards: [SHARD_COUNT]Shard,
+    /// Live (non-sst) key count — maintained by shardPut/Remove for O(1) STATUS.
+    /// Avoids locking all 256 shards on every STATUS call (#91).
+    live_keys: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     wal: ?Wal,
     wal_enqueue_mutex: core.compat.Mutex,
     config: Config,
@@ -369,6 +373,7 @@ pub const Store = struct {
             shard.sorted.ensureUnusedCapacity(self.allocator, 1) catch return error.OutOfMemory;
             shard.data.putAssumeCapacity(entry.key, entry);
             shard.sorted.insertAssumeCapacity(idx, entry);
+            _ = self.live_keys.fetchAdd(1, .monotonic);
         }
     }
 
@@ -377,7 +382,7 @@ pub const Store = struct {
     /// `data.fetchRemove`, this keeps the ordered index in sync.
     pub fn deleteUnsafe(self: *Store, key: []const u8) void {
         const shard = &self.shards[shardIndex(key)];
-        if (shardRemoveLocked(shard, key)) |removed| {
+        if (shardRemoveLocked(self, shard, key)) |removed| {
             self.destroyEntry(removed);
         }
     }
@@ -461,48 +466,46 @@ pub const Store = struct {
         const si = shardIndex(key);
         const shard = &self.shards[si];
 
-        shard.mutex.lock();
-        defer shard.mutex.unlock();
-
-        if (shard.data.get(key)) |existing| {
-            if (existing.flags.is_worm) {
-                return error.WormViolation;
+        // Phase 1: WORM check under shard lock only (no WAL I/O while held — #91).
+        {
+            shard.mutex.lock();
+            defer shard.mutex.unlock();
+            if (shard.data.get(key)) |existing| {
+                if (existing.flags.is_worm) return error.WormViolation;
+            } else if (self.sstHit(key)) |frozen| {
+                // A frozen WORM key may not be shadowed by a live write — that
+                // would silently serve the new value over the immutable one.
+                if (frozen.is_worm) return error.WormViolation;
             }
-        } else if (self.sstHit(key)) |frozen| {
-            // A frozen WORM key may not be shadowed by a live write — that
-            // would silently serve the new value over the immutable one.
-            if (frozen.is_worm) return error.WormViolation;
         }
 
+        // Phase 2: durable record / entry allocation without the shard lock.
         const entry = if (self.config.persistence == .full) blk: {
             self.wal_enqueue_mutex.lock();
-            const e = self.wal.?.appendSet(key, value, .{ .is_worm = is_worm, .is_deleted = false }, timestamp) catch {
-                self.wal_enqueue_mutex.unlock();
+            defer self.wal_enqueue_mutex.unlock();
+            break :blk self.wal.?.appendSet(key, value, .{ .is_worm = is_worm, .is_deleted = false }, timestamp) catch {
                 return error.IoError;
             };
-            self.wal_enqueue_mutex.unlock();
-            break :blk e;
         } else blk: {
-            // snapshot/none mode: create Entry directly, no WAL IO
             break :blk try self.createMemoryEntry(key, value, is_worm, timestamp);
         };
         errdefer self.destroyEntry(entry);
 
-        // Insert into the hashmap + ordered index together. The shard lock is
-        // held for the whole operation (upstream restructure), so no WORM
-        // re-check is needed; on error the errdefer above destroys `entry`.
-        try self.shardPutLocked(shard, entry);
-
-        // Release shard lock before snapshot check to avoid deadlock
-        // (writeSnapshot locks ALL shards).
-        shard.mutex.unlock();
+        // Phase 3: insert under shard lock with WORM re-check (race window).
+        {
+            shard.mutex.lock();
+            defer shard.mutex.unlock();
+            if (shard.data.get(key)) |existing| {
+                if (existing.flags.is_worm) return error.WormViolation;
+            } else if (self.sstHit(key)) |frozen| {
+                if (frozen.is_worm) return error.WormViolation;
+            }
+            try self.shardPutLocked(shard, entry);
+        }
 
         if (self.config.persistence == .full) {
             self.maybeSnapshotAndTruncate() catch {};
         }
-
-        // shard.mutex was unlocked above — re-lock so the defer unlock is safe
-        shard.mutex.lock();
     }
 
     /// Append a vector-insert metadata record to the WAL. The vector bytes
@@ -613,7 +616,7 @@ pub const Store = struct {
                 self.wal_enqueue_mutex.unlock();
             }
 
-            if (shardRemoveLocked(shard, key)) |removed| {
+            if (shardRemoveLocked(self, shard, key)) |removed| {
                 self.destroyEntry(removed);
             }
 
@@ -631,13 +634,9 @@ pub const Store = struct {
     }
 
     pub fn count(self: *Store) usize {
-        var total: usize = 0;
-        for (&self.shards) |*shard| {
-            shard.mutex.lock();
-            total += shard.data.count();
-            shard.mutex.unlock();
-        }
-        return total;
+        // O(1): STATUS and operators must not wait on 256 shard locks while
+        // writers hold any of them for WAL/snapshot work (#91).
+        return self.live_keys.load(.monotonic);
     }
 
     /// Get WAL size in bytes.
@@ -960,7 +959,7 @@ pub const Store = struct {
                     // ordered index in sync for the non-WORM path.
                     if (shard.data.get(key)) |existing| {
                         if (!existing.flags.is_worm) {
-                            if (shardRemoveLocked(shard, key)) |removed| {
+                            if (shardRemoveLocked(self, shard, key)) |removed| {
                                 self.destroyEntry(removed);
                             }
                         }
@@ -1166,8 +1165,57 @@ pub const Store = struct {
     }
 
     fn writeSnapshot(self: *Store) !void {
-        for (&self.shards) |*shard| shard.mutex.lock();
-        defer for (&self.shards) |*shard| shard.mutex.unlock();
+        // Phase 1: under all shard locks, deep-copy live entries into owned
+        // buffers. Phase 2 (disk I/O) must NOT hold shard locks — that froze
+        // STATUS and concurrent EXECs for the whole snapshot duration (#91).
+        const SnapRec = struct {
+            key: []u8,
+            value: []u8,
+            flags: EntryFlags,
+            timestamp: u64,
+        };
+
+        var records: std.ArrayListUnmanaged(SnapRec) = .empty;
+        defer {
+            for (records.items) |rec| {
+                self.allocator.free(rec.key);
+                self.allocator.free(rec.value);
+            }
+            records.deinit(self.allocator);
+        }
+
+        {
+            for (&self.shards) |*shard| shard.mutex.lock();
+            defer for (&self.shards) |*shard| shard.mutex.unlock();
+
+            var data_count: usize = 0;
+            for (&self.shards) |*shard| data_count += shard.data.count();
+            try records.ensureTotalCapacity(self.allocator, data_count);
+
+            for (&self.shards) |*shard| {
+                var iter = shard.data.iterator();
+                while (iter.next()) |item| {
+                    const entry = item.value_ptr.*;
+                    const k = try self.allocator.dupe(u8, entry.key);
+                    errdefer self.allocator.free(k);
+                    const v = try self.allocator.dupe(u8, entry.value);
+                    var flags = entry.flags;
+                    flags.arena_owned = false;
+                    records.appendAssumeCapacity(.{
+                        .key = k,
+                        .value = v,
+                        .flags = flags,
+                        .timestamp = entry.timestamp,
+                    });
+                }
+            }
+        }
+
+        std.sort.heap(SnapRec, records.items, {}, struct {
+            fn lessThan(_: void, lhs: SnapRec, rhs: SnapRec) bool {
+                return std.mem.lessThan(u8, lhs.key, rhs.key);
+            }
+        }.lessThan);
 
         const temp_snapshot_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{self.config.snapshot_path});
         defer self.allocator.free(temp_snapshot_path);
@@ -1175,30 +1223,9 @@ pub const Store = struct {
         const snapshot_file = try compat.Dir.createFile(core.compat.cwd(), temp_snapshot_path, .{ .read = true, .truncate = true });
         errdefer compat.File.close(snapshot_file);
 
-        var data_count: usize = 0;
-        for (&self.shards) |*shard| data_count += shard.data.count();
-
-        var entries = try self.allocator.alloc(*Entry, data_count);
-        defer self.allocator.free(entries);
-
-        var entry_index: usize = 0;
-        for (&self.shards) |*shard| {
-            var iter = shard.data.iterator();
-            while (iter.next()) |item| {
-                entries[entry_index] = item.value_ptr.*;
-                entry_index += 1;
-            }
-        }
-
-        std.sort.heap(*Entry, entries[0..entry_index], {}, struct {
-            fn lessThan(_: void, lhs: *Entry, rhs: *Entry) bool {
-                return std.mem.lessThan(u8, lhs.key, rhs.key);
-            }
-        }.lessThan);
-
         // Mirror of the load path's buffering: per-field raw writes cost a
         // kernel round-trip each (shutdown saves of multi-million-key stores
-        // took minutes of syscall overhead while holding every shard lock).
+        // took minutes of syscall overhead).
         var writer = BufferedFileWriter{
             .file = snapshot_file,
             .buf = try self.allocator.alloc(u8, SNAPSHOT_READ_BUF_SIZE),
@@ -1212,30 +1239,26 @@ pub const Store = struct {
         try writer.writeAll(version_buf[0..4]);
 
         var count_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, count_buf[0..8], @intCast(entry_index), .little);
+        std.mem.writeInt(u64, count_buf[0..8], @intCast(records.items.len), .little);
         try writer.writeAll(count_buf[0..8]);
 
-        for (entries[0..entry_index]) |entry| {
+        for (records.items) |rec| {
             // Fixed entry header (matches the load path's single 17-byte read):
             // key_len u32 | value_len u32 | flags u8 | timestamp u64.
             var header_buf: [17]u8 = undefined;
-            std.mem.writeInt(u32, header_buf[0..4], @intCast(entry.key.len), .little);
-            std.mem.writeInt(u32, header_buf[4..8], @intCast(entry.value.len), .little);
-            var flags = entry.flags;
-            flags.arena_owned = false; // placement detail, never persisted
-            header_buf[8] = @bitCast(flags);
-            std.mem.writeInt(u64, header_buf[9..17], entry.timestamp, .little);
+            std.mem.writeInt(u32, header_buf[0..4], @intCast(rec.key.len), .little);
+            std.mem.writeInt(u32, header_buf[4..8], @intCast(rec.value.len), .little);
+            header_buf[8] = @bitCast(rec.flags);
+            std.mem.writeInt(u64, header_buf[9..17], rec.timestamp, .little);
             try writer.writeAll(header_buf[0..]);
 
-            try writer.writeAll(entry.key);
-            try writer.writeAll(entry.value);
+            try writer.writeAll(rec.key);
+            try writer.writeAll(rec.value);
         }
 
         // ── v2 HNSW trailer (optional) ──
-        // Only written when a registry is attached and has at least one
-        // namespace. Shards are still locked at this point (from the top
-        // of writeSnapshot's defer), so no new vinsert can race with the
-        // per-namespace write-locks we acquire inside registry.writeTo.
+        // Registry writeTo takes its own per-namespace locks; store shards are
+        // intentionally unlocked so STATUS/EXECs can proceed during disk I/O.
         if (self.vector_registry) |reg| {
             if (reg.map.count() > 0) {
                 reg.writeTo(&writer) catch |err| {
@@ -1681,6 +1704,23 @@ test "Store restores from snapshot then replays WAL" {
         try testing.expectEqualStrings("v2", reloaded.get("k2").?.value);
         try testing.expect(reloaded.get("k2").?.flags.is_worm);
     }
+}
+
+test "live_keys count is O(1) and tracks set/delete (#91)" {
+    const testing = std.testing;
+    var store = try Store.init(testing.allocator, .{ .persistence = .none, .sync_writes = false });
+    defer store.deinit();
+
+    try testing.expectEqual(@as(usize, 0), store.count());
+    try store.set("a", "1", false);
+    try store.set("b", "2", false);
+    try testing.expectEqual(@as(usize, 2), store.count());
+    try store.set("a", "1b", false); // replace — count unchanged
+    try testing.expectEqual(@as(usize, 2), store.count());
+    try store.delete("b");
+    try testing.expectEqual(@as(usize, 1), store.count());
+    store.deleteUnsafe("a");
+    try testing.expectEqual(@as(usize, 0), store.count());
 }
 
 test "setUnsafe does not append to WAL under full persistence (#88)" {

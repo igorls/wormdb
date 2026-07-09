@@ -48,6 +48,7 @@ const Command = core.types.Command;
 const Response = core.types.Response;
 const Cluster = cluster_mod.Cluster;
 const Sha1 = std.crypto.hash.Sha1;
+const ServerMetrics = @import("metrics.zig").ServerMetrics;
 
 /// WebSocket gateway server.
 pub const Gateway = struct {
@@ -67,6 +68,8 @@ pub const Gateway = struct {
     auth_required: bool,
     /// Optional server-side SCT minting config.
     auth_mint: ?AuthMintConfig,
+    /// Optional shared liveness/concurrency counters surfaced by STATUS.
+    metrics: ?*ServerMetrics,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -86,7 +89,12 @@ pub const Gateway = struct {
             .max_token_age = 0,
             .auth_required = false,
             .auth_mint = null,
+            .metrics = null,
         };
+    }
+
+    pub fn attachMetrics(self: *Gateway, metrics: *ServerMetrics) void {
+        self.metrics = metrics;
     }
 
     /// Run the gateway on a dedicated thread. Call from main after server start.
@@ -130,10 +138,14 @@ pub const Gateway = struct {
 
     fn handleConnection(self: *Gateway, conn: core.compat.net.ServerCompat.Connection) void {
         var stream = conn.stream;
+        if (self.metrics) |metrics| metrics.beginGatewayThread();
+        defer if (self.metrics) |metrics| metrics.endGatewayThread();
         defer stream.close();
 
         // Disable Nagle for low-latency request/response
         core.compat.setNoDelay(stream.getHandle());
+        // Bound sends so a slow WebSocket peer cannot pin a publisher thread (#84).
+        core.compat.setSendTimeoutMs(stream.getHandle(), 2_000);
 
         // Step 1: WebSocket handshake
         var request_buf: [4096]u8 = undefined;
@@ -159,6 +171,8 @@ pub const Gateway = struct {
             .{accept_value},
         ) catch return;
         stream.writeAll(response) catch return;
+        if (self.metrics) |metrics| metrics.beginGatewayWebSocket();
+        defer if (self.metrics) |metrics| metrics.endGatewayWebSocket();
 
         // Step 2: WebSocket session — command loop
         var conn_ctx = ConnContext.init(self.allocator, self.event_bus, &stream);
@@ -185,12 +199,12 @@ pub const Gateway = struct {
             switch (ws_frame.opcode) {
                 0x08 => {
                     // Close frame — send close reply and exit
-                    sendWsFrame(&stream, 0x08, ws_frame.payload) catch {};
+                    conn_ctx.sendWsFrame(0x08, ws_frame.payload) catch {};
                     return;
                 },
                 0x09 => {
                     // Ping — respond with pong
-                    sendWsFrame(&stream, 0x0A, ws_frame.payload) catch {};
+                    conn_ctx.sendWsFrame(0x0A, ws_frame.payload) catch {};
                     continue;
                 },
                 0x0A => continue, // Pong — ignore
@@ -199,12 +213,12 @@ pub const Gateway = struct {
                     // Text frame — the cc32d9 Light-API WebSocket dialect (JSON-RPC 2.0). Reuses the
                     // same store/segment; streams notifications back as text frames.
                     _ = cmd_arena.reset(.retain_capacity);
-                    self.handleJsonRpc(&stream, cmd_arena.allocator(), ws_frame.payload);
+                    self.handleJsonRpc(&conn_ctx, cmd_arena.allocator(), ws_frame.payload);
                     continue;
                 },
                 else => {
                     // Other opcodes — reject
-                    sendWsCloseWithCode(&stream, 1003) catch {};
+                    conn_ctx.sendWsCloseWithCode(1003) catch {};
                     return;
                 },
             }
@@ -216,29 +230,33 @@ pub const Gateway = struct {
             const payload = ws_frame.payload;
             if (payload.len < 5) {
                 const err_resp = wireEncodeError("frame too short");
-                sendWsFrame(&stream, 0x02, err_resp) catch return;
+                conn_ctx.sendWsFrame(0x02, err_resp) catch return;
                 continue;
             }
 
             const cmd_id_raw = payload[0];
             const cmd_id = core.compat.intToEnum(core.types.CommandId, cmd_id_raw) catch {
                 const err_resp = wireEncodeError("unknown command");
-                sendWsFrame(&stream, 0x02, err_resp) catch return;
+                conn_ctx.sendWsFrame(0x02, err_resp) catch return;
                 continue;
             };
             const payload_len = std.mem.readInt(u32, payload[1..5], .big);
             if (5 + payload_len > payload.len) {
                 const err_resp = wireEncodeError("incomplete frame");
-                sendWsFrame(&stream, 0x02, err_resp) catch return;
+                conn_ctx.sendWsFrame(0x02, err_resp) catch return;
                 continue;
             }
 
             const cmd_payload = payload[5 .. 5 + payload_len];
             const cmd = wire.parseCommandPayloadZeroCopy(cmd_id, cmd_payload, arena_alloc) catch {
                 const err_resp = wireEncodeError("malformed command");
-                sendWsFrame(&stream, 0x02, err_resp) catch return;
+                conn_ctx.sendWsFrame(0x02, err_resp) catch return;
                 continue;
             };
+
+            if (self.metrics) |metrics| metrics.beginGatewayCommand();
+            var command_succeeded = false;
+            defer if (self.metrics) |metrics| metrics.endGatewayCommand(command_succeeded);
 
             // Step 4: Handle AUTH command at connection level
             const resp = switch (cmd) {
@@ -310,6 +328,7 @@ pub const Gateway = struct {
                         else
                             .disabled,
                         .auth_mint = self.auth_mint,
+                        .metrics = self.metrics,
                     }, cmd) catch |err| {
                         const err_msg: []const u8 = switch (err) {
                             error.WormViolation => "WORM violation",
@@ -324,7 +343,9 @@ pub const Gateway = struct {
             };
 
             // Step 6: Encode WormWire response and send as WebSocket binary frame
-            sendWireResponseFrame(&stream, self.allocator, resp) catch return;
+            // (serialized with event fanout via ConnContext.write_mutex — #84)
+            conn_ctx.sendWireResponse(resp) catch return;
+            command_succeeded = responseSucceeded(resp);
         }
     }
 
@@ -349,6 +370,9 @@ pub const Gateway = struct {
     fn handleHttpRequest(self: *Gateway, stream: *core.compat.net.Stream, alloc: std.mem.Allocator, request: []const u8) bool {
         const line_end = std.mem.indexOf(u8, request, "\r\n") orelse return false;
         const line = request[0..line_end];
+        if (self.metrics) |metrics| metrics.beginGatewayCommand();
+        var command_succeeded = false;
+        defer if (self.metrics) |metrics| metrics.endGatewayCommand(command_succeeded);
         if (!std.mem.startsWith(u8, line, "GET ")) {
             return writeHttp(stream, 405, "text/plain", "method not allowed");
         }
@@ -362,7 +386,9 @@ pub const Gateway = struct {
         }
 
         if (self.route(alloc, path, query)) |r| {
-            return writeHttp(stream, r.status, r.content_type, r.body);
+            const written = writeHttp(stream, r.status, r.content_type, r.body);
+            command_succeeded = written and r.status < 400;
+            return written;
         }
         return writeHttp(stream, 404, "text/plain", "not found");
     }
@@ -422,6 +448,7 @@ pub const Gateway = struct {
             .cluster = self.cluster,
             .auth = if (self.auth_required) .{ .enforce = null } else .disabled,
             .auth_mint = self.auth_mint,
+            .metrics = self.metrics,
         }, .{ .exec = .{ .procedure = proc, .args = args } }) catch return null;
         return switch (resp) {
             .value => |v| v orelse "null",
@@ -457,29 +484,33 @@ pub const Gateway = struct {
     // Per-WS-request state the trampolines below dereference — the gateway side of the WsCtx vtable.
     const WsImpl = struct {
         gw: *Gateway,
-        stream: *core.compat.net.Stream,
+        conn: *ConnContext,
         a: std.mem.Allocator,
         method: []const u8,
         reqid: []const u8,
     };
     fn wsEmitTramp(impl: *anyopaque, data_json: []const u8) void {
         const w: *WsImpl = @ptrCast(@alignCast(impl));
-        w.gw.wsData(w.stream, w.a, w.method, w.reqid, data_json);
+        w.gw.wsData(w.conn, w.a, w.method, w.reqid, data_json);
     }
     fn wsEndTramp(impl: *anyopaque) void {
         const w: *WsImpl = @ptrCast(@alignCast(impl));
-        w.gw.wsEnd(w.stream, w.a, w.method, w.reqid);
+        w.gw.wsEnd(w.conn, w.a, w.method, w.reqid);
     }
     fn wsErrTramp(impl: *anyopaque, msg: []const u8) void {
         const w: *WsImpl = @ptrCast(@alignCast(impl));
-        w.gw.wsErr(w.stream, w.a, w.method, w.reqid, msg);
+        w.gw.wsErr(w.conn, w.a, w.method, w.reqid, msg);
     }
     fn wsExecTramp(impl: *anyopaque, proc: []const u8, args: []const []const u8) ?[]const u8 {
         const w: *WsImpl = @ptrCast(@alignCast(impl));
         return w.gw.execProc(w.a, proc, args);
     }
 
-    fn handleJsonRpc(self: *Gateway, stream: *core.compat.net.Stream, a: std.mem.Allocator, text: []const u8) void {
+    fn handleJsonRpc(self: *Gateway, conn: *ConnContext, a: std.mem.Allocator, text: []const u8) void {
+        if (self.metrics) |metrics| metrics.beginGatewayCommand();
+        var command_succeeded = false;
+        defer if (self.metrics) |metrics| metrics.endGatewayCommand(command_succeeded);
+
         const parsed = std.json.parseFromSlice(std.json.Value, a, text, .{}) catch return;
         defer parsed.deinit();
         if (parsed.value != .object) return;
@@ -495,7 +526,7 @@ pub const Gateway = struct {
         // Dispatch to the registered domain WS method; the handler streams via the WsCtx vtable.
         for (domain_ws_methods) |wm| {
             if (std.mem.eql(u8, wm.name, m)) {
-                var impl = WsImpl{ .gw = self, .stream = stream, .a = a, .method = m, .reqid = reqid };
+                var impl = WsImpl{ .gw = self, .conn = conn, .a = a, .method = m, .reqid = reqid };
                 const ctx = domain.WsCtx{
                     .impl = &impl,
                     .allocator = a,
@@ -506,10 +537,11 @@ pub const Gateway = struct {
                     .execFn = wsExecTramp,
                 };
                 wm.handler(&ctx);
+                command_succeeded = true;
                 return;
             }
         }
-        self.wsErr(stream, a, m, reqid, "unknown method");
+        self.wsErr(conn, a, m, reqid, "unknown method");
     }
 
     /// reqid re-emitted verbatim (number or JSON string); defaults to null.
@@ -523,7 +555,7 @@ pub const Gateway = struct {
         };
     }
 
-    fn wsData(_: *Gateway, stream: *core.compat.net.Stream, a: std.mem.Allocator, method: []const u8, reqid: []const u8, data_json: []const u8) void {
+    fn wsData(_: *Gateway, conn: *ConnContext, a: std.mem.Allocator, method: []const u8, reqid: []const u8, data_json: []const u8) void {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(a);
         buf.appendSlice(a, "{\"jsonrpc\":\"2.0\",\"method\":\"reqdata\",\"params\":{\"method\":\"") catch return;
@@ -533,10 +565,10 @@ pub const Gateway = struct {
         buf.appendSlice(a, ",\"data\":") catch return;
         buf.appendSlice(a, data_json) catch return;
         buf.appendSlice(a, "}}") catch return;
-        sendWsFrame(stream, 0x01, buf.items) catch {};
+        conn.sendWsFrame(0x01, buf.items) catch {};
     }
 
-    fn wsEnd(_: *Gateway, stream: *core.compat.net.Stream, a: std.mem.Allocator, method: []const u8, reqid: []const u8) void {
+    fn wsEnd(_: *Gateway, conn: *ConnContext, a: std.mem.Allocator, method: []const u8, reqid: []const u8) void {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(a);
         buf.appendSlice(a, "{\"jsonrpc\":\"2.0\",\"method\":\"reqdata\",\"params\":{\"method\":\"") catch return;
@@ -544,10 +576,10 @@ pub const Gateway = struct {
         buf.appendSlice(a, "\",\"reqid\":") catch return;
         buf.appendSlice(a, reqid) catch return;
         buf.appendSlice(a, ",\"end\":true,\"status\":200,\"error\":null}}") catch return;
-        sendWsFrame(stream, 0x01, buf.items) catch {};
+        conn.sendWsFrame(0x01, buf.items) catch {};
     }
 
-    fn wsErr(_: *Gateway, stream: *core.compat.net.Stream, a: std.mem.Allocator, method: []const u8, reqid: []const u8, msg: []const u8) void {
+    fn wsErr(_: *Gateway, conn: *ConnContext, a: std.mem.Allocator, method: []const u8, reqid: []const u8, msg: []const u8) void {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(a);
         buf.appendSlice(a, "{\"jsonrpc\":\"2.0\",\"method\":\"reqdata\",\"params\":{\"method\":\"") catch return;
@@ -557,7 +589,7 @@ pub const Gateway = struct {
         buf.appendSlice(a, ",\"end\":true,\"status\":500,\"error\":\"") catch return;
         buf.appendSlice(a, msg) catch return;
         buf.appendSlice(a, "\"}}") catch return;
-        sendWsFrame(stream, 0x01, buf.items) catch {};
+        conn.sendWsFrame(0x01, buf.items) catch {};
     }
 
     // --- WebSocket Protocol Implementation ---
@@ -759,6 +791,10 @@ pub const Gateway = struct {
         stream: *core.compat.net.Stream,
         subscriptions: std.StringHashMap(u64),
         write_mutex: core.compat.Mutex,
+        /// Set before unsub/teardown; event writers check this under write_mutex.
+        closed: std.atomic.Value(bool) = .init(false),
+        /// In-flight EventBus deliveries that retained this connection.
+        in_flight: std.atomic.Value(u32) = .init(0),
 
         fn init(allocator: std.mem.Allocator, event_bus: *EventBus, stream: *core.compat.net.Stream) ConnContext {
             return .{
@@ -771,12 +807,27 @@ pub const Gateway = struct {
         }
 
         fn deinit(self: *ConnContext) void {
+            self.closed.store(true, .release);
             var iter = self.subscriptions.iterator();
             while (iter.next()) |entry| {
                 self.event_bus.unsubscribe(entry.key_ptr.*, entry.value_ptr.*);
                 self.allocator.free(entry.key_ptr.*);
             }
             self.subscriptions.deinit();
+            // Wait for publishers that already snapshotted us under retain.
+            while (self.in_flight.load(.acquire) != 0) {
+                std.Thread.yield() catch {};
+            }
+        }
+
+        fn retain(ctx: *anyopaque) void {
+            const self: *ConnContext = @ptrCast(@alignCast(ctx));
+            _ = self.in_flight.fetchAdd(1, .acquire);
+        }
+
+        fn release(ctx: *anyopaque) void {
+            const self: *ConnContext = @ptrCast(@alignCast(ctx));
+            _ = self.in_flight.fetchSub(1, .release);
         }
 
         fn subscribe(self: *ConnContext, channel: []const u8, filter: ?[]const u8) !void {
@@ -785,11 +836,12 @@ pub const Gateway = struct {
             const channel_copy = try self.allocator.dupe(u8, channel);
             errdefer self.allocator.free(channel_copy);
 
-            const sub_id = try self.event_bus.subscribeFiltered(
+            const sub_id = try self.event_bus.subscribeFilteredHooks(
                 channel_copy,
                 filter,
                 ConnContext.writeEvent,
                 @ptrCast(self),
+                .{ .retain_fn = ConnContext.retain, .release_fn = ConnContext.release },
             );
             errdefer self.event_bus.unsubscribe(channel_copy, sub_id);
 
@@ -803,17 +855,46 @@ pub const Gateway = struct {
             }
         }
 
-        /// Event callback — called from EventBus publisher thread.
-        /// Wraps the WormWire event response in a WebSocket binary frame.
+        /// Blocking write path for command responses and control frames.
+        fn sendWsFrame(self: *ConnContext, opcode: u8, payload: []const u8) !void {
+            self.write_mutex.lock();
+            defer self.write_mutex.unlock();
+            if (self.closed.load(.acquire)) return error.ConnectionClosed;
+            try Gateway.sendWsFrame(self.stream, opcode, payload);
+        }
+
+        fn sendWsCloseWithCode(self: *ConnContext, code: u16) !void {
+            var buf: [2]u8 = undefined;
+            std.mem.writeInt(u16, &buf, code, .big);
+            try self.sendWsFrame(0x08, &buf);
+        }
+
+        fn sendWireResponse(self: *ConnContext, response: Response) !void {
+            self.write_mutex.lock();
+            defer self.write_mutex.unlock();
+            if (self.closed.load(.acquire)) return error.ConnectionClosed;
+            try Gateway.sendWireResponseFrame(self.stream, self.allocator, response);
+        }
+
+        /// Event callback — called from EventBus publisher thread after channel.mutex
+        /// is released. Fail-soft: tryLock drops the event if the command path is
+        /// writing; socket send timeout (set on accept) bounds blocked writes.
         fn writeEvent(ctx: *anyopaque, data: []const u8) void {
             const self: *ConnContext = @ptrCast(@alignCast(ctx));
+            if (self.closed.load(.acquire)) return;
 
             // Parse the text event payload to extract channel/message
             const parsed = parseTextEvent(data) orelse return;
 
-            self.write_mutex.lock();
+            if (!self.write_mutex.tryLock()) {
+                // Another writer holds the socket — drop rather than block the
+                // publisher (and every other connection waiting on fanout).
+                self.event_bus.recordDrop();
+                return;
+            }
             defer self.write_mutex.unlock();
-            sendWireResponseFrame(self.stream, self.allocator, .{ .event = .{
+            if (self.closed.load(.acquire)) return;
+            Gateway.sendWireResponseFrame(self.stream, self.allocator, .{ .event = .{
                 .channel = parsed.channel,
                 .message = parsed.message,
             } }) catch {};
@@ -834,6 +915,13 @@ pub const Gateway = struct {
         }
     };
 };
+
+fn responseSucceeded(response: Response) bool {
+    return switch (response) {
+        .err => false,
+        else => true,
+    };
+}
 
 test "gateway allocator-backed response encoder handles payloads over 64 KiB" {
     const testing = std.testing;

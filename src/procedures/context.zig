@@ -490,8 +490,14 @@ pub const Ctx = struct {
     /// Publish an event to all subscribers of `channel`. No-op if the event
     /// bus is unattached (tests, single-node builds). Errors are logged and
     /// swallowed — pub/sub is best-effort from the procedure's perspective.
+    ///
+    /// Releases all held shard locks for the duration of the fanout (same
+    /// dance as `setDurable`). Event delivery may do socket I/O; holding a
+    /// store shard across that would wedge STATUS/GET on that shard (#84).
     pub fn publish(self: *Ctx, channel: []const u8, message: []const u8) void {
         const bus = self.event_bus orelse return;
+        const held = self.saveAndReleaseAllHeldShards();
+        defer self.reacquireAllHeldShards(held);
         bus.publish(channel, message) catch |e| {
             std.log.warn("procedure publish to '{s}' failed: {s}", .{ channel, @errorName(e) });
         };
@@ -579,4 +585,47 @@ test "Ctx arg helpers" {
     try testing.expect(ctx.argInt(i64, 99) == null); // out of bounds
     try testing.expectEqual(@as(usize, 3), ctx.argCount());
     try testing.expect(ctx.identity() == null); // no identity
+}
+
+test "Ctx.publish releases shard locks during fanout" {
+    const testing = std.testing;
+    const Config = @import("../core/config.zig").Config;
+
+    var store = try Store.init(testing.allocator, Config{ .persistence = .none });
+    defer store.deinit();
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    const Probe = struct {
+        store: *Store,
+        saw_unlocked_shard: bool = false,
+
+        fn write(raw: *anyopaque, _: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // If publish released locks, tryLock on every shard should succeed.
+            var all_free = true;
+            for (&self.store.shards) |*shard| {
+                if (!shard.mutex.tryLock()) {
+                    all_free = false;
+                    break;
+                }
+                shard.mutex.unlock();
+            }
+            self.saw_unlocked_shard = all_free;
+        }
+    };
+
+    var probe = Probe{ .store = &store };
+    _ = try bus.subscribe("ch", Probe.write, @ptrCast(&probe));
+
+    var ctx = Ctx.init(&store, &.{}, testing.allocator, null, null, &bus, null);
+    defer ctx.deinit();
+
+    ctx.lockKey("some-key");
+    try testing.expect(ctx.lock_count >= 1);
+    ctx.publish("ch", "hello");
+    // Locks re-acquired after fanout.
+    try testing.expect(ctx.lock_count >= 1);
+    try testing.expect(probe.saw_unlocked_shard);
 }

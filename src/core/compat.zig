@@ -245,6 +245,35 @@ pub fn setNoDelay(handle: std.posix.fd_t) void {
     }
 }
 
+/// Bound socket send so slow/dead peers cannot block a writer forever.
+/// Best-effort; failures are ignored.
+///
+/// Windows: `SO_SNDTIMEO` is a DWORD in milliseconds.
+/// POSIX: `struct timeval`.
+pub fn setSendTimeoutMs(handle: std.posix.fd_t, timeout_ms: u32) void {
+    if (builtin.os.tag == .windows) {
+        const setsockopt = @extern(
+            *const fn (usize, c_int, c_int, [*]const u8, c_int) callconv(.c) c_int,
+            .{ .name = "setsockopt", .library_name = "ws2_32" },
+        );
+        // winsock2.h
+        const SOL_SOCKET: c_int = 0xffff;
+        const SO_SNDTIMEO: c_int = 0x1005;
+        var ms: u32 = timeout_ms;
+        _ = setsockopt(@intFromPtr(handle), SOL_SOCKET, SO_SNDTIMEO, @ptrCast(&ms), @sizeOf(u32));
+    } else {
+        const sec: i64 = @intCast(timeout_ms / 1000);
+        const usec: i64 = @as(i64, @intCast(timeout_ms % 1000)) * 1000;
+        const timeval = std.posix.timeval{ .sec = @intCast(sec), .usec = @intCast(usec) };
+        std.posix.setsockopt(
+            handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.SNDTIMEO,
+            std.mem.asBytes(&timeval),
+        ) catch {};
+    }
+}
+
 /// Networking compatibility layer.
 /// Maps the old std.net.* API to the new std.Io.net.* API.
 pub const net = struct {

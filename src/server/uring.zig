@@ -13,6 +13,7 @@ const wire = protocol.wire;
 const event = @import("../event/mod.zig");
 const cluster_mod = @import("../cluster/mod.zig");
 const executor = @import("executor.zig");
+const ServerMetrics = @import("metrics.zig").ServerMetrics;
 
 const Store = storage.Store;
 const EventBus = event.EventBus;
@@ -92,6 +93,22 @@ pub const UringServer = struct {
         bind_address: []const u8,
         port: u16,
     ) !UringServer {
+        return initWithMetrics(allocator, store, event_bus, cluster, auth_enforce, bind_address, port, null);
+    }
+
+    pub fn initWithMetrics(
+        allocator: std.mem.Allocator,
+        store: *Store,
+        event_bus: *EventBus,
+        cluster: ?*Cluster,
+        /// Whether this binary listener enforces auth (set by the composition root from
+        /// `cfg.auth.require_auth && cfg.server.auth_enabled`). Phase 1 has no AUTH-frame handling
+        /// here, so enforce ⇒ every protected command fails closed at the executor gate.
+        auth_enforce: bool,
+        bind_address: []const u8,
+        port: u16,
+        metrics: ?*ServerMetrics,
+    ) !UringServer {
         // Create listening socket.
         // We parse the bind IP using std.Io.net.IpAddress (0.16) and manually
         // populate a posix sockaddr_in so the remainder of this module can
@@ -153,9 +170,14 @@ pub const UringServer = struct {
                 .event_bus = event_bus,
                 .cluster = cluster,
                 .auth = if (auth_enforce) .{ .enforce = null } else .disabled,
+                .metrics = metrics,
             },
             .running = false,
         };
+    }
+
+    pub fn attachMetrics(self: *UringServer, metrics: *ServerMetrics) void {
+        self.exec_ctx.metrics = metrics;
     }
 
     pub fn deinit(self: *UringServer) void {
@@ -219,7 +241,11 @@ pub const UringServer = struct {
 
     /// Free a connection slot back to the pool.
     fn freeSlot(self: *UringServer, slot: u16) void {
-        self.conns[slot].reset();
+        const conn = &self.conns[slot];
+        if (conn.active) {
+            if (self.exec_ctx.metrics) |metrics| metrics.endTcpConnection();
+        }
+        conn.reset();
         self.free_slots.appendAssumeCapacity(slot);
     }
 
@@ -270,17 +296,20 @@ pub const UringServer = struct {
             const cmd_id_byte = conn.recv_buf[0];
             const cmd_id: wire.CommandId = core.compat.intToEnum(wire.CommandId, cmd_id_byte) catch {
                 // Unknown command — send error, close
-                self.writeError(slot, "unknown command");
+                _ = self.writeError(slot, "unknown command");
                 self.flushAndClose(slot);
                 return;
             };
 
             const payload = conn.recv_buf[5..frame_len];
             const cmd = wire.parseCommandPayloadZeroCopy(cmd_id, payload, self.allocator) catch {
-                self.writeError(slot, "malformed frame");
+                _ = self.writeError(slot, "malformed frame");
                 self.flushAndClose(slot);
                 return;
             };
+
+            if (self.exec_ctx.metrics) |metrics| metrics.beginTcpCommand();
+            defer if (self.exec_ctx.metrics) |metrics| metrics.endTcpCommand();
 
             // Execute
             const response = executor.execute(self.exec_ctx, cmd) catch |err| {
@@ -291,7 +320,9 @@ pub const UringServer = struct {
                     error.KeyNotFound => "key not found",
                     error.Corruption => "data corruption",
                 };
-                self.writeError(slot, err_msg);
+                if (self.writeError(slot, err_msg)) {
+                    if (self.exec_ctx.metrics) |metrics| metrics.completeTcpCommand(false);
+                }
                 // Shift buffer, continue processing
                 self.shiftBuffer(slot, frame_len);
                 continue;
@@ -299,7 +330,9 @@ pub const UringServer = struct {
             defer protocol.deinitResponse(self.allocator, response);
 
             // Serialize response into send buffer
-            self.writeResponse(slot, response);
+            if (self.writeResponse(slot, response)) {
+                if (self.exec_ctx.metrics) |metrics| metrics.completeTcpCommand(responseSucceeded(response));
+            }
 
             // Shift consumed bytes out of recv buffer
             self.shiftBuffer(slot, frame_len);
@@ -338,14 +371,15 @@ pub const UringServer = struct {
         }
     };
 
-    fn writeResponse(self: *UringServer, slot: u16, response: Response) void {
+    fn writeResponse(self: *UringServer, slot: u16, response: Response) bool {
         const conn = &self.conns[slot];
         var writer = SendBufWriter{ .buf = &conn.send_buf, .allocator = self.allocator };
-        wire.writeResponse(&writer, response) catch {};
+        wire.writeResponse(&writer, response) catch return false;
+        return true;
     }
 
-    fn writeError(self: *UringServer, slot: u16, msg: []const u8) void {
-        self.writeResponse(slot, .{ .err = msg });
+    fn writeError(self: *UringServer, slot: u16, msg: []const u8) bool {
+        return self.writeResponse(slot, .{ .err = msg });
     }
 
     fn flushAndClose(self: *UringServer, slot: u16) void {
@@ -401,6 +435,7 @@ pub const UringServer = struct {
                             const conn = &self.conns[new_slot];
                             conn.fd = client_fd;
                             conn.active = true;
+                            if (self.exec_ctx.metrics) |metrics| metrics.beginTcpConnection();
                             self.queueRecv(new_slot) catch {
                                 core.compat.close(client_fd);
                                 self.freeSlot(new_slot);
@@ -454,3 +489,10 @@ pub const UringServer = struct {
         self.running = false;
     }
 };
+
+fn responseSucceeded(response: Response) bool {
+    return switch (response) {
+        .err => false,
+        else => true,
+    };
+}

@@ -170,6 +170,7 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
 
     var event_bus = EventBus.init(allocator);
     defer event_bus.deinit();
+    var metrics = wormdb.server.ServerMetrics.init();
 
     var cluster: ?Cluster = null;
     if (args.cluster_name != null) {
@@ -201,6 +202,7 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
         .cluster = if (cluster) |*c| c else null,
         .vector_registry = &vector_registry,
         .org_trust = &org_trust,
+        .metrics = &metrics,
     });
 
     if (cluster) |*c| c.start();

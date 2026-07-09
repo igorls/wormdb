@@ -13,6 +13,7 @@ const wire = protocol.wire;
 const event_mod = @import("../event/mod.zig");
 const cluster_mod = @import("../cluster/mod.zig");
 const executor = @import("executor.zig");
+const ServerMetrics = @import("metrics.zig").ServerMetrics;
 
 const Store = storage.Store;
 const EventBus = event_mod.EventBus;
@@ -128,6 +129,22 @@ pub const EpollServer = struct {
         bind_address: []const u8,
         port: u16,
     ) !EpollServer {
+        return initWithMetrics(allocator, store, event_bus, cluster, auth_enforce, bind_address, port, null);
+    }
+
+    pub fn initWithMetrics(
+        allocator: std.mem.Allocator,
+        store: *Store,
+        event_bus: *EventBus,
+        cluster: ?*Cluster,
+        /// Whether this binary listener enforces auth (set by the composition root from
+        /// `cfg.auth.require_auth && cfg.server.auth_enabled`). Phase 1 has no AUTH-frame handling
+        /// here, so enforce ⇒ every protected command fails closed at the executor gate.
+        auth_enforce: bool,
+        bind_address: []const u8,
+        port: u16,
+        metrics: ?*ServerMetrics,
+    ) !EpollServer {
         // Create listening socket (non-blocking). std.net and posix.socket
         // were removed in 0.16; parse IP via std.Io.net and build the
         // sockaddr_in directly, then use the libc wrappers in core.compat.
@@ -188,9 +205,14 @@ pub const EpollServer = struct {
                 .event_bus = event_bus,
                 .cluster = cluster,
                 .auth = if (auth_enforce) .{ .enforce = null } else .disabled,
+                .metrics = metrics,
             },
             .running = false,
         };
+    }
+
+    pub fn attachMetrics(self: *EpollServer, metrics: *ServerMetrics) void {
+        self.exec_ctx.metrics = metrics;
     }
 
     pub fn deinit(self: *EpollServer) void {
@@ -216,6 +238,7 @@ pub const EpollServer = struct {
             epollCtl(self.epoll_fd, linux.EPOLL.CTL_DEL, conn.fd, null) catch {};
             core.compat.close(conn.fd);
             if (conn.send_buf.len > 0) self.allocator.free(conn.send_buf);
+            if (self.exec_ctx.metrics) |metrics| metrics.endTcpConnection();
             conn.reset();
         }
         self.free_slots.appendAssumeCapacity(slot);
@@ -233,6 +256,7 @@ pub const EpollServer = struct {
                 const conn = &self.conns[slot];
                 conn.fd = client_fd;
                 conn.active = true;
+                if (self.exec_ctx.metrics) |metrics| metrics.beginTcpConnection();
 
                 // Register for read events; store slot index in data
                 var ev = linux.epoll_event{
@@ -240,9 +264,7 @@ pub const EpollServer = struct {
                     .data = .{ .u32 = slot },
                 };
                 epollCtl(self.epoll_fd, linux.EPOLL.CTL_ADD, client_fd, &ev) catch {
-                    core.compat.close(client_fd);
-                    conn.reset();
-                    self.free_slots.appendAssumeCapacity(slot);
+                    self.freeSlotAndClose(slot);
                 };
             } else {
                 core.compat.close(client_fd);
@@ -318,6 +340,9 @@ pub const EpollServer = struct {
                 return;
             };
 
+            if (self.exec_ctx.metrics) |metrics| metrics.beginTcpCommand();
+            defer if (self.exec_ctx.metrics) |metrics| metrics.endTcpCommand();
+
             const response = executor.execute(self.exec_ctx, cmd) catch |err| {
                 const err_msg: []const u8 = switch (err) {
                     error.WormViolation => "WORM violation",
@@ -327,14 +352,22 @@ pub const EpollServer = struct {
                     error.Corruption => "data corruption",
                 };
                 var w = RespBufWriter{ .buf = &conn.resp_buf, .allocator = self.allocator };
-                wire.writeResponse(&w, .{ .err = err_msg }) catch {};
+                wire.writeResponse(&w, .{ .err = err_msg }) catch {
+                    consumed += frame_len;
+                    continue;
+                };
+                if (self.exec_ctx.metrics) |metrics| metrics.completeTcpCommand(false);
                 consumed += frame_len;
                 continue;
             };
             defer protocol.deinitResponse(self.allocator, response);
 
             var w = RespBufWriter{ .buf = &conn.resp_buf, .allocator = self.allocator };
-            wire.writeResponse(&w, response) catch {};
+            wire.writeResponse(&w, response) catch {
+                consumed += frame_len;
+                continue;
+            };
+            if (self.exec_ctx.metrics) |metrics| metrics.completeTcpCommand(responseSucceeded(response));
             consumed += frame_len;
         }
 
@@ -437,3 +470,10 @@ pub const EpollServer = struct {
         self.running = false;
     }
 };
+
+fn responseSucceeded(response: Response) bool {
+    return switch (response) {
+        .err => false,
+        else => true,
+    };
+}

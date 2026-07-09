@@ -58,6 +58,10 @@ event_bus_drops=3
 | `event_bus_publishes`                         | integer | Publish calls accepted by the EventBus              |
 | `event_bus_drops`                             | integer | Event deliveries dropped because a subscriber write path was busy |
 
+### Transport Metric Wiring
+
+The stock `wormdb` binary wires one `ServerMetrics` instance into the threadpool TCP server. Embedders that start a WebSocket gateway should construct it with `Gateway.initWithMetrics(...)` or call `gateway.attachMetrics(&metrics)` before `gateway.start()`; otherwise `gateway_*` fields remain zero for that listener. Linux embedders that construct `EpollServer` or `UringServer` directly should use `initWithMetrics(...)` or `attachMetrics(...)` so `STATUS` reports the same process timestamps and transport counters.
+
 ### Cluster Mode
 
 ```

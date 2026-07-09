@@ -114,8 +114,11 @@ pub const ServerMetrics = struct {
         _ = self.tcp_commands_in_flight.fetchAdd(1, .monotonic);
     }
 
-    pub fn endTcpCommand(self: *ServerMetrics, succeeded: bool) void {
+    pub fn endTcpCommand(self: *ServerMetrics) void {
         _ = self.tcp_commands_in_flight.fetchSub(1, .monotonic);
+    }
+
+    pub fn completeTcpCommand(self: *ServerMetrics, succeeded: bool) void {
         _ = self.tcp_commands_completed.fetchAdd(1, .monotonic);
         if (succeeded) {
             _ = self.tcp_commands_succeeded.fetchAdd(1, .monotonic);
@@ -149,8 +152,11 @@ pub const ServerMetrics = struct {
         _ = self.gateway_commands_in_flight.fetchAdd(1, .monotonic);
     }
 
-    pub fn endGatewayCommand(self: *ServerMetrics, succeeded: bool) void {
+    pub fn endGatewayCommand(self: *ServerMetrics) void {
         _ = self.gateway_commands_in_flight.fetchSub(1, .monotonic);
+    }
+
+    pub fn completeGatewayCommand(self: *ServerMetrics, succeeded: bool) void {
         _ = self.gateway_commands_completed.fetchAdd(1, .monotonic);
         if (succeeded) {
             _ = self.gateway_commands_succeeded.fetchAdd(1, .monotonic);

@@ -518,8 +518,7 @@ pub const Server = struct {
             // No need for deinitCommand — arena reset handles cleanup
 
             if (self.metrics) |metrics| metrics.beginTcpCommand();
-            var command_succeeded = false;
-            defer if (self.metrics) |metrics| metrics.endTcpCommand(command_succeeded);
+            defer if (self.metrics) |metrics| metrics.endTcpCommand();
 
             const response = self.executeForConnectionWithAlloc(cmd, conn_ctx, arena_alloc) catch |err| {
                 const err_msg: []const u8 = switch (err) {
@@ -530,15 +529,16 @@ pub const Server = struct {
                     error.Corruption => "data corruption",
                     error.InvalidPredicate => "invalid filter predicate",
                 };
-                wire.writeResponse(&w, .{ .err = err_msg }) catch {};
-                w.flush() catch {};
+                wire.writeResponse(&w, .{ .err = err_msg }) catch return;
+                w.flush() catch return;
+                if (self.metrics) |metrics| metrics.completeTcpCommand(false);
                 continue;
             };
             // No defer deinitResponse needed — arena reset handles cleanup
 
             wire.writeResponse(&w, response) catch return;
             w.flush() catch return;
-            command_succeeded = responseSucceeded(response);
+            if (self.metrics) |metrics| metrics.completeTcpCommand(responseSucceeded(response));
         }
     }
 
@@ -938,8 +938,7 @@ pub const Server = struct {
         defer protocol.deinitCommand(self.allocator, cmd);
 
         if (self.metrics) |metrics| metrics.beginTcpCommand();
-        var command_succeeded = false;
-        defer if (self.metrics) |metrics| metrics.endTcpCommand(command_succeeded);
+        defer if (self.metrics) |metrics| metrics.endTcpCommand();
 
         switch (cmd) {
             .subscribe => |params| {
@@ -949,16 +948,17 @@ pub const Server = struct {
                         else => "-ERR out of memory\r\n",
                     };
                     conn_ctx.writeAllLocked(err_msg);
+                    if (self.metrics) |metrics| metrics.completeTcpCommand(false);
                     return;
                 };
                 conn_ctx.writeAllLocked("+OK\r\n");
-                command_succeeded = true;
+                if (self.metrics) |metrics| metrics.completeTcpCommand(true);
                 return;
             },
             .unsubscribe => |channel| {
                 conn_ctx.unsubscribe(channel);
                 conn_ctx.writeAllLocked("+OK\r\n");
-                command_succeeded = true;
+                if (self.metrics) |metrics| metrics.completeTcpCommand(true);
                 return;
             },
             else => {},
@@ -976,6 +976,7 @@ pub const Server = struct {
             };
             const msg = std.fmt.bufPrint(&buf, "-ERR {s}\r\n", .{err_msg}) catch "-ERR internal\r\n";
             conn_ctx.writeAllLocked(msg);
+            if (self.metrics) |metrics| metrics.completeTcpCommand(false);
             return;
         };
         defer protocol.deinitResponse(self.allocator, response);
@@ -992,7 +993,7 @@ pub const Server = struct {
         };
 
         conn_ctx.writeAllLocked(resp_str);
-        command_succeeded = responseSucceeded(response);
+        if (self.metrics) |metrics| metrics.completeTcpCommand(responseSucceeded(response));
     }
 
     fn executeForConnection(self: *Server, cmd: Command, conn_ctx: *ConnectionContext) !Response {

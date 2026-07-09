@@ -78,6 +78,17 @@ pub const Gateway = struct {
         cluster: ?*Cluster,
         port: u16,
     ) Gateway {
+        return initWithMetrics(allocator, store, event_bus, cluster, port, null);
+    }
+
+    pub fn initWithMetrics(
+        allocator: std.mem.Allocator,
+        store: *Store,
+        event_bus: *EventBus,
+        cluster: ?*Cluster,
+        port: u16,
+        metrics: ?*ServerMetrics,
+    ) Gateway {
         return .{
             .allocator = allocator,
             .store = store,
@@ -89,7 +100,7 @@ pub const Gateway = struct {
             .max_token_age = 0,
             .auth_required = false,
             .auth_mint = null,
-            .metrics = null,
+            .metrics = metrics,
         };
     }
 
@@ -254,8 +265,7 @@ pub const Gateway = struct {
                 continue;
             };
             if (self.metrics) |metrics| metrics.beginGatewayCommand();
-            var command_succeeded = false;
-            defer if (self.metrics) |metrics| metrics.endGatewayCommand(command_succeeded);
+            defer if (self.metrics) |metrics| metrics.endGatewayCommand();
 
             // Step 4: Handle AUTH command at connection level
             const resp = switch (cmd) {
@@ -344,7 +354,7 @@ pub const Gateway = struct {
             // Step 6: Encode WormWire response and send as WebSocket binary frame
             // (serialized with event fanout via ConnContext.write_mutex — #84)
             conn_ctx.sendWireResponse(resp) catch return;
-            command_succeeded = responseSucceeded(resp);
+            if (self.metrics) |metrics| metrics.completeGatewayCommand(responseSucceeded(resp));
         }
     }
 
@@ -370,10 +380,13 @@ pub const Gateway = struct {
         const line_end = std.mem.indexOf(u8, request, "\r\n") orelse return false;
         const line = request[0..line_end];
         if (self.metrics) |metrics| metrics.beginGatewayCommand();
-        var command_succeeded = false;
-        defer if (self.metrics) |metrics| metrics.endGatewayCommand(command_succeeded);
+        defer if (self.metrics) |metrics| metrics.endGatewayCommand();
         if (!std.mem.startsWith(u8, line, "GET ")) {
-            return writeHttp(stream, 405, "text/plain", "method not allowed");
+            const written = writeHttp(stream, 405, "text/plain", "method not allowed");
+            if (written) {
+                if (self.metrics) |metrics| metrics.completeGatewayCommand(false);
+            }
+            return written;
         }
         const after = line[4..];
         const sp = std.mem.indexOfScalar(u8, after, ' ') orelse return false;
@@ -386,10 +399,16 @@ pub const Gateway = struct {
 
         if (self.route(alloc, path, query)) |r| {
             const written = writeHttp(stream, r.status, r.content_type, r.body);
-            command_succeeded = written and r.status < 400;
+            if (written) {
+                if (self.metrics) |metrics| metrics.completeGatewayCommand(r.status < 400);
+            }
             return written;
         }
-        return writeHttp(stream, 404, "text/plain", "not found");
+        const written = writeHttp(stream, 404, "text/plain", "not found");
+        if (written) {
+            if (self.metrics) |metrics| metrics.completeGatewayCommand(false);
+        }
+        return written;
     }
 
     const RouteResult = struct {
@@ -487,18 +506,31 @@ pub const Gateway = struct {
         a: std.mem.Allocator,
         method: []const u8,
         reqid: []const u8,
+        completed: bool = false,
+        failed: bool = false,
     };
     fn wsEmitTramp(impl: *anyopaque, data_json: []const u8) void {
         const w: *WsImpl = @ptrCast(@alignCast(impl));
-        w.gw.wsData(w.conn, w.a, w.method, w.reqid, data_json);
+        if (w.gw.wsData(w.conn, w.a, w.method, w.reqid, data_json)) {
+            w.completed = true;
+        } else {
+            w.failed = true;
+        }
     }
     fn wsEndTramp(impl: *anyopaque) void {
         const w: *WsImpl = @ptrCast(@alignCast(impl));
-        w.gw.wsEnd(w.conn, w.a, w.method, w.reqid);
+        if (w.gw.wsEnd(w.conn, w.a, w.method, w.reqid)) {
+            w.completed = true;
+        } else {
+            w.failed = true;
+        }
     }
     fn wsErrTramp(impl: *anyopaque, msg: []const u8) void {
         const w: *WsImpl = @ptrCast(@alignCast(impl));
-        w.gw.wsErr(w.conn, w.a, w.method, w.reqid, msg);
+        if (w.gw.wsErr(w.conn, w.a, w.method, w.reqid, msg)) {
+            w.completed = true;
+        }
+        w.failed = true;
     }
     fn wsExecTramp(impl: *anyopaque, proc: []const u8, args: []const []const u8) ?[]const u8 {
         const w: *WsImpl = @ptrCast(@alignCast(impl));
@@ -507,8 +539,7 @@ pub const Gateway = struct {
 
     fn handleJsonRpc(self: *Gateway, conn: *ConnContext, a: std.mem.Allocator, text: []const u8) void {
         if (self.metrics) |metrics| metrics.beginGatewayCommand();
-        var command_succeeded = false;
-        defer if (self.metrics) |metrics| metrics.endGatewayCommand(command_succeeded);
+        defer if (self.metrics) |metrics| metrics.endGatewayCommand();
 
         const parsed = std.json.parseFromSlice(std.json.Value, a, text, .{}) catch return;
         defer parsed.deinit();
@@ -536,11 +567,15 @@ pub const Gateway = struct {
                     .execFn = wsExecTramp,
                 };
                 wm.handler(&ctx);
-                command_succeeded = true;
+                if (impl.completed) {
+                    if (self.metrics) |metrics| metrics.completeGatewayCommand(!impl.failed);
+                }
                 return;
             }
         }
-        self.wsErr(conn, a, m, reqid, "unknown method");
+        if (self.wsErr(conn, a, m, reqid, "unknown method")) {
+            if (self.metrics) |metrics| metrics.completeGatewayCommand(false);
+        }
     }
 
     /// reqid re-emitted verbatim (number or JSON string); defaults to null.
@@ -554,41 +589,44 @@ pub const Gateway = struct {
         };
     }
 
-    fn wsData(_: *Gateway, conn: *ConnContext, a: std.mem.Allocator, method: []const u8, reqid: []const u8, data_json: []const u8) void {
+    fn wsData(_: *Gateway, conn: *ConnContext, a: std.mem.Allocator, method: []const u8, reqid: []const u8, data_json: []const u8) bool {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(a);
-        buf.appendSlice(a, "{\"jsonrpc\":\"2.0\",\"method\":\"reqdata\",\"params\":{\"method\":\"") catch return;
-        buf.appendSlice(a, method) catch return;
-        buf.appendSlice(a, "\",\"reqid\":") catch return;
-        buf.appendSlice(a, reqid) catch return;
-        buf.appendSlice(a, ",\"data\":") catch return;
-        buf.appendSlice(a, data_json) catch return;
-        buf.appendSlice(a, "}}") catch return;
-        conn.sendWsFrame(0x01, buf.items) catch {};
+        buf.appendSlice(a, "{\"jsonrpc\":\"2.0\",\"method\":\"reqdata\",\"params\":{\"method\":\"") catch return false;
+        buf.appendSlice(a, method) catch return false;
+        buf.appendSlice(a, "\",\"reqid\":") catch return false;
+        buf.appendSlice(a, reqid) catch return false;
+        buf.appendSlice(a, ",\"data\":") catch return false;
+        buf.appendSlice(a, data_json) catch return false;
+        buf.appendSlice(a, "}}") catch return false;
+        conn.sendWsFrame(0x01, buf.items) catch return false;
+        return true;
     }
 
-    fn wsEnd(_: *Gateway, conn: *ConnContext, a: std.mem.Allocator, method: []const u8, reqid: []const u8) void {
+    fn wsEnd(_: *Gateway, conn: *ConnContext, a: std.mem.Allocator, method: []const u8, reqid: []const u8) bool {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(a);
-        buf.appendSlice(a, "{\"jsonrpc\":\"2.0\",\"method\":\"reqdata\",\"params\":{\"method\":\"") catch return;
-        buf.appendSlice(a, method) catch return;
-        buf.appendSlice(a, "\",\"reqid\":") catch return;
-        buf.appendSlice(a, reqid) catch return;
-        buf.appendSlice(a, ",\"end\":true,\"status\":200,\"error\":null}}") catch return;
-        conn.sendWsFrame(0x01, buf.items) catch {};
+        buf.appendSlice(a, "{\"jsonrpc\":\"2.0\",\"method\":\"reqdata\",\"params\":{\"method\":\"") catch return false;
+        buf.appendSlice(a, method) catch return false;
+        buf.appendSlice(a, "\",\"reqid\":") catch return false;
+        buf.appendSlice(a, reqid) catch return false;
+        buf.appendSlice(a, ",\"end\":true,\"status\":200,\"error\":null}}") catch return false;
+        conn.sendWsFrame(0x01, buf.items) catch return false;
+        return true;
     }
 
-    fn wsErr(_: *Gateway, conn: *ConnContext, a: std.mem.Allocator, method: []const u8, reqid: []const u8, msg: []const u8) void {
+    fn wsErr(_: *Gateway, conn: *ConnContext, a: std.mem.Allocator, method: []const u8, reqid: []const u8, msg: []const u8) bool {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(a);
-        buf.appendSlice(a, "{\"jsonrpc\":\"2.0\",\"method\":\"reqdata\",\"params\":{\"method\":\"") catch return;
-        buf.appendSlice(a, method) catch return;
-        buf.appendSlice(a, "\",\"reqid\":") catch return;
-        buf.appendSlice(a, reqid) catch return;
-        buf.appendSlice(a, ",\"end\":true,\"status\":500,\"error\":\"") catch return;
-        buf.appendSlice(a, msg) catch return;
-        buf.appendSlice(a, "\"}}") catch return;
-        conn.sendWsFrame(0x01, buf.items) catch {};
+        buf.appendSlice(a, "{\"jsonrpc\":\"2.0\",\"method\":\"reqdata\",\"params\":{\"method\":\"") catch return false;
+        buf.appendSlice(a, method) catch return false;
+        buf.appendSlice(a, "\",\"reqid\":") catch return false;
+        buf.appendSlice(a, reqid) catch return false;
+        buf.appendSlice(a, ",\"end\":true,\"status\":500,\"error\":\"") catch return false;
+        buf.appendSlice(a, msg) catch return false;
+        buf.appendSlice(a, "\"}}") catch return false;
+        conn.sendWsFrame(0x01, buf.items) catch return false;
+        return true;
     }
 
     // --- WebSocket Protocol Implementation ---

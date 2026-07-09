@@ -358,12 +358,14 @@ test "STATUS surfaces liveness and event bus counters" {
     var metrics = ServerMetrics.init();
     metrics.beginTcpConnection();
     metrics.beginTcpCommand();
-    metrics.endTcpCommand(true);
+    metrics.completeTcpCommand(true);
+    metrics.endTcpCommand();
     metrics.setTcpConnectionQueueDepth(2);
     metrics.beginGatewayThread();
     metrics.beginGatewayWebSocket();
     metrics.beginGatewayCommand();
-    metrics.endGatewayCommand(true);
+    metrics.completeGatewayCommand(true);
+    metrics.endGatewayCommand();
 
     const Capture = struct {
         fn write(_: *anyopaque, _: []const u8) void {}

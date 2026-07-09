@@ -321,7 +321,7 @@ pub const Server = struct {
         self.running.store(true, .release);
 
         const addr = try core.compat.net.Address.parseIp(self.config.bind_address, self.config.port);
-        var listener = try addr.listen(.{ .reuse_address = true });
+        var listener = try addr.listen(.{ .reuse_address = true, .kernel_backlog = 1024 });
         defer listener.deinit();
 
         // Start worker pool

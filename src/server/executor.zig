@@ -18,6 +18,7 @@ const vector_ops = @import("../procedures/vector_ops.zig");
 const Metric = @import("../vector/metric.zig").Metric;
 const auth = @import("auth.zig");
 const AuthMintConfig = procedures.context.AuthMintConfig;
+const ServerMetrics = @import("metrics.zig").ServerMetrics;
 
 /// Execute context — bundles the dependencies needed for command execution.
 pub const ExecContext = struct {
@@ -34,6 +35,8 @@ pub const ExecContext = struct {
     auth: auth.AuthContext = .trusted,
     /// Optional server-side SCT minting config for auth_mint_scoped.
     auth_mint: ?AuthMintConfig = null,
+    /// Shared process/transport liveness counters surfaced by STATUS.
+    metrics: ?*ServerMetrics = null,
 };
 
 /// Execute a command, returning the response.
@@ -95,12 +98,13 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
         .status => blk: {
             const key_count = ctx.store.count();
             const wal_size = ctx.store.walSize() catch 0;
+            const ms = if (ctx.metrics) |metrics| metrics.snapshot() else ServerMetrics.emptySnapshot();
 
             if (ctx.cluster) |cluster| {
                 const s = cluster.status();
                 const payload = try std.fmt.allocPrint(
                     ctx.allocator,
-                    "keys={d}\nwal_size={d}\ncluster_nodes={d}\ncluster_alive={d}\ncluster_suspected={d}\ncluster_dead={d}\nreplication_factor={d}\nproof_checkpoint_records={d}\nproof_witness_records={d}\nproof_last_verified_ms={d}\nanti_entropy_mode={s}\n",
+                    "keys={d}\nwal_size={d}\ncluster_nodes={d}\ncluster_alive={d}\ncluster_suspected={d}\ncluster_dead={d}\nreplication_factor={d}\nproof_checkpoint_records={d}\nproof_witness_records={d}\nproof_last_verified_ms={d}\nanti_entropy_mode={s}\nserver_started_ms={d}\nstatus_generated_ms={d}\ntcp_connections_active={d}\ntcp_commands_in_flight={d}\ntcp_commands_completed={d}\ntcp_commands_succeeded={d}\ntcp_last_successful_command_completed_ms={d}\ntcp_connection_queue_depth={d}\ngateway_connections_active={d}\ngateway_websocket_connections_active={d}\ngateway_threads_active={d}\ngateway_commands_in_flight={d}\ngateway_commands_completed={d}\ngateway_commands_succeeded={d}\ngateway_last_successful_command_completed_ms={d}\nevent_bus_channels={d}\nevent_bus_subscribers={d}\nevent_bus_publishes={d}\nevent_bus_drops={d}\n",
                     .{
                         key_count,
                         wal_size,
@@ -113,6 +117,25 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
                         s.proof_witness_records,
                         s.proof_last_verified_ms,
                         s.anti_entropy_mode,
+                        ms.started_ms,
+                        ms.status_generated_ms,
+                        ms.tcp_connections_active,
+                        ms.tcp_commands_in_flight,
+                        ms.tcp_commands_completed,
+                        ms.tcp_commands_succeeded,
+                        ms.tcp_last_successful_command_completed_ms,
+                        ms.tcp_connection_queue_depth,
+                        ms.gateway_connections_active,
+                        ms.gateway_websocket_connections_active,
+                        ms.gateway_threads_active,
+                        ms.gateway_commands_in_flight,
+                        ms.gateway_commands_completed,
+                        ms.gateway_commands_succeeded,
+                        ms.gateway_last_successful_command_completed_ms,
+                        ctx.event_bus.channelCount(),
+                        ctx.event_bus.subscriberCount(),
+                        ctx.event_bus.publishCount(),
+                        ctx.event_bus.dropCount(),
                     },
                 );
                 break :blk Response{ .value = payload };
@@ -120,8 +143,30 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
 
             const payload = try std.fmt.allocPrint(
                 ctx.allocator,
-                "keys={d}\nwal_size={d}\ncluster_enabled=0\n",
-                .{ key_count, wal_size },
+                "keys={d}\nwal_size={d}\ncluster_enabled=0\nserver_started_ms={d}\nstatus_generated_ms={d}\ntcp_connections_active={d}\ntcp_commands_in_flight={d}\ntcp_commands_completed={d}\ntcp_commands_succeeded={d}\ntcp_last_successful_command_completed_ms={d}\ntcp_connection_queue_depth={d}\ngateway_connections_active={d}\ngateway_websocket_connections_active={d}\ngateway_threads_active={d}\ngateway_commands_in_flight={d}\ngateway_commands_completed={d}\ngateway_commands_succeeded={d}\ngateway_last_successful_command_completed_ms={d}\nevent_bus_channels={d}\nevent_bus_subscribers={d}\nevent_bus_publishes={d}\nevent_bus_drops={d}\n",
+                .{
+                    key_count,
+                    wal_size,
+                    ms.started_ms,
+                    ms.status_generated_ms,
+                    ms.tcp_connections_active,
+                    ms.tcp_commands_in_flight,
+                    ms.tcp_commands_completed,
+                    ms.tcp_commands_succeeded,
+                    ms.tcp_last_successful_command_completed_ms,
+                    ms.tcp_connection_queue_depth,
+                    ms.gateway_connections_active,
+                    ms.gateway_websocket_connections_active,
+                    ms.gateway_threads_active,
+                    ms.gateway_commands_in_flight,
+                    ms.gateway_commands_completed,
+                    ms.gateway_commands_succeeded,
+                    ms.gateway_last_successful_command_completed_ms,
+                    ctx.event_bus.channelCount(),
+                    ctx.event_bus.subscriberCount(),
+                    ctx.event_bus.publishCount(),
+                    ctx.event_bus.dropCount(),
+                },
             );
             break :blk Response{ .value = payload };
         },
@@ -301,6 +346,52 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
             break :blk .ok;
         },
     };
+}
+
+test "STATUS surfaces liveness and event bus counters" {
+    const testing = std.testing;
+    var store = try Store.init(testing.allocator, .{ .persistence = .none });
+    defer store.deinit();
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    var metrics = ServerMetrics.init();
+    metrics.beginTcpConnection();
+    metrics.beginTcpCommand();
+    metrics.endTcpCommand(true);
+    metrics.setTcpConnectionQueueDepth(2);
+    metrics.beginGatewayThread();
+    metrics.beginGatewayWebSocket();
+    metrics.beginGatewayCommand();
+    metrics.endGatewayCommand(true);
+
+    const Capture = struct {
+        fn write(_: *anyopaque, _: []const u8) void {}
+    };
+    _ = try bus.subscribe("ops", Capture.write, @ptrCast(&metrics));
+    try bus.publish("ops", "{}");
+
+    const resp = try execute(.{
+        .allocator = testing.allocator,
+        .store = &store,
+        .event_bus = &bus,
+        .cluster = null,
+        .metrics = &metrics,
+    }, .status);
+    defer if (resp.value) |value| testing.allocator.free(value);
+    try testing.expect(resp == .value);
+    const value = resp.value.?;
+    try testing.expect(std.mem.containsAtLeast(u8, value, 1, "tcp_connections_active=1\n"));
+    try testing.expect(std.mem.containsAtLeast(u8, value, 1, "tcp_commands_completed=1\n"));
+    try testing.expect(std.mem.containsAtLeast(u8, value, 1, "tcp_commands_succeeded=1\n"));
+    try testing.expect(std.mem.containsAtLeast(u8, value, 1, "tcp_connection_queue_depth=2\n"));
+    try testing.expect(std.mem.containsAtLeast(u8, value, 1, "gateway_connections_active=1\n"));
+    try testing.expect(std.mem.containsAtLeast(u8, value, 1, "gateway_websocket_connections_active=1\n"));
+    try testing.expect(std.mem.containsAtLeast(u8, value, 1, "gateway_commands_completed=1\n"));
+    try testing.expect(std.mem.containsAtLeast(u8, value, 1, "event_bus_channels=1\n"));
+    try testing.expect(std.mem.containsAtLeast(u8, value, 1, "event_bus_subscribers=1\n"));
+    try testing.expect(std.mem.containsAtLeast(u8, value, 1, "event_bus_publishes=1\n"));
+    try testing.expect(std.mem.containsAtLeast(u8, value, 1, "event_bus_drops=0\n"));
 }
 
 test "executor auth gate: enforce blocks unauthenticated writes, public passes, disabled/trusted bypass" {

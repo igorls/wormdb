@@ -48,6 +48,7 @@ const Command = core.types.Command;
 const Response = core.types.Response;
 const Cluster = cluster_mod.Cluster;
 const Sha1 = std.crypto.hash.Sha1;
+const ServerMetrics = @import("metrics.zig").ServerMetrics;
 
 /// WebSocket gateway server.
 pub const Gateway = struct {
@@ -68,6 +69,7 @@ pub const Gateway = struct {
     /// Optional server-side SCT minting config.
     auth_mint: ?AuthMintConfig,
     /// Optional shared liveness/concurrency counters surfaced by STATUS.
+    metrics: ?*ServerMetrics,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -87,7 +89,12 @@ pub const Gateway = struct {
             .max_token_age = 0,
             .auth_required = false,
             .auth_mint = null,
+            .metrics = null,
         };
+    }
+
+    pub fn attachMetrics(self: *Gateway, metrics: *ServerMetrics) void {
+        self.metrics = metrics;
     }
 
     /// Run the gateway on a dedicated thread. Call from main after server start.
@@ -131,6 +138,8 @@ pub const Gateway = struct {
 
     fn handleConnection(self: *Gateway, conn: core.compat.net.ServerCompat.Connection) void {
         var stream = conn.stream;
+        if (self.metrics) |metrics| metrics.beginGatewayThread();
+        defer if (self.metrics) |metrics| metrics.endGatewayThread();
         defer stream.close();
 
         // Disable Nagle for low-latency request/response
@@ -162,6 +171,8 @@ pub const Gateway = struct {
             .{accept_value},
         ) catch return;
         stream.writeAll(response) catch return;
+        if (self.metrics) |metrics| metrics.beginGatewayWebSocket();
+        defer if (self.metrics) |metrics| metrics.endGatewayWebSocket();
 
         // Step 2: WebSocket session — command loop
         var conn_ctx = ConnContext.init(self.allocator, self.event_bus, &stream);
@@ -242,6 +253,10 @@ pub const Gateway = struct {
                 conn_ctx.sendWsFrame(0x02, err_resp) catch return;
                 continue;
             };
+            if (self.metrics) |metrics| metrics.beginGatewayCommand();
+            var command_succeeded = false;
+            defer if (self.metrics) |metrics| metrics.endGatewayCommand(command_succeeded);
+
             // Step 4: Handle AUTH command at connection level
             const resp = switch (cmd) {
                 .auth => |token| blk: {
@@ -312,6 +327,7 @@ pub const Gateway = struct {
                         else
                             .disabled,
                         .auth_mint = self.auth_mint,
+                        .metrics = self.metrics,
                     }, cmd) catch |err| {
                         const err_msg: []const u8 = switch (err) {
                             error.WormViolation => "WORM violation",
@@ -328,6 +344,7 @@ pub const Gateway = struct {
             // Step 6: Encode WormWire response and send as WebSocket binary frame
             // (serialized with event fanout via ConnContext.write_mutex — #84)
             conn_ctx.sendWireResponse(resp) catch return;
+            command_succeeded = responseSucceeded(resp);
         }
     }
 
@@ -352,6 +369,9 @@ pub const Gateway = struct {
     fn handleHttpRequest(self: *Gateway, stream: *core.compat.net.Stream, alloc: std.mem.Allocator, request: []const u8) bool {
         const line_end = std.mem.indexOf(u8, request, "\r\n") orelse return false;
         const line = request[0..line_end];
+        if (self.metrics) |metrics| metrics.beginGatewayCommand();
+        var command_succeeded = false;
+        defer if (self.metrics) |metrics| metrics.endGatewayCommand(command_succeeded);
         if (!std.mem.startsWith(u8, line, "GET ")) {
             return writeHttp(stream, 405, "text/plain", "method not allowed");
         }
@@ -365,7 +385,9 @@ pub const Gateway = struct {
         }
 
         if (self.route(alloc, path, query)) |r| {
-            return writeHttp(stream, r.status, r.content_type, r.body);
+            const written = writeHttp(stream, r.status, r.content_type, r.body);
+            command_succeeded = written and r.status < 400;
+            return written;
         }
         return writeHttp(stream, 404, "text/plain", "not found");
     }
@@ -425,6 +447,7 @@ pub const Gateway = struct {
             .cluster = self.cluster,
             .auth = if (self.auth_required) .{ .enforce = null } else .disabled,
             .auth_mint = self.auth_mint,
+            .metrics = self.metrics,
         }, .{ .exec = .{ .procedure = proc, .args = args } }) catch return null;
         return switch (resp) {
             .value => |v| v orelse "null",
@@ -483,6 +506,10 @@ pub const Gateway = struct {
     }
 
     fn handleJsonRpc(self: *Gateway, conn: *ConnContext, a: std.mem.Allocator, text: []const u8) void {
+        if (self.metrics) |metrics| metrics.beginGatewayCommand();
+        var command_succeeded = false;
+        defer if (self.metrics) |metrics| metrics.endGatewayCommand(command_succeeded);
+
         const parsed = std.json.parseFromSlice(std.json.Value, a, text, .{}) catch return;
         defer parsed.deinit();
         if (parsed.value != .object) return;
@@ -509,6 +536,7 @@ pub const Gateway = struct {
                     .execFn = wsExecTramp,
                 };
                 wm.handler(&ctx);
+                command_succeeded = true;
                 return;
             }
         }
@@ -886,6 +914,13 @@ pub const Gateway = struct {
         }
     };
 };
+
+fn responseSucceeded(response: Response) bool {
+    return switch (response) {
+        .err => false,
+        else => true,
+    };
+}
 
 test "gateway allocator-backed response encoder handles payloads over 64 KiB" {
     const testing = std.testing;

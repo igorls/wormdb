@@ -20,7 +20,6 @@ const Metric = @import("../vector/metric.zig").Metric;
 const AuthMintConfig = @import("../procedures/context.zig").AuthMintConfig;
 const auth = @import("auth.zig");
 const org_trust_mod = @import("../cluster/org_trust.zig");
-const ServerMetrics = @import("metrics.zig").ServerMetrics;
 
 /// Fallback trust when no org_trust is configured: enforce=false, zero grants.
 /// A W2 handshake verified against it always fails OrgNotTrusted (deny-by-default).
@@ -49,7 +48,6 @@ pub const ServerConfig = struct {
     /// Optional server-side SCT minting config.
     auth_mint: ?AuthMintConfig = null,
     /// Optional shared liveness/concurrency counters surfaced by STATUS.
-    metrics: ?*ServerMetrics = null,
     /// Org trust for the replication channel (#63). Null or `enforce=false`
     /// keeps legacy behavior: unauthenticated "WR" connections are accepted.
     /// When enforcing: "WR" is rejected loudly, "W2" requires the org-cert
@@ -64,7 +62,6 @@ pub const Server = struct {
     event_bus: *EventBus,
     cluster: ?*Cluster,
     config: ServerConfig,
-    metrics: ?*ServerMetrics,
     running: std.atomic.Value(bool),
 
     // Thread pool infrastructure
@@ -310,7 +307,6 @@ pub const Server = struct {
             .event_bus = event_bus,
             .cluster = config.cluster,
             .config = config,
-            .metrics = config.metrics,
             .running = std.atomic.Value(bool).init(false),
             .conn_queue = .{},
             .workers = &.{},
@@ -347,11 +343,9 @@ pub const Server = struct {
             if (!self.conn_queue.push(conn)) {
                 // Queue full — reject connection
                 std.log.warn("Connection queue full, rejecting", .{});
-                if (self.metrics) |metrics| metrics.setTcpConnectionQueueDepth(self.conn_queue.len());
                 conn.stream.close();
                 continue;
             }
-            if (self.metrics) |metrics| metrics.setTcpConnectionQueueDepth(self.conn_queue.len());
         }
 
         // Shutdown: wake all workers so they exit
@@ -367,7 +361,6 @@ pub const Server = struct {
     fn workerLoop(self: *Server) void {
         while (self.running.load(.acquire)) {
             if (self.conn_queue.pop()) |conn| {
-                if (self.metrics) |metrics| metrics.setTcpConnectionQueueDepth(self.conn_queue.len());
                 self.handleConnection(conn);
             } else {
                 // Wait for new connections
@@ -376,7 +369,6 @@ pub const Server = struct {
         }
         // Drain remaining connections on shutdown
         while (self.conn_queue.pop()) |conn| {
-            if (self.metrics) |metrics| metrics.setTcpConnectionQueueDepth(self.conn_queue.len());
             self.handleConnection(conn);
         }
     }
@@ -387,8 +379,6 @@ pub const Server = struct {
 
     fn handleConnection(self: *Server, conn: core.compat.net.ServerCompat.Connection) void {
         var stream = conn.stream;
-        if (self.metrics) |metrics| metrics.beginTcpConnection();
-        defer if (self.metrics) |metrics| metrics.endTcpConnection();
 
         // Disable Nagle's algorithm — critical for low-latency request/response.
         // Without this, small response packets get buffered for up to 40ms.
@@ -516,11 +506,6 @@ pub const Server = struct {
                 }
             };
             // No need for deinitCommand — arena reset handles cleanup
-
-            if (self.metrics) |metrics| metrics.beginTcpCommand();
-            var command_succeeded = false;
-            defer if (self.metrics) |metrics| metrics.endTcpCommand(command_succeeded);
-
             const response = self.executeForConnectionWithAlloc(cmd, conn_ctx, arena_alloc) catch |err| {
                 const err_msg: []const u8 = switch (err) {
                     error.WormViolation => "WORM violation",
@@ -538,7 +523,6 @@ pub const Server = struct {
 
             wire.writeResponse(&w, response) catch return;
             w.flush() catch return;
-            command_succeeded = responseSucceeded(response);
         }
     }
 
@@ -937,10 +921,6 @@ pub const Server = struct {
         };
         defer protocol.deinitCommand(self.allocator, cmd);
 
-        if (self.metrics) |metrics| metrics.beginTcpCommand();
-        var command_succeeded = false;
-        defer if (self.metrics) |metrics| metrics.endTcpCommand(command_succeeded);
-
         switch (cmd) {
             .subscribe => |params| {
                 conn_ctx.subscribe(params.channel, params.filter) catch |err| {
@@ -952,13 +932,11 @@ pub const Server = struct {
                     return;
                 };
                 conn_ctx.writeAllLocked("+OK\r\n");
-                command_succeeded = true;
                 return;
             },
             .unsubscribe => |channel| {
                 conn_ctx.unsubscribe(channel);
                 conn_ctx.writeAllLocked("+OK\r\n");
-                command_succeeded = true;
                 return;
             },
             else => {},
@@ -992,7 +970,6 @@ pub const Server = struct {
         };
 
         conn_ctx.writeAllLocked(resp_str);
-        command_succeeded = responseSucceeded(response);
     }
 
     fn executeForConnection(self: *Server, cmd: Command, conn_ctx: *ConnectionContext) !Response {
@@ -1071,18 +1048,10 @@ pub const Server = struct {
                 else
                     .disabled,
                 .auth_mint = self.config.auth_mint,
-                .metrics = self.metrics,
             }, cmd),
         };
     }
 };
-
-fn responseSucceeded(response: Response) bool {
-    return switch (response) {
-        .err => false,
-        else => true,
-    };
-}
 
 test "Server SUB/UNSUB command wiring updates subscriber count" {
     const testing = std.testing;

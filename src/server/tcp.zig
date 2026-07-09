@@ -47,6 +47,7 @@ pub const ServerConfig = struct {
     auth_max_token_age: u64 = 0,
     /// Optional server-side SCT minting config.
     auth_mint: ?AuthMintConfig = null,
+    /// Optional shared liveness/concurrency counters surfaced by STATUS.
     /// Org trust for the replication channel (#63). Null or `enforce=false`
     /// keeps legacy behavior: unauthenticated "WR" connections are accepted.
     /// When enforcing: "WR" is rejected loudly, "W2" requires the org-cert
@@ -100,6 +101,12 @@ pub const Server = struct {
             self.count -= 1;
             return conn;
         }
+
+        fn len(self: *ConnQueue) usize {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.count;
+        }
     };
 
     const TEXT_READ_BUF_SIZE = 16384;
@@ -115,6 +122,8 @@ pub const Server = struct {
         /// Verified SCT token state, set by an AUTH frame. Heap-allocated from
         /// `allocator` (NOT the per-command arena — it must outlive commands).
         auth_state: ?auth.TokenState,
+        closed: std.atomic.Value(bool) = .init(false),
+        in_flight: std.atomic.Value(u32) = .init(0),
 
         fn init(allocator: std.mem.Allocator, event_bus: *EventBus, stream: ?*core.compat.net.Stream) ConnectionContext {
             return .{
@@ -148,6 +157,7 @@ pub const Server = struct {
         }
 
         fn deinit(self: *ConnectionContext) void {
+            self.closed.store(true, .release);
             var iter = self.subscriptions.iterator();
             while (iter.next()) |entry| {
                 const channel = entry.key_ptr.*;
@@ -157,6 +167,19 @@ pub const Server = struct {
             }
             self.subscriptions.deinit();
             self.clearAuthState();
+            while (self.in_flight.load(.acquire) != 0) {
+                std.Thread.yield() catch {};
+            }
+        }
+
+        fn retain(ctx: *anyopaque) void {
+            const self: *ConnectionContext = @ptrCast(@alignCast(ctx));
+            _ = self.in_flight.fetchAdd(1, .acquire);
+        }
+
+        fn release(ctx: *anyopaque) void {
+            const self: *ConnectionContext = @ptrCast(@alignCast(ctx));
+            _ = self.in_flight.fetchSub(1, .release);
         }
 
         fn clearAuthState(self: *ConnectionContext) void {
@@ -174,7 +197,13 @@ pub const Server = struct {
             const channel_copy = try self.allocator.dupe(u8, channel);
             errdefer self.allocator.free(channel_copy);
 
-            const sub_id = try self.event_bus.subscribeFiltered(channel_copy, filter, ConnectionContext.writeEvent, @ptrCast(self));
+            const sub_id = try self.event_bus.subscribeFilteredHooks(
+                channel_copy,
+                filter,
+                ConnectionContext.writeEvent,
+                @ptrCast(self),
+                .{ .retain_fn = ConnectionContext.retain, .release_fn = ConnectionContext.release },
+            );
             errdefer self.event_bus.unsubscribe(channel_copy, sub_id);
 
             try self.subscriptions.put(channel_copy, sub_id);
@@ -202,12 +231,19 @@ pub const Server = struct {
 
         fn writeEvent(ctx: *anyopaque, data: []const u8) void {
             const self: *ConnectionContext = @ptrCast(@alignCast(ctx));
+            if (self.closed.load(.acquire)) return;
+
+            // Fail-soft: if the command path holds the write mutex, drop the
+            // event rather than blocking the publisher under EventBus fanout.
+            if (!self.write_mutex.tryLock()) {
+                self.event_bus.recordDrop();
+                return;
+            }
+            defer self.write_mutex.unlock();
+            if (self.closed.load(.acquire)) return;
 
             if (self.binary_mode) {
                 const parsed = parseTextEventPayload(data) orelse return;
-
-                self.write_mutex.lock();
-                defer self.write_mutex.unlock();
 
                 if (self.write_capture) |capture| {
                     capture.appendSlice(self.allocator, data) catch {};
@@ -222,7 +258,12 @@ pub const Server = struct {
                 return;
             }
 
-            self.writeAllLocked(data);
+            if (self.write_capture) |capture| {
+                capture.appendSlice(self.allocator, data) catch {};
+            }
+            if (self.stream) |stream| {
+                stream.writeAll(data) catch {};
+            }
         }
 
         const ParsedTextEvent = struct {
@@ -303,6 +344,7 @@ pub const Server = struct {
                 // Queue full — reject connection
                 std.log.warn("Connection queue full, rejecting", .{});
                 conn.stream.close();
+                continue;
             }
         }
 
@@ -341,6 +383,8 @@ pub const Server = struct {
         // Disable Nagle's algorithm — critical for low-latency request/response.
         // Without this, small response packets get buffered for up to 40ms.
         core.compat.setNoDelay(stream.getHandle());
+        // Bound sends so a slow peer cannot pin an EventBus publisher (#84).
+        core.compat.setSendTimeoutMs(stream.getHandle(), 2_000);
         var conn_ctx = ConnectionContext.init(self.allocator, self.event_bus, &stream);
         defer conn_ctx.deinit();
         defer conn.stream.close();
@@ -462,7 +506,6 @@ pub const Server = struct {
                 }
             };
             // No need for deinitCommand — arena reset handles cleanup
-
             const response = self.executeForConnectionWithAlloc(cmd, conn_ctx, arena_alloc) catch |err| {
                 const err_msg: []const u8 = switch (err) {
                     error.WormViolation => "WORM violation",

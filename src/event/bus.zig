@@ -2,15 +2,23 @@
 //!
 //! Supports channels with multiple subscribers.
 //! Thread-safe with atomic operations for subscriber counts.
+//!
+//! Fanout contract (#84): `publish` never holds `channel.mutex` across
+//! `write_fn` (socket I/O). Subscribers that may outlive the deliver window
+//! must supply retain/release hooks so connection teardown cannot free
+//! `ctx` while a publisher is still delivering.
 
 const std = @import("std");
 const core = @import("../core/mod.zig");
 const compat = core.compat;
 const predicate = core.predicate;
 
+pub const WriteFn = *const fn (ctx: *anyopaque, data: []const u8) void;
+pub const LifetimeFn = *const fn (ctx: *anyopaque) void;
+
 pub const Subscriber = struct {
     id: u64,
-    write_fn: *const fn (ctx: *anyopaque, data: []const u8) void,
+    write_fn: WriteFn,
     ctx: *anyopaque,
     filter: ?predicate.Predicate = null,
     // Owned copy of the raw filter bytes. The parsed `filter` predicate stores
@@ -19,6 +27,10 @@ pub const Subscriber = struct {
     // this the predicate would dangle into the transient per-command buffer.
     filter_src: ?[]u8 = null,
     filter_allocator: ?std.mem.Allocator = null,
+    /// Incremented under channel.mutex before unlock-for-deliver; pairs with release.
+    retain_fn: ?LifetimeFn = null,
+    /// Called after write_fn returns (or if snapshot assembly fails mid-way).
+    release_fn: ?LifetimeFn = null,
 
     fn deinit(self: *Subscriber) void {
         if (self.filter) |*filter| filter.deinit();
@@ -26,6 +38,18 @@ pub const Subscriber = struct {
             if (self.filter_allocator) |a| a.free(src);
         }
     }
+};
+
+/// Optional lifetime hooks for connection-backed subscribers (gateway/TCP).
+pub const LifetimeHooks = struct {
+    retain_fn: ?LifetimeFn = null,
+    release_fn: ?LifetimeFn = null,
+};
+
+const Delivery = struct {
+    write_fn: WriteFn,
+    ctx: *anyopaque,
+    release_fn: ?LifetimeFn,
 };
 
 pub const Channel = struct {
@@ -61,6 +85,8 @@ pub const EventBus = struct {
     pub const Stats = struct {
         publish_count: std.atomic.Value(u64),
         subscriber_count: std.atomic.Value(u64),
+        /// Events dropped because a subscriber's write path was busy (tryLock fail).
+        drop_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     };
 
     pub fn init(allocator: std.mem.Allocator) EventBus {
@@ -71,6 +97,7 @@ pub const EventBus = struct {
             .stats = .{
                 .publish_count = std.atomic.Value(u64).init(0),
                 .subscriber_count = std.atomic.Value(u64).init(0),
+                .drop_count = std.atomic.Value(u64).init(0),
             },
         };
     }
@@ -88,7 +115,7 @@ pub const EventBus = struct {
     pub fn subscribe(
         self: *EventBus,
         channel_name: []const u8,
-        write_fn: *const fn (ctx: *anyopaque, data: []const u8) void,
+        write_fn: WriteFn,
         ctx: *anyopaque,
     ) !u64 {
         return self.subscribeFiltered(channel_name, null, write_fn, ctx);
@@ -98,8 +125,19 @@ pub const EventBus = struct {
         self: *EventBus,
         channel_name: []const u8,
         filter_raw: ?[]const u8,
-        write_fn: *const fn (ctx: *anyopaque, data: []const u8) void,
+        write_fn: WriteFn,
         ctx: *anyopaque,
+    ) !u64 {
+        return self.subscribeFilteredHooks(channel_name, filter_raw, write_fn, ctx, .{});
+    }
+
+    pub fn subscribeFilteredHooks(
+        self: *EventBus,
+        channel_name: []const u8,
+        filter_raw: ?[]const u8,
+        write_fn: WriteFn,
+        ctx: *anyopaque,
+        hooks: LifetimeHooks,
     ) !u64 {
         // Own a copy of the raw filter bytes: the parsed predicate borrows
         // slices from it and the subscription outlives the caller's buffer.
@@ -137,6 +175,8 @@ pub const EventBus = struct {
             .filter = parsed_filter,
             .filter_src = filter_src,
             .filter_allocator = self.allocator,
+            .retain_fn = hooks.retain_fn,
+            .release_fn = hooks.release_fn,
         });
         parsed_filter = null;
         filter_src = null;
@@ -161,28 +201,72 @@ pub const EventBus = struct {
         }
     }
 
+    /// Publish `message` to all subscribers of `channel_name`.
+    ///
+    /// Filter matching runs under `channel.mutex`. Delivery (`write_fn`) runs
+    /// **after both** the bus map lock and the channel lock are released so
+    /// slow socket I/O cannot stall other publishers, block subscribe
+    /// (exclusive bus lock), or wedge unsubscribe. Callers that free `ctx`
+    /// on disconnect must provide retain/release hooks.
+    ///
+    /// Channel pointers remain valid for the process lifetime of the bus
+    /// (channels are only destroyed in `EventBus.deinit`).
     pub fn publish(self: *EventBus, channel_name: []const u8, message: []const u8) !void {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+        const channel: *Channel = blk: {
+            self.mutex.lockShared();
+            defer self.mutex.unlockShared();
+            break :blk self.channels.get(channel_name) orelse return;
+        };
 
-        const channel = self.channels.get(channel_name) orelse return;
         const event_msg = try std.fmt.allocPrint(self.allocator, ">EVENT {s}\r\n{s}\r\n", .{ channel_name, message });
         defer self.allocator.free(event_msg);
         const ts_ms = eventTimestamp(self.allocator, message);
 
-        channel.mutex.lock();
-        defer channel.mutex.unlock();
-
-        var iter = channel.subscribers.iterator();
-        while (iter.next()) |entry| {
-            const sub = entry.value_ptr.*;
-            if (sub.filter) |filter| {
-                if (!filter.matches(message, ts_ms)) continue;
+        var deliveries: std.ArrayListUnmanaged(Delivery) = .empty;
+        defer {
+            // Only runs if we abort before the deliver loop takes ownership;
+            // after successful assembly the loop clears via release_fn.
+            for (deliveries.items) |d| {
+                if (d.release_fn) |rel| rel(d.ctx);
             }
-            sub.write_fn(sub.ctx, event_msg);
+            deliveries.deinit(self.allocator);
         }
 
-        _ = self.stats.publish_count.fetchAdd(1, .monotonic);
+        {
+            channel.mutex.lock();
+            defer channel.mutex.unlock();
+
+            var iter = channel.subscribers.iterator();
+            while (iter.next()) |entry| {
+                const sub = entry.value_ptr.*;
+                if (sub.filter) |filter| {
+                    if (!filter.matches(message, ts_ms)) continue;
+                }
+                // Retain before leaving the lock so deinit cannot free ctx.
+                if (sub.retain_fn) |retain| retain(sub.ctx);
+                errdefer if (sub.release_fn) |rel| rel(sub.ctx);
+
+                try deliveries.append(self.allocator, .{
+                    .write_fn = sub.write_fn,
+                    .ctx = sub.ctx,
+                    .release_fn = sub.release_fn,
+                });
+            }
+
+            _ = self.stats.publish_count.fetchAdd(1, .monotonic);
+        }
+
+        // Deliver outside all bus/channel locks — head-of-line socket I/O must
+        // not serialize all publishers or block subscribe/unsubscribe.
+        var i: usize = 0;
+        while (i < deliveries.items.len) : (i += 1) {
+            const d = deliveries.items[i];
+            // Clear release from the defer list by nulling so defer doesn't double-release.
+            deliveries.items[i].release_fn = null;
+            d.write_fn(d.ctx, event_msg);
+            if (d.release_fn) |rel| rel(d.ctx);
+        }
+        deliveries.clearRetainingCapacity();
     }
 
     pub fn channelCount(self: *EventBus) usize {
@@ -197,6 +281,15 @@ pub const EventBus = struct {
 
     pub fn publishCount(self: *EventBus) u64 {
         return self.stats.publish_count.load(.monotonic);
+    }
+
+    pub fn dropCount(self: *EventBus) u64 {
+        return self.stats.drop_count.load(.monotonic);
+    }
+
+    /// Record a dropped event delivery (busy write path). Called from transports.
+    pub fn recordDrop(self: *EventBus) void {
+        _ = self.stats.drop_count.fetchAdd(1, .monotonic);
     }
 };
 
@@ -305,4 +398,135 @@ test "EventBus rejects malformed subscription filter" {
         error.InvalidPredicate,
         bus.subscribeFiltered("memory", "filter='meta.user.name=\"x\"'", TestContext.write, @ptrCast(&ctx)),
     );
+}
+
+test "EventBus publish does not hold channel mutex across write_fn" {
+    const testing = std.testing;
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    const State = struct {
+        bus: *EventBus,
+        nested_publish_ok: bool = false,
+        nested_sub_ok: bool = false,
+
+        fn write(ctx: *anyopaque, _: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            // Must not deadlock: channel.mutex is released before write_fn.
+            self.bus.publish("other", "nested") catch return;
+            self.nested_publish_ok = true;
+
+            const Dummy = struct {
+                fn w(_: *anyopaque, _: []const u8) void {}
+            };
+            var dummy: u8 = 0;
+            const id = self.bus.subscribe("other", Dummy.w, @ptrCast(&dummy)) catch return;
+            self.bus.unsubscribe("other", id);
+            self.nested_sub_ok = true;
+        }
+    };
+
+    var state = State{ .bus = &bus };
+    _ = try bus.subscribe("ch", State.write, @ptrCast(&state));
+    try bus.publish("ch", "ping");
+    try testing.expect(state.nested_publish_ok);
+    try testing.expect(state.nested_sub_ok);
+}
+
+test "EventBus write_fn can unsubscribe self without deadlock" {
+    const testing = std.testing;
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    const State = struct {
+        bus: *EventBus,
+        channel: []const u8,
+        sub_id: u64 = 0,
+        calls: usize = 0,
+
+        fn write(ctx: *anyopaque, _: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            self.bus.unsubscribe(self.channel, self.sub_id);
+        }
+    };
+
+    var state = State{ .bus = &bus, .channel = "self-unsub" };
+    state.sub_id = try bus.subscribe("self-unsub", State.write, @ptrCast(&state));
+    try bus.publish("self-unsub", "bye");
+    try testing.expectEqual(@as(usize, 1), state.calls);
+    try testing.expectEqual(@as(u64, 0), bus.subscriberCount());
+
+    // Second publish has no subscribers — must not call write or hang.
+    try bus.publish("self-unsub", "again");
+    try testing.expectEqual(@as(usize, 1), state.calls);
+}
+
+test "EventBus retain/release keeps ctx alive across concurrent unsub" {
+    const testing = std.testing;
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    const State = struct {
+        alive: std.atomic.Value(bool) = .init(true),
+        in_flight: std.atomic.Value(u32) = .init(0),
+        writes: std.atomic.Value(u32) = .init(0),
+        gate: std.atomic.Value(bool) = .init(false),
+        bus: *EventBus,
+        channel: []const u8 = "life",
+        sub_id: u64 = 0,
+
+        fn retain(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.in_flight.fetchAdd(1, .acquire);
+        }
+        fn release(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.in_flight.fetchSub(1, .release);
+        }
+        fn write(ctx: *anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            // Hold until main thread has unsubscribed (slow-consumer race).
+            while (!self.gate.load(.acquire)) {
+                std.Thread.yield() catch {};
+            }
+            if (!self.alive.load(.acquire)) return;
+            _ = data;
+            _ = self.writes.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var state = State{ .bus = &bus };
+    state.sub_id = try bus.subscribeFilteredHooks(
+        "life",
+        null,
+        State.write,
+        @ptrCast(&state),
+        .{ .retain_fn = State.retain, .release_fn = State.release },
+    );
+
+    const Pub = struct {
+        fn run(b: *EventBus) void {
+            b.publish("life", "payload") catch {};
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Pub.run, .{&bus});
+
+    // Wait until publisher has retained us, then unsubscribe under race.
+    while (state.in_flight.load(.acquire) == 0) {
+        std.Thread.yield() catch {};
+    }
+    bus.unsubscribe("life", state.sub_id);
+    state.alive.store(false, .release);
+    state.gate.store(true, .release);
+
+    thread.join();
+
+    // Drain in-flight: publisher must have released.
+    try testing.expectEqual(@as(u32, 0), state.in_flight.load(.acquire));
+    // Write either completed (1) or saw closed (0) — never UAF crash.
+    try testing.expect(state.writes.load(.acquire) <= 1);
 }

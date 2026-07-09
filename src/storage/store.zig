@@ -585,16 +585,11 @@ pub const Store = struct {
     fn createMemoryEntry(self: *Store, key: []const u8, value: []const u8, is_worm: bool, timestamp: u64) StoreError!*Entry {
         const e = self.allocator.create(Entry) catch return error.OutOfMemory;
         errdefer self.allocator.destroy(e);
-        const ek = self.allocator.dupe(u8, key) catch {
-            self.allocator.destroy(e);
-            return error.OutOfMemory;
-        };
+        // Use errdefer only for cleanup — do not free manually in catch arms
+        // or errdefer will double-free on the same error path (#90 review).
+        const ek = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(ek);
-        const ev = self.allocator.dupe(u8, value) catch {
-            self.allocator.free(ek);
-            self.allocator.destroy(e);
-            return error.OutOfMemory;
-        };
+        const ev = try self.allocator.dupe(u8, value);
         e.* = .{ .key = ek, .value = ev, .timestamp = timestamp, .flags = .{ .is_worm = is_worm, .is_deleted = false } };
         return e;
     }

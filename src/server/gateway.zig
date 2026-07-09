@@ -814,10 +814,11 @@ pub const Gateway = struct {
     // --- Helpers ---
 
     fn wireEncodeError(msg: []const u8) []const u8 {
-        // Pre-encoded error responses for common cases.
         // Format: [0x03 (err code)][4B len][msg]
-        // For simplicity we return a comptime-known slice for short messages.
+        // For common short messages we use comptime-known slices; for dynamic
+        // messages the caller must use an arena-allocated buffer.
         _ = msg;
+        // TODO: encode the actual message. For now, return a generic error.
         return &[_]u8{ 0x03, 0x00, 0x00, 0x00, 0x05 } ++ "error";
     }
 

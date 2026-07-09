@@ -466,33 +466,67 @@ pub const Store = struct {
         const si = shardIndex(key);
         const shard = &self.shards[si];
 
-        // Phase 1: WORM check under shard lock only (no WAL I/O while held — #91).
-        {
-            shard.mutex.lock();
-            defer shard.mutex.unlock();
-            if (shard.data.get(key)) |existing| {
-                if (existing.flags.is_worm) return error.WormViolation;
-            } else if (self.sstHit(key)) |frozen| {
-                // A frozen WORM key may not be shadowed by a live write — that
-                // would silently serve the new value over the immutable one.
-                if (frozen.is_worm) return error.WormViolation;
-            }
-        }
-
-        // Phase 2: durable record / entry allocation without the shard lock.
-        const entry = if (self.config.persistence == .full) blk: {
+        // Durable path: hold the key shard only for WORM checks + map insert.
+        // WAL enqueue uses wal_enqueue_mutex alone so snapshot+truncate can
+        // exclude concurrent durable writers (see maybeSnapshotAndTruncate).
+        //
+        // Order: optional early WORM check → wal_enqueue → (append) → shard
+        // re-check+put → release wal_enqueue → maybeSnapshot.
+        // Holding wal_enqueue across append+put prevents a WORM race from
+        // acknowledging failure after a durable WAL append was published to
+        // concurrent snapshot truncation (#92 review).
+        if (self.config.persistence == .full) {
+            // Manual unlock (not defer): maybeSnapshotAndTruncate also takes
+            // wal_enqueue_mutex — must not hold it across that call.
             self.wal_enqueue_mutex.lock();
-            defer self.wal_enqueue_mutex.unlock();
-            break :blk self.wal.?.appendSet(key, value, .{ .is_worm = is_worm, .is_deleted = false }, timestamp) catch {
+
+            {
+                shard.mutex.lock();
+                defer shard.mutex.unlock();
+                if (shard.data.get(key)) |existing| {
+                    if (existing.flags.is_worm) {
+                        self.wal_enqueue_mutex.unlock();
+                        return error.WormViolation;
+                    }
+                } else if (self.sstHit(key)) |frozen| {
+                    if (frozen.is_worm) {
+                        self.wal_enqueue_mutex.unlock();
+                        return error.WormViolation;
+                    }
+                }
+            }
+
+            const entry = self.wal.?.appendSet(key, value, .{ .is_worm = is_worm, .is_deleted = false }, timestamp) catch {
+                self.wal_enqueue_mutex.unlock();
                 return error.IoError;
             };
-        } else blk: {
-            break :blk try self.createMemoryEntry(key, value, is_worm, timestamp);
-        };
-        errdefer self.destroyEntry(entry);
 
-        // Phase 3: insert under shard lock with WORM re-check (race window).
-        {
+            {
+                shard.mutex.lock();
+                defer shard.mutex.unlock();
+                // Durable WORM races serialize on wal_enqueue. setUnsafe WORM
+                // under the shard lock is visible here.
+                if (shard.data.get(key)) |existing| {
+                    if (existing.flags.is_worm) {
+                        self.destroyEntry(entry);
+                        self.wal_enqueue_mutex.unlock();
+                        return error.WormViolation;
+                    }
+                } else if (self.sstHit(key)) |frozen| {
+                    if (frozen.is_worm) {
+                        self.destroyEntry(entry);
+                        self.wal_enqueue_mutex.unlock();
+                        return error.WormViolation;
+                    }
+                }
+                self.shardPutLocked(shard, entry) catch |err| {
+                    self.destroyEntry(entry);
+                    self.wal_enqueue_mutex.unlock();
+                    return err;
+                };
+            }
+            self.wal_enqueue_mutex.unlock();
+        } else {
             shard.mutex.lock();
             defer shard.mutex.unlock();
             if (shard.data.get(key)) |existing| {
@@ -500,6 +534,8 @@ pub const Store = struct {
             } else if (self.sstHit(key)) |frozen| {
                 if (frozen.is_worm) return error.WormViolation;
             }
+            const entry = try self.createMemoryEntry(key, value, is_worm, timestamp);
+            errdefer self.destroyEntry(entry);
             try self.shardPutLocked(shard, entry);
         }
 
@@ -1157,6 +1193,12 @@ pub const Store = struct {
         if (self.config.sync_writes) return;
         if (self.config.max_wal_size == 0) return;
         if (self.wal) |*w| {
+            // Hold wal_enqueue for the entire snap+truncate window so no
+            // concurrent durable SET can append a WAL record that is missing
+            // from the snapshot copy and then get wiped by truncate (#92 P1).
+            self.wal_enqueue_mutex.lock();
+            defer self.wal_enqueue_mutex.unlock();
+
             const wal_size = try w.size();
             if (wal_size < self.config.max_wal_size) return;
             try self.writeSnapshot();
@@ -1165,9 +1207,11 @@ pub const Store = struct {
     }
 
     fn writeSnapshot(self: *Store) !void {
-        // Phase 1: under all shard locks, deep-copy live entries into owned
-        // buffers. Phase 2 (disk I/O) must NOT hold shard locks — that froze
-        // STATUS and concurrent EXECs for the whole snapshot duration (#91).
+        // Phase 1: under all shard locks, deep-copy live KV (+ optional HNSW
+        // trailer bytes) into owned buffers. Phase 2 (disk I/O) does NOT hold
+        // shard locks — that froze STATUS/EXECs for the whole snapshot (#91).
+        // Callers that truncate the WAL must hold wal_enqueue_mutex across
+        // this function + truncate so durable writers cannot interleave.
         const SnapRec = struct {
             key: []u8,
             value: []u8,
@@ -1183,6 +1227,9 @@ pub const Store = struct {
             }
             records.deinit(self.allocator);
         }
+
+        var hnsw_trailer: std.ArrayListUnmanaged(u8) = .empty;
+        defer hnsw_trailer.deinit(self.allocator);
 
         {
             for (&self.shards) |*shard| shard.mutex.lock();
@@ -1207,6 +1254,25 @@ pub const Store = struct {
                         .flags = flags,
                         .timestamp = entry.timestamp,
                     });
+                }
+            }
+
+            // Capture HNSW while shards are still locked so the trailer matches
+            // the copied KV set (Copilot: unlocked writeTo raced with vinsert).
+            if (self.vector_registry) |reg| {
+                if (reg.map.count() > 0) {
+                    const MemWriter = struct {
+                        list: *std.ArrayListUnmanaged(u8),
+                        allocator: std.mem.Allocator,
+                        pub fn writeAll(mw: *@This(), data: []const u8) !void {
+                            try mw.list.appendSlice(mw.allocator, data);
+                        }
+                    };
+                    var mw = MemWriter{ .list = &hnsw_trailer, .allocator = self.allocator };
+                    reg.writeTo(&mw) catch |err| {
+                        std.log.warn("writeSnapshot: HNSW trailer skipped: {s}", .{@errorName(err)});
+                        hnsw_trailer.clearRetainingCapacity();
+                    };
                 }
             }
         }
@@ -1256,15 +1322,8 @@ pub const Store = struct {
             try writer.writeAll(rec.value);
         }
 
-        // ── v2 HNSW trailer (optional) ──
-        // Registry writeTo takes its own per-namespace locks; store shards are
-        // intentionally unlocked so STATUS/EXECs can proceed during disk I/O.
-        if (self.vector_registry) |reg| {
-            if (reg.map.count() > 0) {
-                reg.writeTo(&writer) catch |err| {
-                    std.log.warn("writeSnapshot: HNSW trailer skipped: {s}", .{@errorName(err)});
-                };
-            }
+        if (hnsw_trailer.items.len > 0) {
+            try writer.writeAll(hnsw_trailer.items);
         }
 
         try writer.flush();

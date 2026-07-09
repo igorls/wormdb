@@ -864,7 +864,8 @@ pub const Gateway = struct {
 
         fn retain(ctx: *anyopaque) void {
             const self: *ConnContext = @ptrCast(@alignCast(ctx));
-            _ = self.refs.fetchAdd(1, .acquire);
+            // Monotonic is enough for refcount increment (Copilot #92).
+            _ = self.refs.fetchAdd(1, .monotonic);
         }
 
         fn release(ctx: *anyopaque) void {
@@ -873,7 +874,9 @@ pub const Gateway = struct {
         }
 
         fn releaseRef(self: *ConnContext) void {
-            if (self.refs.fetchSub(1, .release) == 1) {
+            // acq_rel on the last drop: free must not race prior writers that
+            // only synchronized with .release on their fetchSub.
+            if (self.refs.fetchSub(1, .acq_rel) == 1) {
                 const a = self.allocator;
                 a.destroy(self);
             }

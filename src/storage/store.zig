@@ -1711,14 +1711,24 @@ test "setUnsafe does not append to WAL under full persistence (#88)" {
         var store = try Store.init(testing.allocator, config);
         defer store.deinit();
 
+        // setUnsafe requires the key's shard lock (procedure Ctx.lockKey contract).
+        const set_unsafe = struct {
+            fn call(s: *Store, key: []const u8, value: []const u8) !void {
+                const si = shardIndex(key);
+                s.shards[si].mutex.lock();
+                defer s.shards[si].mutex.unlock();
+                try s.setUnsafe(key, value, false);
+            }
+        }.call;
+
         const wal_before = try store.walSize();
 
         // Procedure-style hot write: live map only, no WAL growth.
-        try store.setUnsafe("hot:counter", "1", false);
+        try set_unsafe(&store, "hot:counter", "1");
         try testing.expectEqual(wal_before, try store.walSize());
         try testing.expectEqualStrings("1", store.get("hot:counter").?.value);
 
-        try store.setUnsafe("hot:counter", "2", false);
+        try set_unsafe(&store, "hot:counter", "2");
         try testing.expectEqual(wal_before, try store.walSize());
         try testing.expectEqualStrings("2", store.get("hot:counter").?.value);
 
@@ -1728,7 +1738,7 @@ test "setUnsafe does not append to WAL under full persistence (#88)" {
         try testing.expect(wal_after_set > wal_before);
 
         // More unsafe writes still must not grow WAL further.
-        try store.setUnsafe("hot:other", "x", false);
+        try set_unsafe(&store, "hot:other", "x");
         try testing.expectEqual(wal_after_set, try store.walSize());
     }
 

@@ -436,9 +436,15 @@ pub const Store = struct {
         return self.shards[shardIndex(key)].data.get(key);
     }
 
-    /// Write without acquiring a lock. Caller must hold the key shard lock.
+    /// Write without acquiring a lock and **without WAL**. Caller must hold
+    /// the key shard lock. Used by procedure hot-path (`Ctx.set` / `setInt`).
+    ///
+    /// On `.full` persistence the durable path is `set` / `setWithTimestamp`
+    /// (or procedure `setDurable*`). Unsafe writes stay in the live map only
+    /// until the next snapshot — they must not enqueue WAL records or they
+    /// would pay WAL IO and be replayed on restart (#88).
     pub fn setUnsafe(self: *Store, key: []const u8, value: []const u8, is_worm: bool) StoreError!void {
-        return self.setInternalLocked(shardIndex(key), key, value, is_worm);
+        return self.setInternalLockedNoWal(shardIndex(key), key, value, is_worm);
     }
 
     /// Write — acquires only the key shard mutex.
@@ -478,19 +484,7 @@ pub const Store = struct {
             break :blk e;
         } else blk: {
             // snapshot/none mode: create Entry directly, no WAL IO
-            const e = self.allocator.create(Entry) catch return error.OutOfMemory;
-            errdefer self.allocator.destroy(e);
-            const ek = self.allocator.dupe(u8, key) catch {
-                self.allocator.destroy(e);
-                return error.OutOfMemory;
-            };
-            const ev = self.allocator.dupe(u8, value) catch {
-                self.allocator.free(ek);
-                self.allocator.destroy(e);
-                return error.OutOfMemory;
-            };
-            e.* = .{ .key = ek, .value = ev, .timestamp = timestamp, .flags = .{ .is_worm = is_worm, .is_deleted = false } };
-            break :blk e;
+            break :blk try self.createMemoryEntry(key, value, is_worm, timestamp);
         };
         errdefer self.destroyEntry(entry);
 
@@ -566,7 +560,10 @@ pub const Store = struct {
         self.shards[pair.low].mutex.unlock();
     }
 
-    fn setInternalLocked(self: *Store, si: usize, key: []const u8, value: []const u8, is_worm: bool) StoreError!void {
+    /// In-memory put under an already-held shard lock. Never touches the WAL
+    /// or snapshot truncation (callers that need durability use `set` /
+    /// `setWithTimestamp`). Enforces live and frozen WORM immutability.
+    fn setInternalLockedNoWal(self: *Store, si: usize, key: []const u8, value: []const u8, is_worm: bool) StoreError!void {
         const shard = &self.shards[si];
         const timestamp: u64 = @intCast(compat.nowMs());
 
@@ -578,36 +575,28 @@ pub const Store = struct {
             if (frozen.is_worm) return error.WormViolation;
         }
 
-        const entry = if (self.config.persistence == .full) blk: {
-            self.wal_enqueue_mutex.lock();
-            const e = self.wal.?.appendSet(key, value, .{ .is_worm = is_worm, .is_deleted = false }, timestamp) catch {
-                self.wal_enqueue_mutex.unlock();
-                return error.IoError;
-            };
-            self.wal_enqueue_mutex.unlock();
-            break :blk e;
-        } else blk: {
-            const e = self.allocator.create(Entry) catch return error.OutOfMemory;
-            errdefer self.allocator.destroy(e);
-            const ek = self.allocator.dupe(u8, key) catch {
-                self.allocator.destroy(e);
-                return error.OutOfMemory;
-            };
-            const ev = self.allocator.dupe(u8, value) catch {
-                self.allocator.free(ek);
-                self.allocator.destroy(e);
-                return error.OutOfMemory;
-            };
-            e.* = .{ .key = ek, .value = ev, .timestamp = timestamp, .flags = .{ .is_worm = is_worm, .is_deleted = false } };
-            break :blk e;
-        };
+        const entry = try self.createMemoryEntry(key, value, is_worm, timestamp);
         errdefer self.destroyEntry(entry);
-
         try self.shardPutLocked(shard, entry);
+    }
 
-        if (self.config.persistence == .full) {
-            self.maybeSnapshotAndTruncate() catch {};
-        }
+    /// Allocate an Entry that is not backed by a WAL record (snapshot/none
+    /// durable path, or setUnsafe procedure path).
+    fn createMemoryEntry(self: *Store, key: []const u8, value: []const u8, is_worm: bool, timestamp: u64) StoreError!*Entry {
+        const e = self.allocator.create(Entry) catch return error.OutOfMemory;
+        errdefer self.allocator.destroy(e);
+        const ek = self.allocator.dupe(u8, key) catch {
+            self.allocator.destroy(e);
+            return error.OutOfMemory;
+        };
+        errdefer self.allocator.free(ek);
+        const ev = self.allocator.dupe(u8, value) catch {
+            self.allocator.free(ek);
+            self.allocator.destroy(e);
+            return error.OutOfMemory;
+        };
+        e.* = .{ .key = ek, .value = ev, .timestamp = timestamp, .flags = .{ .is_worm = is_worm, .is_deleted = false } };
+        return e;
     }
 
     /// Delete a key.
@@ -1696,6 +1685,66 @@ test "Store restores from snapshot then replays WAL" {
         try testing.expectEqualStrings("12345678901234567890123456789012345678901234567890", reloaded.get("k1").?.value);
         try testing.expectEqualStrings("v2", reloaded.get("k2").?.value);
         try testing.expect(reloaded.get("k2").?.flags.is_worm);
+    }
+}
+
+test "setUnsafe does not append to WAL under full persistence (#88)" {
+    const testing = std.testing;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_setunsafe_nowal.wal", .{tmp_path});
+    defer testing.allocator.free(wal_path);
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_setunsafe_nowal.snapshot", .{tmp_path});
+    defer testing.allocator.free(snapshot_path);
+
+    const file = try compat.Dir.createFile(tmp_dir.dir, "test_setunsafe_nowal.wal", .{});
+    compat.File.close(file);
+
+    const config = Config{
+        .wal_path = wal_path,
+        .snapshot_path = snapshot_path,
+        .persistence = .full,
+        .sync_writes = false,
+        .max_wal_size = 10 * 1024 * 1024,
+    };
+
+    {
+        var store = try Store.init(testing.allocator, config);
+        defer store.deinit();
+
+        const wal_before = try store.walSize();
+
+        // Procedure-style hot write: live map only, no WAL growth.
+        try store.setUnsafe("hot:counter", "1", false);
+        try testing.expectEqual(wal_before, try store.walSize());
+        try testing.expectEqualStrings("1", store.get("hot:counter").?.value);
+
+        try store.setUnsafe("hot:counter", "2", false);
+        try testing.expectEqual(wal_before, try store.walSize());
+        try testing.expectEqualStrings("2", store.get("hot:counter").?.value);
+
+        // Durable SET still enqueues WAL.
+        try store.set("durable:k", "v", false);
+        const wal_after_set = try store.walSize();
+        try testing.expect(wal_after_set > wal_before);
+
+        // More unsafe writes still must not grow WAL further.
+        try store.setUnsafe("hot:other", "x", false);
+        try testing.expectEqual(wal_after_set, try store.walSize());
+    }
+
+    // After restart: durable key replays; unsafe-only keys are gone.
+    {
+        var reloaded = try Store.init(testing.allocator, config);
+        defer reloaded.deinit();
+
+        try testing.expectEqualStrings("v", reloaded.get("durable:k").?.value);
+        try testing.expect(reloaded.get("hot:counter") == null);
+        try testing.expect(reloaded.get("hot:other") == null);
     }
 }
 

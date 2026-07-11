@@ -104,7 +104,7 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
                 const s = cluster.status();
                 const payload = try std.fmt.allocPrint(
                     ctx.allocator,
-                    "keys={d}\nwal_size={d}\ncluster_nodes={d}\ncluster_alive={d}\ncluster_suspected={d}\ncluster_dead={d}\nreplication_factor={d}\nproof_checkpoint_records={d}\nproof_witness_records={d}\nproof_last_verified_ms={d}\nanti_entropy_mode={s}\nserver_started_ms={d}\nstatus_generated_ms={d}\ntcp_connections_active={d}\ntcp_commands_in_flight={d}\ntcp_commands_completed={d}\ntcp_commands_succeeded={d}\ntcp_last_successful_command_completed_ms={d}\ntcp_connection_queue_depth={d}\ngateway_connections_active={d}\ngateway_websocket_connections_active={d}\ngateway_threads_active={d}\ngateway_commands_in_flight={d}\ngateway_commands_completed={d}\ngateway_commands_succeeded={d}\ngateway_last_successful_command_completed_ms={d}\nevent_bus_channels={d}\nevent_bus_subscribers={d}\nevent_bus_publishes={d}\nevent_bus_drops={d}\n",
+                    "keys={d}\nwal_size={d}\ncluster_nodes={d}\ncluster_alive={d}\ncluster_suspected={d}\ncluster_dead={d}\nreplication_factor={d}\nproof_checkpoint_records={d}\nproof_witness_records={d}\nproof_last_verified_ms={d}\nanti_entropy_mode={s}\nserver_started_ms={d}\nstatus_generated_ms={d}\ntcp_connections_active={d}\ntcp_commands_in_flight={d}\ntcp_commands_completed={d}\ntcp_commands_succeeded={d}\ntcp_last_successful_command_completed_ms={d}\ntcp_connection_queue_depth={d}\ngateway_connections_active={d}\ngateway_websocket_connections_active={d}\ngateway_threads_active={d}\ngateway_commands_in_flight={d}\ngateway_commands_completed={d}\ngateway_commands_succeeded={d}\ngateway_last_successful_command_completed_ms={d}\ngateway_per_ip_rejections={d}\nevent_bus_channels={d}\nevent_bus_subscribers={d}\nevent_bus_publishes={d}\nevent_bus_drops={d}\n",
                     .{
                         key_count,
                         wal_size,
@@ -132,6 +132,7 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
                         ms.gateway_commands_completed,
                         ms.gateway_commands_succeeded,
                         ms.gateway_last_successful_command_completed_ms,
+                        ms.gateway_per_ip_rejections,
                         ctx.event_bus.channelCount(),
                         ctx.event_bus.subscriberCount(),
                         ctx.event_bus.publishCount(),
@@ -143,7 +144,7 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
 
             const payload = try std.fmt.allocPrint(
                 ctx.allocator,
-                "keys={d}\nwal_size={d}\ncluster_enabled=0\nserver_started_ms={d}\nstatus_generated_ms={d}\ntcp_connections_active={d}\ntcp_commands_in_flight={d}\ntcp_commands_completed={d}\ntcp_commands_succeeded={d}\ntcp_last_successful_command_completed_ms={d}\ntcp_connection_queue_depth={d}\ngateway_connections_active={d}\ngateway_websocket_connections_active={d}\ngateway_threads_active={d}\ngateway_commands_in_flight={d}\ngateway_commands_completed={d}\ngateway_commands_succeeded={d}\ngateway_last_successful_command_completed_ms={d}\nevent_bus_channels={d}\nevent_bus_subscribers={d}\nevent_bus_publishes={d}\nevent_bus_drops={d}\n",
+                "keys={d}\nwal_size={d}\ncluster_enabled=0\nserver_started_ms={d}\nstatus_generated_ms={d}\ntcp_connections_active={d}\ntcp_commands_in_flight={d}\ntcp_commands_completed={d}\ntcp_commands_succeeded={d}\ntcp_last_successful_command_completed_ms={d}\ntcp_connection_queue_depth={d}\ngateway_connections_active={d}\ngateway_websocket_connections_active={d}\ngateway_threads_active={d}\ngateway_commands_in_flight={d}\ngateway_commands_completed={d}\ngateway_commands_succeeded={d}\ngateway_last_successful_command_completed_ms={d}\ngateway_per_ip_rejections={d}\nevent_bus_channels={d}\nevent_bus_subscribers={d}\nevent_bus_publishes={d}\nevent_bus_drops={d}\n",
                 .{
                     key_count,
                     wal_size,
@@ -162,6 +163,7 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
                     ms.gateway_commands_completed,
                     ms.gateway_commands_succeeded,
                     ms.gateway_last_successful_command_completed_ms,
+                    ms.gateway_per_ip_rejections,
                     ctx.event_bus.channelCount(),
                     ctx.event_bus.subscriberCount(),
                     ctx.event_bus.publishCount(),

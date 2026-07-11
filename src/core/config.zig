@@ -119,6 +119,17 @@ pub const GatewayConfig = struct {
     /// false only on a trusted network to disable capability checks on the WS listener.
     auth_enabled: bool = true,
 
+    /// Max concurrent WebSocket-gateway connections per client IP. 0 (default) = unlimited.
+    /// NEVER default this to a small number: players behind one NAT and localhost capacity
+    /// benches share a single address (#89). Enforced only when the peer address is
+    /// resolvable on the accept path; rejections are logged and counted in STATUS
+    /// (`gateway_per_ip_rejections`).
+    max_connections_per_ip: u32 = 0,
+
+    /// Exempt loopback peers (127.0.0.0/8, ::1) from `max_connections_per_ip` so local
+    /// benches can open hundreds of sockets from one address (#89).
+    per_ip_exempt_loopback: bool = true,
+
     /// Per-transport auth opt-out for the QUIC/WebTransport gateway. Secure by default (true).
     quic_auth_enabled: bool = true,
 };
@@ -253,6 +264,23 @@ test "loadFromJson: empty object uses defaults" {
     try std.testing.expectEqual(true, cfg.server.auth_enabled);
     try std.testing.expectEqual(true, cfg.gateway.auth_enabled);
     try std.testing.expectEqual(true, cfg.gateway.quic_auth_enabled);
+    // Per-IP cap ships OFF (#89): a default cap breaks NAT'd players and localhost benches.
+    try std.testing.expectEqual(@as(u32, 0), cfg.gateway.max_connections_per_ip);
+    try std.testing.expectEqual(true, cfg.gateway.per_ip_exempt_loopback);
+}
+
+test "loadFromJson: gateway per-IP cap overrides" {
+    const cfg = try loadFromJson(
+        \\{
+        \\  "gateway": {
+        \\    "enabled": true,
+        \\    "max_connections_per_ip": 256,
+        \\    "per_ip_exempt_loopback": false
+        \\  }
+        \\}
+    , std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 256), cfg.gateway.max_connections_per_ip);
+    try std.testing.expectEqual(false, cfg.gateway.per_ip_exempt_loopback);
 }
 
 test "loadFromJson: override specific fields" {

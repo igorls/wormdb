@@ -20,6 +20,7 @@ pub const ServerMetrics = struct {
     gateway_commands_completed: std.atomic.Value(u64),
     gateway_commands_succeeded: std.atomic.Value(u64),
     gateway_last_successful_command_completed_ms: std.atomic.Value(u64),
+    gateway_per_ip_rejections: std.atomic.Value(u64),
 
     pub const Snapshot = struct {
         started_ms: u64,
@@ -39,6 +40,7 @@ pub const ServerMetrics = struct {
         gateway_commands_completed: u64,
         gateway_commands_succeeded: u64,
         gateway_last_successful_command_completed_ms: u64,
+        gateway_per_ip_rejections: u64,
     };
 
     pub fn init() ServerMetrics {
@@ -58,6 +60,7 @@ pub const ServerMetrics = struct {
             .gateway_commands_completed = std.atomic.Value(u64).init(0),
             .gateway_commands_succeeded = std.atomic.Value(u64).init(0),
             .gateway_last_successful_command_completed_ms = std.atomic.Value(u64).init(0),
+            .gateway_per_ip_rejections = std.atomic.Value(u64).init(0),
         };
     }
 
@@ -79,6 +82,7 @@ pub const ServerMetrics = struct {
             .gateway_commands_completed = 0,
             .gateway_commands_succeeded = 0,
             .gateway_last_successful_command_completed_ms = 0,
+            .gateway_per_ip_rejections = 0,
         };
     }
 
@@ -99,6 +103,7 @@ pub const ServerMetrics = struct {
             .gateway_commands_completed = self.gateway_commands_completed.load(.monotonic),
             .gateway_commands_succeeded = self.gateway_commands_succeeded.load(.monotonic),
             .gateway_last_successful_command_completed_ms = self.gateway_last_successful_command_completed_ms.load(.monotonic),
+            .gateway_per_ip_rejections = self.gateway_per_ip_rejections.load(.monotonic),
         };
     }
 
@@ -154,6 +159,10 @@ pub const ServerMetrics = struct {
 
     pub fn endGatewayCommand(self: *ServerMetrics) void {
         _ = self.gateway_commands_in_flight.fetchSub(1, .monotonic);
+    }
+
+    pub fn recordGatewayPerIpRejection(self: *ServerMetrics) void {
+        _ = self.gateway_per_ip_rejections.fetchAdd(1, .monotonic);
     }
 
     pub fn completeGatewayCommand(self: *ServerMetrics, succeeded: bool) void {

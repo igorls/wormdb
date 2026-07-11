@@ -24,6 +24,26 @@ Or in `wormdb.json`:
 
 The gateway shares the same store, event bus, procedure registry, cluster handle, and vector registry as the TCP server.
 
+## Per-IP Connection Cap
+
+`gateway.max_connections_per_ip` bounds concurrent gateway connections per client IP. The default is **0 = unlimited** — a small default cap would break real deployments, because players behind one NAT (schools, offices) and localhost capacity benches all share a single address ([#89](https://github.com/igorls/wormdb/issues/89)).
+
+```json
+{
+  "gateway": {
+    "enabled": true,
+    "port": 6390,
+    "max_connections_per_ip": 1024,
+    "per_ip_exempt_loopback": true
+  }
+}
+```
+
+- The cap is enforced only when the peer address is resolvable on the accept path; a connection that cannot be attributed to an IP is admitted uncounted, never rejected.
+- `per_ip_exempt_loopback` (default `true`) skips the cap for `127.0.0.0/8` and `::1`, so local benches can open hundreds of sockets from one address.
+- Each rejection is logged with the peer address and active count, and counted in the `STATUS` field `gateway_per_ip_rejections`.
+- Embedders starting the gateway themselves apply the setting with `gateway.setPerIpLimit(cfg.gateway.max_connections_per_ip, cfg.gateway.per_ip_exempt_loopback)` before `gateway.start()`.
+
 ## WormWire Over WebSocket
 
 Binary WebSocket frames carry WormWire command and response frames without the raw TCP `WW` preface. Browser clients can use `apps/browser/src/client.ts` and the demo pages under `apps/browser/demo/`.

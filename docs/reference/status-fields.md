@@ -27,6 +27,7 @@ gateway_commands_in_flight=2
 gateway_commands_completed=884
 gateway_commands_succeeded=870
 gateway_last_successful_command_completed_ms=1783570059988
+gateway_per_ip_rejections=0
 event_bus_channels=4
 event_bus_subscribers=41
 event_bus_publishes=516
@@ -53,6 +54,7 @@ event_bus_drops=3
 | `gateway_commands_completed`                  | integer | Gateway commands that reached a response write completion path |
 | `gateway_commands_succeeded`                  | integer | Completed gateway commands whose response was not `ERR` |
 | `gateway_last_successful_command_completed_ms` | integer | Last successful gateway command completion timestamp; `0` until one succeeds |
+| `gateway_per_ip_rejections`                   | integer | Connections rejected by the per-IP cap (`gateway.max_connections_per_ip`); `0` when the cap is unset |
 | `event_bus_channels`                          | integer | Pub/sub channels currently allocated                |
 | `event_bus_subscribers`                       | integer | Active pub/sub subscriptions                        |
 | `event_bus_publishes`                         | integer | Publish calls accepted by the EventBus              |
@@ -91,6 +93,7 @@ gateway_commands_in_flight=2
 gateway_commands_completed=884
 gateway_commands_succeeded=870
 gateway_last_successful_command_completed_ms=1783570059988
+gateway_per_ip_rejections=0
 event_bus_channels=4
 event_bus_subscribers=41
 event_bus_publishes=516

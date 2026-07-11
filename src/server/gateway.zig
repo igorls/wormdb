@@ -50,6 +50,70 @@ const Cluster = cluster_mod.Cluster;
 const Sha1 = std.crypto.hash.Sha1;
 const ServerMetrics = @import("metrics.zig").ServerMetrics;
 
+/// Per-IP concurrent-connection accounting for the gateway accept path (#89).
+/// Keys are peer IPs normalized to 16 bytes (IPv4 mapped to ::ffff:a.b.c.d) so a
+/// v4 peer and the same peer seen as v4-mapped-v6 share one bucket. Guarded by
+/// `core.compat.Mutex` (NOT `std.Thread.Mutex`, which is gone in Zig 0.16).
+/// Fails open: an OOM while tracking admits the connection uncounted — the cap
+/// is a brake against address-sharing floods, not a security boundary.
+pub const IpLimiter = struct {
+    allocator: std.mem.Allocator,
+    mutex: core.compat.Mutex = .{},
+    counts: std.AutoHashMapUnmanaged(Key, u32) = .empty,
+
+    pub const Key = [16]u8;
+
+    const v4_mapped_prefix = [12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+
+    pub fn init(allocator: std.mem.Allocator) IpLimiter {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *IpLimiter) void {
+        self.counts.deinit(self.allocator);
+    }
+
+    pub fn keyFromAddress(addr: std.Io.net.IpAddress) Key {
+        return std.Io.net.Ip6Address.fromAny(addr).bytes;
+    }
+
+    /// ::1 or ::ffff:127.0.0.0/8.
+    pub fn isLoopback(key: Key) bool {
+        const v6_loopback = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+        if (std.mem.eql(u8, &key, &v6_loopback)) return true;
+        return std.mem.eql(u8, key[0..12], &v4_mapped_prefix) and key[12] == 127;
+    }
+
+    /// Reserve one connection slot for `key`. Returns false when the peer
+    /// already holds `max` slots (caller rejects the connection).
+    pub fn acquire(self: *IpLimiter, key: Key, max: u32) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const gop = self.counts.getOrPut(self.allocator, key) catch return true; // fail open
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        if (gop.value_ptr.* >= max) return false;
+        gop.value_ptr.* += 1;
+        return true;
+    }
+
+    /// Return a slot taken by `acquire`. Tolerates keys it never counted
+    /// (fail-open admissions) so a stray release cannot underflow.
+    pub fn release(self: *IpLimiter, key: Key) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const entry = self.counts.getPtr(key) orelse return;
+        if (entry.* > 0) entry.* -= 1;
+        if (entry.* == 0) _ = self.counts.remove(key);
+    }
+
+    /// Current active count for `key` (tests/diagnostics).
+    pub fn activeCount(self: *IpLimiter, key: Key) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.counts.get(key) orelse 0;
+    }
+};
+
 /// WebSocket gateway server.
 pub const Gateway = struct {
     allocator: std.mem.Allocator,
@@ -70,6 +134,14 @@ pub const Gateway = struct {
     auth_mint: ?AuthMintConfig,
     /// Optional shared liveness/concurrency counters surfaced by STATUS.
     metrics: ?*ServerMetrics,
+    /// Max concurrent connections per peer IP. 0 = unlimited (the default — #89:
+    /// a small cap breaks NAT'd multiplayer sites and localhost capacity benches).
+    /// Set before start(), e.g. from `cfg.gateway.max_connections_per_ip`.
+    max_connections_per_ip: u32,
+    /// Skip the per-IP cap for loopback peers (127.0.0.0/8, ::1) so local benches
+    /// can open many sockets from one address. Set before start().
+    per_ip_exempt_loopback: bool,
+    ip_limiter: IpLimiter,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -101,11 +173,27 @@ pub const Gateway = struct {
             .auth_required = false,
             .auth_mint = null,
             .metrics = metrics,
+            .max_connections_per_ip = 0,
+            .per_ip_exempt_loopback = true,
+            .ip_limiter = IpLimiter.init(allocator),
         };
+    }
+
+    /// Release per-IP accounting memory. Call only after the accept loop has
+    /// stopped and connection threads have drained (connection threads are
+    /// detached, so in practice: at process exit).
+    pub fn deinit(self: *Gateway) void {
+        self.ip_limiter.deinit();
     }
 
     pub fn attachMetrics(self: *Gateway, metrics: *ServerMetrics) void {
         self.metrics = metrics;
+    }
+
+    /// Apply per-IP admission settings (typically from `cfg.gateway`). Call before start().
+    pub fn setPerIpLimit(self: *Gateway, max_per_ip: u32, exempt_loopback: bool) void {
+        self.max_connections_per_ip = max_per_ip;
+        self.per_ip_exempt_loopback = exempt_loopback;
     }
 
     /// Run the gateway on a dedicated thread. Call from main after server start.
@@ -131,16 +219,44 @@ pub const Gateway = struct {
             self.port,
             if (self.auth_required) @as([]const u8, ", auth required") else @as([]const u8, ""),
         });
+        if (self.max_connections_per_ip > 0) {
+            std.log.info("Gateway: per-IP connection cap: {d}{s}", .{
+                self.max_connections_per_ip,
+                if (self.per_ip_exempt_loopback) @as([]const u8, " (loopback exempt)") else @as([]const u8, ""),
+            });
+        }
 
         while (self.running.load(.acquire)) {
             const conn = listener.accept() catch |err| {
                 std.log.debug("Gateway: accept error: {}", .{err});
                 continue;
             };
+            // Per-IP admission (#89): enforced only when a cap is configured AND the
+            // peer address resolves. An unresolvable peer is admitted uncounted —
+            // never rejected — because it cannot be attributed to an IP.
+            var ip_key: ?IpLimiter.Key = null;
+            if (self.max_connections_per_ip > 0) {
+                if (core.compat.getPeerAddress(conn.stream.getHandle())) |peer| {
+                    const key = IpLimiter.keyFromAddress(peer.inner);
+                    if (!(self.per_ip_exempt_loopback and IpLimiter.isLoopback(key))) {
+                        if (self.ip_limiter.acquire(key, self.max_connections_per_ip)) {
+                            ip_key = key;
+                        } else {
+                            std.log.warn("Gateway: rejecting connection from {f}: per-IP cap reached ({d} active)", .{
+                                peer.inner, self.max_connections_per_ip,
+                            });
+                            if (self.metrics) |metrics| metrics.recordGatewayPerIpRejection();
+                            conn.stream.close();
+                            continue;
+                        }
+                    }
+                }
+            }
             // Spawn a thread per connection — simple and sufficient for browser clients.
             // Browser connections are long-lived and few in number compared to TCP backend traffic.
-            const thread = std.Thread.spawn(.{}, handleConnection, .{ self, conn }) catch |err| {
+            const thread = std.Thread.spawn(.{}, handleConnection, .{ self, conn, ip_key }) catch |err| {
                 std.log.warn("Gateway: spawn thread failed: {}", .{err});
+                if (ip_key) |key| self.ip_limiter.release(key);
                 conn.stream.close();
                 continue;
             };
@@ -148,7 +264,8 @@ pub const Gateway = struct {
         }
     }
 
-    fn handleConnection(self: *Gateway, conn: core.compat.net.ServerCompat.Connection) void {
+    fn handleConnection(self: *Gateway, conn: core.compat.net.ServerCompat.Connection, ip_key: ?IpLimiter.Key) void {
+        defer if (ip_key) |key| self.ip_limiter.release(key);
         var stream = conn.stream;
         if (self.metrics) |metrics| metrics.beginGatewayThread();
         defer if (self.metrics) |metrics| metrics.endGatewayThread();
@@ -977,6 +1094,56 @@ fn responseSucceeded(response: Response) bool {
         .err => false,
         else => true,
     };
+}
+
+test "IpLimiter enforces the per-IP cap and frees slots on release" {
+    const testing = std.testing;
+    var limiter = IpLimiter.init(testing.allocator);
+    defer limiter.deinit();
+
+    const peer_a = IpLimiter.keyFromAddress(.{ .ip4 = .{ .bytes = .{ 203, 0, 113, 7 }, .port = 50000 } });
+    const peer_b = IpLimiter.keyFromAddress(.{ .ip4 = .{ .bytes = .{ 203, 0, 113, 8 }, .port = 50000 } });
+
+    // Two slots per IP: third acquire for the same peer is rejected...
+    try testing.expect(limiter.acquire(peer_a, 2));
+    try testing.expect(limiter.acquire(peer_a, 2));
+    try testing.expect(!limiter.acquire(peer_a, 2));
+    // ...but a different peer is unaffected.
+    try testing.expect(limiter.acquire(peer_b, 2));
+    try testing.expectEqual(@as(u32, 2), limiter.activeCount(peer_a));
+
+    // Releasing a slot re-admits, and draining removes the bucket entirely.
+    limiter.release(peer_a);
+    try testing.expect(limiter.acquire(peer_a, 2));
+    limiter.release(peer_a);
+    limiter.release(peer_a);
+    limiter.release(peer_b);
+    try testing.expectEqual(@as(u32, 0), limiter.activeCount(peer_a));
+    try testing.expectEqual(@as(usize, 0), limiter.counts.count());
+
+    // A release for a never-acquired key must be a harmless no-op (fail-open path).
+    limiter.release(peer_a);
+    try testing.expectEqual(@as(u32, 0), limiter.activeCount(peer_a));
+}
+
+test "IpLimiter key normalization: v4 and v4-mapped v6 share a bucket; loopback detected" {
+    const testing = std.testing;
+
+    const v4 = IpLimiter.keyFromAddress(.{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 1234 } });
+    const v4_mapped = IpLimiter.keyFromAddress(.{ .ip6 = .{
+        .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 1 },
+        .port = 5678,
+    } });
+    try testing.expectEqualSlices(u8, &v4, &v4_mapped);
+
+    // Loopback: 127.0.0.1, anywhere in 127/8, and ::1 — but not public addresses.
+    try testing.expect(IpLimiter.isLoopback(IpLimiter.keyFromAddress(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } })));
+    try testing.expect(IpLimiter.isLoopback(IpLimiter.keyFromAddress(.{ .ip4 = .{ .bytes = .{ 127, 8, 9, 10 }, .port = 0 } })));
+    try testing.expect(IpLimiter.isLoopback(IpLimiter.keyFromAddress(.{ .ip6 = .{
+        .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+        .port = 0,
+    } })));
+    try testing.expect(!IpLimiter.isLoopback(v4));
 }
 
 test "gateway allocator-backed response encoder handles payloads over 64 KiB" {

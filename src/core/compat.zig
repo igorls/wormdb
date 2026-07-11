@@ -274,6 +274,66 @@ pub fn setSendTimeoutMs(handle: std.posix.fd_t, timeout_ms: u32) void {
     }
 }
 
+/// Best-effort peer IP of a connected socket via getpeername(2).
+/// Returns null when the peer address is unavailable (getpeername failure or a
+/// non-IP family) — callers must treat null as "cannot attribute this
+/// connection to an IP", never as an error (#89: per-IP policies are enforced
+/// only when the peer address is available on the accept path).
+///
+/// `std.posix.getpeername` is a hard `@compileError` on Windows, so the
+/// Windows path calls Winsock's `getpeername` directly (same pattern as
+/// `setNoDelay` above) and parses the raw sockaddr bytes.
+pub fn getPeerAddress(handle: std.posix.fd_t) ?net.Address {
+    if (builtin.os.tag == .windows) {
+        const getpeername_fn = @extern(
+            *const fn (usize, [*]u8, *c_int) callconv(.c) c_int,
+            .{ .name = "getpeername", .library_name = "ws2_32" },
+        );
+        var buf: [128]u8 align(8) = undefined;
+        var len: c_int = buf.len;
+        if (getpeername_fn(@intFromPtr(handle), &buf, &len) != 0) return null;
+        const family = std.mem.bytesToValue(u16, buf[0..2]);
+        switch (family) {
+            2 => { // AF_INET
+                if (len < 8) return null;
+                return .{ .inner = .{ .ip4 = .{
+                    .bytes = buf[4..8].*,
+                    .port = std.mem.readInt(u16, buf[2..4], .big),
+                } } };
+            },
+            23 => { // AF_INET6
+                if (len < 24) return null;
+                return .{ .inner = .{ .ip6 = .{
+                    .bytes = buf[8..24].*,
+                    .port = std.mem.readInt(u16, buf[2..4], .big),
+                } } };
+            },
+            else => return null,
+        }
+    } else {
+        var storage_buf = std.mem.zeroes(std.posix.sockaddr.storage);
+        var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+        std.posix.getpeername(handle, @ptrCast(&storage_buf), &len) catch return null;
+        switch (storage_buf.family) {
+            std.posix.AF.INET => {
+                const sa: *const std.posix.sockaddr.in = @ptrCast(&storage_buf);
+                return .{ .inner = .{ .ip4 = .{
+                    .bytes = @bitCast(sa.addr),
+                    .port = std.mem.bigToNative(u16, sa.port),
+                } } };
+            },
+            std.posix.AF.INET6 => {
+                const sa: *const std.posix.sockaddr.in6 = @ptrCast(&storage_buf);
+                return .{ .inner = .{ .ip6 = .{
+                    .bytes = sa.addr,
+                    .port = std.mem.bigToNative(u16, sa.port),
+                } } };
+            },
+            else => return null,
+        }
+    }
+}
+
 /// Networking compatibility layer.
 /// Maps the old std.net.* API to the new std.Io.net.* API.
 pub const net = struct {

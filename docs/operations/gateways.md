@@ -42,7 +42,7 @@ The gateway shares the same store, event bus, procedure registry, cluster handle
 - The cap is enforced only when the peer address is resolvable on the accept path; a connection that cannot be attributed to an IP is admitted uncounted, never rejected.
 - `per_ip_exempt_loopback` (default `true`) skips the cap for `127.0.0.0/8` and `::1`, so local benches can open hundreds of sockets from one address.
 - Each rejection is logged with the peer address and active count, and counted in the `STATUS` field `gateway_per_ip_rejections`.
-- Embedders starting the gateway themselves apply the setting with `gateway.setPerIpLimit(cfg.gateway.max_connections_per_ip, cfg.gateway.per_ip_exempt_loopback)` before `gateway.start()`.
+- The stock `wormdb` binary applies these settings from `wormdb.json` automatically. Embedders starting the gateway themselves apply them with `gateway.setPerIpLimit(cfg.gateway.max_connections_per_ip, cfg.gateway.per_ip_exempt_loopback)` before `gateway.start()`.
 
 ## WormWire Over WebSocket
 

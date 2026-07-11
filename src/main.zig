@@ -25,6 +25,9 @@ const Args = struct {
     replicas: usize = 0,
     gossip_port: u16 = 51821,
     wg_port: u16 = 51830,
+    /// WebSocket gateway port. Setting it enables the gateway (overrides the
+    /// config file's `gateway.port`; `gateway.enabled` in the file also works).
+    gateway_port: ?u16 = null,
     /// JSON config file (currently consumed for the `org_trust` section;
     /// CLI flags keep overriding everything else).
     config_path: []const u8 = "./wormdb.json",
@@ -87,6 +90,10 @@ fn parseArgs(args: []const []const u8) !Args {
             i += 1;
             if (i >= args.len) return error.InvalidArgs;
             out.wg_port = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--gateway-port")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgs;
+            out.gateway_port = try std.fmt.parseInt(u16, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--config")) {
             i += 1;
             if (i >= args.len) return error.InvalidArgs;
@@ -108,8 +115,9 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     try std.Io.Dir.cwd().createDirPath(io, args.data);
 
-    // Load the JSON config file (missing file ⇒ all defaults). Currently only
-    // the org_trust section is consumed here; CLI flags own everything else.
+    // Load the JSON config file (missing file ⇒ all defaults). Consumed here for
+    // the org_trust, auth, and gateway sections; CLI flags own everything else
+    // and override the gateway port.
     const file_cfg = wormdb.core.config.loadFromFile(args.config_path, allocator) catch |err| {
         std.log.err("failed to load config '{s}': {s}", .{ args.config_path, @errorName(err) });
         std.process.exit(1);
@@ -172,6 +180,39 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
     defer event_bus.deinit();
     var metrics = wormdb.server.ServerMetrics.init();
 
+    // Auth material from the config file, shared by the TCP listener and the
+    // gateway. Enforcement needs at least one verification key: `require_auth`
+    // defaults to true in the schema, but with no keys configured every
+    // protected command would fail closed — so a keyless config keeps the
+    // listeners open (matching docs/operations/gateways.md) and warns loudly.
+    const srv_auth = wormdb.server.auth;
+    const auth_keys = try allocator.alloc(srv_auth.PublicKey, file_cfg.auth.public_keys.len);
+    defer allocator.free(auth_keys);
+    for (file_cfg.auth.public_keys, auth_keys) |b64, *pk| {
+        pk.* = srv_auth.decodePublicKey(b64) catch {
+            std.log.err("invalid auth.public_keys entry in '{s}': {s}", .{ args.config_path, b64 });
+            std.process.exit(1);
+        };
+    }
+    const auth_enforce = file_cfg.auth.require_auth and auth_keys.len > 0;
+    if (file_cfg.auth.require_auth and auth_keys.len == 0) {
+        std.log.warn("auth.require_auth is set but auth.public_keys is empty — listeners run UNAUTHENTICATED", .{});
+    }
+
+    var mint_secret: [64]u8 = undefined;
+    var auth_mint: ?wormdb.procedures.context.AuthMintConfig = null;
+    if (file_cfg.auth.mint_secret_key) |b64| {
+        mint_secret = srv_auth.decodeSecretKey(b64) catch {
+            std.log.err("invalid auth.mint_secret_key in '{s}'", .{args.config_path});
+            std.process.exit(1);
+        };
+        auth_mint = .{
+            .secret_key = &mint_secret,
+            .default_ttl_s = file_cfg.auth.namespace_token_ttl_s,
+            .max_ttl_s = file_cfg.auth.token_max_age_s,
+        };
+    }
+
     var cluster: ?Cluster = null;
     if (args.cluster_name != null) {
         if (comptime wormdb.server.is_linux) {
@@ -203,9 +244,43 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
         .vector_registry = &vector_registry,
         .org_trust = &org_trust,
         .metrics = &metrics,
+        .auth_enforce = auth_enforce and file_cfg.server.auth_enabled,
+        .auth_public_keys = auth_keys,
+        .auth_max_token_age = file_cfg.auth.token_max_age_s,
+        .auth_mint = auth_mint,
     });
 
     if (cluster) |*c| c.start();
+
+    // WebSocket gateway: --gateway-port enables it (and overrides the file's
+    // port); `gateway.enabled` in the config file works too. Lives on this
+    // frame — the accept-loop thread borrows it for the process lifetime.
+    var gateway: wormdb.server.Gateway = undefined;
+    if (args.gateway_port != null or file_cfg.gateway.enabled) {
+        const gw_port = args.gateway_port orelse file_cfg.gateway.port;
+        gateway = wormdb.server.Gateway.initWithMetrics(
+            allocator,
+            &store,
+            &event_bus,
+            if (cluster) |*c| c else null,
+            gw_port,
+            &metrics,
+        );
+        gateway.public_keys = auth_keys;
+        gateway.max_token_age = file_cfg.auth.token_max_age_s;
+        gateway.auth_required = auth_enforce and file_cfg.gateway.auth_enabled;
+        gateway.auth_mint = auth_mint;
+        gateway.setPerIpLimit(
+            file_cfg.gateway.max_connections_per_ip,
+            file_cfg.gateway.per_ip_exempt_loopback,
+        );
+        const gw_thread = try gateway.start();
+        gw_thread.detach();
+        std.log.info("Gateway: WebSocket on port {d} (auth: {s})", .{
+            gw_port,
+            if (gateway.auth_required) @as([]const u8, "required") else @as([]const u8, "disabled"),
+        });
+    }
 
     std.log.info("WormDB starting on port {d}", .{args.port});
     std.log.info("Data directory: {s}", .{args.data});
@@ -240,8 +315,10 @@ fn printHelp() !void {
         \\  --replicas <n>            Replication factor (default: 0 = all peers)
         \\  --gossip-port <port>      SWIM gossip UDP port (default: 51821)
         \\  --wg-port <port>          WireGuard listen port (default: 51830)
+        \\  --gateway-port <port>     Enable the WebSocket gateway on this port
+        \\                            (config file: gateway.enabled/gateway.port)
         \\  --config <path>           JSON config file (default: ./wormdb.json;
-        \\                            consumed for the org_trust section)
+        \\                            consumed for org_trust, auth, and gateway)
         \\  --cluster-open            Acknowledge running cluster replication OPEN
         \\                            (unauthenticated). Required to start a cluster
         \\                            without org_trust configured.
@@ -249,6 +326,7 @@ fn printHelp() !void {
         \\
         \\Examples:
         \\  wormdb --port 6389 --data ./data
+        \\  wormdb --port 6389 --gateway-port 6390
         \\  wormdb --cluster myapp --port 6389
         \\  wormdb --cluster myapp --seed 10.0.0.1:51821 --port 6390
         \\

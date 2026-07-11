@@ -62,7 +62,7 @@ event_bus_drops=3
 
 ### Transport Metric Wiring
 
-The stock `wormdb` binary wires one `ServerMetrics` instance into the threadpool TCP server. Embedders that start a WebSocket gateway should construct it with `Gateway.initWithMetrics(...)` or call `gateway.attachMetrics(&metrics)` before `gateway.start()`; otherwise `gateway_*` fields remain zero for that listener. Linux embedders that construct `EpollServer` or `UringServer` directly should use `initWithMetrics(...)` or `attachMetrics(...)` so `STATUS` reports the same process timestamps and transport counters.
+The stock `wormdb` binary wires one `ServerMetrics` instance into the threadpool TCP server and, when the gateway is enabled (`--gateway-port` or `gateway.enabled`), into the WebSocket gateway. Embedders that start a WebSocket gateway themselves should construct it with `Gateway.initWithMetrics(...)` or call `gateway.attachMetrics(&metrics)` before `gateway.start()`; otherwise `gateway_*` fields remain zero for that listener. Linux embedders that construct `EpollServer` or `UringServer` directly should use `initWithMetrics(...)` or `attachMetrics(...)` so `STATUS` reports the same process timestamps and transport counters.
 
 ### Cluster Mode
 

@@ -18,7 +18,7 @@ Zig gives WormDB explicit control over memory allocation, no hidden allocators, 
 
 **Agent Memory** — The `mem_*` procedure family stores document chunks, metadata, embeddings, and pub/sub notifications in one round-trip, with optional embedder-id enforcement for model swaps.
 
-**Browser Gateways** — The optional gateway exposes WormWire over WebSocket and plain HTTP Light-API routes backed by compiled procedures. QUIC/WebTransport is available only in binaries built with `-Dquic=true` and configured with TLS material.
+**Browser Gateways** — The optional gateway exposes WormWire over WebSocket and plain HTTP routes backed by compiled procedures. QUIC/WebTransport is available only in binaries built with `-Dquic=true` and configured with TLS material.
 
 **Mesh Clustering** — Nodes find each other through SWIM gossip over UDP and replicate writes over persistent TCP connections using the same WormWire framing. No external coordinator (ZooKeeper, etcd) is needed.
 

@@ -30,7 +30,7 @@ pub fn registerRoutes(routes: []const domain.Route) void {
 }
 
 /// Domain WebSocket JSON-RPC methods, registered at startup from the manifests. The gateway owns the
-/// WS framing + the executor; the cc32d9 dialect (method names, param shapes, row JSON) lives in the
+/// WS framing + the executor; the WS dialect (method names, param shapes, row JSON) lives in the
 /// domains. Read-only during serving.
 var domain_ws_methods: []const domain.WsMethod = &.{};
 
@@ -281,8 +281,8 @@ pub const Gateway = struct {
         const request = readHttpRequest(&stream, &request_buf) orelse return;
 
         const ws_key = extractWebSocketKey(request) orelse {
-            // Not a WebSocket upgrade — serve the plain-HTTP Light-API drop-in (GET /api/...),
-            // so HTTP clients consume the same contract as cc32d9 / Hyperion with no app tier.
+            // Not a WebSocket upgrade — serve the plain-HTTP domain routes (GET /api/...),
+            // so HTTP clients consume the domain's REST contract with no app tier.
             self.serveHttp(&stream, &request_buf, request);
             return;
         };
@@ -342,7 +342,7 @@ pub const Gateway = struct {
                 0x0A => continue, // Pong — ignore
                 0x02 => {}, // Binary — process below
                 0x01 => {
-                    // Text frame — the cc32d9 Light-API WebSocket dialect (JSON-RPC 2.0). Reuses the
+                    // Text frame — the domain WebSocket dialect (JSON-RPC 2.0). Reuses the
                     // same store/segment; streams notifications back as text frames.
                     _ = cmd_arena.reset(.retain_capacity);
                     self.handleJsonRpc(conn_ctx, cmd_arena.allocator(), ws_frame.payload);
@@ -479,7 +479,7 @@ pub const Gateway = struct {
         }
     }
 
-    // --- Plain HTTP (Light-API drop-in) ---
+    // --- Plain HTTP (domain routes) ---
     //
     // Answers `GET /api/...` directly over HTTP/1.1 by routing to an EXEC procedure and returning its
     // JSON value — the SAME executor pipeline as WormWire/WS clients, no application tier. Keep-alive
@@ -514,7 +514,7 @@ pub const Gateway = struct {
         var path = after[0..sp];
         var query: []const u8 = "";
         if (std.mem.indexOfScalar(u8, path, '?')) |q| {
-            query = path[q + 1 ..]; // AtomicAssets endpoints take filter/sort/page params here
+            query = path[q + 1 ..]; // domain endpoints take filter/sort/page params here
             path = path[0..q];
         }
 
@@ -614,11 +614,11 @@ pub const Gateway = struct {
         return true;
     }
 
-    // --- cc32d9 WebSocket JSON-RPC API (jsonrpc2-ws dialect) ---
+    // --- WebSocket JSON-RPC API (jsonrpc2-ws dialect) ---
     //
     // A text WS frame carries a JSON-RPC 2.0 request {method, params:{reqid, …}}. We stream results
     // back as `reqdata` notifications — one per row `{method, reqid, data}` — terminated by
-    // `{method, reqid, end:true, status:200, error:null}`. Mirrors cc32d9's wsapi/lightapi_wsapi.js.
+    // `{method, reqid, end:true, status:200, error:null}`. The method set comes from the domains.
 
     // Per-WS-request state the trampolines below dereference — the gateway side of the WsCtx vtable.
     const WsImpl = struct {

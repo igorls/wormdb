@@ -1,9 +1,9 @@
-//! Domain manifest interface — the contract a serving DOMAIN (Light-API, AtomicAssets,
-//! …) exposes so the engine can compose it WITHOUT naming it. A domain ships
+//! Domain manifest interface — the contract an external serving DOMAIN package exposes
+//! so the engine can compose it WITHOUT naming it. A domain ships
 //! `pub const manifest = Domain{ … }`; the composition root collects manifests into the
 //! dispatch tables (the EXEC registry, and later the route + WS tables). This is the seam
-//! that lets a domain live in its own module — and eventually its own repository (see the
-//! sibling package `wormdb-domain-atomicassets`).
+//! that lets a domain live in its own package/repository — the engine repo carries no
+//! domain code.
 //!
 //! Minimal first cut: identity + segment namespace + table-id range + procedures. Routes,
 //! WS methods, and config/seed hooks are added as the registration inversion lands (WP-013).
@@ -43,8 +43,8 @@ pub const Captures = struct {
 };
 
 /// The procedure call a Route resolves to: which proc, with which args, response content type, and
-/// the HTTP status — either fixed, or derived from the response body (e.g. cc32d9's 503 on
-/// "OUT_OF_SYNC"). Routes default to JSON to preserve the original gateway behavior.
+/// the HTTP status — either fixed, or derived from the response body (e.g. a 503 when the body
+/// reports an out-of-sync condition). Routes default to JSON to preserve the original gateway behavior.
 pub const ExecCall = struct {
     proc: []const u8,
     args: []const []const u8,
@@ -64,8 +64,8 @@ pub const Route = struct {
 
 /// The streaming context a WebSocket JSON-RPC handler receives. The gateway owns the WS framing +
 /// the executor; the domain handler only emits data rows / end / err and runs procedures — so the
-/// cc32d9 (or any) WS dialect (method names, param shapes, row JSON) lives in the domain, not the
-/// engine. `impl` + the fn pointers are a small vtable the gateway fills in; handlers use the methods.
+/// WS dialect (method names, param shapes, row JSON) lives in the domain, not the engine.
+/// `impl` + the fn pointers are a small vtable the gateway fills in; handlers use the methods.
 pub const WsCtx = struct {
     impl: *anyopaque,
     allocator: std.mem.Allocator,

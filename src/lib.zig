@@ -22,12 +22,6 @@ pub const proof = @import("proof/mod.zig");
 // reads the SAME instance the engine compiled against — a second build_options module would conflict.
 pub const build_options = @import("build_options");
 
-// Antelope codecs — a shared leaf library used by the domain packages (Light-API, AtomicAssets).
-// Not a serving domain itself; the engine exposes it so domains import it via @import("wormdb").
-// (Light-API + AtomicAssets each now live in their own package, composed into the binary at build
-// time — see build.zig + main.zig.)
-pub const antelope = @import("antelope/mod.zig");
-
 // Re-export commonly used types
 pub const Entry = core.types.Entry;
 pub const Command = core.types.Command;

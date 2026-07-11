@@ -99,7 +99,6 @@ The registry currently includes several procedure families:
 | Auth | `auth_mint_scoped` |
 | Verifiable logs | `append_log_append`, `append_log_verify`, `append_log_mmr_proof`, `append_log_mmr_verify`, `append_log_checkpoint`, `append_log_proof_bundle`, `append_log_proof_verify`, `append_log_witness`, `append_log_witness_request`, `append_log_witness_import`, `append_log_witness_verify` |
 | Proof diagnostics | `proof_prefix_root` |
-| Light-API | `lightapi_*` procedures served through the gateway's HTTP and JSON-RPC routes |
 
 ### `increment`
 
@@ -171,9 +170,9 @@ See [Verifiable Append Log](/protocol/append-log) for the canonical envelope and
 - `append_log_proof_verify` — verify a record hash and MMR proof against a stored signed checkpoint.
 - `proof_prefix_root` — compute a deterministic `prefix-sha256-v1` root over sorted key/value/timestamp entries for diagnostics and cluster anti-entropy.
 
-### Light-API Procedures
+### Domain Procedures
 
-The `lightapi_*` procedures are compiled into the same registry and can be called through `EXEC`, but most users reach them through the gateway's `/api/...` routes. See [Gateways & Light-API](/operations/gateways).
+External domain packages register additional procedures at startup via their manifests (`registerDomains()`); they share the same registry and `EXEC` dispatch, and are typically reached through the gateway's `/api/...` routes. See [Gateways](/operations/gateways).
 
 ## Anatomy of a Procedure
 

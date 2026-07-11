@@ -1,6 +1,6 @@
-# Gateways & Light-API
+# Gateways
 
-WormDB's primary server port speaks WormWire over TCP. The optional gateway port adds browser-facing access: WormWire over binary WebSocket frames, plain HTTP Light-API routes, and a cc32d9-compatible JSON-RPC WebSocket dialect. QUIC/WebTransport is available only when the binary is built with `-Dquic=true`.
+WormDB's primary server port speaks WormWire over TCP. The optional gateway port adds browser-facing access: WormWire over binary WebSocket frames, plain HTTP routes contributed by domain packages, and a JSON-RPC WebSocket dialect whose methods are also domain-contributed. QUIC/WebTransport is available only when the binary is built with `-Dquic=true`.
 
 ## Enable The Gateway
 
@@ -91,50 +91,16 @@ It requires prebuilt `deps/msquic` and `deps/libwtf`, plus TLS cert/key paths in
 
 QUIC/WebTransport support depends on the optional `deps/msquic` and `deps/libwtf` artifacts used by the `-Dquic=true` build. The Windows page tracks platform support separately.
 
-## Plain HTTP Light-API
+## Plain HTTP Routes
 
-Non-WebSocket `GET /api/...` requests on the gateway are routed directly to compiled `lightapi_*` procedures. There is no Node or Bun application tier in the serving path.
+Non-WebSocket `GET /api/...` requests on the gateway are routed through the domain route table (`gateway.registerRoutes`). Each route resolves to a compiled `EXEC` procedure — there is no Node or Bun application tier in the serving path. The engine itself ships no HTTP routes; external domain packages contribute them via their manifests at composition time.
 
-| Route | Procedure |
-| ----- | --------- |
-| `/api/balances/<chain>/<account>` | `lightapi_balances` |
-| `/api/account/<chain>/<account>` | `lightapi_account` |
-| `/api/accinfo/<chain>/<account>` | `lightapi_accinfo` |
-| `/api/tokenbalance/<chain>/<account>/<contract>/<symbol>` | `lightapi_tokenbalance` |
-| `/api/usercount/<chain>` | `lightapi_get uc:<chain>` |
-| `/api/holdercount/<chain>/<contract>/<symbol>` | `lightapi_holdercount` |
-| `/api/networks` | `lightapi_networks` |
-| `/api/codehash/<sha256>` | `lightapi_codehash` |
-| `/api/key/<pubkey>` | `lightapi_key` |
-| `/api/topholders/<chain>/<contract>/<symbol>/<n>` | `lightapi_topholders` |
-| `/api/topram/<chain>/<n>` | `lightapi_topram` |
-| `/api/topstake/<chain>/<n>` | `lightapi_topstake` |
-| `/api/rexbalance/<chain>/<account>` | `lightapi_rexbalance` |
-| `/api/rexraw/<chain>` | `lightapi_get rexraw:<chain>` |
-| `/api/sync/<chain>` | `lightapi_sync` |
-| `/api/status` | `lightapi_status` |
-
-`/api/status` returns HTTP 503 when the body starts with `OUT_OF_SYNC`.
+A route's HTTP status can be fixed or derived from the response body (e.g. a health endpoint returning 503 while out of sync).
 
 ## Frozen Segment Tier
 
-Large Light-API tables can be served from an mmap-backed frozen segment:
-
-```bash
-./zig-out/bin/wormdb --gateway-port 6390 --lightapi-segment ./lightapi.wseg
-```
-
-`lightapi_segment` can also be set in `wormdb.json`. When present, account and balance procedures read bulk tables from the segment while small aggregate values can still come from the KV overlay. Network metadata under `lightapi.networks` is seeded into KV at startup.
+Large static tables can be served from an mmap-backed frozen segment (`.wseg`), mounted at startup via the `segments` config section and looked up by an opaque name the serving domain owns. See [WSEG format](/WSEG_FORMAT) for the file layout. When present, domain procedures read bulk tables from the segment while small aggregate values can still come from the KV overlay.
 
 ## JSON-RPC WebSocket Dialect
 
-Text WebSocket frames support a cc32d9-style JSON-RPC 2.0 dialect. Supported methods include:
-
-| Method | Purpose |
-| ------ | ------- |
-| `get_networks` | Stream configured networks |
-| `get_balances` | Stream balances for up to 100 accounts |
-| `get_token_holders` | Stream token holder rows |
-| `get_accounts_from_keys` | Stream account permission rows for public keys |
-
-Responses are streamed as `reqdata` notifications and terminated with an `end:true` message.
+Text WebSocket frames carry JSON-RPC 2.0 requests dispatched to domain-registered WS methods (`gateway.registerWsMethods`). Responses are streamed as `reqdata` notifications — one per row — and terminated with an `end:true` message. The method set, parameter shapes, and row JSON are defined by the composed domain packages, not the engine.

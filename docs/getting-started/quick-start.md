@@ -125,4 +125,4 @@ Open [http://localhost:8099](http://localhost:8099) for a visual dashboard showi
 - **Use the client in detail** → [Clients & Commands](/getting-started/clients)
 - **Understand the internals** → [Architecture](/architecture/)
 - **Deploy with persistence and clustering** → [Operations](/operations/)
-- **Expose browser and Light-API routes** → [Gateways & Light-API](/operations/gateways)
+- **Expose browser and HTTP routes** → [Gateways](/operations/gateways)

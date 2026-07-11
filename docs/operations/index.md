@@ -1,6 +1,6 @@
 # Operations
 
-This section covers everything you need to run WormDB in practice — from choosing a durability mode to deploying a multi-node cluster, exposing browser/Light-API gateways, maintaining vector indexes, and diagnosing failures.
+This section covers everything you need to run WormDB in practice — from choosing a durability mode to deploying a multi-node cluster, exposing browser gateways, maintaining vector indexes, and diagnosing failures.
 
 ## Before You Deploy
 
@@ -60,5 +60,5 @@ Then open [http://localhost:8099](http://localhost:8099). The UI shows key count
 
 - [Persistence Modes](/operations/persistence) — WAL, snapshot, and in-memory tradeoffs
 - [Clustering](/operations/clustering) — forming a mesh, replication, and verifying health
-- [Gateways & Light-API](/operations/gateways) — WebSocket, QUIC/WebTransport, SCT auth, and plain HTTP Light-API routes
+- [Gateways](/operations/gateways) — WebSocket, QUIC/WebTransport, SCT auth, and plain HTTP domain routes
 - [Troubleshooting](/operations/troubleshooting) — common failures, error messages, and diagnostics

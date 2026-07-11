@@ -160,8 +160,8 @@ pub const Store = struct {
     vector_registry: ?*NamespaceRegistry = null,
     /// Registry of frozen read-only segments (mmap'd `.wseg`), addressed by an
     /// opaque caller-chosen name. The engine is domain-agnostic: a serving layer
-    /// attaches and looks up "its" segment by a string it owns (e.g. "lightapi",
-    /// "atomicassets"), so no blockchain/domain identity lives in the store.
+    /// attaches and looks up "its" segment by a string it owns, so no
+    /// domain identity lives in the store.
     /// Attached by the composition root (`main.zig`) after construction; each
     /// segment (and its name) must outlive the store. Small fixed capacity —
     /// there are only a handful of serving domains.

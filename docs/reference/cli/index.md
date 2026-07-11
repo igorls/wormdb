@@ -21,7 +21,6 @@ Command-line options for the `wormdb` binary.
 | `--replicas <n>` | integer | `0` | Replication factor hint (`0` = replicate to all peers) |
 | `--gossip-port <n>` | integer | `51821` | UDP port for SWIM gossip |
 | `--wg-port <n>` | integer | `51830` | WireGuard listen port used by meshguard |
-| `--lightapi-segment <path>` | path | none | mmap a frozen Light-API segment at startup |
 | `--gateway-port <n>` | integer | disabled | Enable the HTTP/WebSocket gateway on this port |
 | `--io-uring` | flag | off | Legacy shortcut for `--backend uring` |
 | `--help`, `-h` | flag | — | Show help text |
@@ -60,13 +59,13 @@ Joins an existing cluster named `myapp` via the seed node's gossip endpoint.
 
 Requires Linux kernel 5.6+. See [Server Backends](/architecture/server-backends) for tradeoffs.
 
-### Gateway And Light-API Segment
+### Gateway
 
 ```bash
-./zig-out/bin/wormdb --port 6389 --gateway-port 6390 --lightapi-segment ./lightapi.wseg
+./zig-out/bin/wormdb --port 6389 --gateway-port 6390
 ```
 
-Enables the HTTP/WebSocket gateway and serves large Light-API tables from a frozen segment. See [Gateways & Light-API](/operations/gateways).
+Enables the HTTP/WebSocket gateway. See [Gateways](/operations/gateways).
 
 ## JSON Config
 
@@ -86,16 +85,8 @@ CLI flags override the JSON config. Fields not present in the file use defaults,
     "require_auth": true,
     "token_max_age_s": 3600
   },
-  "lightapi_segment": "./lightapi.wseg",
-  "lightapi": {
-    "networks": [
-      {
-        "chain": "wax",
-        "systoken": "WAX",
-        "decimals": 8,
-        "chainid": "..."
-      }
-    ]
-  }
+  "segments": [
+    { "name": "mydomain", "path": "./mydomain.wseg" }
+  ]
 }
 ```

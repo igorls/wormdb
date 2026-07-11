@@ -178,8 +178,7 @@ pub const OrgTrustConfig = struct {
 
 /// One frozen segment mount: a `.wseg` file mmap'd at startup and attached to the
 /// store under `name`. The engine is domain-agnostic — `name` is an opaque string
-/// a serving layer looks up (e.g. "lightapi", "atomicassets"); core assigns it no
-/// meaning.
+/// a serving layer looks up; core assigns it no meaning.
 pub const SegmentMount = struct {
     name: []const u8,
     path: []const u8,

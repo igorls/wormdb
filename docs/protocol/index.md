@@ -80,4 +80,4 @@ For engine-level linear provenance chains, see [Verifiable Append Log](/protocol
 
 ## Browser Gateways
 
-Browser clients do not open raw TCP sockets and do not send the TCP `WW` preface. Use the gateway port for WormWire frames over WebSocket or QUIC/WebTransport. The gateway can also enforce SCT auth before forwarding commands to the executor. See [Gateways & Light-API](/operations/gateways).
+Browser clients do not open raw TCP sockets and do not send the TCP `WW` preface. Use the gateway port for WormWire frames over WebSocket or QUIC/WebTransport. The gateway can also enforce SCT auth before forwarding commands to the executor. See [Gateways](/operations/gateways).

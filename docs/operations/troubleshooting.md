@@ -120,11 +120,11 @@ The TCP replication channel isn't established. The node may be alive at the goss
 
 ### HTTP `/api/...` returns 404
 
-The request is not on a known Light-API route, or the gateway is not enabled. Start WormDB with `--gateway-port <port>` or set `gateway.enabled=true` in config, then request the route from the gateway port, not the primary WormWire TCP port.
+The request is not on any route registered by a composed domain package, or the gateway is not enabled. Start WormDB with `--gateway-port <port>` or set `gateway.enabled=true` in config, then request the route from the gateway port, not the primary WormWire TCP port.
 
 ### `/api/status` returns 503
 
-For the Light-API drop-in, `/api/status` intentionally returns HTTP 503 when the body starts with `OUT_OF_SYNC`. Check the live feed, segment watermark, and chain metadata.
+A domain route may intentionally map a body value to an error status (e.g. a health endpoint returning 503 while its data is out of sync). Check the domain's feed and segment freshness.
 
 ### WebSocket command returns `auth required`
 

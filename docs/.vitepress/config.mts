@@ -37,7 +37,7 @@ export default defineConfig({
             { text: 'Overview', link: '/operations/' },
             { text: 'Persistence Modes', link: '/operations/persistence' },
             { text: 'Clustering', link: '/operations/clustering' },
-            { text: 'Gateways & Light-API', link: '/operations/gateways' },
+            { text: 'Gateways', link: '/operations/gateways' },
             { text: 'Troubleshooting', link: '/operations/troubleshooting' },
           ]
         }

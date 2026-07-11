@@ -27,8 +27,8 @@ pub const coordination = @import("coordination.zig");
 pub const cluster_presence = @import("cluster_presence.zig");
 pub const proof_prefix_root = @import("proof_prefix_root.zig");
 pub const trust_log = @import("trust_log.zig");
-// Light-API + AtomicAssets procedures are NOT here — they live in their own packages
-// (wormdb-domain-lightapi, wormdb-domain-atomicassets) and register via the manifest at startup.
+// Domain procedures are NOT here — each domain lives in its own external package
+// and registers via the manifest at startup.
 
 test {
     @import("std").testing.refAllDecls(@This());

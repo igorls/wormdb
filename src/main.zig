@@ -28,8 +28,8 @@ const Args = struct {
     /// WebSocket gateway port. Setting it enables the gateway (overrides the
     /// config file's `gateway.port`; `gateway.enabled` in the file also works).
     gateway_port: ?u16 = null,
-    /// JSON config file (currently consumed for the `org_trust` section;
-    /// CLI flags keep overriding everything else).
+    /// JSON config file. CLI flags keep overriding port/data/persistence;
+    /// transport settings such as the bind address are read from this file.
     config_path: []const u8 = "./wormdb.json",
     /// Explicit acknowledgement that cluster replication runs unauthenticated.
     /// Without org_trust configured, a cluster refuses to start unless this
@@ -240,6 +240,7 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
 
     var server = Server.init(allocator, &store, &event_bus, .{
         .port = args.port,
+        .bind_address = file_cfg.server.bind_address,
         .cluster = if (cluster) |*c| c else null,
         .vector_registry = &vector_registry,
         .org_trust = &org_trust,

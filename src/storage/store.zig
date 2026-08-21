@@ -1003,17 +1003,26 @@ pub const Store = struct {
                     self.allocator.free(key);
                 },
                 .vinsert => |vinsert| {
-                    self.replayVectorInsert(vinsert) catch |err| {
-                        std.log.warn("WAL vector insert replay skipped '{s}': {s}", .{ vinsert.key, @errorName(err) });
-                    };
+                    // Configured indexes are rebuilt from final live `vec:*`
+                    // KV state after replay. Replaying all of their historical
+                    // HNSW mutations first is redundant and very expensive.
+                    // Unconfigured vector namespaces still depend on WAL
+                    // metadata for their metric, so preserve that legacy path.
+                    if (!self.vectorNamespaceHasConfig(vinsert.namespace)) {
+                        self.replayVectorInsert(vinsert) catch |err| {
+                            std.log.warn("WAL vector insert replay skipped '{s}': {s}", .{ vinsert.key, @errorName(err) });
+                        };
+                    }
                     self.allocator.free(vinsert.key);
                     self.allocator.free(vinsert.namespace);
                     self.allocator.free(vinsert.metric);
                 },
                 .vdelete => |vdelete| {
-                    self.replayVectorDelete(vdelete) catch |err| {
-                        std.log.warn("WAL vector delete replay skipped '{s}': {s}", .{ vdelete.key, @errorName(err) });
-                    };
+                    if (!self.vectorNamespaceHasConfig(vdelete.namespace)) {
+                        self.replayVectorDelete(vdelete) catch |err| {
+                            std.log.warn("WAL vector delete replay skipped '{s}': {s}", .{ vdelete.key, @errorName(err) });
+                        };
+                    }
                     self.allocator.free(vdelete.key);
                     self.allocator.free(vdelete.namespace);
                 },
@@ -1024,6 +1033,16 @@ pub const Store = struct {
         if (record_count > 0) {
             std.log.info("WAL replay complete. Processed {d} records.", .{record_count});
         }
+    }
+
+    fn vectorNamespaceHasConfig(self: *Store, namespace: []const u8) bool {
+        var key_buf: [512]u8 = undefined;
+        const config_key = std.fmt.bufPrint(
+            &key_buf,
+            "__meta:vecns:{s}",
+            .{namespace},
+        ) catch return false;
+        return self.get(config_key) != null;
     }
 
     fn replayVectorInsert(self: *Store, record: WalRecord.VinsertRecord) !void {
@@ -1157,6 +1176,18 @@ pub const Store = struct {
             const metric = Metric.fromStr(metric_name) orelse .cosine;
             const vec_namespace = try std.fmt.allocPrint(self.allocator, "vec:mem:{s}:", .{ns});
             defer self.allocator.free(vec_namespace);
+
+            // Normal memory ingest also creates a generic vector-namespace
+            // config. `rebuildConfiguredVectorIndexesFromKv` has already
+            // rebuilt that exact namespace, so do not clear and build the
+            // same HNSW graph a second time.
+            const vec_config_key = try std.fmt.allocPrint(
+                self.allocator,
+                "__meta:vecns:{s}",
+                .{vec_namespace},
+            );
+            defer self.allocator.free(vec_config_key);
+            if (self.get(vec_config_key) != null) continue;
 
             try self.rebuildVectorNamespaceFromKv(vec_namespace, metric);
         }

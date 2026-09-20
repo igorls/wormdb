@@ -215,6 +215,43 @@ export fn wormdb_open(dir_ptr: [*:0]const u8, persistence: c_int) ?*Db {
     return db;
 }
 
+/// Open (or create) a database rooted at `dir` with synchronous per-write WAL sync.
+/// Does not start the background writer thread, so every write is flushed and fsynced
+/// directly before returning. Returns null on failure.
+export fn wormdb_open_sync(dir_ptr: [*:0]const u8) ?*Db {
+    const dir = std.mem.span(dir_ptr);
+
+    // Ensure the data directory exists (app sandbox dir on mobile).
+    std.Io.Dir.cwd().createDirPath(io(), dir) catch {};
+
+    const wal_path = std.fmt.allocPrint(gpa, "{s}/wormdb.wal", .{dir}) catch return null;
+    errdefer gpa.free(wal_path);
+    const snapshot_path = std.fmt.allocPrint(gpa, "{s}/wormdb.snapshot", .{dir}) catch return null;
+    errdefer gpa.free(snapshot_path);
+
+    const db = gpa.create(Db) catch return null;
+    db.* = .{
+        .store = Store.init(gpa, .{
+            .wal_path = wal_path,
+            .snapshot_path = snapshot_path,
+            .sync_writes = true,
+            .persistence = .full,
+        }) catch {
+            gpa.destroy(db);
+            gpa.free(wal_path);
+            gpa.free(snapshot_path);
+            return null;
+        },
+        .wal_path = wal_path,
+        .snapshot_path = snapshot_path,
+    };
+
+    // Intentionally do NOT call db.store.startBackgroundTasks().
+    // writer_started remains false, so all writes execute synchronous writeAll + sync.
+
+    return db;
+}
+
 /// Flush, close, and free a database handle. The handle is invalid afterwards.
 export fn wormdb_close(db: *Db) void {
     db.store.deinit();
@@ -649,3 +686,41 @@ test "ffi exec runs stored procedures and returns owned values" {
     defer wormdb_free(err_out, err_len);
     try testing.expectEqualStrings("unknown procedure", err_out.?[0..err_len]);
 }
+
+test "ffi open_sync provides immediate synchronous WAL durability" {
+    const testing = std.testing;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try wormdb.core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+    const zpath = try testing.allocator.dupeZ(u8, tmp_path);
+    defer testing.allocator.free(zpath);
+
+    const db = wormdb_open_sync(zpath.ptr) orelse return error.OpenFailed;
+    // Writer thread must NOT be started
+    try testing.expect(!db.store.wal.?.writer_started);
+
+    const k = "sync-test-key";
+    const v = "sync-test-val";
+    try testing.expectEqual(OK, wormdb_set(db, k.ptr, k.len, v.ptr, v.len));
+
+    // File should immediately have content before close
+    const wal_size = try db.store.wal.?.size();
+    try testing.expect(wal_size > 0);
+
+    wormdb_close(db);
+
+    // Reopen to verify WAL replay
+    const db2 = wormdb_open_sync(zpath.ptr) orelse return error.OpenFailed;
+    defer wormdb_close(db2);
+
+    var out_val: ?[*]u8 = null;
+    var out_len: usize = 0;
+    try testing.expectEqual(OK, wormdb_get(db2, k.ptr, k.len, &out_val, &out_len));
+    defer wormdb_free(out_val, out_len);
+    try testing.expect(out_val != null);
+    try testing.expectEqualStrings(v, out_val.?[0..out_len]);
+}
+

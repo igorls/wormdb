@@ -216,8 +216,9 @@ export fn wormdb_open(dir_ptr: [*:0]const u8, persistence: c_int) ?*Db {
 }
 
 /// Open (or create) a database rooted at `dir` with synchronous per-write WAL sync.
-/// Does not start the background writer thread, so every write is flushed and fsynced
-/// directly before returning. Returns null on failure.
+/// Guarantees immediate fsync on all WAL-backed writes (wormdb_set, append_log)
+/// without starting a background writer thread. Does not make in-memory unsafe
+/// procedure mutations durable. Returns null on failure.
 export fn wormdb_open_sync(dir_ptr: [*:0]const u8) ?*Db {
     const dir = std.mem.span(dir_ptr);
 
@@ -723,4 +724,30 @@ test "ffi open_sync provides immediate synchronous WAL durability" {
     try testing.expect(out_val != null);
     try testing.expectEqualStrings(v, out_val.?[0..out_len]);
 }
+
+test "ffi open_sync propagates WAL I/O failures" {
+    const testing = std.testing;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try wormdb.core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+    const zpath = try testing.allocator.dupeZ(u8, tmp_path);
+    defer testing.allocator.free(zpath);
+
+    const db = wormdb_open_sync(zpath.ptr) orelse return error.OpenFailed;
+    defer wormdb_close(db);
+
+    // Swap WAL file to a read-only handle to trigger write I/O failure cleanly
+    const ro_file = try tmp_dir.dir.openFile(io(), "wormdb.wal", .{ .mode = .read_only });
+    wormdb.core.compat.File.close(db.store.wal.?.file);
+    db.store.wal.?.file = ro_file;
+
+    const k = "io-fail-key";
+    const v = "io-fail-val";
+    // Must return ERR (-1) and propagate failure, never reporting success
+    try testing.expectEqual(ERR, wormdb_set(db, k.ptr, k.len, v.ptr, v.len));
+}
+
 

@@ -1,7 +1,11 @@
 {
-  "name": "wormdb-bun-tools",
+  "name": "@wormdb/client",
   "version": "0.2.0",
-  "private": true,
+  "private": false,
+  "license": "BSL-1.0",
+  "publishConfig": {
+    "access": "restricted"
+  },
   "type": "module",
   "exports": {
     ".": "./src/lib/index.ts"

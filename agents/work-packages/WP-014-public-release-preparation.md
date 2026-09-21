@@ -31,5 +31,6 @@ package publication, and deployment are separate maintainer actions.
 - Validate workflow/template YAML and changed Markdown links.
 - `git diff --check`
 
-Linux CI and an anonymous checkout of the exact release commit remain required
-before publication; Windows results alone do not establish Linux support.
+Linux and Windows CI must pass on the final PR commit before merging. Immediately
+after changing visibility, verify an anonymous checkout of the merged commit and
+enable the public repository's private vulnerability reporting channel.

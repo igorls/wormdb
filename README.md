@@ -1,437 +1,221 @@
 # WormDB
 
-A key-value store and embeddable engine built in Zig, with WORM semantics,
-pub/sub, compiled procedures, vector search, and Linux clustering.
+**Write-once records, compiled logic, and vector search in one engine.**
 
-WormDB is under active development. Review the deployment and recovery limits
-below before using it with important data. Public source availability is not a
-production-readiness guarantee.
+WormDB is an MIT-licensed key-value store and embeddable engine written in Zig.
+Keep selected records immutable, run native procedures next to your data, and
+search embeddings in the same store. Run it as a standalone server over the
+WormWire binary protocol, or compose the engine into your own Zig application.
 
-- **WORM mode** — Write-Once-Read-Many for immutable audit trails
-- **WormWire protocol** — Binary framing over TCP, zero-copy capable
-- **Pub/Sub streaming** — Real-time event channels with subscription management
-- **Clustering** — meshguard peer discovery and WormWire replication; transport protection depends on the deployment
-- **Org trust** — certificate-based replication grants, configured through `org_trust`
-- **Vector search** — SIMD-accelerated (AVX2/NEON) with BQ prefilter and HNSW graph index; per-namespace cosine/dot/L2
-- **Stored procedures** — Server-side transactional ops via `EXEC`, compiled into the binary
+[Website](https://wormdb.dev/) · [Quick start](#quick-start) ·
+[Documentation](#documentation) · [Contributing](CONTRIBUTING.md) ·
+[Meshrooms](https://meshrooms.wormdb.dev/)
 
-## Quick Start
+WormDB is under active development. Start on localhost and review the
+[current boundaries](#current-boundaries) before deploying with important data.
 
-```bash
-# Clone and fetch the dependency required for the normal build
+## What you can build
+
+- **Audit histories:** write-once records, with append-log procedures for Merkle
+  proofs, signed checkpoints, and witness receipts.
+- **Searchable context:** vector indexes and memory procedures alongside the keys
+  and metadata your application already stores.
+- **Application services:** compiled handlers for operations on keys, with
+  pub/sub events and optional peer replication on Linux.
+
+| Capability | How it works |
+| --- | --- |
+| Write-once storage | The WORM flag makes normal `SET` and `DEL` reject later changes to a key. Mutable keys are also supported. |
+| Persistence | An in-memory, 256-shard store backed by a write-ahead log and snapshots. |
+| Stored procedures | `EXEC` calls native Zig handlers with access to the store, events, and cluster. Each handler chooses its locking and durability behavior. |
+| Vector search | Per-namespace HNSW, binary quantization, RaBitQ, and exact search, with cosine, dot product, and L2 metrics. |
+| Pub/sub | Prefix-matched channels deliver events over existing client connections. |
+| Linux clustering | MeshGuard peer discovery, best-effort replication, and synchronization for joining peers. |
+| Clients | Bun/TypeScript over TCP; a browser client over WebSocket or optional WebTransport. |
+
+## Quick start
+
+You need **Git**, **Zig 0.16.0**, and **Bun** for the client examples. Linux and
+Windows builds are checked in [CI](https://github.com/igorls/wormdb/actions/workflows/ci.yml).
+Windows supports single-node operation; clustering is Linux-only.
+
+### 1. Build and start the server
+
+```sh
 git clone https://github.com/igorls/wormdb.git
 cd wormdb
 git submodule update --init deps/meshguard
-
-# Build with Zig 0.16.0; std.crypto avoids an external libsodium dependency
 zig build -Doptimize=ReleaseSmall -Dcrypto-backend=std
-
-# Run tests
-zig build test -Dcrypto-backend=std
-
-# Start a local, unauthenticated development server on loopback
-./zig-out/bin/wormdb --config examples/local.json --port 6389 --data ./data
+./zig-out/bin/wormdb --config examples/local.json
 ```
 
-> **Platforms:** Linux is the primary target (full feature set, including clustering and the io_uring/epoll backends). WormDB also builds and runs natively on **Windows** for single-node use (threadpool backend; clustering is Linux-only) — see [docs/WINDOWS.md](docs/WINDOWS.md).
+This builds the normal server with Zig's `std.crypto` backend, without an external
+libsodium dependency. It fetches only MeshGuard; optional QUIC dependencies are
+not needed. See [Windows setup](docs/WINDOWS.md) for platform-specific details.
 
-The local example disables authentication and the WebSocket gateway. Use it only
-on your own machine. In the current standalone server, authentication is enforced
-only when `auth.require_auth` is true **and** at least one valid verification key
-is configured. Empty `auth.public_keys` leaves listeners unauthenticated. Plain
-WormWire TCP has no TLS; protect remote connections with a secure tunnel or an
-appropriate TLS proxy. See [scoped authentication](docs/AUTH_SCOPED.md).
+The [local configuration](examples/local.json) listens on **127.0.0.1:6389** and
+stores data in `./data`. Authentication and the browser gateway are disabled in
+this example. Keep it on your own machine.
 
-The default Linux build uses shared libsodium. `-Dcrypto-backend=std` selects Zig's
-built-in crypto. QUIC is optional and needs additional dependencies; the quick
-start above does not build it.
+### 2. Write and read an immutable record
 
-### Connect with the Bun Client
+In another terminal, from the repository root:
 
-```bash
-# Basic operations
-bun run apps/bun/src/bin/client.ts SET mykey "hello world"
-bun run apps/bun/src/bin/client.ts GET mykey
-bun run apps/bun/src/bin/client.ts SET audit-log entry-001 --worm
+```sh
+bun run apps/bun/src/bin/client.ts SET audit:001 ready --worm
+bun run apps/bun/src/bin/client.ts GET audit:001
+```
+
+The commands return `OK` and `ready`. Try changing or deleting the record:
+
+```sh
+bun run apps/bun/src/bin/client.ts SET audit:001 changed
+bun run apps/bun/src/bin/client.ts DEL audit:001
+```
+
+Both commands return `ERR: WORM violation: key is immutable` and exit with a
+nonzero status. Use a fresh key if you repeat this example. For a mutable key,
+omit `--worm` when first creating it.
+
+```sh
 bun run apps/bun/src/bin/client.ts STATUS
-
-# Admin UI (http://localhost:8099)
-UI_PORT=8099 WORMDB_PORT=6389 bun run apps/bun/src/bin/ui.ts
 ```
 
-> **Note:** WormDB uses the WormWire binary protocol. Raw `nc`/`telnet` connections are not supported. Use the Bun client or any WormWire-compatible client.
+WormWire is a binary protocol. Redis clients, `telnet`, and text `PING` requests
+are not compatible. Use the supplied client or implement the
+[WormWire protocol](docs/protocol/index.md).
 
-## WormWire Protocol
+### 3. Use the Bun client in code
 
-All client connections use the **WormWire** binary framing protocol. Connections must begin with the magic bytes `0x57 0x57` ("WW"). The server rejects connections without the magic handshake.
+Save this as `example.ts` in the repository root and run `bun run example.ts`:
 
-### Frame Structure
+```ts
+import { WormDB } from "./apps/bun/src/lib/wormdb";
 
+const db = new WormDB({ host: "127.0.0.1", port: 6389 });
+try {
+  await db.set("example:greeting", "hello");
+  console.log(await db.get("example:greeting"));
+} finally {
+  await db.close();
+}
 ```
-Connection:  [ 0x57 0x57 ]                                        (once, on connect)
-Request:     [ 1B Command ID ] [ 4B Payload Length (BE) ] [ payload... ]
-Response:    [ 1B Response Code ] [ 4B Payload Length (BE) ] [ payload... ]
-```
 
-### Commands
+The client also exposes byte values, subscriptions, stored procedures, and vector
+operations. See the [Bun client](apps/bun) and [client guide](docs/getting-started/clients.md).
+The [browser client](apps/browser) uses a separately configured gateway.
 
-| ID     | Command        | Payload                                                                     |
-| ------ | -------------- | --------------------------------------------------------------------------- |
-| `0x01` | GET            | `[4B key_len] [key]`                                                        |
-| `0x02` | SET            | `[1B flags] [4B key_len] [key] [4B val_len] [value]`                        |
-| `0x03` | DEL            | `[4B key_len] [key]`                                                        |
-| `0x04` | STATUS         | _(empty)_                                                                   |
-| `0x05` | CLUSTER STATUS | _(empty)_                                                                   |
-| `0x06` | SUB            | `[4B channel_len] [channel]`                                                |
-| `0x07` | UNSUB          | `[4B channel_len] [channel]`                                                |
-| `0x08` | PUB            | `[4B channel_len] [channel] [4B msg_len] [message]`                         |
-| `0x09` | EXEC           | `[4B proc_len] [proc_name] [4B arg_count] [ [4B arg_len] [arg] ... ]`       |
-| `0x0A` | CLUSTER PEERS  | _(empty)_                                                                   |
-| `0x0B` | SAVE           | _(empty — manual snapshot flush)_                                           |
-| `0x0C` | AUTH           | `[4B token_len] [token]`                                                     |
-| `0x0D` | VINSERT        | `[key] [vector] [1B flags] [namespace] [metric] [8B timestamp]`              |
-| `0x0E` | VDELETE        | `[key] [namespace]`                                                          |
-| `0x0F` | VBULKINSERT    | `[namespace] [metric] [1B flags] [4B count] [ [key] [vector] [8B ts] ... ]` |
+## Stored procedures
 
-### Response Codes
+One `EXEC` request invokes a compiled Zig function. Built-in families cover key
+operations, counters, append logs, audit proofs, vector search, agent memory,
+coordination, and trust. See the [procedure registry](src/procedures/registry.zig)
+for the current list.
 
-| Code   | Meaning | Payload                                 |
-| ------ | ------- | --------------------------------------- |
-| `0x00` | OK      | _(empty)_                               |
-| `0x01` | VALUE   | Data (GET result or STATUS diagnostics) |
-| `0x02` | NULL    | _(empty — key not found)_               |
-| `0x03` | ERR     | UTF-8 error string                      |
-| `0x04` | EVENT   | Unsolicited pub/sub push                |
+Handlers use an explicit context for locking, store access, and responses. Some
+helpers update memory without appending to the WAL; durable helpers release and
+reacquire held locks around writes. `EXEC` does not provide a general multi-key
+transaction or rollback guarantee. See the [procedure guide](docs/architecture/procedures.md)
+before adding a handler.
 
-In the native vector commands, `key`, `vector`, `namespace`, and `metric` are normal WormWire length-prefixed byte fields: `[4B len] [bytes]`. The vector flags byte uses bit `0x01` for WORM and bit `0x02` to request async HNSW construction. All multi-byte integers use **big endian** (network byte order). Maximum payload: **16 MiB**.
+## Vector search
+
+Vectors are stored as ordinary `vec:<namespace>:<id>` keys. A per-namespace HNSW
+graph and quantized companions are derived serving structures. Queries select an
+available index or exact search; native vector inserts and the Bun vector wrapper
+default to WORM.
+
+`vsearch` queries the local node. `vsearch_cluster` is a separate fan-out procedure.
+Snapshot v2 persists index state, but WAL replay after the snapshot does not replay
+every index mutation. Run `EXEC vreindex <namespace>` after raw ingestion or
+recovery beyond the last snapshot.
+
+See [vector search](docs/VECTOR_SEARCH.md) and the
+[agent memory example](docs/AGENT_MEMORY_DEMO.md) for the APIs and index lifecycle.
 
 ## Clustering
 
-WormDB clusters use [meshguard](https://github.com/igorls/meshguard) for peer discovery
-(SWIM gossip), failure detection, and WireGuard integration. Replication uses TCP;
-connections to real peer addresses are not inherently encrypted by WormDB. Verify
-the actual route and provide transport protection before crossing an untrusted
-network. Replication is asynchronous and does not provide quorum acknowledgements.
+On Linux, [MeshGuard](https://github.com/igorls/meshguard) provides SWIM discovery,
+failure detection, identity, and WireGuard integration. WormDB replicates writes
+after committing locally: peer failures do not turn a successful local write into an error.
+Joining peers receive a full-state synchronization.
 
-### Standalone
+Configure `org_trust.grants` and `org_trust.node_cert_path` for replication
+authorization. A cluster without trust enforcement requires an explicit
+`--cluster-open`, intended for isolated tests. Replication uses TCP, and connections
+to real peer addresses are not inherently encrypted. Verify the actual route and
+provide transport protection. See [replication trust](docs/architecture/replication-proofs.md).
 
-```bash
-wormdb --config examples/local.json --port 6389 --data ./data
+## Current boundaries
+
+- **Network access:** raw WormWire TCP has no TLS. Authentication requires
+  `auth.require_auth` and valid verification keys; an empty key list leaves
+  listeners unauthenticated. Configure and test both authorization and transport.
+- **Immutability:** WORM is an engine property. It does not prevent an administrator
+  from replacing data files or code; procedure authors must use helpers that
+  enforce the guarantees they need.
+- **Durability:** WAL and snapshot behavior depends on persistence settings and the
+  write path. Procedure writes and derived indexes have the recovery behavior
+  described above.
+- **Replication:** local commits are authoritative. There are no quorum
+  acknowledgements or cross-node transaction guarantees.
+- **Distribution:** the quick start builds from source. Binary size and dynamic
+  dependencies vary with platform and build options. Docker and optional QUIC
+  builds need their own validation.
+
+See [SECURITY.md](SECURITY.md) for deployment boundaries and private vulnerability
+reporting, and [persistence](docs/operations/persistence.md) for storage operations.
+
+## Documentation
+
+| Start here | Reference |
+| --- | --- |
+| Build and connect | [Quick-start guide](docs/getting-started/quick-start.md), [Windows](docs/WINDOWS.md), [clients](docs/getting-started/clients.md) |
+| Protocol | [WormWire framing](docs/protocol/index.md), [commands](docs/protocol/commands.md), [status fields](docs/reference/status-fields.md) |
+| Storage and proofs | [WORM semantics](docs/architecture/worm-semantics.md), [append logs](docs/protocol/append-log.md), [proofs](docs/protocol/proofs.md) |
+| Extend the engine | [Procedures](docs/architecture/procedures.md), [composition root](src/main.zig), [library root](src/lib.zig), [FFI](ffi) |
+| Search and memory | [Vector search](docs/VECTOR_SEARCH.md), [agent memory example](docs/AGENT_MEMORY_DEMO.md) |
+| Operate | [Persistence](docs/operations/persistence.md), [authentication](docs/AUTH_SCOPED.md), [replication trust](docs/architecture/replication-proofs.md) |
+
+## Development
+
+From the repository root:
+
+```sh
+zig build test -Dcrypto-backend=std
+bun install --frozen-lockfile
+bun run docs:build
 ```
 
-### Multi-Node Cluster
+For the Bun client tests:
 
-```bash
-# Isolated, trusted test network ONLY: --cluster-open permits unauthenticated replication
-# Seed node
-wormdb --port 6389 --data ./data1 --cluster myapp --cluster-open --gossip-port 51821
-
-# Join nodes
-wormdb --port 6390 --data ./data2 --cluster myapp --cluster-open --seed 10.0.0.1:51821
-wormdb --port 6391 --data ./data3 --cluster myapp --cluster-open --seed 10.0.0.1:51821
+```sh
+cd apps/bun
+bun install --frozen-lockfile
+bun test
 ```
 
-### Org Trust (MeshGuard)
+The default Linux build uses libsodium; `-Dcrypto-backend=std` selects Zig's built-in
+backend. The server is Zig; the Bun code is clients and tooling.
 
-WormDB embeds meshguard for identity, SWIM gossip, and WireGuard tunnel setup.
-Configure `org_trust.grants` and `org_trust.node_cert_path` for certificate-based
-replication authorization. Configuring grants enables enforcement; a cluster
-without enforcement refuses startup unless `--cluster-open` is explicitly passed.
-Authorization does not itself encrypt the TCP stream. See
-[replication proofs and trust](docs/architecture/replication-proofs.md).
+To measure vector operations on your hardware, run the
+[microbenchmark](src/vector/bench.zig):
 
-MeshGuard's standalone CLI flow is:
-
-```bash
-# One-time: create org keypair
-meshguard org-keygen
-# → cluster-org.key (secret)  +  cluster-org.pub (share with seeds)
-
-# Mint certificate for a new node
-meshguard org-sign ./data2/identity.pub --name node-2
-
-# Trust the org on a meshguard node
-meshguard trust cluster-org.pub --org
-```
-
-### Docker Compose
-
-```yaml
-services:
-  node1:
-    image: wormdb:latest
-    ports:
-      - "16379:6389"
-      - "51821:51821/udp"
-    command: --cluster wormdb-cluster --cluster-open --gossip-port 51821
-
-  node2:
-    image: wormdb:latest
-    ports:
-      - "16380:6389"
-      - "51822:51822/udp"
-    command: --cluster wormdb-cluster --cluster-open --seed node1:51821 --gossip-port 51822
-    depends_on:
-      - node1
-```
-
-This Compose example is for an isolated test network. The image recipe consumes
-a prebuilt **Linux** executable from `zig-out/bin/wormdb`.
-
-```bash
-zig build -Doptimize=ReleaseSmall
-docker build -t wormdb:latest .
-docker compose up -d
-```
-
-## Vector Search
-
-Approximate-nearest-neighbor search over embeddings, co-located with the KV store. Every write is durable and replicated through the same WormWire path; a per-namespace HNSW graph accelerates the query path.
-
-### Quickstart
-
-```bash
-# Insert (vector_bytes = raw little-endian f32 array; WORM by default)
-bun run apps/bun/src/bin/client.ts EXEC vinsert doc-1 <bytes> 1 vec: cosine
-
-# Search — top-10, optional temporal-decay weight, optional mode
-bun run apps/bun/src/bin/client.ts EXEC vsearch query-key 10 vec: cosine 0 auto
-
-# Bulk rebuild HNSW (use after restart, mixed SET-ingest, or replication catch-up)
-bun run apps/bun/src/bin/client.ts EXEC vreindex vec:
-
-# Pairwise similarity
-bun run apps/bun/src/bin/client.ts EXEC vsim doc-1 doc-2 cosine
-
-# Namespace stats
-bun run apps/bun/src/bin/client.ts EXEC vstats vec:
-```
-
-### Dispatch hierarchy
-
-`vsearch` auto-selects the fastest path that fits the namespace:
-
-1. **HNSW graph** when the namespace has a registered index with a matching metric. Stage-1 traversal (ef = K × 10) → stage-2 exact refine with the user's metric and optional temporal decay.
-2. **Binary-quantized prefilter** when no HNSW is available but `bq:*` hashes exist (every `vinsert` writes one — 1 bit per dimension, 32× compression). Hamming-ranks into a top-M pool, refines with exact distances.
-3. **Brute-force** as the floor. Also the forced path when `mode=exact`.
-
-Key layout:
-
-```
-vec:<namespace>:<id>         → raw f32 bytes (the embedding)
-bq:vec:<namespace>:<id>      → 1-bit-per-dim BQ hash
-__meta:<namespace>:count     → per-node insert counter (local, not replicated)
-```
-
-The HNSW graph is a serving index derived from the durable `vec:*` entries. Snapshot format v2 persists the graph, tombstones, and RaBitQ parameters when a snapshot is written; `vreindex` still rebuilds the graph from KV entries after raw `SET` ingest, WAL-only catch-up since the last snapshot, or manual recovery.
-
-### Per-namespace metric
-
-A namespace's distance metric is captured on its first `vinsert` and frozen. Queries under the same metric hit the HNSW fast path; queries under a different metric fall through to BQ (which is metric-agnostic — stage-2 re-ranks with whatever metric the query asked for).
-
-```
-EXEC vinsert doc-1 <bytes> 1 vec:articles:  cosine   # creates ns, metric=cosine
-EXEC vinsert p-1   <bytes> 1 vec:products:  l2       # creates ns, metric=l2
-EXEC vsearch q-vec 10 vec:articles:  cosine          # HNSW fast path
-EXEC vsearch q-vec 10 vec:articles:  l2              # BQ fallback (metric mismatch)
-```
-
-### Temporal decay
-
-All three procedures accept an optional decay weight λ ∈ [0, 1]. Final score is `(1 − λ)·similarity + λ·exp(−age_hours / 168)` — exponential decay with a 1-week time constant (half-life ≈ 116h). Useful for AI-agent memory stores where recency matters.
-
-### Pub/sub on vector inserts
-
-Every successful `vinsert` publishes the inserted key to `<namespace>inserted`:
-
-```
-SUB vec:articles:inserted
-# stream: >EVENT vec:articles:inserted\r\nvec:articles:doc-1\r\n
-```
-
-Subscribe at any prefix to filter by namespace breadth — `SUB vec:` catches every vector insert across the server.
-
-### Measured performance
-
-Microbench (`zig run src/vector/bench.zig -O ReleaseFast -lc`), AVX2, single thread, N=50K vectors, K=10, cosine metric:
-
-| Dim  | Brute-force cosine | BQ prefilter + refine |
-| ---- | ------------------:| ---------------------:|
-| 384  |     220 QPS        |      **3,520 QPS** (16×) |
-| 768  |     115 QPS        |      **2,440 QPS** (21×) |
-| 1536 |      59 QPS        |      **1,210 QPS** (20×) |
-
-HNSW recall@10 = 1.000 on a rigorous brute-force ground-truth check (400 random 48-dim vectors, 20 queries, ef=100). Inner-loop cosine throughput is ~13 GFLOP/s — ~23 % of AVX2 f32 FMA peak.
-
-### Current limitations
-
-- **`vsearch` is local-node search**: cluster fan-out is a separate `EXEC vsearch_cluster` procedure. Validate its timeout, partial-result, and consistency behavior for your deployment.
-- **Index restore is snapshot-bound**: snapshot v2 restores HNSW/RaBitQ state, but WAL replay after the most recent snapshot does not replay vector-index mutations. Run `EXEC vreindex <namespace>` after large raw ingests or recovery from an old snapshot.
-- **Deletes are tombstone-based**: `VDELETE`/`EXEC vdelete` tombstone non-WORM vectors in HNSW and remove store entries. WORM-default vectors remain immutable; use `EXEC vnsdrop <namespace> 1` only for best-effort namespace purges where skipped WORM entries are acceptable.
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                          WormDB                              │
-├──────────────┬──────────────┬────────────┬───────────────────┤
-│ TCP Server   │ Protocol     │ Store      │ EventBus          │
-│ (thread/conn)│ (WormWire v1)│ (Map+WAL)  │ (pub/sub)         │
-├──────────────┴──────────────┴────────────┴───────────────────┤
-│                      Cluster Layer                           │
-│  ┌───────────┐  ┌──────────────┐  ┌────────────────────┐    │
-│  │ meshguard │  │ SWIM Gossip  │  │ Peer                │    │
-│  │ (Ed25519) │  │ (discovery)  │  │ Replication (TCP)   │    │
-│  └───────────┘  └──────────────┘  └────────────────────┘    │
-└──────────────────────────────────────────────────────────────┘
-```
-
-### Components
-
-| Component      | File                           | Description                                              |
-| -------------- | ------------------------------ | -------------------------------------------------------- |
-| **Types**      | `src/core/types.zig`           | Entry, Command, Response, CommandId                      |
-| **Config**     | `src/core/config.zig`          | Store, Server, and Cluster configuration                 |
-| **WAL**        | `src/storage/wal.zig`          | Write-Ahead Log with CRC32 integrity                     |
-| **Store**      | `src/storage/store.zig`        | In-memory HashMap + WAL persistence                      |
-| **Wire**       | `src/protocol/wire.zig`        | WormWire binary codec (read/write frames)                |
-| **EventBus**   | `src/event/bus.zig`            | Pub/sub channel management                               |
-| **Server**     | `src/server/tcp.zig`           | TCP server (thread-per-connection)                       |
-| **Cluster**    | `src/cluster/node.zig`         | meshguard SWIM + encrypted replication                   |
-| **Procedures** | `src/procedures/`              | Compiled-in EXEC handlers + Ctx (store/cluster/events)   |
-| **Distance**   | `src/vector/distance.zig`      | SIMD cosine/dot/L2 + Hamming + binary quantization       |
-| **HNSW**       | `src/vector/hnsw.zig`          | Hierarchical Navigable Small World graph index           |
-| **Metric**     | `src/vector/metric.zig`        | Metric enum + per-metric distance functions              |
-| **TopK**       | `src/vector/topk.zig`          | Bounded min-heap for O(N log K) top-K                    |
-| **Index**      | `src/vector/index.zig`         | NamespaceIndex + NamespaceRegistry (per-namespace HNSW)  |
-
-### WAL Format
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│ Record Header (13 bytes)                                     │
-├──────────┬──────────┬────────────────────────────────────────┤
-│ CRC32    │ Type     │ Length (u64)                           │
-│ (4 bytes)│ (1 byte) │ (8 bytes)                              │
-└──────────┴──────────┴────────────────────────────────────────┘
-Payload:
-  SET: [key_len:2][value_len:4][flags:1][timestamp:8][key][value]
-  DEL: [key_len:2][key]
-```
-
-## Port Policy
-
-| Port      | Purpose                       | Protocol |
-| --------- | ----------------------------- | -------- |
-| **6389**  | Client connections (WormWire) | TCP      |
-| **51821** | Cluster gossip (SWIM)         | UDP      |
-
-Default client port is `6389` (avoids Redis `6379` collision). Override with `--port`. Gossip port defaults to `51821` (WireGuard convention). Override with `--gossip-port`.
-
-## Performance
-
-- **Binary and image size**: depend on the target, crypto backend, and optional gateways; measure the artifact you intend to distribute.
-- **KV read**: O(1) in-memory lookup (single shard-mutex acquire)
-- **KV write**: memory update + WAL append (+ cluster replication if enabled)
-- **Vector cosine distance**: ~13 GFLOP/s single-threaded on AVX2 (~170ns for a 768-dim compare)
-- **Vector search QPS** (50K vectors, K=10, single thread — see [`src/vector/bench.zig`](src/vector/bench.zig)):
-  - 384-dim: 220 QPS brute-force → **3,520 QPS** with BQ prefilter
-  - 768-dim: 115 QPS brute-force → **2,440 QPS** with BQ prefilter
-  - 1536-dim: 59 QPS brute-force → **1,210 QPS** with BQ prefilter
-
-## Development Status
-
-### ✅ Implemented
-
-- [x] Core KV store with HashMap + WAL persistence (CRC32)
-- [x] WORM mode enforcement
-- [x] TCP server (thread-per-connection)
-- [x] WormWire binary protocol (v1)
-- [x] Pub/Sub event bus
-- [x] Bun reference client + admin UI
-- [x] WebSocket gateway (browser-direct WormWire over WS)
-- [x] QUIC/WebTransport gateway (libwtf + MsQuic, compile-time gated)
-- [x] io_uring event loop + epoll fallback
-- [x] Auth system (Ed25519 SCT tokens, per-gateway enforcement)
-- [x] Docker containerization
-- [x] meshguard cluster integration (SWIM + encrypted replication)
-- [x] Stored procedures (`EXEC`) with replication + event-bus from the procedure context
-- [x] KV procedures (`kv_put`, `kv_get`, `kv_stats`, `scan`, `transfer`, `increment`)
-- [x] Chat procedures (`chat_send`, `chat_history`)
-- [x] Memory procedures (`mem_init`, `mem_add`, `mem_bulk_add`, `mem_get`, `mem_query`, `mem_range`, `mem_stats`, `mem_drop`, `mem_capabilities`)
-- [x] Vector search — SIMD distances, BQ prefilter, HNSW graph index, per-namespace metric
-- [x] `vreindex` bulk rebuild for HNSW
-- [x] Native vector wire commands (`VINSERT`, `VDELETE`, `VBULKINSERT`) with replication-aware apply paths
-- [x] Snapshot format v2 for HNSW graphs, tombstones, and RaBitQ parameters
-- [x] RaBitQ 1-bit quantization (`EXEC vrabitq`) with `bq` and `bq_rerank` query modes
-- [x] Namespace drop and tombstone lifecycle (`vdelete`, `vnsdrop`)
-
-### 🚧 In Progress
-
-- [x] WormDB-side org-trust configuration for meshguard certificates
-- [ ] Protocol-level integration tests for pipelined commands with interleaved `EVENT` frames
-- [ ] Live server integration tests for native vector wire commands and cluster anti-echo
-
-### 📋 Planned
-
-- [ ] Merkle-tree consistency checks across peers
-- [x] Separate cluster fan-out procedure (`vsearch_cluster`); deployment qualification remains workload-specific
-- [ ] Web dashboard
-- [ ] Backup/restore
-
-## Testing
-
-```bash
-# Full suite (via build system)
-zig build test
-
-# Isolated vector module tests
-zig test src/vector/distance.zig
-zig test src/vector/topk.zig
-zig test src/vector/metric.zig
-zig test src/vector/hnsw.zig
-zig test src/vector/index.zig
-
-# Vector search microbench (ReleaseFast)
+```sh
 zig run src/vector/bench.zig -O ReleaseFast -lc
-
-# Local cluster smoke testing is being refreshed for WormWire-only clients.
-# Until then, start nodes manually and verify with the Bun client commands above.
-
-# Docker cluster test
-docker compose up -d
-docker compose -f docker-compose.bench.yml run --rm benchmark
 ```
 
-## Dependencies
-
-- **Zig 0.16.0** — Tested language and build system version
-- **libsodium** — Optional crypto backend; selected by default on Linux, disabled with `-Dcrypto-backend=std`
-- **meshguard** — P2P mesh networking (SWIM gossip, encrypted messaging), vendored as `deps/meshguard`
-
-## Troubleshooting
-
-| Problem                       | Solution                                                         |
-| ----------------------------- | ---------------------------------------------------------------- |
-| Port already in use           | `wormdb --port <other-port>`                                     |
-| Permission denied on data dir | Check `--data` directory permissions                             |
-| Bun client connection refused | Verify `--host`/`--port` and that WormDB is running              |
-| Node won't join cluster       | Verify seed address, gossip port reachability, and WireGuard permissions |
-
-## License
-
-[MIT](LICENSE). First-party engine, clients, and tooling use the same license.
-
-See [third-party notices](THIRD_PARTY_NOTICES.md) for dependency licenses and
-binary provenance requirements.
+Record the commit, build flags, hardware, dataset, and query settings alongside
+results. A microbenchmark does not establish end-to-end server throughput.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, checks, and pull request guidance.
-See [SECURITY.md](SECURITY.md) for vulnerability reporting and deployment boundaries.
-Maintainers preparing a public release should use the
-[release checklist](docs/PUBLIC_RELEASE_CHECKLIST.md).
+Bug reports, focused proposals, documentation improvements, and patches are
+welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md), then use
+[GitHub issues](https://github.com/igorls/wormdb/issues) or open a pull request.
+Report vulnerabilities through [GitHub private reporting](https://github.com/igorls/wormdb/security/advisories/new).
 
----
+## License
 
-Built with Zig.
+[MIT](LICENSE) for the first-party engine, clients, and tooling.
+See [third-party notices](THIRD_PARTY_NOTICES.md) for dependency licenses.

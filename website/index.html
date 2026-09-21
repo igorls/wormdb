@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 
 <title>WormDB — write once, read many</title>
-<meta name="description" content="WormDB is a distributed key-value store in a single 45 KB Zig binary: write-once keys with cryptographic audit proofs, stored procedures that turn the database into your API, encrypted clustering with no coordinator, and co-located vector search." />
+<meta name="description" content="An open-source key-value store and embeddable engine in Zig. Write-once records, compiled procedures, pub/sub, and vector search in the same store. MIT licensed." />
 <meta name="theme-color" content="#FAF9F3" media="(prefers-color-scheme: light)" />
 <meta name="theme-color" content="#111413" media="(prefers-color-scheme: dark)" />
 <link rel="canonical" href="https://wormdb.dev/" />
@@ -14,14 +14,14 @@
 <meta property="og:type" content="website" />
 <meta property="og:site_name" content="WormDB" />
 <meta property="og:title" content="WormDB — write once, read many" />
-<meta property="og:description" content="A distributed key-value store in a single 45 KB Zig binary. Write-once keys, stored procedures as your API, encrypted clustering, co-located vector search." />
+<meta property="og:description" content="An open-source key-value store and embeddable engine in Zig. Write-once records, compiled procedures, pub/sub, and vector search in the same store. MIT licensed." />
 <meta property="og:url" content="https://wormdb.dev/" />
 <meta property="og:image" content="https://wormdb.dev/og.png" />
 <meta property="og:image:width" content="1200" />
 <meta property="og:image:height" content="630" />
 <meta name="twitter:card" content="summary_large_image" />
 <meta name="twitter:title" content="WormDB — write once, read many" />
-<meta name="twitter:description" content="A distributed KV store in a 45 KB Zig binary. Write-once keys, procedures as your API, encrypted clustering, co-located vector search." />
+<meta name="twitter:description" content="An open-source key-value store and embeddable engine in Zig. Write-once records, compiled procedures, pub/sub, and vector search in the same store. MIT licensed." />
 <meta name="twitter:image" content="https://wormdb.dev/og.png" />
 
 <script>
@@ -36,7 +36,7 @@ try { var t = localStorage.getItem("wormdb-theme"); if (t) document.documentElem
   "name": "WormDB",
   "operatingSystem": "Linux, Windows",
   "applicationCategory": "DeveloperApplication",
-  "description": "Distributed key-value store in Zig with WORM (write-once-read-many) semantics, stored procedures, encrypted clustering, and co-located vector search.",
+  "description": "An open-source key-value store and embeddable engine in Zig. Write-once records, compiled procedures, pub/sub, and vector search in the same store. MIT licensed.",
   "url": "https://wormdb.dev/",
   "license": "https://opensource.org/licenses/MIT",
   "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
@@ -176,7 +176,7 @@ try { var t = localStorage.getItem("wormdb-theme"); if (t) document.documentElem
 .mode-fiche { display: none; }
 
 * { box-sizing: border-box; }
-html { scroll-behavior: smooth; }
+html { scroll-behavior: smooth; scroll-padding-top: 88px; }
 @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
 
 body {
@@ -240,15 +240,15 @@ code, pre, kbd { font-family: var(--mono); }
 }
 .brand:hover { color: var(--ink); }
 .brand svg { width: 24px; height: 24px; display: block; }
-.nav-links { display: flex; gap: 20px; margin-left: auto; }
+.nav-links { display: flex; gap: 16px; margin-left: auto; }
 .nav-links a {
-  font-family: var(--mono); font-size: 0.74rem; font-weight: 500;
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 500;
   letter-spacing: 0.07em; color: var(--soft); text-decoration: none;
 }
 .nav-links a:hover { color: var(--red); }
 .nav-gh {
   display: inline-flex; align-items: center; gap: 8px;
-  font-family: var(--mono); font-size: 0.74rem; font-weight: 600;
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 600;
   letter-spacing: 0.05em;
   color: var(--paper); background: var(--ink);
   padding: 8px 14px; text-decoration: none;
@@ -260,7 +260,7 @@ code, pre, kbd { font-family: var(--mono); }
   background: none; cursor: pointer;
   border: 1px solid var(--edge);
   color: var(--soft);
-  font-family: var(--mono); font-size: 0.7rem; font-weight: 500;
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 500;
   letter-spacing: 0.07em;
   padding: 7px 11px;
   white-space: nowrap;
@@ -268,9 +268,18 @@ code, pre, kbd { font-family: var(--mono); }
 .nav-mode:hover { color: var(--red); border-color: var(--red); }
 .nav-mode b { font-weight: 600; color: var(--ink); }
 .nav-mode:hover b { color: var(--red); }
-@media (max-width: 800px) {
-  .nav-links { display: none; }
+@media (max-width: 1100px) {
+  html { scroll-padding-top: 170px; }
+  .nav-in { height: auto; min-height: 60px; flex-wrap: wrap; gap: 12px; padding-top: 12px; padding-bottom: 8px; }
+  .nav-links { order: 4; width: 100%; margin: 0; flex-wrap: wrap; gap: 2px 20px; padding: 4px 0; }
+  .nav-links a { flex: none; padding: 6px 0; }
   .nav-mode { margin-left: auto; }
+}
+@media (max-width: 380px) {
+  .nav-in { gap: 8px; }
+  .nav-gh { padding: 8px; }
+  .nav-mode { padding: 7px; }
+  .mode-prefix { display: none; }
 }
 
 /* ---------- page headers & perforations ---------- */
@@ -281,7 +290,7 @@ code, pre, kbd { font-family: var(--mono); }
 }
 .pghead {
   display: flex; align-items: baseline; gap: 14px;
-  font-family: var(--mono); font-size: 0.72rem; font-weight: 500;
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 500;
   letter-spacing: 0.1em; color: var(--mut);
   padding: 14px 0 44px;
   white-space: nowrap; overflow: hidden;
@@ -303,7 +312,7 @@ h2 .rd { color: var(--red); }
 /* ---------- hero ---------- */
 .hero { padding: 74px 0 92px; }
 .tof {
-  font-family: var(--mono); font-size: 0.72rem; font-weight: 500;
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 500;
   letter-spacing: 0.1em; color: var(--mut);
   display: flex; align-items: baseline; gap: 14px;
   margin: 0 0 46px; white-space: nowrap; overflow: hidden;
@@ -345,10 +354,23 @@ h1 .l2 { color: var(--red); display: block; }
 .btn svg { width: 15px; height: 15px; }
 .hero-meta {
   margin-top: 28px;
-  font-family: var(--mono); font-size: 0.74rem; color: var(--mut);
+  font-family: var(--mono); font-size: 0.75rem; color: var(--mut);
   letter-spacing: 0.03em;
 }
 .hero-meta b { color: var(--soft); font-weight: 500; }
+.hero-status { margin: 14px 0 0; color: var(--soft); font-size: 0.88rem; }
+.hero-status a { white-space: nowrap; }
+.skip-link { position: absolute; top: 8px; left: 16px; z-index: 100; padding: 10px 16px; background: var(--paper); transform: translateY(-160%); }
+.skip-link:focus { transform: none; }
+.code pre { scrollbar-color: var(--edge) var(--form); }
+.code-status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+.resources { margin: 26px 0 0; padding: 0; list-style: none; }
+.resources li { padding: 14px 0; border-top: 1px solid var(--edge); }
+.resources li:last-child { border-bottom: 1px solid var(--edge); }
+.resources a { font-weight: 600; }
+.resources span { display: block; color: var(--soft); font-size: 0.9rem; margin-top: 3px; }
+.section-note { margin-top: 24px; color: var(--soft); font-size: 0.9rem; }
+.figure-note { margin: 14px 0 0; color: var(--mut); font-size: 0.85rem; }
 
 /* ---------- the printer (audit log demo) ---------- */
 .printer {
@@ -360,14 +382,14 @@ h1 .l2 { color: var(--red); display: block; }
   display: flex; align-items: center; gap: 12px;
   padding: 10px 16px;
   border-bottom: 2px solid var(--ink);
-  font-family: var(--mono); font-size: 0.68rem; font-weight: 600;
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 600;
   letter-spacing: 0.08em; color: var(--ink);
   white-space: nowrap;
 }
 .printer-bar .lite { color: var(--mut); font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
 .printer-replay {
   margin-left: auto; background: none; border: 1px solid var(--edge); cursor: pointer;
-  color: var(--soft); font-family: var(--mono); font-size: 0.68rem;
+  color: var(--soft); font-family: var(--mono); font-size: 0.75rem;
   padding: 3px 9px;
 }
 .printer-replay:hover { color: var(--red); border-color: var(--red); }
@@ -410,7 +432,7 @@ h1 .l2 { color: var(--red); display: block; }
 .jobcard-hd {
   padding: 10px 18px;
   border-bottom: 2px solid var(--ink);
-  font-size: 0.7rem; font-weight: 600; letter-spacing: 0.12em;
+  font-size: 0.75rem; font-weight: 600; letter-spacing: 0.12em;
 }
 .jobcard-hd .lite { color: var(--mut); font-weight: 500; }
 .jobcard pre { margin: 0; padding: 16px 18px; font-size: 0.76rem; line-height: 1.9; overflow-x: auto; }
@@ -423,7 +445,7 @@ h1 .l2 { color: var(--red); display: block; }
 .proc-fam {
   display: grid; grid-template-columns: 128px 1fr; gap: 14px;
   padding: 10px 0; border-bottom: 1px solid var(--edge);
-  font-family: var(--mono); font-size: 0.74rem;
+  font-family: var(--mono); font-size: 0.8rem;
 }
 .proc-fam b { color: var(--ink); font-weight: 600; letter-spacing: 0.06em; }
 .proc-fam span { color: var(--mut); line-height: 1.8; }
@@ -444,7 +466,7 @@ h1 .l2 { color: var(--red); display: block; }
 }
 .opcode {
   display: inline-block;
-  font-family: var(--mono); font-size: 0.7rem; font-weight: 600;
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 600;
   letter-spacing: 0.08em;
   color: var(--ink);
   background: var(--bar);
@@ -462,36 +484,7 @@ h1 .l2 { color: var(--red); display: block; }
 @media (max-width: 960px) { .cards { grid-template-columns: repeat(2, minmax(0,1fr)); } }
 @media (max-width: 620px) { .cards { grid-template-columns: minmax(0,1fr); } }
 
-/* ---------- benchmark summary ---------- */
-.bench-src {
-  font-family: var(--mono); font-size: 0.74rem; color: var(--mut);
-  margin: 12px 0 0; letter-spacing: 0.02em;
-}
-.tiles {
-  margin: 46px 0 56px;
-  display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 16px;
-}
-.tile {
-  background: var(--form);
-  border: 1px solid var(--edge);
-  border-top: 3px solid var(--green);
-  padding: 20px 16px 18px;
-}
-.tile-v {
-  font-family: var(--dot); font-size: clamp(1.45rem, 2.2vw, 1.95rem);
-  line-height: 1; color: var(--ink); letter-spacing: 0.01em;
-}
-.tile-v small { font-size: 0.5em; color: var(--soft); margin-left: 2px; }
-.tile-l {
-  margin-top: 12px;
-  font-family: var(--mono); font-size: 0.67rem; font-weight: 500;
-  letter-spacing: 0.05em; color: var(--mut); line-height: 1.55;
-  text-transform: uppercase;
-}
-@media (max-width: 960px) { .tiles { grid-template-columns: repeat(3, minmax(0,1fr)); } }
-@media (max-width: 560px) { .tiles { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+/* ---------- vector search ---------- */
 
 .dispatch { margin: 24px 0 0; padding: 0; list-style: none; counter-reset: d; }
 .dispatch li {
@@ -511,53 +504,11 @@ h1 .l2 { color: var(--red); display: block; }
 .dispatch span { color: var(--soft); font-size: 0.92rem; }
 .dispatch span code { font-size: 0.88em; background: var(--form); }
 
-/* ---------- qps chart ---------- */
-.qps {
-  background: var(--form);
-  border: 1px solid var(--edge);
-  box-shadow: 5px 5px 0 var(--shadow);
-  padding: 22px 24px 18px;
-}
-.qps-head {
-  font-family: var(--mono); font-size: 0.7rem; font-weight: 600; color: var(--ink);
-  letter-spacing: 0.1em; margin: 0 0 6px;
-}
-.qps-sub { font-family: var(--mono); font-size: 0.68rem; color: var(--mut); margin: 0 0 18px; }
-.qps-legend {
-  display: flex; gap: 18px; margin: 0 0 20px;
-  font-family: var(--mono); font-size: 0.72rem; color: var(--soft);
-}
-.qps-legend i { display: inline-block; width: 10px; height: 10px; margin-right: 7px; vertical-align: -1px; }
-.i-brute { background: var(--s-red); }
-.i-bq { background: var(--s-blue); }
-.qps-row {
-  display: grid; grid-template-columns: 64px 1fr; gap: 14px;
-  align-items: center; padding: 12px 0;
-}
-.qps-row + .qps-row { border-top: 1px dashed var(--edge); }
-.qps-dim { font-family: var(--mono); font-weight: 600; font-size: 1.02rem; }
-.qps-dim small { display: block; font-size: 0.6rem; font-weight: 500; letter-spacing: 0.1em; color: var(--mut); }
-.qps-bar { display: flex; align-items: center; gap: 10px; height: 21px; }
-.qps-bar i {
-  display: block; height: 10px;
-  width: max(calc(var(--p) * 1%), 3px);
-  transition: width 0.8s cubic-bezier(0.2, 0.8, 0.2, 1);
-  transition-delay: var(--d, 0s);
-}
-.qps:not(.grown) .qps-bar i { width: 3px; }
-.b-brute i { background: var(--s-red); }
-.b-bq i { background: var(--s-blue); }
-.qps-val { font-family: var(--mono); font-size: 0.76rem; font-weight: 500; color: var(--ink); white-space: nowrap; }
-.qps-val small { color: var(--mut); font-weight: 400; }
-.qps-x { font-family: var(--mono); font-style: normal; font-size: 0.7rem; font-weight: 600; color: var(--green); white-space: nowrap; }
-.qps-note { margin: 16px 0 0; font-family: var(--mono); font-size: 0.68rem; color: var(--mut); }
-@media (prefers-reduced-motion: reduce) {
-  .qps:not(.grown) .qps-bar i { width: max(calc(var(--p) * 1%), 3px); }
-  .qps-bar i { transition: none; }
-}
+
 
 /* ---------- code forms ---------- */
 .code {
+  margin: 0;
   position: relative;
   background: var(--form);
   border: 1px solid var(--edge);
@@ -565,7 +516,8 @@ h1 .l2 { color: var(--red); display: block; }
   overflow-x: auto;
 }
 .code pre {
-  margin: 0; padding: 18px 20px;
+  margin: 0; padding: 50px 20px 20px;
+  white-space: pre-wrap; overflow-wrap: anywhere;
   font-size: 0.82rem; line-height: 1.8;
   color: var(--ink);
 }
@@ -577,7 +529,7 @@ h1 .l2 { color: var(--red); display: block; }
   background: var(--paper);
   border: 1px solid var(--edge);
   color: var(--soft);
-  font-family: var(--mono); font-size: 0.66rem; font-weight: 500;
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 500;
   padding: 4px 9px; cursor: pointer;
 }
 .copy-btn:hover { color: var(--red); border-color: var(--red); }
@@ -600,7 +552,7 @@ h1 .l2 { color: var(--red); display: block; }
   gap: 20px;
 }
 .qs-pane h3 {
-  font-family: var(--mono); font-size: 0.72rem; font-weight: 600;
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 600;
   letter-spacing: 0.12em; text-transform: uppercase;
   color: var(--ink); margin: 0 0 12px;
 }
@@ -625,7 +577,7 @@ footer { padding: 26px 0 60px; }
 }
 .foot-tag { margin: 0; color: var(--soft); font-size: 0.92rem; max-width: 26rem; }
 .foot-h {
-  font-family: var(--mono); font-size: 0.68rem; font-weight: 600;
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 600;
   letter-spacing: 0.14em; text-transform: uppercase;
   color: var(--mut); margin: 0 0 14px;
 }
@@ -640,20 +592,17 @@ footer { padding: 26px 0 60px; }
   margin-top: 52px; padding-top: 20px;
   border-top: 2px dashed var(--hard);
   display: flex; justify-content: space-between; gap: 20px; flex-wrap: wrap;
-  font-family: var(--mono); font-size: 0.7rem; color: var(--mut);
+  font-family: var(--mono); font-size: 0.75rem; color: var(--mut);
   letter-spacing: 0.02em;
 }
 @media (max-width: 860px) { .foot-grid { grid-template-columns: 1fr; gap: 34px; } }
 
 /* ---------- reveal ---------- */
-.reveal { opacity: 0; transform: translateY(12px); transition: opacity 0.5s ease, transform 0.5s ease; }
-.reveal.in { opacity: 1; transform: none; }
-@media (prefers-reduced-motion: reduce) {
-  .reveal { opacity: 1; transform: none; transition: none; }
-}
+.reveal { opacity: 1; }
 </style>
 </head>
 <body>
+<a class="skip-link" href="#top">Skip to content</a>
 <div class="sheet">
 
 <!-- ============ nav ============ -->
@@ -675,13 +624,13 @@ footer { padding: 26px 0 60px; }
       WORMDB
     </a>
     <nav class="nav-links" aria-label="Sections">
-      <a href="#procedures">PROCEDURES</a>
-      <a href="#capabilities">CAPABILITIES</a>
-      <a href="#benchmarks">BENCHMARKS</a>
+      <a href="#capabilities">FEATURES</a>
+      <a href="#benchmarks">VECTORS</a>
       <a href="#cluster">CLUSTER</a>
-      <a href="#install">INSTALL</a>
+      <a href="#install">QUICK START</a>
+      <a href="https://meshrooms.wormdb.dev/">MESHROOMS</a>
     </nav>
-    <button class="nav-mode" id="modeToggle" aria-label="Switch between paper and microfiche view">VIEW: <b id="modeLabel">PAPER</b></button>
+    <button class="nav-mode" id="modeToggle" aria-label="Switch between paper and microfiche view"><span class="mode-prefix">VIEW: </span><b id="modeLabel">PAPER</b></button>
     <a class="nav-gh" href="https://github.com/igorls/wormdb">
       <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
       GITHUB
@@ -689,7 +638,7 @@ footer { padding: 26px 0 60px; }
   </div>
 </header>
 
-<main id="top">
+<main id="top" tabindex="-1">
 
 <!-- ============ page 001: system log (hero) ============ -->
 <section class="hero">
@@ -704,10 +653,9 @@ footer { padding: 26px 0 60px; }
       <div>
         <h1>WRITE ONCE.<span class="l2">READ MANY.</span></h1>
         <p class="hero-sub">
-          WormDB is a distributed key-value store in a <strong>single 45&nbsp;KB Zig binary</strong>.
-          Seal a key forever with one flag, prove it with Merkle audit trails, run your business
-          logic <strong>inside the database</strong>, and replicate everything over encrypted
-          tunnels — no coordinator, no sidecars.
+          An <strong>open-source key-value store and embeddable engine in Zig</strong>.
+          Keep selected records write-once, run compiled procedures next to your data,
+          and search vectors in the same store. Start with a local server and a Bun client.
         </p>
         <div class="cta-row">
           <a class="btn btn-solid" href="#install">GET STARTED</a>
@@ -716,24 +664,25 @@ footer { padding: 26px 0 60px; }
             VIEW SOURCE
           </a>
         </div>
-        <p class="hero-meta"><b>MIT</b> · ZIG 0.16 · <b>LINUX</b> FULL FEATURE SET · <b>WINDOWS</b> SINGLE-NODE · NO RUNTIME, NO GC</p>
+        <p class="hero-meta"><b>MIT LICENSED</b> · ZIG 0.16.0 · <b>LINUX</b> + <b>WINDOWS</b> · BUN &amp; BROWSER CLIENTS</p>
+        <p class="hero-status">Under active development. <a href="https://github.com/igorls/wormdb/blob/main/SECURITY.md">Read the deployment notes</a> before running beyond localhost.</p>
       </div>
 
       <div class="printer" id="printer">
         <div class="printer-bar">
           <span>AUDIT LOG</span>
-          <span class="lite">CONTINUOUS FORM · 127.0.0.1:6389</span>
+          <span class="lite">ILLUSTRATIVE SESSION</span>
           <button class="printer-replay" id="replay" aria-label="Reprint the demo">⟳ REPRINT</button>
         </div>
         <div class="printer-body" id="printerBody" aria-live="off">
-          <p class="p-line p-cmd">SET audit:2026-07-04:001 "deploy v2.3.1 approved" WORM</p>
-          <p class="p-line p-ok">OK <span class="m">· wal seq=48213 · crc32 9F2E11D4</span></p>
-          <p class="p-line p-cmd">GET audit:2026-07-04:001</p>
-          <p class="p-line p-val">"deploy v2.3.1 approved"</p>
-          <p class="p-line p-cmd">SET audit:2026-07-04:001 "rewrite history"</p>
-          <p class="p-line p-err">ERR WormViolation: key is write-once</p>
-          <p class="p-line p-cmd">DEL audit:2026-07-04:001</p>
-          <p class="p-line p-err">ERR WormViolation: WORM keys cannot be deleted</p>
+          <p class="p-line p-cmd">SET audit:001 ready WORM</p>
+          <p class="p-line p-ok">OK</p>
+          <p class="p-line p-cmd">GET audit:001</p>
+          <p class="p-line p-val">ready</p>
+          <p class="p-line p-cmd">SET audit:001 changed</p>
+          <p class="p-line p-err">ERR WORM violation: key is immutable</p>
+          <p class="p-line p-cmd">DEL audit:001</p>
+          <p class="p-line p-err">ERR WORM violation: key is immutable</p>
           <p class="p-line p-note">-- 4 statements · 0 rewrites --</p>
         </div>
       </div>
@@ -749,42 +698,42 @@ footer { padding: 26px 0 60px; }
 
     <div class="split">
       <div class="split-copy">
-        <h2>Your database <span class="rd">is</span> your API.</h2>
+        <h2>Bring your logic <span class="rd">to</span> the data.</h2>
         <p>
           Stored procedures in WormDB are <strong>native Zig functions compiled into the server
-          binary</strong>. One <code>EXEC</code> frame runs a multi-key operation atomically under
-          automatic shard locking and returns in a single round trip — no application-side
-          transactions, no read-modify-write races, no ORM in the middle.
+          binary</strong>. Call them with one <code>EXEC</code> request over WormWire.
+          Handlers can work with keys, publish events, and query vectors without a series of
+          application-to-database round trips.
         </p>
         <p>
-          <strong>52 procedures ship in the binary today</strong>, and adding your own is three
-          files and a recompile. Your entire backend logic rides inside a 45&nbsp;KB static
-          executable — deploy it like the mainframes deployed jobs: one artifact, no drift.
+          Built-in handlers cover counters, audit proofs, agent memory, coordination, and
+          vector search. Extend the registry or register procedures from an external domain
+          package when embedding the engine.
         </p>
         <p>
-          When "trust me" isn't enough, the <code>append_log</code> family notarizes your history:
-          Merkle Mountain Range proofs, signed checkpoints, and third-party witnesses make any
-          tampering <strong>mathematically evident</strong> — not just against policy.
+          <strong>Locking and durability are explicit.</strong> Some helpers write only to memory
+          until the next snapshot; durable helpers have different locking behavior. Choose the
+          right contract for each handler. <a href="https://github.com/igorls/wormdb/blob/main/docs/architecture/procedures.md">Read the procedure guide</a>.
         </p>
       </div>
 
       <div>
         <div class="jobcard">
-          <div class="jobcard-hd">// JOB SUBMITTED <span class="lite">· EXEC PGM=TRANSFER</span></div>
-          <pre><span class="jk">EXEC transfer acct:alice acct:bob 250</span>
-<span class="jc">lock shards 0x2F, 0xA1 · ordered, deadlock-free</span>
-<span class="jg">OK  alice=1750 · bob=2250 · 1 round trip</span>
+          <div class="jobcard-hd">COMPILED HANDLERS <span class="lite">· ONE EXEC REQUEST</span></div>
+          <pre><span class="jc"># inspect stored keys and namespace state</span>
+<span class="jk">EXEC scan audit:</span>
+<span class="jk">EXEC vstats vec:articles:</span>
 
-<span class="jk">EXEC append_log_mmr_proof audit 48213</span>
-<span class="jc">merkle mountain range proof, verifiable offline</span>
-<span class="jg">OK  17 hashes · root 4C6F…E2A1</span></pre>
+<span class="jc"># rebuild a derived vector index from its keys</span>
+<span class="jk">EXEC vreindex vec:articles:</span></pre>
         </div>
 
+
         <div class="proc-fams">
-          <div class="proc-fam"><b>KV + ATOMICS</b><span>kv_put · kv_get · kv_stats · scan · transfer · increment</span></div>
+          <div class="proc-fam"><b>KEYS + COUNTERS</b><span>kv_put · kv_get · kv_stats · scan · transfer · increment</span></div>
           <div class="proc-fam"><b>AUDIT PROOF</b><span>append_log_append · verify · mmr_proof · checkpoint · witness ×4 · proof_bundle</span></div>
           <div class="proc-fam"><b>VECTOR</b><span>vinsert · vsearch · vsearch_cluster · vsim · vstats · vreindex · vrabitq · vdelete</span></div>
-          <div class="proc-fam"><b>AGENT MEMORY</b><span>mem_init · mem_add · mem_query · mem_range · mem_verify · mem_stats + 7 more</span></div>
+          <div class="proc-fam"><b>AGENT MEMORY</b><span>mem_init · mem_add · mem_query · mem_range · mem_verify · mem_stats</span></div>
           <div class="proc-fam"><b>COORDINATION</b><span>append_log_claim · claim_status · claim_release · claim_supersede</span></div>
           <div class="proc-fam"><b>TRUST + AUTH</b><span>trust_grant · trust_revoke · trust_fold · auth_mint_scoped · cluster_presence</span></div>
         </div>
@@ -799,118 +748,84 @@ footer { padding: 26px 0 60px; }
   <div class="wrap">
     <p class="pghead"><span class="no">PAGE 003</span><span class="fill"></span><span>CAPABILITY REPORT</span><span class="fill"></span><span>[1B OPCODE][4B LENGTH][PAYLOAD]</span></p>
 
-    <h2>The feature list is a command table.</h2>
+    <h2>Keep records. Run logic. Find context.</h2>
     <p class="lede">
-      Every capability is a first-class frame on the WormWire protocol — one opcode byte, a
-      big-endian length, a payload, 16&nbsp;MiB cap. Here's what the bytes buy you.
+      Build around an append-only audit history, an application event stream, or searchable
+      agent memory. The same engine provides the storage and the operations around it.
     </p>
 
     <div class="cards">
       <article class="fcard reveal">
         <span class="opcode">0x02 · SET</span>
-        <h3>Immutability is a flag, not a product tier</h3>
-        <p>Set a key with the WORM bit and the engine refuses every later overwrite and delete — enforced under the shard lock, replicated to every peer, surfaced as a protocol error. Audit trails without a compliance vendor.</p>
+        <h3>Write-once records</h3>
+        <p>Set a key with the WORM flag and normal SET and DEL commands reject changes to it. Use the append-log procedures for Merkle proofs, signed checkpoints, and witness receipts.</p>
       </article>
       <article class="fcard reveal">
         <span class="opcode">0x57 0x57 · HELLO</span>
-        <h3>A wire protocol, not string parsing</h3>
-        <p>Every session opens with two magic bytes — <code>WW</code>. There is zero grammar to fuzz and zero escaping to get wrong. Raw <code>telnet</code> is rejected at byte one.</p>
+        <h3>A compact binary protocol</h3>
+        <p>WormWire uses a two-byte handshake, an opcode, and length-prefixed payloads. The Bun TCP client and browser WebSocket client handle framing for you; Redis and text clients are not compatible.</p>
       </article>
       <article class="fcard reveal">
         <span class="opcode">0x06 · SUB</span>
         <h3>Pub/sub that matches prefixes</h3>
-        <p>Subscribe to <code>vec:</code> and receive every vector insert on the server as unsolicited <code>EVENT</code> frames on the connection you already have. No polling loop, no sidecar broker.</p>
+        <p>Subscribe to a channel or prefix and receive matching EVENT frames on the same connection. Use it for application events or to follow vector insert notifications by namespace.</p>
       </article>
       <article class="fcard reveal">
         <span class="opcode">0x05 · CLUSTER</span>
-        <h3>No coordinator, no plaintext</h3>
-        <p>Embedded meshguard runs SWIM gossip for discovery and failure detection; replication travels ChaCha20-Poly1305-encrypted over WireGuard tunnels. Joining peers converge by anti-entropy. There is no etcd.</p>
+        <h3>Peer discovery and replication</h3>
+        <p>On Linux, MeshGuard provides peer discovery and failure detection. WormDB replicates committed writes and synchronizes joining peers. Configure trust and transport protection for your network.</p>
       </article>
       <article class="fcard reveal">
         <span class="opcode">0x0D · VINSERT</span>
         <h3>Vectors live with your data</h3>
-        <p>Embeddings write through the same durable, replicated path as any key, then serve from a per-namespace HNSW graph with a 1-bit quantized prefilter (32× smaller) and AVX2/NEON distance kernels.</p>
+        <p>Store embeddings as keys, then query a per-namespace HNSW index, a quantized prefilter, or exact search. Cosine, dot product, and L2 metrics use SIMD distance kernels.</p>
       </article>
       <article class="fcard reveal">
         <span class="opcode">0x09 · EXEC</span>
         <h3>Procedures compiled into the binary</h3>
-        <p>Native Zig functions run atomic multi-key operations under automatic shard locking, in one round trip. Counters, transfers, agent memory, Merkle proofs — or handlers you write yourself.</p>
+        <p>Run native Zig handlers with access to the store, events, and cluster. Built-in memory and audit procedures give you a starting point; your handler chooses its locking and persistence behavior.</p>
       </article>
     </div>
   </div>
 </section>
 
-<!-- ============ page 004: benchmark summary ============ -->
+<!-- ============ page 004: vector search ============ -->
 <hr class="tear" />
 <section class="pg" id="benchmarks">
   <div class="wrap">
-    <p class="pghead"><span class="no">PAGE 004</span><span class="fill"></span><span>BENCHMARK SUMMARY</span><span class="fill"></span><span>MEASURED, NOT MARKETED</span></p>
-
-    <h2>Numbers you can re-run.</h2>
-    <p class="bench-src">$ zig run src/vector/bench.zig -O ReleaseFast -lc · AVX2 · SINGLE THREAD · 50K VECTORS · K=10</p>
-
-    <div class="tiles reveal">
-      <div class="tile"><div class="tile-v">45<small>KB</small></div><div class="tile-l">server binary, ReleaseSmall</div></div>
-      <div class="tile"><div class="tile-v">1.000</div><div class="tile-l">HNSW recall@10 vs ground truth</div></div>
-      <div class="tile"><div class="tile-v">13<small>GF/s</small></div><div class="tile-l">single-thread SIMD cosine</div></div>
-      <div class="tile"><div class="tile-v">256</div><div class="tile-l">store shards, independently locked</div></div>
-      <div class="tile"><div class="tile-v">52</div><div class="tile-l">built-in EXEC procedures</div></div>
-      <div class="tile"><div class="tile-v">0</div><div class="tile-l">external coordinators required</div></div>
-    </div>
-
+    <p class="pghead"><span class="no">PAGE 004</span><span class="fill"></span><span>VECTOR SEARCH</span><span class="fill"></span><span>KEYS + CONTEXT</span></p>
     <div class="split">
       <div class="split-copy">
-        <h2 style="font-size:clamp(1.2rem,2.2vw,1.5rem)">Vector search, co-located.</h2>
-        <p>
-          Most stacks bolt a vector database next to the real one, then spend their uptime keeping
-          the two in agreement. WormDB stores embeddings as ordinary keys —
-          <code>vec:&lt;ns&gt;:&lt;id&gt;</code> — durable in the WAL, replicated with everything
-          else, <strong>WORM-sealed by default</strong>. Queries take the fastest path the
-          namespace supports:
-        </p>
+        <h2>Your vectors belong with your records.</h2>
+        <p>Embeddings are ordinary <code>vec:&lt;ns&gt;:&lt;id&gt;</code> keys backed by the write-ahead log.
+          A derived index accelerates search within each namespace. Native vector inserts and
+          the Bun vector wrapper default to WORM; mutable vectors are an explicit choice.</p>
         <ol class="dispatch">
-          <li><b>HNSW graph</b><span>per-namespace index; graph traversal, then exact refine with your metric. Persisted in snapshots.</span></li>
-          <li><b>Binary-quantized prefilter</b><span>every insert also writes a 1-bit-per-dimension hash. Hamming-rank a candidate pool, refine exact.</span></li>
-          <li><b>Brute force</b><span>the floor — and the forced path when you ask for <code>mode=exact</code>.</span></li>
+          <li><b>HNSW graph</b><span>Traverse a per-namespace graph and refine candidates with the selected metric.</span></li>
+          <li><b>Quantized prefilter</b><span>Rank a smaller candidate set with binary hashes, then refine using the original vectors.</span></li>
+          <li><b>Exact search</b><span>Scan the vectors directly when requested or when no suitable index is available.</span></li>
         </ol>
-        <p style="margin-top:20px">
-          <strong>Cluster-wide:</strong> <code>EXEC vsearch_cluster</code> scatters the query to
-          every peer over the already-encrypted replication links and merges top-K. For agent
-          memory, optional temporal decay lets fresh context outrank stale embeddings.
-        </p>
+        <p class="section-note"><code>vsearch</code> searches one node. <code>vsearch_cluster</code>
+          is the separate fan-out procedure. Rebuild derived indexes with <code>vreindex</code>
+          after raw ingestion or WAL recovery beyond the last snapshot.</p>
       </div>
-
       <div>
-        <div class="qps" id="qps">
-          <p class="qps-head">VSEARCH THROUGHPUT</p>
-          <p class="qps-sub">cosine · 50,000 vectors · K=10 · one thread · queries/sec</p>
-          <div class="qps-legend">
-            <span><i class="i-brute"></i>brute force</span>
-            <span><i class="i-bq"></i>BQ prefilter + exact refine</span>
-          </div>
-          <div class="qps-row">
-            <div class="qps-dim">384<small>DIM</small></div>
-            <div>
-              <div class="qps-bar b-brute"><i style="--p:6.25;--d:0s"></i><span class="qps-val">220</span></div>
-              <div class="qps-bar b-bq"><i style="--p:100;--d:.08s"></i><span class="qps-val">3,520</span><em class="qps-x">16×</em></div>
-            </div>
-          </div>
-          <div class="qps-row">
-            <div class="qps-dim">768<small>DIM</small></div>
-            <div>
-              <div class="qps-bar b-brute"><i style="--p:3.3;--d:.16s"></i><span class="qps-val">115</span></div>
-              <div class="qps-bar b-bq"><i style="--p:69.3;--d:.24s"></i><span class="qps-val">2,440</span><em class="qps-x">21×</em></div>
-            </div>
-          </div>
-          <div class="qps-row">
-            <div class="qps-dim">1536<small>DIM</small></div>
-            <div>
-              <div class="qps-bar b-brute"><i style="--p:1.7;--d:.32s"></i><span class="qps-val">59</span></div>
-              <div class="qps-bar b-bq"><i style="--p:34.4;--d:.4s"></i><span class="qps-val">1,210</span><em class="qps-x">20×</em></div>
-            </div>
-          </div>
-          <p class="qps-note">bars share one linear scale · reproduce with src/vector/bench.zig</p>
+        <div class="jobcard">
+          <div class="jobcard-hd">FOLLOW THE DATA</div>
+          <pre><span class="jk">VINSERT / VBULKINSERT</span>
+    <span class="jc">write vector keys through the store</span>
+    KV + WAL
+        |
+    <span class="jg">derived namespace index</span>
+        |
+<span class="jk">EXEC vsearch</span>
+    <span class="jc">query locally, return nearest matches</span></pre>
         </div>
+        <ul class="resources">
+          <li><a href="https://github.com/igorls/wormdb/blob/main/docs/VECTOR_SEARCH.md">Explore vector search</a><span>Index lifecycle, metrics, and query modes.</span></li>
+          <li><a href="https://github.com/igorls/wormdb/blob/main/docs/AGENT_MEMORY_DEMO.md">Explore agent memory</a><span>Memory procedures, retrieval, and verification.</span></li>
+          <li><a href="https://github.com/igorls/wormdb/blob/main/src/vector/bench.zig">Run the vector benchmark</a><span>Measure your build and hardware with the included harness.</span></li>
+        </ul>
       </div>
     </div>
   </div>
@@ -924,37 +839,37 @@ footer { padding: 26px 0 60px; }
 
     <div class="split">
       <div class="split-copy">
-        <h2>Clustering without a control plane.</h2>
+        <h2>Start local. Connect peers on Linux.</h2>
         <p>
-          A WormDB cluster is just WormDB. Peer discovery, failure detection, identity, and
-          encrypted transport ship inside the same 45&nbsp;KB binary, via the embedded
-          <a href="https://github.com/igorls/meshguard">meshguard</a> mesh layer.
+          <a href="https://github.com/igorls/meshguard">MeshGuard</a> supplies SWIM gossip,
+          node identity, and WireGuard integration. WormDB adds best-effort replication and
+          full-state synchronization for joining peers.
         </p>
         <ul class="mesh-list">
-          <li><b>SWIM gossip</b> — discovery, failure detection, and presence. No quorum service to babysit.</li>
-          <li><b>Ed25519 identity</b> — every node keypair-signed; org-trust certificates mint and revoke membership.</li>
-          <li><b>ChaCha20-Poly1305 over WireGuard</b> — replication never travels in plaintext, even inside your VPC.</li>
-          <li><b>Anti-entropy sync</b> — a joining peer converges to full state automatically.</li>
-          <li><b>Local commit is authoritative</b> — a slow peer never fails your write.</li>
+          <li><b>Discovery</b> — a new node joins through a seed and learns its peers.</li>
+          <li><b>Trust</b> — configure org-trust grants and node certificates for replication authorization.</li>
+          <li><b>Transport</b> — replication uses TCP; verify that the actual route is protected by a tunnel or another secure transport.</li>
+          <li><b>Write behavior</b> — the local commit is authoritative. Replication failures are logged without failing the client write.</li>
         </ul>
+        <p class="section-note">Replication does not provide quorum acknowledgements.
+          Windows currently supports single-node operation.</p>
+
+
       </div>
 
       <div>
-        <figure class="code">
-          <button class="copy-btn" data-copy aria-label="Copy commands">COPY</button>
-          <pre><span class="c"># first node seeds the mesh</span>
-wormdb --port 6389 --data ./n1 \
-       --cluster prod --gossip-port 51821
-
-<span class="c"># everyone else just names a seed</span>
-wormdb --port 6390 --data ./n2 \
-       --cluster prod --seed 10.0.0.1:51821
-
-<span class="c"># watch it converge</span>
-wormdb&gt; CLUSTER PEERS
-<span class="g">n1  10.0.0.1  alive  seed
-n2  10.0.0.2  alive  synced 48,214 keys</span></pre>
-        </figure>
+        <div class="jobcard">
+          <div class="jobcard-hd">FOLLOW A WRITE</div>
+          <pre><span class="jk">Client → local node</span>
+    <span class="jg">local commit: store + write-ahead log</span>
+        |
+    replication attempts → peers
+    <span class="jc">peer failure does not undo local commit</span>
+        |
+    <span class="jk">client response</span></pre>
+        </div>
+        <p class="figure-note">Choose trust and network settings before connecting nodes.
+          <a href="https://github.com/igorls/wormdb/blob/main/docs/architecture/replication-proofs.md">Configure replication trust</a>.</p>
       </div>
     </div>
   </div>
@@ -964,37 +879,49 @@ n2  10.0.0.2  alive  synced 48,214 keys</span></pre>
 <hr class="tear" />
 <section class="pg" id="install">
   <div class="wrap">
-    <p class="pghead"><span class="no">PAGE 006</span><span class="fill"></span><span>INSTALLATION</span><span class="fill"></span><span>ZIG 0.16+ · LIBSODIUM</span></p>
+    <p class="pghead"><span class="no">PAGE 006</span><span class="fill"></span><span>INSTALLATION</span><span class="fill"></span><span>ZIG 0.16.0 + BUN</span></p>
 
-    <h2>Clone to running node in three commands.</h2>
-    <p class="lede">One static binary out, nothing to install on the target box.</p>
+    <h2>Run your first write-once record.</h2>
+    <p class="lede">Build from source, start on localhost, and try the Bun client. You need Git, Zig 0.16.0, and Bun.</p>
 
     <div class="qs-grid">
-      <div class="qs-pane reveal">
-        <h3>From source</h3>
+      <div class="qs-pane">
+        <h3>1. Build and start the server</h3>
         <figure class="code">
           <button class="copy-btn" data-copy aria-label="Copy build commands">COPY</button>
-          <pre>git clone --recursive \
-    https://github.com/igorls/wormdb
-cd wormdb &amp;&amp; zig build -Doptimize=ReleaseSmall
-./zig-out/bin/wormdb --port 6389 --data ./data</pre>
+          <pre>git clone https://github.com/igorls/wormdb.git
+cd wormdb
+git submodule update --init deps/meshguard
+zig build -Doptimize=ReleaseSmall -Dcrypto-backend=std
+./zig-out/bin/wormdb --config examples/local.json</pre>
         </figure>
-        <p class="qs-note"><b>Linux:</b> full feature set — clustering, io_uring, epoll. <b>Windows:</b> single-node, threadpool backend.</p>
+        <p class="qs-note">The <code>std</code> crypto backend avoids an external libsodium dependency.
+          The example binds to <b>127.0.0.1:6389</b> with authentication and the browser gateway disabled.</p>
       </div>
-      <div class="qs-pane reveal">
-        <h3>Docker</h3>
+      <div class="qs-pane">
+        <h3>2. In another terminal, from the repo root</h3>
         <figure class="code">
-          <button class="copy-btn" data-copy aria-label="Copy docker commands">COPY</button>
-          <pre>docker build -t wormdb:latest .
-docker compose up -d   <span class="c"># 2-node encrypted cluster</span></pre>
+          <button class="copy-btn" data-copy aria-label="Copy client commands">COPY</button>
+          <pre>bun run apps/bun/src/bin/client.ts SET audit:001 ready --worm
+bun run apps/bun/src/bin/client.ts GET audit:001
+
+<span class="c"># both commands below return a WORM violation</span>
+bun run apps/bun/src/bin/client.ts SET audit:001 changed
+bun run apps/bun/src/bin/client.ts DEL audit:001</pre>
         </figure>
-        <p class="qs-note">The repo's <b>docker-compose.yml</b> brings up a gossiping two-node cluster; the bench compose file adds a load generator.</p>
+        <p class="qs-note">The first two commands return <b>OK</b> and <b>ready</b>.
+          The next two demonstrate an immutable key. Use a fresh key to repeat the example.</p>
       </div>
     </div>
+    <p class="section-note">Linux supports clustering; Windows supports the standalone server.
+      <a href="https://github.com/igorls/wormdb/blob/main/docs/WINDOWS.md">Windows setup</a> ·
+      <a href="https://github.com/igorls/wormdb/blob/main/SECURITY.md">Authentication and deployment limits</a></p>
+
+
 
     <div class="qs-ctas">
-      <a class="btn btn-solid" href="https://github.com/igorls/wormdb">READ THE DOCS</a>
-      <a class="btn btn-ghost" href="https://github.com/igorls/wormdb">STAR ON GITHUB</a>
+      <a class="btn btn-solid" href="https://github.com/igorls/wormdb/blob/main/README.md#quick-start">READ THE QUICK START</a>
+      <a class="btn btn-ghost" href="https://github.com/igorls/wormdb/blob/main/CONTRIBUTING.md">CONTRIBUTE ON GITHUB</a>
     </div>
   </div>
 </section>
@@ -1012,8 +939,8 @@ docker compose up -d   <span class="c"># 2-node encrypted cluster</span></pre>
       <div>
         <p class="foot-h">WormDB</p>
         <p class="foot-tag">
-          A write-once data engine built in Zig — for audit trails, agent memory, and every record
-          you never want silently rewritten.
+          An open-source engine for write-once records, compiled logic, and vector search.
+          Built in Zig. Released under MIT.
         </p>
       </div>
       <div>
@@ -1030,7 +957,10 @@ docker compose up -d   <span class="c"># 2-node encrypted cluster</span></pre>
         <ul class="foot-links">
           <li><a href="https://github.com/igorls/wormdb">github.com/igorls/wormdb</a></li>
           <li><a href="https://github.com/igorls/meshguard">meshguard (mesh layer)</a></li>
-          <li><a href="https://github.com/igorls/wormdb/tree/main/apps/bun">bun reference client</a></li>
+          <li><a href="https://github.com/igorls/wormdb/tree/main/apps/bun">Bun reference client</a></li>
+          <li><a href="https://meshrooms.wormdb.dev/">Meshrooms</a></li>
+          <li><a href="https://github.com/igorls/wormdb/issues">Issues and feature requests</a></li>
+          <li><a href="https://github.com/igorls/wormdb/security">Report a vulnerability</a></li>
         </ul>
       </div>
     </div>
@@ -1044,20 +974,12 @@ docker compose up -d   <span class="c"># 2-node encrypted cluster</span></pre>
 
 </div><!-- /sheet -->
 
+<p class="code-status" id="copyStatus" role="status"></p>
 <script>
 (function () {
   var reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-  /* ---- reveals + QPS bar growth ---- */
-  var io = new IntersectionObserver(function (entries) {
-    entries.forEach(function (e) {
-      if (!e.isIntersecting) return;
-      e.target.classList.add("in");
-      if (e.target.id === "qps") e.target.classList.add("grown");
-      io.unobserve(e.target);
-    });
-  }, { threshold: 0.25 });
-  document.querySelectorAll(".reveal, #qps").forEach(function (el) { io.observe(el); });
+
 
   /* ---- the line printer: whole lines print one at a time ---- */
   var body = document.getElementById("printerBody");
@@ -1092,10 +1014,21 @@ docker compose up -d   <span class="c"># 2-node encrypted cluster</span></pre>
   document.querySelectorAll("[data-copy]").forEach(function (btn) {
     btn.addEventListener("click", function () {
       var pre = btn.parentElement.querySelector("pre");
+      function copyFailed() {
+        btn.textContent = "SELECT CODE";
+        var selection = window.getSelection();
+        var range = document.createRange();
+        range.selectNodeContents(pre);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        document.getElementById("copyStatus").textContent = "Copy unavailable. Code selected; use your browser's copy command.";
+      }
+      if (!navigator.clipboard) { copyFailed(); return; }
       navigator.clipboard.writeText(pre.textContent).then(function () {
         btn.textContent = "COPIED";
+        document.getElementById("copyStatus").textContent = "Commands copied.";
         setTimeout(function () { btn.textContent = "COPY"; }, 1400);
-      });
+      }).catch(copyFailed);
     });
   });
 

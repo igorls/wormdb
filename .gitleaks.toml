@@ -1,0 +1,14 @@
+title = "WormDB secret scanning"
+
+[extend]
+useDefault = true
+
+# Public, deterministic signing fixture used only by the append-log round-trip
+# unit test. Match BOTH its exact value and file; do not exempt other keys,
+# tests in general, or historical credential files.
+[[allowlists]]
+description = "Append-log unit-test signing fixture"
+condition = "AND"
+paths = ['''(?:^|/)src/procedures/append_log\.zig$''']
+regexTarget = "secret"
+regexes = ['''^8052030376d47112be7f73ed7a019293dd12ad910b654455798b4667d73de1662d6f7455d97b4a3a10d7293909d1a4f2058cb9a370e43fa8154bb280db839083$''']

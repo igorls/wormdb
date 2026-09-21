@@ -2,7 +2,7 @@
   "name": "@wormdb/client",
   "version": "0.2.0",
   "private": false,
-  "license": "BSL-1.0",
+  "license": "MIT",
   "publishConfig": {
     "access": "restricted"
   },

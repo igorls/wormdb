@@ -20,11 +20,10 @@ build, what works, the limitations, and what a clustering port would take.
 
 ## Prerequisites
 
-- **Zig 0.16+**. The native target resolves to `x86_64-windows-gnu` (MinGW ABI).
-- **libsodium** — a static MinGW build is vendored at
-  `deps/lib/windows-x86_64/libsodium.a`; [build.zig](../build.zig) links it
-  (plus `advapi32`/`bcrypt` for libsodium's CSPRNG and `ws2_32` for Winsock) for
-  Windows targets. No system install or `sodium.h` header is required.
+- **Zig 0.16.0**. The native target resolves to `x86_64-windows-gnu` (MinGW ABI).
+- **Crypto backend** — Windows defaults to Zig's `std.crypto`, with no libsodium
+  dependency. `-Dcrypto-backend=sodium` explicitly selects the static MinGW build
+  at `deps/lib/windows-x86_64/libsodium.a`. See [build.zig](../build.zig).
 - **meshguard** sources at `deps/meshguard` (the same submodule used on Linux).
   Cluster code is compiled but inert on Windows.
 
@@ -33,14 +32,14 @@ build, what works, the limitations, and what a clustering port would take.
 ```powershell
 zig build                       # debug build → zig-out\bin\wormdb.exe
 zig build -Doptimize=ReleaseSmall
-zig build test                  # full unit suite (126/126 pass on Windows)
+zig build test                  # full unit suite
 
-zig-out\bin\wormdb.exe --port 6389 --data .\data
+zig-out\bin\wormdb.exe --config examples/local.json --port 6389 --data .\data
 ```
 
-The threadpool backend is the default and the only one available on Windows; a
-`--backend uring|epoll` request logs a warning and transparently falls back to
-threadpool.
+The stock standalone executable uses the threadpool backend and does not expose
+a `--backend` option. The engine's `io_uring` and `epoll` implementations are
+Linux-only; check the composition root when embedding a different backend.
 
 ## How the port works
 

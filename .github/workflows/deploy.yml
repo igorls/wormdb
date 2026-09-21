@@ -22,7 +22,8 @@ concurrency:
 
 # GitHub Pages serves ONLY the static public site in website/ (wormdb.dev) —
 # the docs/ VitePress site is intentionally NOT built or published here, so
-# internal documentation never leaves the repo.
+# documentation is not deployed to Pages. Repository visibility separately
+# controls access to docs/ and its Git history.
 jobs:
   deploy:
     environment:

@@ -1,0 +1,33 @@
+name: Bug report
+description: Report a reproducible problem in WormDB.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, private data, or security exploit details.
+        Follow SECURITY.md for private vulnerability reporting.
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Commit or version, OS, Zig/Bun version, server backend, and relevant configuration (redacted).
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal commands or code that reproduce the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs and evidence
+      description: Redact keys, tokens, customer data, and private infrastructure.

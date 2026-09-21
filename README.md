@@ -1,32 +1,50 @@
 # WormDB
 
-A fast, distributed key-value store built in Zig. Encrypted replication, zero-config scaling, single static binary.
+A key-value store and embeddable engine built in Zig, with WORM semantics,
+pub/sub, compiled procedures, vector search, and Linux clustering.
+
+WormDB is under active development. Review the deployment and recovery limits
+below before using it with important data. Public source availability is not a
+production-readiness guarantee.
 
 - **WORM mode** — Write-Once-Read-Many for immutable audit trails
 - **WormWire protocol** — Binary framing over TCP, zero-copy capable
 - **Pub/Sub streaming** — Real-time event channels with subscription management
-- **Encrypted clustering** — P2P replication via meshguard (SWIM gossip + ChaCha20-Poly1305)
-- **Org trust foundation** — meshguard certificate model, with WormDB-side enforcement wiring in progress
+- **Clustering** — meshguard peer discovery and WormWire replication; transport protection depends on the deployment
+- **Org trust** — certificate-based replication grants, configured through `org_trust`
 - **Vector search** — SIMD-accelerated (AVX2/NEON) with BQ prefilter and HNSW graph index; per-namespace cosine/dot/L2
 - **Stored procedures** — Server-side transactional ops via `EXEC`, compiled into the binary
 
 ## Quick Start
 
 ```bash
-# Fetch in-tree dependencies
-git submodule update --init --recursive
+# Clone and fetch the dependency required for the normal build
+git clone https://github.com/igorls/wormdb.git
+cd wormdb
+git submodule update --init deps/meshguard
 
-# Build (requires Zig 0.16+, libsodium)
-zig build -Doptimize=ReleaseSmall
+# Build with Zig 0.16.0; std.crypto avoids an external libsodium dependency
+zig build -Doptimize=ReleaseSmall -Dcrypto-backend=std
 
 # Run tests
-zig build test
+zig build test -Dcrypto-backend=std
 
-# Start server
-./zig-out/bin/wormdb --port 6389 --data ./data
+# Start a local, unauthenticated development server on loopback
+./zig-out/bin/wormdb --config examples/local.json --port 6389 --data ./data
 ```
 
 > **Platforms:** Linux is the primary target (full feature set, including clustering and the io_uring/epoll backends). WormDB also builds and runs natively on **Windows** for single-node use (threadpool backend; clustering is Linux-only) — see [docs/WINDOWS.md](docs/WINDOWS.md).
+
+The local example disables authentication and the WebSocket gateway. Use it only
+on your own machine. In the current standalone server, authentication is enforced
+only when `auth.require_auth` is true **and** at least one valid verification key
+is configured. Empty `auth.public_keys` leaves listeners unauthenticated. Plain
+WormWire TCP has no TLS; protect remote connections with a secure tunnel or an
+appropriate TLS proxy. See [scoped authentication](docs/AUTH_SCOPED.md).
+
+The default Linux build uses shared libsodium. `-Dcrypto-backend=std` selects Zig's
+built-in crypto. QUIC is optional and needs additional dependencies; the quick
+start above does not build it.
 
 ### Connect with the Bun Client
 
@@ -34,7 +52,7 @@ zig build test
 # Basic operations
 bun run apps/bun/src/bin/client.ts SET mykey "hello world"
 bun run apps/bun/src/bin/client.ts GET mykey
-bun run apps/bun/src/bin/client.ts SET audit-log entry-001 WORM
+bun run apps/bun/src/bin/client.ts SET audit-log entry-001 --worm
 bun run apps/bun/src/bin/client.ts STATUS
 
 # Admin UI (http://localhost:8099)
@@ -89,28 +107,38 @@ In the native vector commands, `key`, `vector`, `namespace`, and `metric` are no
 
 ## Clustering
 
-WormDB clusters use [meshguard](https://github.com/igorls/meshguard) for peer discovery (SWIM gossip), failure detection, and encrypted replication. No central coordinator required.
+WormDB clusters use [meshguard](https://github.com/igorls/meshguard) for peer discovery
+(SWIM gossip), failure detection, and WireGuard integration. Replication uses TCP;
+connections to real peer addresses are not inherently encrypted by WormDB. Verify
+the actual route and provide transport protection before crossing an untrusted
+network. Replication is asynchronous and does not provide quorum acknowledgements.
 
 ### Standalone
 
 ```bash
-wormdb --port 6389 --data ./data
+wormdb --config examples/local.json --port 6389 --data ./data
 ```
 
 ### Multi-Node Cluster
 
 ```bash
+# Isolated, trusted test network ONLY: --cluster-open permits unauthenticated replication
 # Seed node
-wormdb --port 6389 --data ./data1 --cluster myapp --gossip-port 51821
+wormdb --port 6389 --data ./data1 --cluster myapp --cluster-open --gossip-port 51821
 
 # Join nodes
-wormdb --port 6390 --data ./data2 --cluster myapp --seed 10.0.0.1:51821
-wormdb --port 6391 --data ./data3 --cluster myapp --seed 10.0.0.1:51821
+wormdb --port 6390 --data ./data2 --cluster myapp --cluster-open --seed 10.0.0.1:51821
+wormdb --port 6391 --data ./data3 --cluster myapp --cluster-open --seed 10.0.0.1:51821
 ```
 
 ### Org Trust (MeshGuard)
 
-WormDB embeds meshguard for identity, SWIM gossip, and WireGuard tunnel setup. The current WormDB CLI runs the embedded cluster path in open mode; org-trust certificate issuance and enforcement lives in meshguard and is the next WormDB-side configuration surface to wire through.
+WormDB embeds meshguard for identity, SWIM gossip, and WireGuard tunnel setup.
+Configure `org_trust.grants` and `org_trust.node_cert_path` for certificate-based
+replication authorization. Configuring grants enables enforcement; a cluster
+without enforcement refuses startup unless `--cluster-open` is explicitly passed.
+Authorization does not itself encrypt the TCP stream. See
+[replication proofs and trust](docs/architecture/replication-proofs.md).
 
 MeshGuard's standalone CLI flow is:
 
@@ -135,19 +163,23 @@ services:
     ports:
       - "16379:6389"
       - "51821:51821/udp"
-    command: --cluster wormdb-cluster --gossip-port 51821
+    command: --cluster wormdb-cluster --cluster-open --gossip-port 51821
 
   node2:
     image: wormdb:latest
     ports:
       - "16380:6389"
       - "51822:51822/udp"
-    command: --cluster wormdb-cluster --seed node1:51821 --gossip-port 51822
+    command: --cluster wormdb-cluster --cluster-open --seed node1:51821 --gossip-port 51822
     depends_on:
       - node1
 ```
 
+This Compose example is for an isolated test network. The image recipe consumes
+a prebuilt **Linux** executable from `zig-out/bin/wormdb`.
+
 ```bash
+zig build -Doptimize=ReleaseSmall
 docker build -t wormdb:latest .
 docker compose up -d
 ```
@@ -233,7 +265,7 @@ HNSW recall@10 = 1.000 on a rigorous brute-force ground-truth check (400 random 
 
 ### Current limitations
 
-- **Cluster-wide search is not scatter-gather yet**: vector writes replicate through native WormWire vector frames, but `vsearch` answers from the local node. A distributed coordinator that fans out to peers and merges top-K results is still planned.
+- **`vsearch` is local-node search**: cluster fan-out is a separate `EXEC vsearch_cluster` procedure. Validate its timeout, partial-result, and consistency behavior for your deployment.
 - **Index restore is snapshot-bound**: snapshot v2 restores HNSW/RaBitQ state, but WAL replay after the most recent snapshot does not replay vector-index mutations. Run `EXEC vreindex <namespace>` after large raw ingests or recovery from an old snapshot.
 - **Deletes are tombstone-based**: `VDELETE`/`EXEC vdelete` tombstone non-WORM vectors in HNSW and remove store entries. WORM-default vectors remain immutable; use `EXEC vnsdrop <namespace> 1` only for best-effort namespace purges where skipped WORM entries are acceptable.
 
@@ -248,8 +280,8 @@ HNSW recall@10 = 1.000 on a rigorous brute-force ground-truth check (400 random 
 ├──────────────┴──────────────┴────────────┴───────────────────┤
 │                      Cluster Layer                           │
 │  ┌───────────┐  ┌──────────────┐  ┌────────────────────┐    │
-│  │ meshguard │  │ SWIM Gossip  │  │ Encrypted           │    │
-│  │ (Ed25519) │  │ (discovery)  │  │ Replication (E2E)   │    │
+│  │ meshguard │  │ SWIM Gossip  │  │ Peer                │    │
+│  │ (Ed25519) │  │ (discovery)  │  │ Replication (TCP)   │    │
 │  └───────────┘  └──────────────┘  └────────────────────┘    │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -298,8 +330,7 @@ Default client port is `6389` (avoids Redis `6379` collision). Override with `--
 
 ## Performance
 
-- **Binary size**: 45KB (ReleaseSmall)
-- **Docker image**: 37MB (Debian slim)
+- **Binary and image size**: depend on the target, crypto backend, and optional gateways; measure the artifact you intend to distribute.
 - **KV read**: O(1) in-memory lookup (single shard-mutex acquire)
 - **KV write**: memory update + WAL append (+ cluster replication if enabled)
 - **Vector cosine distance**: ~13 GFLOP/s single-threaded on AVX2 (~170ns for a 768-dim compare)
@@ -337,14 +368,14 @@ Default client port is `6389` (avoids Redis `6379` collision). Override with `--
 
 ### 🚧 In Progress
 
-- [ ] WormDB-side org-trust configuration for meshguard certificates
+- [x] WormDB-side org-trust configuration for meshguard certificates
 - [ ] Protocol-level integration tests for pipelined commands with interleaved `EVENT` frames
 - [ ] Live server integration tests for native vector wire commands and cluster anti-echo
 
 ### 📋 Planned
 
 - [ ] Merkle-tree consistency checks across peers
-- [ ] Cluster-wide vector scatter-gather search
+- [x] Separate cluster fan-out procedure (`vsearch_cluster`); deployment qualification remains workload-specific
 - [ ] Web dashboard
 - [ ] Backup/restore
 
@@ -354,7 +385,7 @@ Default client port is `6389` (avoids Redis `6379` collision). Override with `--
 # Full suite (via build system)
 zig build test
 
-# Vector module tests — 89 cases: distance, topk, metric, hnsw, index
+# Isolated vector module tests
 zig test src/vector/distance.zig
 zig test src/vector/topk.zig
 zig test src/vector/metric.zig
@@ -374,8 +405,8 @@ docker compose -f docker-compose.bench.yml run --rm benchmark
 
 ## Dependencies
 
-- **Zig 0.16+** — Language and build system
-- **libsodium** — Crypto primitives (ChaCha20-Poly1305, Ed25519)
+- **Zig 0.16.0** — Tested language and build system version
+- **libsodium** — Optional crypto backend; selected by default on Linux, disabled with `-Dcrypto-backend=std`
 - **meshguard** — P2P mesh networking (SWIM gossip, encrypted messaging), vendored as `deps/meshguard`
 
 ## Troubleshooting
@@ -389,8 +420,18 @@ docker compose -f docker-compose.bench.yml run --rm benchmark
 
 ## License
 
-MIT
+[MIT](LICENSE). First-party engine, clients, and tooling use the same license.
+
+See [third-party notices](THIRD_PARTY_NOTICES.md) for dependency licenses and
+binary provenance requirements.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, checks, and pull request guidance.
+See [SECURITY.md](SECURITY.md) for vulnerability reporting and deployment boundaries.
+Maintainers preparing a public release should use the
+[release checklist](docs/PUBLIC_RELEASE_CHECKLIST.md).
 
 ---
 
-Built with Zig for speed, simplicity, and reliability.
+Built with Zig.

@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "wormdb-bun-tools",
+      "name": "@wormdb/client",
       "devDependencies": {
         "@types/bun": "^1.3.9",
         "@types/node": "^25.3.3",

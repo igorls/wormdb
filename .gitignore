@@ -39,6 +39,7 @@ coverage
 # Logs
 logs
 _.log
+*.log
 report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Dotenv
@@ -47,6 +48,22 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .env.test.local
 .env.production.local
 .env.local
+.env.*
+!.env.example
+!.env.*.example
+
+# Local credentials and database files
+*.key
+*.pem
+*.p12
+*.pfx
+*.wal
+*.wseg
+wormdb.local.json
+
+# Generated documentation site files
+docs/.vitepress/cache/
+docs/.vitepress/dist/
 
 # Caches
 .eslintcache

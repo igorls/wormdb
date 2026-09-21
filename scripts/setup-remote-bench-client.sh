@@ -2,11 +2,13 @@
 set -euo pipefail
 
 # Usage:
-#   scripts/setup-remote-bench-client.sh [user@host]
-# Default host:
-#   igorls@z590-vision-d
+#   scripts/setup-remote-bench-client.sh user@host
 
-REMOTE="${1:-igorls@z590-vision-d}"
+if [[ $# -ne 1 || -z "$1" || "$1" == -* ]]; then
+  echo "Usage: $0 user@host" >&2
+  exit 2
+fi
+REMOTE="$1"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 cd "$ROOT_DIR"

@@ -1,7 +1,11 @@
 {
-  "name": "wormdb-bun-tools",
+  "name": "@wormdb/client",
   "version": "0.2.0",
-  "private": true,
+  "private": false,
+  "license": "MIT",
+  "publishConfig": {
+    "access": "restricted"
+  },
   "type": "module",
   "exports": {
     ".": "./src/lib/index.ts"

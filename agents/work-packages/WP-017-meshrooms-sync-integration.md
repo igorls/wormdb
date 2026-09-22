@@ -1,7 +1,7 @@
 # WP-017: Meshrooms synchronous native integration
 
 - Priority: P0
-- Status: Review (engine checks passed; native consumer qualification and merge pending)
+- Status: Review (approved in REVIEW-017; merge tracked in PR #96)
 - Scope: combine the reviewed security changes with the additive synchronous
   FFI/WAL commits, preserve the legacy asynchronous API, and qualify a new native
   artifact for Meshrooms. Do not replace running daemons or publish a release.

@@ -122,6 +122,12 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
         std.log.err("failed to load config '{s}': {s}", .{ args.config_path, @errorName(err) });
         std.process.exit(1);
     };
+    // Validate before starting background tasks or borrowing stack-owned
+    // state into the gateway thread.
+    if (file_cfg.server.max_connections == 0 or file_cfg.server.timeout_ms == 0 or
+        ((args.gateway_port != null or file_cfg.gateway.enabled) and
+            (file_cfg.gateway.max_connections == 0 or file_cfg.gateway.timeout_ms == 0)))
+        return error.InvalidConnectionLimits;
 
     // Build runtime org trust once; shared read-only by the cluster (outbound
     // handshake) and the TCP server (inbound handshake + per-frame checks).
@@ -141,6 +147,9 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
         }
         std.log.warn("cluster replication is OPEN (unauthenticated) — --cluster-open acknowledged; any peer can replicate arbitrary keys", .{});
     }
+    // Replication magic shares the client port even in standalone mode.
+    // Never let it bypass SCT enforcement without the explicit open opt-in.
+    if (!args.cluster_open) org_trust.enforce = true;
     if (org_trust.enforce and args.cluster_name != null and org_trust.node_cert == null) {
         std.log.warn("org_trust enforced but no node_cert_path set — this node cannot authenticate its own outbound replication (enforcing peers will reject it)", .{});
     }
@@ -180,11 +189,8 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
     defer event_bus.deinit();
     var metrics = wormdb.server.ServerMetrics.init();
 
-    // Auth material from the config file, shared by the TCP listener and the
-    // gateway. Enforcement needs at least one verification key: `require_auth`
-    // defaults to true in the schema, but with no keys configured every
-    // protected command would fail closed — so a keyless config keeps the
-    // listeners open (matching docs/operations/gateways.md) and warns loudly.
+    // Enforcement is independent of key availability. A keyless protected
+    // listener stays locked until the operator supplies verification keys.
     const srv_auth = wormdb.server.auth;
     const auth_keys = try allocator.alloc(srv_auth.PublicKey, file_cfg.auth.public_keys.len);
     defer allocator.free(auth_keys);
@@ -194,9 +200,9 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
             std.process.exit(1);
         };
     }
-    const auth_enforce = file_cfg.auth.require_auth and auth_keys.len > 0;
+    const auth_enforce = file_cfg.auth.require_auth;
     if (file_cfg.auth.require_auth and auth_keys.len == 0) {
-        std.log.warn("auth.require_auth is set but auth.public_keys is empty — listeners run UNAUTHENTICATED", .{});
+        std.log.warn("auth.require_auth is set but auth.public_keys is empty — protected commands remain LOCKED on auth-enabled listeners", .{});
     }
 
     var mint_secret: [64]u8 = undefined;
@@ -239,8 +245,10 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
     defer if (cluster != null) cluster.?.deinit();
 
     var server = Server.init(allocator, &store, &event_bus, .{
-        .port = args.port,
         .bind_address = file_cfg.server.bind_address,
+        .port = args.port,
+        .max_connections = file_cfg.server.max_connections,
+        .timeout_ms = file_cfg.server.timeout_ms,
         .cluster = if (cluster) |*c| c else null,
         .vector_registry = &vector_registry,
         .org_trust = &org_trust,
@@ -271,6 +279,8 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
         gateway.max_token_age = file_cfg.auth.token_max_age_s;
         gateway.auth_required = auth_enforce and file_cfg.gateway.auth_enabled;
         gateway.auth_mint = auth_mint;
+        gateway.max_connections = file_cfg.gateway.max_connections;
+        gateway.timeout_ms = file_cfg.gateway.timeout_ms;
         gateway.setPerIpLimit(
             file_cfg.gateway.max_connections_per_ip,
             file_cfg.gateway.per_ip_exempt_loopback,

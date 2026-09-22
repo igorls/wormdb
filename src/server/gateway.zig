@@ -49,6 +49,7 @@ const Response = core.types.Response;
 const Cluster = cluster_mod.Cluster;
 const Sha1 = std.crypto.hash.Sha1;
 const ServerMetrics = @import("metrics.zig").ServerMetrics;
+const ConnectionLimit = @import("connection_limit.zig").ConnectionLimit;
 
 /// Per-IP concurrent-connection accounting for the gateway accept path (#89).
 /// Keys are peer IPs normalized to 16 bytes (IPv4 mapped to ::ffff:a.b.c.d) so a
@@ -142,6 +143,10 @@ pub const Gateway = struct {
     /// can open many sockets from one address. Set before start().
     per_ip_exempt_loopback: bool,
     ip_limiter: IpLimiter,
+    /// Global budget also covers loopback, unknown IPs and HTTP handshakes.
+    max_connections: usize = 256,
+    timeout_ms: usize = 30000,
+    connection_limit: ConnectionLimit = .{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -198,6 +203,7 @@ pub const Gateway = struct {
 
     /// Run the gateway on a dedicated thread. Call from main after server start.
     pub fn start(self: *Gateway) !std.Thread {
+        if (self.max_connections == 0 or self.timeout_ms == 0) return error.InvalidConnectionLimits;
         return try std.Thread.spawn(.{}, runLoop, .{self});
     }
 
@@ -227,10 +233,15 @@ pub const Gateway = struct {
         }
 
         while (self.running.load(.acquire)) {
-            const conn = listener.accept() catch |err| {
+            var conn = listener.accept() catch |err| {
                 std.log.debug("Gateway: accept error: {}", .{err});
                 continue;
             };
+            if (!self.connection_limit.acquire(self.max_connections)) {
+                conn.stream.close();
+                continue;
+            }
+            conn.stream.read_limit_ns = core.compat.nowNs() + @as(i128, self.timeout_ms) * 1_000_000;
             // Per-IP admission (#89): enforced only when a cap is configured AND the
             // peer address resolves. An unresolvable peer is admitted uncounted —
             // never rejected — because it cannot be attributed to an IP.
@@ -247,6 +258,7 @@ pub const Gateway = struct {
                             });
                             if (self.metrics) |metrics| metrics.recordGatewayPerIpRejection();
                             conn.stream.close();
+                            self.connection_limit.release();
                             continue;
                         }
                     }
@@ -258,6 +270,7 @@ pub const Gateway = struct {
                 std.log.warn("Gateway: spawn thread failed: {}", .{err});
                 if (ip_key) |key| self.ip_limiter.release(key);
                 conn.stream.close();
+                self.connection_limit.release();
                 continue;
             };
             thread.detach();
@@ -265,8 +278,10 @@ pub const Gateway = struct {
     }
 
     fn handleConnection(self: *Gateway, conn: core.compat.net.ServerCompat.Connection, ip_key: ?IpLimiter.Key) void {
+        defer self.connection_limit.release();
         defer if (ip_key) |key| self.ip_limiter.release(key);
         var stream = conn.stream;
+        stream.beginRead(self.timeout_ms, false);
         if (self.metrics) |metrics| metrics.beginGatewayThread();
         defer if (self.metrics) |metrics| metrics.endGatewayThread();
         defer stream.close();
@@ -275,10 +290,12 @@ pub const Gateway = struct {
         core.compat.setNoDelay(stream.getHandle());
         // Bound sends so a slow WebSocket peer cannot pin a publisher thread (#84).
         core.compat.setSendTimeoutMs(stream.getHandle(), 2_000);
+        stream.write_timeout_ms = 2_000;
 
         // Step 1: WebSocket handshake
         var request_buf: [4096]u8 = undefined;
         const request = readHttpRequest(&stream, &request_buf) orelse return;
+        if (!self.auth_required) stream.read_limit_ns = null;
 
         const ws_key = extractWebSocketKey(request) orelse {
             // Not a WebSocket upgrade — serve the plain-HTTP domain routes (GET /api/...),
@@ -315,18 +332,18 @@ pub const Gateway = struct {
 
         // Per-connection auth state
         var auth_state: ?auth.TokenState = null;
+        defer if (auth_state) |*state| auth.freeTokenState(self.allocator, state);
 
         while (self.running.load(.acquire)) {
             // Check if token expired mid-session
-            if (auth_state) |*state| {
-                if (state.isExpired()) {
-                    auth_state = null; // Revoke — force re-auth
-                }
-            }
+            self.expireAuthState(&auth_state, &stream);
 
             // Read one WebSocket frame
+            stream.beginRead(self.timeout_ms, !self.auth_required or auth_state != null);
             const ws_frame = readWsFrame(&stream, self.allocator) orelse return;
             defer if (ws_frame.allocated) self.allocator.free(ws_frame.payload);
+            // The token can expire while waiting for this frame.
+            self.expireAuthState(&auth_state, &stream);
 
             switch (ws_frame.opcode) {
                 0x08 => {
@@ -419,6 +436,7 @@ pub const Gateway = struct {
                         self.allocator.free(old.capabilities);
                     }
                     auth_state = state;
+                    stream.read_limit_ns = null;
                     break :blk Response.ok;
                 },
                 .subscribe => |params| blk: {
@@ -479,6 +497,16 @@ pub const Gateway = struct {
         }
     }
 
+    fn expireAuthState(self: *Gateway, state: *?auth.TokenState, stream: *core.compat.net.Stream) void {
+        if (state.*) |*current| {
+            if (current.isExpired()) {
+                auth.freeTokenState(self.allocator, current);
+                state.* = null;
+                stream.read_limit_ns = core.compat.nowNs() + @as(i128, self.timeout_ms) * 1_000_000;
+            }
+        }
+    }
+
     // --- Plain HTTP (domain routes) ---
     //
     // Answers `GET /api/...` directly over HTTP/1.1 by routing to an EXEC procedure and returning its
@@ -492,6 +520,7 @@ pub const Gateway = struct {
         while (self.running.load(.acquire)) {
             _ = arena.reset(.retain_capacity);
             if (!self.handleHttpRequest(stream, arena.allocator(), current)) return;
+            stream.beginRead(self.timeout_ms, false);
             current = readHttpRequest(stream, request_buf) orelse return;
         }
     }
@@ -790,7 +819,10 @@ pub const Gateway = struct {
 
         var read_total: usize = 0;
         while (read_total < len) {
-            const n = stream.read(buf[read_total..]) catch return null;
+            const n = stream.read(buf[read_total..]) catch {
+                allocator.free(buf);
+                return null;
+            };
             if (n == 0) {
                 allocator.free(buf);
                 return null;

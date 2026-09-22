@@ -147,6 +147,9 @@ pub const Store = struct {
     live_keys: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     wal: ?Wal,
     wal_enqueue_mutex: core.compat.Mutex,
+    /// Lock order: wal_enqueue (if held) -> snapshot -> shards. Covers the
+    /// entire copy/write/rename so every caller shares one snapshot writer.
+    snapshot_mutex: core.compat.Mutex = .{},
     config: Config,
     /// Bump arena owning every snapshot-loaded entry (key, value, and Entry
     /// struct — flagged `arena_owned`). Snapshot data is overwhelmingly the
@@ -636,29 +639,25 @@ pub const Store = struct {
     /// Delete a key.
     pub fn delete(self: *Store, key: []const u8) StoreError!void {
         const si = shardIndex(key);
-        self.shards[si].mutex.lock();
-        defer self.shards[si].mutex.unlock();
-        const shard = &self.shards[si];
-
-        if (shard.data.get(key)) |existing| {
+        {
+            // Match SET's wal_enqueue -> shard order and keep append+remove
+            // together, so compaction cannot truncate an unapplied deletion.
+            if (self.config.persistence == .full) self.wal_enqueue_mutex.lock();
+            defer if (self.config.persistence == .full) self.wal_enqueue_mutex.unlock();
+            const shard = &self.shards[si];
+            shard.mutex.lock();
+            defer shard.mutex.unlock();
+            const existing = shard.data.get(key) orelse return;
             if (existing.flags.is_worm) return error.WormViolation;
-
-            if (self.config.persistence == .full) {
-                self.wal_enqueue_mutex.lock();
-                self.wal.?.appendDelete(key) catch {
-                    self.wal_enqueue_mutex.unlock();
-                    return error.IoError;
-                };
-                self.wal_enqueue_mutex.unlock();
-            }
+            if (self.config.persistence == .full) self.wal.?.appendDelete(key) catch return error.IoError;
 
             if (shardRemoveLocked(self, shard, key)) |removed| {
                 self.destroyEntry(removed);
             }
-
-            if (self.config.persistence == .full) {
-                self.maybeSnapshotAndTruncate() catch {};
-            }
+        }
+        // Snapshot takes every shard; never enter it with one already held.
+        if (self.config.persistence == .full) {
+            self.maybeSnapshotAndTruncate() catch {};
         }
     }
 
@@ -1238,6 +1237,9 @@ pub const Store = struct {
     }
 
     fn writeSnapshot(self: *Store) !void {
+        self.snapshot_mutex.lock();
+        defer self.snapshot_mutex.unlock();
+
         // Phase 1: under all shard locks, deep-copy live KV (+ optional HNSW
         // trailer bytes) into owned buffers. Phase 2 (disk I/O) does NOT hold
         // shard locks — that froze STATUS/EXECs for the whole snapshot (#91).
@@ -1318,7 +1320,8 @@ pub const Store = struct {
         defer self.allocator.free(temp_snapshot_path);
 
         const snapshot_file = try compat.Dir.createFile(core.compat.cwd(), temp_snapshot_path, .{ .read = true, .truncate = true });
-        errdefer compat.File.close(snapshot_file);
+        var file_open = true;
+        defer if (file_open) compat.File.close(snapshot_file);
 
         // Mirror of the load path's buffering: per-field raw writes cost a
         // kernel round-trip each (shutdown saves of multi-million-key stores
@@ -1360,6 +1363,7 @@ pub const Store = struct {
         try writer.flush();
         try compat.File.sync(snapshot_file);
         compat.File.close(snapshot_file);
+        file_open = false;
 
         try compat.Dir.rename(core.compat.cwd(), temp_snapshot_path, self.config.snapshot_path);
     }
@@ -1794,6 +1798,54 @@ test "Store restores from snapshot then replays WAL" {
         try testing.expectEqualStrings("v2", reloaded.get("k2").?.value);
         try testing.expect(reloaded.get("k2").?.flags.is_worm);
     }
+}
+
+test "concurrent manual snapshots and WAL compaction preserve reload" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try compat.Dir.realPathAlloc(tmp.dir, testing.allocator, ".");
+    defer testing.allocator.free(dir);
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/concurrent.wal", .{dir});
+    defer testing.allocator.free(wal_path);
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/concurrent.snapshot", .{dir});
+    defer testing.allocator.free(snapshot_path);
+    const config = Config{ .wal_path = wal_path, .snapshot_path = snapshot_path, .sync_writes = false, .max_wal_size = 128 };
+    var store = try Store.init(testing.allocator, config);
+    defer store.deinit();
+    try store.set("immutable", "original", true);
+    const Worker = struct {
+        fn run(s: *Store, failures: *std.atomic.Value(usize)) void {
+            for (0..12) |_| s.save() catch {
+                _ = failures.fetchAdd(1, .monotonic);
+            };
+        }
+    };
+    var failures: std.atomic.Value(usize) = .init(0);
+    var threads: [4]std.Thread = undefined;
+    var spawned: usize = 0;
+    {
+        defer for (threads[0..spawned]) |thread| thread.join();
+        for (&threads) |*thread| {
+            thread.* = try std.Thread.spawn(.{}, Worker.run, .{ &store, &failures });
+            spawned += 1;
+        }
+        for (0..30) |i| {
+            var buf: [32]u8 = undefined;
+            const value = try std.fmt.bufPrint(&buf, "value-{d}", .{i});
+            try store.set("mutable", value, false);
+            try store.set("deleted", "temporary", false);
+            try store.delete("deleted");
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), failures.load(.acquire));
+    // Reload before original deinit can hide corruption with a shutdown save.
+    var reloaded = try Store.init(testing.allocator, config);
+    defer reloaded.deinit();
+    try testing.expectEqualStrings("value-29", reloaded.get("mutable").?.value);
+    try testing.expectEqualStrings("original", reloaded.get("immutable").?.value);
+    try testing.expect(reloaded.get("immutable").?.flags.is_worm);
+    try testing.expect(reloaded.get("deleted") == null);
 }
 
 test "live_keys count is O(1) and tracks set/delete (#91)" {

@@ -148,9 +148,10 @@ provide transport protection. See [replication trust](docs/architecture/replicat
 
 ## Current boundaries
 
-- **Network access:** raw WormWire TCP has no TLS. Authentication requires
-  `auth.require_auth` and valid verification keys; an empty key list leaves
-  listeners unauthenticated. Configure and test both authorization and transport.
+- **Network access:** raw WormWire TCP has no TLS. With `auth.require_auth`,
+  auth-enabled listeners keep protected commands locked even when verification
+  keys are missing. Configure keys to accept signed SCTs; `SAVE` requires universal
+  admin authority. Configure and test both authorization and transport.
 - **Immutability:** WORM is an engine property. It does not prevent an administrator
   from replacing data files or code; procedure authors must use helpers that
   enforce the guarantees they need.

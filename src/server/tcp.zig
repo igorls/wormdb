@@ -21,6 +21,7 @@ const AuthMintConfig = @import("../procedures/context.zig").AuthMintConfig;
 const auth = @import("auth.zig");
 const org_trust_mod = @import("../cluster/org_trust.zig");
 const ServerMetrics = @import("metrics.zig").ServerMetrics;
+const ConnectionLimit = @import("connection_limit.zig").ConnectionLimit;
 
 /// Fallback trust when no org_trust is configured: enforce=false, zero grants.
 /// A W2 handshake verified against it always fails OrgNotTrusted (deny-by-default).
@@ -30,6 +31,8 @@ pub const ServerConfig = struct {
     bind_address: []const u8 = "0.0.0.0",
     port: u16 = 6389,
     max_connections: usize = 1024,
+    /// Whole handshake/frame deadline, including time in the accept queue.
+    timeout_ms: usize = 30000,
     cluster: ?*Cluster = null,
     vector_registry: ?*@import("../vector/index.zig").NamespaceRegistry = null,
     /// Number of worker threads. 0 = auto (cpu_count * 2, capped at 64).
@@ -70,6 +73,7 @@ pub const Server = struct {
     // Thread pool infrastructure
     conn_queue: ConnQueue,
     workers: []std.Thread,
+    connection_limit: ConnectionLimit = .{},
 
     const CONN_QUEUE_CAP = 1024;
 
@@ -318,6 +322,7 @@ pub const Server = struct {
     }
 
     pub fn run(self: *Server) !void {
+        if (self.config.max_connections == 0 or self.config.timeout_ms == 0) return error.InvalidConnectionLimits;
         self.running.store(true, .release);
 
         const addr = try core.compat.net.Address.parseIp(self.config.bind_address, self.config.port);
@@ -339,16 +344,23 @@ pub const Server = struct {
         std.log.info("WormDB listening on {s}:{d} ({d} workers)", .{ self.config.bind_address, self.config.port, num_workers });
 
         while (self.running.load(.acquire)) {
-            const conn = listener.accept() catch |err| {
+            var conn = listener.accept() catch |err| {
                 std.log.err("Accept error: {}", .{err});
                 continue;
             };
 
+            if (!self.connection_limit.acquire(self.config.max_connections)) {
+                conn.stream.close();
+                continue;
+            }
+            // Preserve accept time through the queue and all pre-AUTH frames.
+            conn.stream.read_limit_ns = core.compat.nowNs() + @as(i128, self.config.timeout_ms) * 1_000_000;
             if (!self.conn_queue.push(conn)) {
                 // Queue full — reject connection
                 std.log.warn("Connection queue full, rejecting", .{});
                 if (self.metrics) |metrics| metrics.setTcpConnectionQueueDepth(self.conn_queue.len());
                 conn.stream.close();
+                self.connection_limit.release();
                 continue;
             }
             if (self.metrics) |metrics| metrics.setTcpConnectionQueueDepth(self.conn_queue.len());
@@ -386,7 +398,9 @@ pub const Server = struct {
     }
 
     fn handleConnection(self: *Server, conn: core.compat.net.ServerCompat.Connection) void {
+        defer self.connection_limit.release();
         var stream = conn.stream;
+        stream.beginRead(self.config.timeout_ms, false);
         if (self.metrics) |metrics| metrics.beginTcpConnection();
         defer if (self.metrics) |metrics| metrics.endTcpConnection();
 
@@ -395,6 +409,7 @@ pub const Server = struct {
         core.compat.setNoDelay(stream.getHandle());
         // Bound sends so a slow peer cannot pin an EventBus publisher (#84).
         core.compat.setSendTimeoutMs(stream.getHandle(), 2_000);
+        stream.write_timeout_ms = 2_000;
         var conn_ctx = ConnectionContext.init(self.allocator, self.event_bus, &stream);
         defer conn_ctx.deinit();
         defer conn.stream.close();
@@ -411,6 +426,7 @@ pub const Server = struct {
         }
 
         if (std.mem.eql(u8, &handshake, &wire.WIRE_MAGIC)) {
+            if (!self.config.auth_enforce) stream.read_limit_ns = null;
             conn_ctx.binary_mode = true;
             self.handleBinaryConnection(&stream, &conn_ctx);
             return;
@@ -428,6 +444,7 @@ pub const Server = struct {
                 }
             }
             conn_ctx.binary_mode = true;
+            stream.read_limit_ns = null;
             self.handleReplicationConnection(&stream, null);
             return;
         }
@@ -439,6 +456,7 @@ pub const Server = struct {
         if (std.mem.eql(u8, &handshake, &wire.REPL_MAGIC_V2)) {
             conn_ctx.binary_mode = true;
             const peer_org = self.replicationOrgHandshake(&stream) orelse return;
+            stream.read_limit_ns = null;
             self.handleReplicationConnection(&stream, peer_org);
             return;
         }
@@ -500,9 +518,13 @@ pub const Server = struct {
             _ = cmd_arena.reset(.retain_capacity);
             const arena_alloc = cmd_arena.allocator();
 
+            self.expireAuthState(conn_ctx);
+            const may_idle = conn_ctx.subscriptions.count() > 0 and
+                (!self.config.auth_enforce or conn_ctx.auth_state != null);
+            stream.beginRead(self.config.timeout_ms, may_idle);
             const cmd = wire.readFrameZeroCopy(&reader, arena_alloc) catch |err| {
                 switch (err) {
-                    error.EndOfStream => return,
+                    error.EndOfStream, error.Timeout => return,
                     error.PayloadTooLarge => {
                         wire.writeResponse(&w, .{ .err = "request too large" }) catch {};
                         w.flush() catch {};
@@ -616,6 +638,7 @@ pub const Server = struct {
         var reader = ReadAdapter{ .stream = stream };
 
         while (true) {
+            stream.beginRead(self.config.timeout_ms, peer_org != null);
             const cmd = wire.readFrameAlloc(&reader, self.allocator) catch return;
             defer protocol.deinitCommand(self.allocator, cmd);
 
@@ -1000,12 +1023,21 @@ pub const Server = struct {
         return self.executeForConnectionWithAlloc(cmd, conn_ctx, self.allocator);
     }
 
+    fn expireAuthState(self: *Server, conn_ctx: *ConnectionContext) void {
+        if (conn_ctx.auth_state) |*state| {
+            if (state.isExpired()) {
+                conn_ctx.clearAuthState();
+                if (conn_ctx.stream) |stream| {
+                    stream.read_limit_ns = core.compat.nowNs() + @as(i128, self.config.timeout_ms) * 1_000_000;
+                }
+            }
+        }
+    }
+
     fn executeForConnectionWithAlloc(self: *Server, cmd: Command, conn_ctx: *ConnectionContext, alloc: std.mem.Allocator) !Response {
         // Revoke expired tokens mid-session — forces re-AUTH instead of letting a
         // long-lived connection outlive its token (mirrors the WS gateway).
-        if (conn_ctx.auth_state) |*state| {
-            if (state.isExpired()) conn_ctx.clearAuthState();
-        }
+        self.expireAuthState(conn_ctx);
 
         // AUTH is handled at the connection level (the executor has no per-connection
         // state to attach the token to). Semantics mirror gateway.zig: verify regardless
@@ -1038,6 +1070,7 @@ pub const Server = struct {
                 // Replace previous auth state (re-AUTH refreshes the token).
                 conn_ctx.clearAuthState();
                 conn_ctx.auth_state = state;
+                if (conn_ctx.stream) |stream| stream.read_limit_ns = null;
                 break :blk .ok;
             },
             .subscribe => |params| blk: {

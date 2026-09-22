@@ -44,8 +44,9 @@ to check its supported options.
 
 ::: warning Remote access
 Do not expose this development configuration to an untrusted network. In the
-standalone server, `auth.require_auth: true` alone does not enforce authentication:
-verification keys must also be configured. Plain TCP has no TLS. See
+standalone server, `auth.require_auth: true` keeps protected commands locked until
+a valid SCT is supplied. Configure verification keys; an empty key list never
+disables enforcement. Plain TCP has no TLS. See
 [Scoped authentication](/AUTH_SCOPED) before configuring remote access.
 :::
 

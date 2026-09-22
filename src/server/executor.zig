@@ -45,7 +45,7 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
     // Unified authorization chokepoint — every transport funnels through here. `.trusted`
     // (internal/replicated) and `.disabled` (explicit per-transport opt-out) bypass checks;
     // `.enforce` runs the capability check for protected commands, while public commands
-    // (STATUS/CLUSTER_*/SAVE/AUTH → no operation) always pass.
+    // (STATUS/CLUSTER_*/AUTH → no operation) always pass.
     switch (ctx.auth) {
         .trusted, .disabled => {},
         .enforce => |maybe_state| {
@@ -460,4 +460,32 @@ test "executor auth gate: enforce blocks unauthenticated writes, public passes, 
         try testing.expectEqualStrings("permission denied", denied.err);
         try testing.expect(try execute(ctx, Command{ .set = .{ .key = "ok:1", .value = "v" } }) == .ok);
     }
+}
+
+test "SAVE requires universal admin authority before reaching storage" {
+    const testing = std.testing;
+    var store = try Store.init(testing.allocator, .{ .persistence = .none });
+    defer store.deinit();
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+    var ctx = ExecContext{ .allocator = testing.allocator, .store = &store, .event_bus = &bus, .cluster = null, .auth = .{ .enforce = null } };
+    try testing.expectEqualStrings("auth required", (try execute(ctx, .save)).err);
+    const denied_caps = [_]auth.Capability{
+        .{ .op = .set, .match_type = .wildcard, .pattern = "" },
+        .{ .op = .exec, .match_type = .exact, .pattern = "SAVE" },
+        .{ .op = .all, .match_type = .prefix, .pattern = "tenant:" },
+        .{ .op = .all, .match_type = .exact, .pattern = "" },
+    };
+    var state = auth.TokenState{ .subject = "test", .iat = 0, .exp = 0, .jti = 0, .capabilities = &.{} };
+    ctx.auth = .{ .enforce = &state };
+    for (&denied_caps) |*cap| {
+        state.capabilities = @as([*]const auth.Capability, @ptrCast(cap))[0..1];
+        try testing.expectEqualStrings("permission denied", (try execute(ctx, .save)).err);
+    }
+    state.capabilities = &.{.{ .op = .all, .match_type = .wildcard, .pattern = "" }};
+    try testing.expect(try execute(ctx, .save) == .ok);
+    ctx.auth = .trusted;
+    try testing.expect(try execute(ctx, .save) == .ok);
+    ctx.auth = .disabled;
+    try testing.expect(try execute(ctx, .save) == .ok);
 }

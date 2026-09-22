@@ -26,6 +26,24 @@ The gateway shares the same store, event bus, procedure registry, cluster handle
 
 ## Per-IP Connection Cap
 
+All accepted gateway connections, including HTTP handshakes and loopback peers,
+share `gateway.max_connections` (default **256**). Admission reserves a slot
+before creating a connection thread. `gateway.timeout_ms` (default **30000**)
+bounds an entire HTTP request or WebSocket frame. Before successful SCT AUTH,
+the same deadline runs from accept and cannot be extended by PING or STATUS.
+Authenticated WebSockets and explicit auth-disabled WebSockets may wait idle
+between frames; once the first byte arrives, the whole-frame deadline applies.
+Both settings must be positive. Embedders set `gateway.max_connections` and
+`gateway.timeout_ms` before `start()`.
+
+The TCP listener applies `server.max_connections` (default **1024**) to accepted
+and queued connections, and `server.timeout_ms` (default **30000**) from accept.
+Queued sockets do not get a fresh authentication deadline at worker pickup.
+Established subscriptions and authenticated W2 replication may wait between
+frames. Other idle TCP sessions expire. The fixed TCP worker pool still limits
+the number of simultaneous long-lived sessions; these bounds do not guarantee
+fairness between authenticated clients.
+
 `gateway.max_connections_per_ip` bounds concurrent gateway connections per client IP. The default is **0 = unlimited** — a small default cap would break real deployments, because players behind one NAT (schools, offices) and localhost capacity benches all share a single address ([#89](https://github.com/igorls/wormdb/issues/89)).
 
 ```json
@@ -48,7 +66,20 @@ The gateway shares the same store, event bus, procedure registry, cluster handle
 
 Binary WebSocket frames carry WormWire command and response frames without the raw TCP `WW` preface. Browser clients can use `apps/browser/src/client.ts` and the demo pages under `apps/browser/demo/`.
 
-Authentication is via signed capability tokens (SCT). Configure Ed25519 public keys in `auth.public_keys`; when at least one valid key is loaded and `auth.require_auth` is true, unauthenticated gateway commands are rejected. An empty public-key list leaves gateway auth disabled.
+Authentication is via signed capability tokens (SCT). When `auth.require_auth`
+is true, auth-enabled listeners reject protected commands until a valid token
+is presented. Configure Ed25519 verification keys in `auth.public_keys`; an empty
+key list keeps protected commands locked. Explicit `auth.require_auth: false`
+or per-listener opt-outs remain available for trusted local use.
+
+`SAVE` is administrative: it requires `all` operations with a wildcard match or
+an empty-prefix match. An exact match on the empty key is insufficient. A normal namespace
+read/write token cannot save the entire database. Existing wildcard admin SCTs
+continue to work without changing the token format.
+
+The standalone binary also rejects unauthenticated legacy replication on the
+client port, even when no cluster is running. `--cluster-open` explicitly opts
+into that legacy path; configured org grants continue to require W2 authentication.
 
 ```json
 {

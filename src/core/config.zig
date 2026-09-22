@@ -48,7 +48,7 @@ pub const ServerConfig = struct {
     /// Maximum concurrent connections
     max_connections: usize = 1024,
 
-    /// Connection timeout in milliseconds
+    /// Whole handshake/frame timeout in milliseconds; must be positive.
     timeout_ms: usize = 30000,
 
     /// Server backend
@@ -93,6 +93,13 @@ pub const ClusterConfig = struct {
 
 /// Gateway configuration (WebSocket endpoint for browser-direct access)
 pub const GatewayConfig = struct {
+    /// Global accepted-connection cap, including HTTP handshakes and loopback.
+    /// Must be positive; separate from the optional per-IP limit.
+    max_connections: usize = 256,
+
+    /// Whole handshake/frame timeout in milliseconds; must be positive.
+    timeout_ms: usize = 30000,
+
     /// Enable the WebSocket gateway
     enabled: bool = false,
 

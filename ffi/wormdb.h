@@ -100,6 +100,14 @@ typedef int (*wormdb_scan_callback)(
 /* Open/create a DB rooted at `dir` (WAL + snapshot live under it). NULL on error. */
 wormdb_Db *wormdb_open(const char *dir, int persistence);
 
+/* Open/create a DB rooted at `dir` with synchronous per-write WAL sync (no background writer).
+ * Guarantees immediate fsync on all WAL-backed writes (wormdb_set, append_log).
+ * An I/O error has an uncertain outcome: a failed write may replay after reopening.
+ * After a direct WAL write/sync error, further WAL-backed writes are rejected
+ * until close/reopen and recovery. Reconcile recovered state before retrying.
+ * Does not make in-memory unsafe procedure mutations durable. NULL on error. */
+wormdb_Db *wormdb_open_sync(const char *dir);
+
 /* Flush, close, and free a handle. */
 void wormdb_close(wormdb_Db *db);
 

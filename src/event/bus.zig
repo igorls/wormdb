@@ -14,11 +14,13 @@ const compat = core.compat;
 const predicate = core.predicate;
 
 pub const WriteFn = *const fn (ctx: *anyopaque, data: []const u8) void;
+pub const EventFn = *const fn (ctx: *anyopaque, channel: []const u8, message: []const u8) void;
 pub const LifetimeFn = *const fn (ctx: *anyopaque) void;
 
 pub const Subscriber = struct {
     id: u64,
-    write_fn: WriteFn,
+    write_fn: ?WriteFn,
+    event_fn: ?EventFn = null,
     ctx: *anyopaque,
     filter: ?predicate.Predicate = null,
     // Owned copy of the raw filter bytes. The parsed `filter` predicate stores
@@ -44,10 +46,14 @@ pub const Subscriber = struct {
 pub const LifetimeHooks = struct {
     retain_fn: ?LifetimeFn = null,
     release_fn: ?LifetimeFn = null,
+    /// Structured delivery preserves arbitrary binary channel/message bytes.
+    /// When absent, the legacy text event envelope is passed to write_fn.
+    event_fn: ?EventFn = null,
 };
 
 const Delivery = struct {
-    write_fn: WriteFn,
+    write_fn: ?WriteFn,
+    event_fn: ?EventFn,
     ctx: *anyopaque,
     release_fn: ?LifetimeFn,
 };
@@ -135,10 +141,11 @@ pub const EventBus = struct {
         self: *EventBus,
         channel_name: []const u8,
         filter_raw: ?[]const u8,
-        write_fn: WriteFn,
+        write_fn: ?WriteFn,
         ctx: *anyopaque,
         hooks: LifetimeHooks,
     ) !u64 {
+        std.debug.assert(write_fn != null or hooks.event_fn != null);
         // Own a copy of the raw filter bytes: the parsed predicate borrows
         // slices from it and the subscription outlives the caller's buffer.
         var filter_src: ?[]u8 = null;
@@ -171,6 +178,7 @@ pub const EventBus = struct {
         try channel.subscribers.put(sub_id, .{
             .id = sub_id,
             .write_fn = write_fn,
+            .event_fn = hooks.event_fn,
             .ctx = ctx,
             .filter = parsed_filter,
             .filter_src = filter_src,
@@ -273,6 +281,7 @@ pub const EventBus = struct {
 
                 deliveries.appendAssumeCapacity(.{
                     .write_fn = sub.write_fn,
+                    .event_fn = sub.event_fn,
                     .ctx = sub.ctx,
                     .release_fn = sub.release_fn,
                 });
@@ -288,7 +297,11 @@ pub const EventBus = struct {
             const d = deliveries.items[i];
             // Clear release from the defer list by nulling so defer doesn't double-release.
             deliveries.items[i].release_fn = null;
-            d.write_fn(d.ctx, event_msg);
+            if (d.event_fn) |deliver_event| {
+                deliver_event(d.ctx, channel_name, message);
+            } else {
+                d.write_fn.?(d.ctx, event_msg);
+            }
             if (d.release_fn) |rel| rel(d.ctx);
         }
         deliveries.clearRetainingCapacity();

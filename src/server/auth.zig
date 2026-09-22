@@ -90,6 +90,13 @@ pub const TokenState = struct {
         const now: u64 = @intCast(@divFloor(compat.nowMs(), 1000));
         return now >= self.exp;
     }
+
+    /// Bind a blocking socket read to this token's absolute expiry. Socket
+    /// deadlines use the monotonic clock; SCT timestamps use wall-clock seconds.
+    pub fn readDeadlineNs(self: *const TokenState) i128 {
+        const remaining = @as(i128, self.exp) * 1_000_000_000 - @as(i128, compat.nowMs()) * 1_000_000;
+        return compat.nowNs() + @max(remaining, 0);
+    }
 };
 
 /// Ed25519 public key (32 bytes).
@@ -397,11 +404,12 @@ pub fn commandToOperation(cmd_id: u8) ?Operation {
         0x07 => .subscribe, // UNSUB uses same permission as SUB
         0x08 => .publish,
         0x09 => .exec,
+        0x0B => .all, // SAVE requires universal administrative authority
         0x0D => .set, // VINSERT writes a vector key
         0x0E => .delete, // VDELETE deletes a vector key
         0x0F => .set, // VBULKINSERT writes every item key
         0x10 => .set, // VRABITQ_INSTALL mutates vector namespace state
-        else => null, // STATUS, CLUSTER_STATUS, SAVE, AUTH, etc. — always permitted
+        else => null, // STATUS, CLUSTER_STATUS, AUTH, etc. — always permitted
     };
 }
 
@@ -419,6 +427,7 @@ pub fn commandTarget(cmd: Command) ?[]const u8 {
         .unsubscribe => |ch| ch,
         .publish => |p| p.channel,
         .exec => |p| p.procedure,
+        .save => "", // global operation; commandPermittedUnion checks universal scope
         .vinsert => |p| p.key,
         .vdelete => |p| p.key,
         .vbulkinsert => null, // multi-target; authorized per-item in commandPermittedUnion
@@ -429,7 +438,7 @@ pub fn commandTarget(cmd: Command) ?[]const u8 {
 
 /// Map a parsed `Command` (union tag) to its auth `Operation`. The executor's gate keys on
 /// this instead of the wire `cmd_id` byte (the executor only has the parsed command). `null`
-/// ⇒ a public command (STATUS / CLUSTER_STATUS / CLUSTER_PEERS / SAVE / AUTH).
+/// ⇒ a public command (STATUS / CLUSTER_STATUS / CLUSTER_PEERS / AUTH).
 pub fn operationForCommand(cmd: Command) ?Operation {
     return switch (cmd) {
         .get => .get,
@@ -440,7 +449,8 @@ pub fn operationForCommand(cmd: Command) ?Operation {
         .exec => .exec,
         .vinsert, .vbulkinsert, .vrabitq_install => .set,
         .vdelete => .delete,
-        else => null, // status, cluster_status, cluster_peers, save, auth
+        .save => .all,
+        else => null, // status, cluster_status, cluster_peers, auth
     };
 }
 
@@ -450,6 +460,15 @@ pub fn operationForCommand(cmd: Command) ?Operation {
 pub fn commandPermittedUnion(state: *const TokenState, cmd: Command) bool {
     const op = operationForCommand(cmd) orelse return true; // public command
     switch (cmd) {
+        .save => {
+            // Exact-empty authority only names the empty key. It must not
+            // become database-wide authority through this targetless command.
+            for (state.capabilities) |cap| {
+                if (cap.op == .all and (cap.match_type == .wildcard or
+                    (cap.match_type == .prefix and cap.pattern.len == 0))) return true;
+            }
+            return false;
+        },
         .vbulkinsert => |p| {
             for (p.items) |item| {
                 if (!state.permits(op, item.key)) return false;
@@ -594,6 +613,7 @@ test "operationForCommand agrees with commandToOperation for every Command id" {
         .{ T.Command{ .unsubscribe = "c" }, T.CommandId.unsubscribe },
         .{ T.Command{ .publish = .{ .channel = "c", .message = "m" } }, T.CommandId.publish },
         .{ T.Command{ .exec = .{ .procedure = "p", .args = &.{} } }, T.CommandId.exec },
+        .{ T.Command.save, T.CommandId.save },
         .{ T.Command{ .vinsert = .{ .key = "vec:n:1", .vector = "\x00\x00\x00\x00", .namespace = "vec:n:", .metric = "l2", .timestamp = 0 } }, T.CommandId.vinsert },
         .{ T.Command{ .vdelete = .{ .key = "vec:n:1", .namespace = "vec:n:" } }, T.CommandId.vdelete },
         .{ T.Command{ .vbulkinsert = .{ .namespace = "vec:n:", .metric = "l2", .items = &.{} } }, T.CommandId.vbulkinsert },
@@ -604,7 +624,7 @@ test "operationForCommand agrees with commandToOperation for every Command id" {
     }
     // Public commands map to no operation on both keyings.
     try testing.expectEqual(@as(?Operation, null), operationForCommand(.status));
-    try testing.expectEqual(@as(?Operation, null), operationForCommand(.save));
+    try testing.expectEqual(@as(?Operation, .all), operationForCommand(.save));
     try testing.expectEqual(@as(?Operation, null), operationForCommand(.{ .auth = "x" }));
 }
 

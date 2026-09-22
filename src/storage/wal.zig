@@ -50,6 +50,11 @@ pub const Wal = struct {
     writer_started: bool,
     sync_requested: std.atomic.Value(bool),
     wake_futex: std.atomic.Value(u32),
+    /// Direct synchronous I/O failures have an uncertain commit outcome. Do
+    /// not acknowledge later writes against a live view that may differ from
+    /// replay. Store serializes these fields with wal_enqueue_mutex.
+    sync_failed: bool = false,
+    fail_sync_for_test: if (@import("builtin").is_test) bool else void = if (@import("builtin").is_test) false else {},
 
     // Power-of-two ring capacity for mask indexing.
     const WAL_QUEUE_CAP: usize = 1 << 16;
@@ -121,6 +126,7 @@ pub const Wal = struct {
 
     /// Flush WAL to durable storage. Called by the group-commit background thread.
     pub fn sync(self: *Wal) !void {
+        if (self.sync_failed) return error.WalNeedsRecovery;
         if (self.writer_started) {
             self.sync_requested.store(true, .release);
             return;
@@ -135,40 +141,40 @@ pub const Wal = struct {
         const record = try self.serializeSetRecord(key, value, flags, timestamp);
         errdefer self.allocator.free(record);
 
-        if (self.writer_started) {
-            self.enqueueRecordBlocking(record);
-        } else {
-            try compat.File.writeAll(self.file, record);
-            self.allocator.free(record);
-            self.write_count += 1;
-        }
-
+        // Finish every fallible live-entry allocation before publishing the
+        // durable record. Once the append succeeds, returning the Entry cannot
+        // fail and the caller can install the exact acknowledged bytes.
         const entry = try self.allocator.create(Entry);
         errdefer self.allocator.destroy(entry);
-
         const entry_key = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(entry_key);
-
         const entry_value = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(entry_value);
         entry.* = .{
             .key = entry_key,
             .value = entry_value,
             .timestamp = timestamp,
             .flags = flags,
         };
+
+        if (self.writer_started) {
+            self.enqueueRecordBlocking(record);
+        } else {
+            try self.writeDirect(record);
+            self.allocator.free(record);
+        }
         return entry;
     }
 
     pub fn appendDelete(self: *Wal, key: []const u8) !void {
         const record = try self.serializeDeleteRecord(key);
-        errdefer self.allocator.free(record);
 
         if (self.writer_started) {
             self.enqueueRecordBlocking(record);
         } else {
-            try compat.File.writeAll(self.file, record);
+            errdefer self.allocator.free(record);
+            try self.writeDirect(record);
             self.allocator.free(record);
-            self.write_count += 1;
         }
     }
 
@@ -181,28 +187,41 @@ pub const Wal = struct {
         timestamp: Timestamp,
     ) !void {
         const record = try self.serializeVinsertRecord(key, namespace, metric, flags, timestamp);
-        errdefer self.allocator.free(record);
 
         if (self.writer_started) {
             self.enqueueRecordBlocking(record);
         } else {
-            try compat.File.writeAll(self.file, record);
+            errdefer self.allocator.free(record);
+            try self.writeDirect(record);
             self.allocator.free(record);
-            self.write_count += 1;
         }
     }
 
     pub fn appendVdelete(self: *Wal, key: []const u8, namespace: []const u8) !void {
         const record = try self.serializeVdeleteRecord(key, namespace);
-        errdefer self.allocator.free(record);
 
         if (self.writer_started) {
             self.enqueueRecordBlocking(record);
         } else {
-            try compat.File.writeAll(self.file, record);
+            errdefer self.allocator.free(record);
+            try self.writeDirect(record);
             self.allocator.free(record);
-            self.write_count += 1;
         }
+    }
+
+    fn writeDirect(self: *Wal, record: []const u8) !void {
+        if (self.sync_failed) return error.WalNeedsRecovery;
+        errdefer if (self.sync_writes) {
+            self.sync_failed = true;
+        };
+        try compat.File.writeAll(self.file, record);
+        if (self.sync_writes) {
+            if (@import("builtin").is_test) {
+                if (self.fail_sync_for_test) return error.InjectedSyncFailure;
+            }
+            try compat.File.sync(self.file);
+        }
+        self.write_count += 1;
     }
 
     fn serializeSetRecord(self: *Wal, key: []const u8, value: []const u8, flags: EntryFlags, timestamp: Timestamp) ![]u8 {

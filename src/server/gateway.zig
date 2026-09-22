@@ -49,6 +49,7 @@ const Response = core.types.Response;
 const Cluster = cluster_mod.Cluster;
 const Sha1 = std.crypto.hash.Sha1;
 const ServerMetrics = @import("metrics.zig").ServerMetrics;
+const ConnectionLimit = @import("connection_limit.zig").ConnectionLimit;
 
 /// Per-IP concurrent-connection accounting for the gateway accept path (#89).
 /// Keys are peer IPs normalized to 16 bytes (IPv4 mapped to ::ffff:a.b.c.d) so a
@@ -142,6 +143,10 @@ pub const Gateway = struct {
     /// can open many sockets from one address. Set before start().
     per_ip_exempt_loopback: bool,
     ip_limiter: IpLimiter,
+    /// Global budget also covers loopback, unknown IPs and HTTP handshakes.
+    max_connections: usize = 256,
+    timeout_ms: usize = 30000,
+    connection_limit: ConnectionLimit = .{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -198,6 +203,7 @@ pub const Gateway = struct {
 
     /// Run the gateway on a dedicated thread. Call from main after server start.
     pub fn start(self: *Gateway) !std.Thread {
+        if (self.max_connections == 0 or self.timeout_ms == 0) return error.InvalidConnectionLimits;
         return try std.Thread.spawn(.{}, runLoop, .{self});
     }
 
@@ -227,10 +233,15 @@ pub const Gateway = struct {
         }
 
         while (self.running.load(.acquire)) {
-            const conn = listener.accept() catch |err| {
+            var conn = listener.accept() catch |err| {
                 std.log.debug("Gateway: accept error: {}", .{err});
                 continue;
             };
+            if (!self.connection_limit.acquire(self.max_connections)) {
+                conn.stream.close();
+                continue;
+            }
+            conn.stream.read_limit_ns = core.compat.nowNs() + @as(i128, self.timeout_ms) * 1_000_000;
             // Per-IP admission (#89): enforced only when a cap is configured AND the
             // peer address resolves. An unresolvable peer is admitted uncounted —
             // never rejected — because it cannot be attributed to an IP.
@@ -247,6 +258,7 @@ pub const Gateway = struct {
                             });
                             if (self.metrics) |metrics| metrics.recordGatewayPerIpRejection();
                             conn.stream.close();
+                            self.connection_limit.release();
                             continue;
                         }
                     }
@@ -258,6 +270,7 @@ pub const Gateway = struct {
                 std.log.warn("Gateway: spawn thread failed: {}", .{err});
                 if (ip_key) |key| self.ip_limiter.release(key);
                 conn.stream.close();
+                self.connection_limit.release();
                 continue;
             };
             thread.detach();
@@ -265,8 +278,10 @@ pub const Gateway = struct {
     }
 
     fn handleConnection(self: *Gateway, conn: core.compat.net.ServerCompat.Connection, ip_key: ?IpLimiter.Key) void {
+        defer self.connection_limit.release();
         defer if (ip_key) |key| self.ip_limiter.release(key);
         var stream = conn.stream;
+        stream.beginRead(self.timeout_ms, false);
         if (self.metrics) |metrics| metrics.beginGatewayThread();
         defer if (self.metrics) |metrics| metrics.endGatewayThread();
         defer stream.close();
@@ -275,10 +290,12 @@ pub const Gateway = struct {
         core.compat.setNoDelay(stream.getHandle());
         // Bound sends so a slow WebSocket peer cannot pin a publisher thread (#84).
         core.compat.setSendTimeoutMs(stream.getHandle(), 2_000);
+        stream.write_timeout_ms = 2_000;
 
         // Step 1: WebSocket handshake
         var request_buf: [4096]u8 = undefined;
         const request = readHttpRequest(&stream, &request_buf) orelse return;
+        if (!self.auth_required) stream.read_limit_ns = null;
 
         const ws_key = extractWebSocketKey(request) orelse {
             // Not a WebSocket upgrade — serve the plain-HTTP domain routes (GET /api/...),
@@ -308,25 +325,22 @@ pub const Gateway = struct {
         // stack frame if publishers are mid-deliver during teardown (#91 UAF).
         const conn_ctx = self.allocator.create(ConnContext) catch return;
         conn_ctx.* = ConnContext.init(self.allocator, self.event_bus, &stream);
+        conn_ctx.auth_required = self.auth_required;
         defer conn_ctx.connectionDone();
 
         var cmd_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer cmd_arena.deinit();
 
-        // Per-connection auth state
-        var auth_state: ?auth.TokenState = null;
-
         while (self.running.load(.acquire)) {
             // Check if token expired mid-session
-            if (auth_state) |*state| {
-                if (state.isExpired()) {
-                    auth_state = null; // Revoke — force re-auth
-                }
-            }
+            self.expireAuthState(conn_ctx, &stream);
 
             // Read one WebSocket frame
+            stream.beginRead(self.timeout_ms, !self.auth_required or conn_ctx.auth_state != null);
             const ws_frame = readWsFrame(&stream, self.allocator) orelse return;
             defer if (ws_frame.allocated) self.allocator.free(ws_frame.payload);
+            // The token can expire while waiting for this frame.
+            self.expireAuthState(conn_ctx, &stream);
 
             switch (ws_frame.opcode) {
                 0x08 => {
@@ -410,21 +424,14 @@ pub const Gateway = struct {
                         };
                         break :blk Response{ .err = msg };
                     };
-                    // Replace previous auth state
-                    if (auth_state) |*old| {
-                        self.allocator.free(old.subject);
-                        for (old.capabilities) |cap| {
-                            self.allocator.free(cap.pattern);
-                        }
-                        self.allocator.free(old.capabilities);
-                    }
-                    auth_state = state;
+                    conn_ctx.replaceAuthState(state);
+                    stream.read_limit_ns = if (self.auth_required) state.readDeadlineNs() else null;
                     break :blk Response.ok;
                 },
                 .subscribe => |params| blk: {
                     // Check capability for subscribe
                     if (self.auth_required) {
-                        if (auth_state) |*state| {
+                        if (conn_ctx.auth_state) |*state| {
                             if (!state.permits(.subscribe, params.channel)) {
                                 break :blk Response{ .err = "permission denied" };
                             }
@@ -454,7 +461,7 @@ pub const Gateway = struct {
                         .event_bus = self.event_bus,
                         .cluster = self.cluster,
                         .auth = if (self.auth_required)
-                            .{ .enforce = if (auth_state) |*s| s else null }
+                            .{ .enforce = if (conn_ctx.auth_state) |*s| s else null }
                         else
                             .disabled,
                         .auth_mint = self.auth_mint,
@@ -479,6 +486,15 @@ pub const Gateway = struct {
         }
     }
 
+    fn expireAuthState(self: *Gateway, conn: *ConnContext, stream: *core.compat.net.Stream) void {
+        if (conn.auth_state) |*current| {
+            if (current.isExpired()) {
+                conn.replaceAuthState(null);
+                stream.read_limit_ns = core.compat.nowNs() + @as(i128, self.timeout_ms) * 1_000_000;
+            }
+        }
+    }
+
     // --- Plain HTTP (domain routes) ---
     //
     // Answers `GET /api/...` directly over HTTP/1.1 by routing to an EXEC procedure and returning its
@@ -492,6 +508,7 @@ pub const Gateway = struct {
         while (self.running.load(.acquire)) {
             _ = arena.reset(.retain_capacity);
             if (!self.handleHttpRequest(stream, arena.allocator(), current)) return;
+            stream.beginRead(self.timeout_ms, false);
             current = readHttpRequest(stream, request_buf) orelse return;
         }
     }
@@ -790,7 +807,10 @@ pub const Gateway = struct {
 
         var read_total: usize = 0;
         while (read_total < len) {
-            const n = stream.read(buf[read_total..]) catch return null;
+            const n = stream.read(buf[read_total..]) catch {
+                allocator.free(buf);
+                return null;
+            };
             if (n == 0) {
                 allocator.free(buf);
                 return null;
@@ -950,6 +970,10 @@ pub const Gateway = struct {
         stream: *core.compat.net.Stream,
         subscriptions: std.StringHashMap(u64),
         write_mutex: core.compat.Mutex,
+        /// Only the connection thread mutates tokens. Event callbacks read them
+        /// under write_mutex, which also guards replacement/free.
+        auth_state: ?auth.TokenState = null,
+        auth_required: bool = false,
         /// Set before unsub/teardown; event writers check this under write_mutex.
         closed: std.atomic.Value(bool) = .init(false),
         /// Ownership refs: 1 for the connection thread + 1 per EventBus retain.
@@ -971,6 +995,7 @@ pub const Gateway = struct {
         /// in-flight EventBus delivers finish (no UAF if publishers still hold us).
         fn connectionDone(self: *ConnContext) void {
             self.closed.store(true, .release);
+            self.replaceAuthState(null);
             var iter = self.subscriptions.iterator();
             while (iter.next()) |entry| {
                 self.event_bus.unsubscribe(entry.key_ptr.*, entry.value_ptr.*);
@@ -981,6 +1006,13 @@ pub const Gateway = struct {
             // EventBus delivers finish (replaces bounded in_flight spin from
             // main's 3eea05e — that path could UAF if it timed out mid-deliver).
             self.releaseRef();
+        }
+
+        fn replaceAuthState(self: *ConnContext, next: ?auth.TokenState) void {
+            self.write_mutex.lock();
+            defer self.write_mutex.unlock();
+            if (self.auth_state) |*state| auth.freeTokenState(self.allocator, state);
+            self.auth_state = next;
         }
 
         fn retain(ctx: *anyopaque) void {
@@ -1012,9 +1044,13 @@ pub const Gateway = struct {
             const sub_id = try self.event_bus.subscribeFilteredHooks(
                 channel_copy,
                 filter,
-                ConnContext.writeEvent,
+                null,
                 @ptrCast(self),
-                .{ .retain_fn = ConnContext.retain, .release_fn = ConnContext.release },
+                .{
+                    .retain_fn = ConnContext.retain,
+                    .release_fn = ConnContext.release,
+                    .event_fn = ConnContext.writeExactEvent,
+                },
             );
             errdefer self.event_bus.unsubscribe(channel_copy, sub_id);
 
@@ -1049,42 +1085,23 @@ pub const Gateway = struct {
             try Gateway.sendWireResponseFrame(self.stream, self.allocator, response);
         }
 
-        /// Event callback — called from EventBus publisher thread after channel.mutex
-        /// is released. Fail-soft: tryLock drops the event if the command path is
-        /// writing; socket send timeout (set on accept) bounds blocked writes.
-        fn writeEvent(ctx: *anyopaque, data: []const u8) void {
+        fn writeExactEvent(ctx: *anyopaque, channel: []const u8, message: []const u8) void {
             const self: *ConnContext = @ptrCast(@alignCast(ctx));
             if (self.closed.load(.acquire)) return;
-
-            // Parse the text event payload to extract channel/message
-            const parsed = parseTextEvent(data) orelse return;
-
             if (!self.write_mutex.tryLock()) {
-                // Another writer holds the socket — drop rather than block the
-                // publisher (and every other connection waiting on fanout).
                 self.event_bus.recordDrop();
                 return;
             }
             defer self.write_mutex.unlock();
             if (self.closed.load(.acquire)) return;
+            if (self.auth_required) {
+                const state = if (self.auth_state) |*s| s else return;
+                if (state.isExpired() or !state.permits(.subscribe, channel)) return;
+            }
             Gateway.sendWireResponseFrame(self.stream, self.allocator, .{ .event = .{
-                .channel = parsed.channel,
-                .message = parsed.message,
+                .channel = channel,
+                .message = message,
             } }) catch {};
-        }
-
-        fn parseTextEvent(data: []const u8) ?struct { channel: []const u8, message: []const u8 } {
-            const prefix = ">EVENT ";
-            if (!std.mem.startsWith(u8, data, prefix)) return null;
-            const ch_start = prefix.len;
-            const ch_end_rel = std.mem.indexOf(u8, data[ch_start..], "\r\n") orelse return null;
-            const ch_end = ch_start + ch_end_rel;
-            const msg_start = ch_end + 2;
-            if (msg_start >= data.len) return null;
-            if (!std.mem.endsWith(u8, data, "\r\n")) return null;
-            const msg_end = data.len - 2;
-            if (msg_end < msg_start) return null;
-            return .{ .channel = data[ch_start..ch_end], .message = data[msg_start..msg_end] };
         }
     };
 };

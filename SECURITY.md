@@ -37,10 +37,17 @@ security boundary.
 
 ## Deployment limitations
 
-- The standalone server enforces SCT authentication only when
-  `auth.require_auth` is true and verification keys are configured. An empty
-  `auth.public_keys` list leaves listeners unauthenticated. Transport-specific
-  opt-outs also disable enforcement on the selected listener.
+- When `auth.require_auth` is true, auth-enabled listeners enforce SCT
+  authentication independently of verification-key availability. An empty
+  `auth.public_keys` list keeps protected commands locked. Global or transport-specific
+  opt-outs explicitly disable enforcement. `SAVE` requires universal admin authority.
+- Authenticated TCP/WebSocket sessions close at token expiry even when idle.
+  Refresh before expiry to keep the session; otherwise reconnect. Event delivery
+  checks the current token's expiry and channel grant, including after re-AUTH.
+- The synchronous FFI acknowledges WAL-backed writes only after write and sync.
+  I/O errors have uncertain outcomes, not rollback guarantees. A direct WAL
+  write/sync failure blocks further WAL-backed writes until close/reopen and
+  recovery; reconcile recovered state before retrying.
 - Raw WormWire TCP does not provide TLS. WebSocket deployments need appropriate
   TLS termination or a secure tunnel. QUIC is an optional, separately configured
   build. Authorization does not provide transport confidentiality.

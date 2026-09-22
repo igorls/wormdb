@@ -4,3 +4,6 @@
 # trust configuration containing it. This exception is limited to that finding;
 # never reuse this published demo key for a deployed service.
 2fd0f39d7f490eda590b1a63aa30fb1b2f8d0871:.wormdb-keys.json:generic-api-key:3
+# Fixed WebSocket handshake test nonce (base64 of "the sample nonce"), not
+# authentication material. Exempt only this historical line/fingerprint.
+6a53cd0ea5121bc5e3473c35d0f7082aa180e35e:scripts/test-security.ts:generic-api-key:74

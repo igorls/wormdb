@@ -274,6 +274,63 @@ pub fn setSendTimeoutMs(handle: std.posix.fd_t, timeout_ms: u32) void {
     }
 }
 
+/// Windows sockets created by Zig use AFD directly and are not Winsock socket
+/// objects. Submit the same AFD read/write as std.Io, but wait on a private event
+/// with a deadline. Always cancel AND drain a pending request before its stack
+/// buffers or the destination can go out of scope.
+fn socketWindowsBefore(comptime reading: bool, handle: std.posix.fd_t, buf: if (reading) []u8 else []const u8, deadline_ns: i128) !usize {
+    const win = std.os.windows;
+    if (deadline_ns <= nowNs()) return error.Timeout;
+    var event: win.HANDLE = undefined;
+    const event_all_access: win.ACCESS_MASK = @bitCast(@as(u32, 0x001f0003));
+    if (win.ntdll.NtCreateEvent(&event, event_all_access, null, .Notification, .FALSE) != .SUCCESS) return error.SystemResources;
+    defer win.CloseHandle(event);
+    var iovec = win.AFD.WSABUF(if (reading) .@"var" else .@"const"){ .len = @intCast(@min(buf.len, std.math.maxInt(u32))), .buf = buf.ptr };
+    const request: if (reading) win.AFD.RECV_INFO else win.AFD.SEND_INFO = .{
+        .BufferArray = @ptrCast(&iovec),
+        .BufferCount = 1,
+        .AfdFlags = .{ .NO_FAST_IO = true, .OVERLAPPED = true },
+        .TdiFlags = if (reading) .{ .NORMAL = true } else .{},
+    };
+    var iosb: win.IO_STATUS_BLOCK = undefined;
+    const status = win.ntdll.NtDeviceIoControlFile(handle, event, null, null, &iosb, if (reading) win.IOCTL.AFD.RECEIVE else win.IOCTL.AFD.SEND, &request, @sizeOf(@TypeOf(request)), null, 0);
+    switch (status) {
+        .SUCCESS => {},
+        .PENDING => {
+            const remaining = @max(deadline_ns - nowNs(), 0);
+            const timeout: i64 = -@as(i64, @intCast(@min(@divTrunc(remaining + 99, 100), std.math.maxInt(i64))));
+            const waited = win.ntdll.NtWaitForSingleObject(event, .FALSE, &timeout);
+            if (waited != .SUCCESS) {
+                var cancel_iosb: win.IO_STATUS_BLOCK = undefined;
+                _ = win.ntdll.NtCancelIoFileEx(handle, &iosb, &cancel_iosb);
+                _ = win.ntdll.NtWaitForSingleObject(event, .FALSE, null);
+                return if (waited == .TIMEOUT) error.Timeout else error.SocketIoFailed;
+            }
+        },
+        else => return error.SocketIoFailed,
+    }
+    if (iosb.u.Status != .SUCCESS) return error.SocketIoFailed;
+    return iosb.Information;
+}
+
+/// POSIX readiness wait before a single-reader socket read. Never extend the
+/// absolute deadline on EINTR or when the peer drips another byte.
+fn waitReadable(handle: std.posix.fd_t, deadline_ns: i128) !void {
+    while (true) {
+        const remaining = deadline_ns - nowNs();
+        if (remaining <= 0) return error.Timeout;
+        const ms: c_int = @intCast(@min(@divTrunc(remaining + 999_999, 1_000_000), std.math.maxInt(c_int)));
+        var pfd = std.posix.pollfd{ .fd = handle, .events = std.posix.POLL.IN, .revents = 0 };
+        const rc = std.c.poll(@ptrCast(&pfd), 1, ms);
+        if (rc < 0) {
+            if (std.posix.errno(rc) == .INTR) continue;
+            return error.SocketPollFailed;
+        }
+        if ((pfd.revents & std.posix.POLL.NVAL) != 0) return error.SocketPollFailed;
+        if (rc > 0) return;
+    }
+}
+
 /// Best-effort peer IP of a connected socket via getpeername(2).
 /// Returns null when the peer address is unavailable (getpeername failure or a
 /// non-IP family) — callers must treat null as "cannot attribute this
@@ -389,13 +446,40 @@ pub const net = struct {
     /// Provides the old read/writeAll/close API over std.Io.net.Stream.
     pub const Stream = struct {
         inner: std.Io.net.Stream,
+        read_timeout_ms: usize = 0,
+        read_deadline_ns: ?i128 = null,
+        /// Optional session deadline (e.g. accept-to-AUTH). Message boundaries
+        /// cannot extend it. The owner clears it only after authentication.
+        read_limit_ns: ?i128 = null,
+        write_timeout_ms: usize = 0,
+
+        pub fn beginRead(self: *Stream, timeout_ms: usize, allow_idle: bool) void {
+            self.read_timeout_ms = timeout_ms;
+            self.read_deadline_ns = if (allow_idle) null else nowNs() + @as(i128, timeout_ms) * 1_000_000;
+        }
 
         pub fn read(self: *Stream, buf: []u8) !usize {
+            if (buf.len == 0) return 0;
+            var deadline = self.read_deadline_ns;
+            if (self.read_limit_ns) |limit| deadline = if (deadline) |d| @min(d, limit) else limit;
+            const handle = self.inner.socket.handle;
+            const n = if (deadline) |d| blk: {
+                if (builtin.os.tag == .windows) break :blk try socketWindowsBefore(true, handle, buf, d);
+                try waitReadable(handle, d);
+                break :blk try self.readAvailable(buf);
+            } else try self.readAvailable(buf);
+            if (n > 0 and self.read_deadline_ns == null and self.read_timeout_ms > 0) {
+                self.read_deadline_ns = nowNs() + @as(i128, self.read_timeout_ms) * 1_000_000;
+            }
+            return n;
+        }
+
+        fn readAvailable(self: *Stream, buf: []u8) !usize {
             const handle = self.inner.socket.handle;
             if (builtin.os.tag == .windows) {
                 // Winsock SOCKETs are not CRT file descriptors, so the POSIX
                 // read(2) path below is invalid on Windows. Route through the
-                // Io net vtable (Winsock recv under the hood).
+                // Io net vtable (AFD receive under the hood).
                 const zio = io();
                 var iov = [_][]u8{buf};
                 return zio.vtable.netRead(zio.userdata, handle, &iov);
@@ -406,8 +490,9 @@ pub const net = struct {
 
         pub fn writeAll(self: *Stream, data: []const u8) !void {
             const handle = self.inner.socket.handle;
+            const deadline: ?i128 = if (self.write_timeout_ms > 0) nowNs() + @as(i128, self.write_timeout_ms) * 1_000_000 else null;
             if (builtin.os.tag == .windows) {
-                // Winsock send via the Io net vtable; loop on partial writes.
+                // AFD send; use a cancellable request when a deadline is set.
                 // netWrite treats `data[data.len-1]` as the splat pattern, so
                 // `data` must be non-empty: pass the payload as a one-element
                 // vector with splat=1 and an empty header (an empty `data`
@@ -417,7 +502,10 @@ pub const net = struct {
                 var written: usize = 0;
                 while (written < data.len) {
                     const chunk = [_][]const u8{data[written..]};
-                    const n = try zio.vtable.netWrite(zio.userdata, handle, empty_header, &chunk, 1);
+                    const n = if (deadline) |d|
+                        try socketWindowsBefore(false, handle, data[written..], d)
+                    else
+                        try zio.vtable.netWrite(zio.userdata, handle, empty_header, &chunk, 1);
                     if (n == 0) return error.BrokenPipe;
                     written += n;
                 }
@@ -425,12 +513,13 @@ pub const net = struct {
             }
             var written: usize = 0;
             while (written < data.len) {
+                if (deadline) |d| if (nowNs() >= d) return error.Timeout;
                 const rc = std.c.write(handle, data[written..].ptr, data.len - written);
                 if (rc < 0) {
                     const errno = std.posix.errno(rc);
                     switch (errno) {
                         .INTR => continue,
-                        .AGAIN => continue,
+                        .AGAIN => return error.WouldBlock, // respect SO_SNDTIMEO
                         .PIPE => return error.BrokenPipe,
                         .CONNRESET => return error.ConnectionResetByPeer,
                         .BADF => return error.NotOpenForWriting,

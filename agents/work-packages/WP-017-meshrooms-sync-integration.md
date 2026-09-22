@@ -24,6 +24,10 @@ refresh. Direct synchronous WAL I/O errors are uncertain commits; block further
 WAL-backed writes until reopen/recovery, and fault-inject the post-write sync
 failure. Requalify the consumer artifact after these changes.
 
+Final merge review also requires every fallible live-entry allocation and shard
+index reservation before a durable SET append. Hold the shard through append
+and install so concurrent unsafe writers cannot consume reserved capacity.
+
 Engine candidate validation on Windows and Ubuntu WSL: 303/303 unit tests,
 8/8 build steps and 14/14 live security regression groups on each platform.
 The independent pre-integration trace confirmed lock compatibility and identified

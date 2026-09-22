@@ -139,28 +139,30 @@ pub const Wal = struct {
     /// Caller owns the returned entry and must call `entry.deinit(allocator)` + `allocator.destroy(entry)`.
     pub fn appendSet(self: *Wal, key: []const u8, value: []const u8, flags: EntryFlags, timestamp: Timestamp) !*Entry {
         const record = try self.serializeSetRecord(key, value, flags, timestamp);
+        errdefer self.allocator.free(record);
 
-        if (self.writer_started) {
-            self.enqueueRecordBlocking(record);
-        } else {
-            errdefer self.allocator.free(record);
-            try self.writeDirect(record);
-            self.allocator.free(record);
-        }
-
+        // Finish every fallible live-entry allocation before publishing the
+        // durable record. Once the append succeeds, returning the Entry cannot
+        // fail and the caller can install the exact acknowledged bytes.
         const entry = try self.allocator.create(Entry);
         errdefer self.allocator.destroy(entry);
-
         const entry_key = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(entry_key);
-
         const entry_value = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(entry_value);
         entry.* = .{
             .key = entry_key,
             .value = entry_value,
             .timestamp = timestamp,
             .flags = flags,
         };
+
+        if (self.writer_started) {
+            self.enqueueRecordBlocking(record);
+        } else {
+            try self.writeDirect(record);
+            self.allocator.free(record);
+        }
         return entry;
     }
 

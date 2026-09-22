@@ -52,6 +52,12 @@ channel/message slices to TCP and WebSocket callbacks. The regression uses a
 CRLF-containing channel, proves a shorter exact grant receives nothing, and
 proves the full exact grant receives the unchanged channel and message.
 
-Windows and Ubuntu WSL passed 304/304 Zig tests, 8/8 build steps and 17/17 live
+A final hosted review found post-append allocation failure could return an error
+after a durable record while leaving the live map unchanged. SET now allocates
+the Entry and reserves both shard indexes before WAL publication, holding the
+shard through append and infallible install. An injected reserve failure proves
+the WAL size and live state remain unchanged before a later WORM write succeeds.
+
+Windows and Ubuntu WSL passed 305/305 Zig tests, 8/8 build steps and 17/17 live
 security groups. Formatting/diff checks passed. Native requalification is
 pending before merge.

@@ -170,6 +170,7 @@ pub const Store = struct {
     /// there are only a handful of serving domains.
     segments_buf: [MAX_SEGMENTS]NamedSegment = undefined,
     segment_count: usize = 0,
+    fail_put_reserve_for_test: if (@import("builtin").is_test) bool else void = if (@import("builtin").is_test) false else {},
     /// Frozen sorted-string segments (`.wsst`, see sst.zig) mounted as a
     /// TRANSPARENT overlay: GET/scan/EXEC consult live shards first, then each
     /// sst in attach order — so live writes shadow frozen keys and procedures
@@ -359,11 +360,23 @@ pub const Store = struct {
     /// superseded entry is destroyed only after both structures point at the
     /// new one (no dangling pointer is ever observable).
     fn shardPutLocked(self: *Store, shard: *Shard, entry: *Entry) StoreError!void {
+        try self.shardReservePutLocked(shard, entry.key);
+        self.shardPutAssumeCapacityLocked(shard, entry);
+    }
+
+    fn shardReservePutLocked(self: *Store, shard: *Shard, key: []const u8) StoreError!void {
+        if (@import("builtin").is_test and self.fail_put_reserve_for_test) return error.OutOfMemory;
+        const idx = lowerBoundKey(shard.sorted.items, key);
+        const replacing = idx < shard.sorted.items.len and std.mem.eql(u8, shard.sorted.items[idx].key, key);
+        shard.data.ensureUnusedCapacity(1) catch return error.OutOfMemory;
+        if (!replacing) shard.sorted.ensureUnusedCapacity(self.allocator, 1) catch return error.OutOfMemory;
+    }
+
+    fn shardPutAssumeCapacityLocked(self: *Store, shard: *Shard, entry: *Entry) void {
         const idx = lowerBoundKey(shard.sorted.items, entry.key);
         const replacing = idx < shard.sorted.items.len and
             std.mem.eql(u8, shard.sorted.items[idx].key, entry.key);
 
-        shard.data.ensureUnusedCapacity(1) catch return error.OutOfMemory;
         if (replacing) {
             // Same key ⇒ same ordered position: swap the pointer in place. The
             // map must re-key to the NEW entry's key bytes (the old key memory
@@ -373,7 +386,6 @@ pub const Store = struct {
             shard.sorted.items[idx] = entry;
             self.destroyEntry(old);
         } else {
-            shard.sorted.ensureUnusedCapacity(self.allocator, 1) catch return error.OutOfMemory;
             shard.data.putAssumeCapacity(entry.key, entry);
             shard.sorted.insertAssumeCapacity(idx, entry);
             _ = self.live_keys.fetchAdd(1, .monotonic);
@@ -469,7 +481,8 @@ pub const Store = struct {
         const si = shardIndex(key);
         const shard = &self.shards[si];
 
-        // Durable path: hold the key shard only for WORM checks + map insert.
+        // Durable path: hold the key shard through validation, capacity
+        // reservation, WAL append and map insert.
         // WAL enqueue uses wal_enqueue_mutex alone so snapshot+truncate can
         // exclude concurrent durable writers (see maybeSnapshotAndTruncate).
         //
@@ -483,51 +496,36 @@ pub const Store = struct {
             // wal_enqueue_mutex — must not hold it across that call.
             self.wal_enqueue_mutex.lock();
 
-            {
-                shard.mutex.lock();
-                defer shard.mutex.unlock();
-                if (shard.data.get(key)) |existing| {
-                    if (existing.flags.is_worm) {
-                        self.wal_enqueue_mutex.unlock();
-                        return error.WormViolation;
-                    }
-                } else if (self.sstHit(key)) |frozen| {
-                    if (frozen.is_worm) {
-                        self.wal_enqueue_mutex.unlock();
-                        return error.WormViolation;
-                    }
+            shard.mutex.lock();
+            if (shard.data.get(key)) |existing| {
+                if (existing.flags.is_worm) {
+                    shard.mutex.unlock();
+                    self.wal_enqueue_mutex.unlock();
+                    return error.WormViolation;
+                }
+            } else if (self.sstHit(key)) |frozen| {
+                if (frozen.is_worm) {
+                    shard.mutex.unlock();
+                    self.wal_enqueue_mutex.unlock();
+                    return error.WormViolation;
                 }
             }
 
+            // Reserve both indexes while the shard is locked. Keep that lock
+            // through WAL append + in-memory publish so no concurrent unsafe
+            // writer can consume the reservation after the durable commit.
+            self.shardReservePutLocked(shard, key) catch |err| {
+                shard.mutex.unlock();
+                self.wal_enqueue_mutex.unlock();
+                return err;
+            };
             const entry = self.wal.?.appendSet(key, value, .{ .is_worm = is_worm, .is_deleted = false }, timestamp) catch {
+                shard.mutex.unlock();
                 self.wal_enqueue_mutex.unlock();
                 return error.IoError;
             };
-
-            {
-                shard.mutex.lock();
-                defer shard.mutex.unlock();
-                // Durable WORM races serialize on wal_enqueue. setUnsafe WORM
-                // under the shard lock is visible here.
-                if (shard.data.get(key)) |existing| {
-                    if (existing.flags.is_worm) {
-                        self.destroyEntry(entry);
-                        self.wal_enqueue_mutex.unlock();
-                        return error.WormViolation;
-                    }
-                } else if (self.sstHit(key)) |frozen| {
-                    if (frozen.is_worm) {
-                        self.destroyEntry(entry);
-                        self.wal_enqueue_mutex.unlock();
-                        return error.WormViolation;
-                    }
-                }
-                self.shardPutLocked(shard, entry) catch |err| {
-                    self.destroyEntry(entry);
-                    self.wal_enqueue_mutex.unlock();
-                    return err;
-                };
-            }
+            self.shardPutAssumeCapacityLocked(shard, entry);
+            shard.mutex.unlock();
             self.wal_enqueue_mutex.unlock();
         } else {
             shard.mutex.lock();
@@ -1619,6 +1617,37 @@ test "Store basic operations" {
     try store.delete("key1");
     try testing.expectEqual(@as(usize, 0), store.count());
     try testing.expect(store.get("key1") == null);
+}
+
+test "durable SET reserves live state before publishing WAL" {
+    const testing = std.testing;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/reserve_before_wal.wal", .{tmp_path});
+    defer testing.allocator.free(wal_path);
+    const file = try compat.Dir.createFile(tmp_dir.dir, "reserve_before_wal.wal", .{});
+    compat.File.close(file);
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/reserve_before_wal.snapshot", .{tmp_path});
+    defer testing.allocator.free(snapshot_path);
+
+    var store = try Store.init(testing.allocator, .{
+        .wal_path = wal_path,
+        .snapshot_path = snapshot_path,
+        .sync_writes = true,
+    });
+    defer store.deinit();
+    const before = try store.wal.?.size();
+    store.fail_put_reserve_for_test = true;
+    try testing.expectError(error.OutOfMemory, store.set("key", "first", true));
+    try testing.expectEqual(before, try store.wal.?.size());
+    try testing.expect(store.get("key") == null);
+
+    store.fail_put_reserve_for_test = false;
+    try store.set("key", "second", true);
+    try testing.expectEqualStrings("second", store.get("key").?.value);
 }
 
 test "WORM enforcement" {

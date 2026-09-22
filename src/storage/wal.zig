@@ -133,12 +133,15 @@ pub const Wal = struct {
     /// Caller owns the returned entry and must call `entry.deinit(allocator)` + `allocator.destroy(entry)`.
     pub fn appendSet(self: *Wal, key: []const u8, value: []const u8, flags: EntryFlags, timestamp: Timestamp) !*Entry {
         const record = try self.serializeSetRecord(key, value, flags, timestamp);
-        errdefer self.allocator.free(record);
 
         if (self.writer_started) {
             self.enqueueRecordBlocking(record);
         } else {
+            errdefer self.allocator.free(record);
             try compat.File.writeAll(self.file, record);
+            if (self.sync_writes) {
+                try compat.File.sync(self.file);
+            }
             self.allocator.free(record);
             self.write_count += 1;
         }
@@ -161,12 +164,15 @@ pub const Wal = struct {
 
     pub fn appendDelete(self: *Wal, key: []const u8) !void {
         const record = try self.serializeDeleteRecord(key);
-        errdefer self.allocator.free(record);
 
         if (self.writer_started) {
             self.enqueueRecordBlocking(record);
         } else {
+            errdefer self.allocator.free(record);
             try compat.File.writeAll(self.file, record);
+            if (self.sync_writes) {
+                try compat.File.sync(self.file);
+            }
             self.allocator.free(record);
             self.write_count += 1;
         }
@@ -181,12 +187,15 @@ pub const Wal = struct {
         timestamp: Timestamp,
     ) !void {
         const record = try self.serializeVinsertRecord(key, namespace, metric, flags, timestamp);
-        errdefer self.allocator.free(record);
 
         if (self.writer_started) {
             self.enqueueRecordBlocking(record);
         } else {
+            errdefer self.allocator.free(record);
             try compat.File.writeAll(self.file, record);
+            if (self.sync_writes) {
+                try compat.File.sync(self.file);
+            }
             self.allocator.free(record);
             self.write_count += 1;
         }
@@ -194,12 +203,15 @@ pub const Wal = struct {
 
     pub fn appendVdelete(self: *Wal, key: []const u8, namespace: []const u8) !void {
         const record = try self.serializeVdeleteRecord(key, namespace);
-        errdefer self.allocator.free(record);
 
         if (self.writer_started) {
             self.enqueueRecordBlocking(record);
         } else {
+            errdefer self.allocator.free(record);
             try compat.File.writeAll(self.file, record);
+            if (self.sync_writes) {
+                try compat.File.sync(self.file);
+            }
             self.allocator.free(record);
             self.write_count += 1;
         }

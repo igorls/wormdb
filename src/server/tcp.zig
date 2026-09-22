@@ -214,9 +214,13 @@ pub const Server = struct {
             const sub_id = try self.event_bus.subscribeFilteredHooks(
                 channel_copy,
                 filter,
-                ConnectionContext.writeEvent,
+                null,
                 @ptrCast(self),
-                .{ .retain_fn = ConnectionContext.retain, .release_fn = ConnectionContext.release },
+                .{
+                    .retain_fn = ConnectionContext.retain,
+                    .release_fn = ConnectionContext.release,
+                    .event_fn = ConnectionContext.writeExactEvent,
+                },
             );
             errdefer self.event_bus.unsubscribe(channel_copy, sub_id);
 
@@ -243,73 +247,31 @@ pub const Server = struct {
             }
         }
 
-        fn writeEvent(ctx: *anyopaque, data: []const u8) void {
+        fn writeExactEvent(ctx: *anyopaque, channel: []const u8, message: []const u8) void {
             const self: *ConnectionContext = @ptrCast(@alignCast(ctx));
             if (self.closed.load(.acquire)) return;
-
-            // Fail-soft: if the command path holds the write mutex, drop the
-            // event rather than blocking the publisher under EventBus fanout.
             if (!self.write_mutex.tryLock()) {
                 self.event_bus.recordDrop();
                 return;
             }
             defer self.write_mutex.unlock();
             if (self.closed.load(.acquire)) return;
+            if (self.auth_enforce) {
+                const state = if (self.auth_state) |*s| s else return;
+                if (state.isExpired() or !state.permits(.subscribe, channel)) return;
+            }
 
             if (self.binary_mode) {
-                const parsed = parseTextEventPayload(data) orelse return;
-                if (self.auth_enforce) {
-                    const state = if (self.auth_state) |*s| s else return;
-                    if (state.isExpired() or !state.permits(.subscribe, parsed.channel)) return;
-                }
-
-                if (self.write_capture) |capture| {
-                    capture.appendSlice(self.allocator, data) catch {};
-                }
-
                 if (self.stream) |stream| {
-                    wire.writeResponse(stream, .{ .event = .{
-                        .channel = parsed.channel,
-                        .message = parsed.message,
-                    } }) catch {};
+                    wire.writeResponse(stream, .{ .event = .{ .channel = channel, .message = message } }) catch {};
                 }
                 return;
             }
 
-            if (self.write_capture) |capture| {
-                capture.appendSlice(self.allocator, data) catch {};
-            }
-            if (self.stream) |stream| {
-                stream.writeAll(data) catch {};
-            }
-        }
-
-        const ParsedTextEvent = struct {
-            channel: []const u8,
-            message: []const u8,
-        };
-
-        fn parseTextEventPayload(data: []const u8) ?ParsedTextEvent {
-            const prefix = ">EVENT ";
-            if (!std.mem.startsWith(u8, data, prefix)) return null;
-
-            const channel_start = prefix.len;
-            const channel_end_rel = std.mem.indexOf(u8, data[channel_start..], "\r\n") orelse return null;
-            const channel_end = channel_start + channel_end_rel;
-
-            const message_start = channel_end + 2;
-            if (message_start > data.len) return null;
-
-            if (data.len < message_start + 2) return null;
-            if (!std.mem.endsWith(u8, data, "\r\n")) return null;
-
-            const message_end = data.len - 2;
-            if (message_end < message_start) return null;
-
-            return .{
-                .channel = data[channel_start..channel_end],
-                .message = data[message_start..message_end],
-            };
+            const data = std.fmt.allocPrint(self.allocator, ">EVENT {s}\r\n{s}\r\n", .{ channel, message }) catch return;
+            defer self.allocator.free(data);
+            if (self.write_capture) |capture| capture.appendSlice(self.allocator, data) catch {};
+            if (self.stream) |stream| stream.writeAll(data) catch {};
         }
     };
 

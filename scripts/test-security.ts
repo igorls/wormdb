@@ -14,7 +14,7 @@ const publicKey = kp.publicKey.export({ type: "spki", format: "der" }).subarray(
 function u32(n: number) { const b = Buffer.alloc(4); b.writeUInt32BE(n); return b; }
 function field(s: string | Buffer) { const b = Buffer.from(s); return Buffer.concat([u32(b.length), b]); }
 function frame(id: number, payload = Buffer.alloc(0)) { return Buffer.concat([Buffer.from([id]), u32(payload.length), payload]); }
-function token(caps: Array<[number, number, string]>, ttl = 300n) {
+function token(caps: Array<[number, number, string | Buffer]>, ttl = 300n) {
   const times = Buffer.alloc(16), now = BigInt(Math.floor(Date.now() / 1000));
   times.writeBigUInt64BE(now); times.writeBigUInt64BE(now + ttl, 8);
   const payload = Buffer.concat([times, field("regression"), u32(1), Buffer.from([caps.length]), ...caps.map(([op, kind, target]) => Buffer.concat([Buffer.from([op, kind]), field(target)]))]);
@@ -45,15 +45,18 @@ class Peer {
     const out = this.data.subarray(0, n); this.data = this.data.subarray(n); return out;
   }
   async response() { const h = await this.read(5); return { code: h[0], body: await this.read(h.readUInt32BE(1)) }; }
-  async request(data: Buffer) { this.socket.write(data); return this.response(); }
-  async ws(data: Buffer, opcode = 2) {
-    this.socket.write(wsFrame(data, opcode));
+  async wsResponse() {
     const h = await this.read(2);
     let size = h[1] & 127;
     if (size === 126) size = (await this.read(2)).readUInt16BE();
     if (size === 127) size = Number((await this.read(8)).readBigUInt64BE());
     const payload = await this.read(size);
     return { code: payload[0], body: payload.subarray(5) };
+  }
+  async request(data: Buffer) { this.socket.write(data); return this.response(); }
+  async ws(data: Buffer, opcode = 2) {
+    this.socket.write(wsFrame(data, opcode));
+    return this.wsResponse();
   }
   close() { this.socket.destroy(); }
 }
@@ -320,6 +323,42 @@ test("reauth refreshes idle expiry while event delivery uses current capabilitie
     await publish(); await delay(100);
     assert.equal(p.data.length, 0, "old TCP subscription must not retain its previous grant");
     assert.equal(w.data.length, 0, "old WS subscription must not retain its previous grant");
+  } finally { p.close(); w.close(); }
+}));
+
+test("event reauthorization uses exact binary channel bytes", () => withServer(settings({ require_auth: true, public_keys: [publicKey] }), async (tcp, ws) => {
+  const p = await connect(tcp), w = await wsConnect(ws); p.socket.write("WW");
+  const channel = Buffer.from("allowed\r\nsecret");
+  const allowedOnly = token([[4, 1, "allowed"]]);
+  const exact = token([[4, 1, channel]]);
+  const parseEvent = (body: Buffer) => {
+    const channelLength = body.readUInt32BE(0), channelBytes = body.subarray(4, 4 + channelLength);
+    const messageOffset = 4 + channelLength, messageLength = body.readUInt32BE(messageOffset);
+    return { channel: channelBytes, message: body.subarray(messageOffset + 4, messageOffset + 4 + messageLength) };
+  };
+  const publish = async (message: string) => {
+    const publisher = await connect(tcp); publisher.socket.write("WW");
+    try {
+      assert.equal((await publisher.request(frame(12, field(admin)))).code, 0);
+      assert.equal((await publisher.request(frame(8, Buffer.concat([field(channel), field(message)])))).code, 0);
+    } finally { publisher.close(); }
+  };
+  try {
+    for (const request of [(b: Buffer) => p.request(b), (b: Buffer) => w.ws(b)]) {
+      assert.equal((await request(frame(12, field(admin)))).code, 0);
+      assert.equal((await request(frame(6, field(channel)))).code, 0);
+      assert.equal((await request(frame(12, field(allowedOnly)))).code, 0);
+    }
+    await publish("denied"); await delay(100);
+    assert.equal(p.data.length, 0); assert.equal(w.data.length, 0);
+    assert.equal((await p.request(frame(12, field(exact)))).code, 0);
+    assert.equal((await w.ws(frame(12, field(exact)))).code, 0);
+    await publish("accepted");
+    for (const event of [await p.response(), await w.wsResponse()]) {
+      assert.equal(event.code, 4);
+      const decoded = parseEvent(event.body);
+      assert.deepEqual(decoded.channel, channel); assert.equal(decoded.message.toString(), "accepted");
+    }
   } finally { p.close(); w.close(); }
 }));
 

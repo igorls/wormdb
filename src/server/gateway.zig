@@ -1044,9 +1044,13 @@ pub const Gateway = struct {
             const sub_id = try self.event_bus.subscribeFilteredHooks(
                 channel_copy,
                 filter,
-                ConnContext.writeEvent,
+                null,
                 @ptrCast(self),
-                .{ .retain_fn = ConnContext.retain, .release_fn = ConnContext.release },
+                .{
+                    .retain_fn = ConnContext.retain,
+                    .release_fn = ConnContext.release,
+                    .event_fn = ConnContext.writeExactEvent,
+                },
             );
             errdefer self.event_bus.unsubscribe(channel_copy, sub_id);
 
@@ -1081,19 +1085,10 @@ pub const Gateway = struct {
             try Gateway.sendWireResponseFrame(self.stream, self.allocator, response);
         }
 
-        /// Event callback — called from EventBus publisher thread after channel.mutex
-        /// is released. Fail-soft: tryLock drops the event if the command path is
-        /// writing; socket send timeout (set on accept) bounds blocked writes.
-        fn writeEvent(ctx: *anyopaque, data: []const u8) void {
+        fn writeExactEvent(ctx: *anyopaque, channel: []const u8, message: []const u8) void {
             const self: *ConnContext = @ptrCast(@alignCast(ctx));
             if (self.closed.load(.acquire)) return;
-
-            // Parse the text event payload to extract channel/message
-            const parsed = parseTextEvent(data) orelse return;
-
             if (!self.write_mutex.tryLock()) {
-                // Another writer holds the socket — drop rather than block the
-                // publisher (and every other connection waiting on fanout).
                 self.event_bus.recordDrop();
                 return;
             }
@@ -1101,26 +1096,12 @@ pub const Gateway = struct {
             if (self.closed.load(.acquire)) return;
             if (self.auth_required) {
                 const state = if (self.auth_state) |*s| s else return;
-                if (state.isExpired() or !state.permits(.subscribe, parsed.channel)) return;
+                if (state.isExpired() or !state.permits(.subscribe, channel)) return;
             }
             Gateway.sendWireResponseFrame(self.stream, self.allocator, .{ .event = .{
-                .channel = parsed.channel,
-                .message = parsed.message,
+                .channel = channel,
+                .message = message,
             } }) catch {};
-        }
-
-        fn parseTextEvent(data: []const u8) ?struct { channel: []const u8, message: []const u8 } {
-            const prefix = ">EVENT ";
-            if (!std.mem.startsWith(u8, data, prefix)) return null;
-            const ch_start = prefix.len;
-            const ch_end_rel = std.mem.indexOf(u8, data[ch_start..], "\r\n") orelse return null;
-            const ch_end = ch_start + ch_end_rel;
-            const msg_start = ch_end + 2;
-            if (msg_start >= data.len) return null;
-            if (!std.mem.endsWith(u8, data, "\r\n")) return null;
-            const msg_end = data.len - 2;
-            if (msg_end < msg_start) return null;
-            return .{ .channel = data[ch_start..ch_end], .message = data[msg_start..msg_end] };
         }
     };
 };

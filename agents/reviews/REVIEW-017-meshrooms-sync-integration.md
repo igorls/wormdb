@@ -45,6 +45,13 @@ later WAL-backed writes until recovery, and does not claim rollback. A test-only
 post-write sync fault verifies rejection of a contradictory WORM retry and all
 other append forms, then reopens and reconciles the original record.
 
-Windows and Ubuntu WSL passed 304/304 Zig tests, 8/8 build steps and 16/16 live
-security groups. Formatting/diff checks passed. Final independent follow-up
-review and native requalification are pending before merge.
+The follow-up reviewer then reproduced a binary-channel representation bypass:
+the first CRLF-delimited portion of an event envelope was being re-authorized
+instead of the original channel bytes. EventBus now supplies exact structured
+channel/message slices to TCP and WebSocket callbacks. The regression uses a
+CRLF-containing channel, proves a shorter exact grant receives nothing, and
+proves the full exact grant receives the unchanged channel and message.
+
+Windows and Ubuntu WSL passed 304/304 Zig tests, 8/8 build steps and 17/17 live
+security groups. Formatting/diff checks passed. Native requalification is
+pending before merge.

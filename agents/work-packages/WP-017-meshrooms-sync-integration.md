@@ -18,6 +18,12 @@ the old DLL for incompatible-symbol rejection. Build from clean pinned source,
 record provenance and hash/size, and review before updating the consumer lock.
 Merge through protected pull requests with current hosted checks green.
 
+Merge review follow-up: close idle authenticated sessions at token expiry and
+recheck current channel authority in retained event callbacks. Preserve valid
+refresh. Direct synchronous WAL I/O errors are uncertain commits; block further
+WAL-backed writes until reopen/recovery, and fault-inject the post-write sync
+failure. Requalify the consumer artifact after these changes.
+
 Engine candidate validation on Windows and Ubuntu WSL: 303/303 unit tests,
 8/8 build steps and 14/14 live security regression groups on each platform.
 The independent pre-integration trace confirmed lock compatibility and identified

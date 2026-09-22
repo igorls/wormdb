@@ -129,6 +129,7 @@ pub const Server = struct {
         /// Verified SCT token state, set by an AUTH frame. Heap-allocated from
         /// `allocator` (NOT the per-command arena — it must outlive commands).
         auth_state: ?auth.TokenState,
+        auth_enforce: bool = false,
         closed: std.atomic.Value(bool) = .init(false),
         in_flight: std.atomic.Value(u32) = .init(0),
 
@@ -190,10 +191,16 @@ pub const Server = struct {
         }
 
         fn clearAuthState(self: *ConnectionContext) void {
+            self.replaceAuthState(null);
+        }
+
+        fn replaceAuthState(self: *ConnectionContext, next: ?auth.TokenState) void {
+            self.write_mutex.lock();
+            defer self.write_mutex.unlock();
             if (self.auth_state) |*state| {
                 auth.freeTokenState(self.allocator, state);
-                self.auth_state = null;
             }
+            self.auth_state = next;
         }
 
         fn subscribe(self: *ConnectionContext, channel: []const u8, filter: ?[]const u8) !void {
@@ -251,6 +258,10 @@ pub const Server = struct {
 
             if (self.binary_mode) {
                 const parsed = parseTextEventPayload(data) orelse return;
+                if (self.auth_enforce) {
+                    const state = if (self.auth_state) |*s| s else return;
+                    if (state.isExpired() or !state.permits(.subscribe, parsed.channel)) return;
+                }
 
                 if (self.write_capture) |capture| {
                     capture.appendSlice(self.allocator, data) catch {};
@@ -411,8 +422,9 @@ pub const Server = struct {
         core.compat.setSendTimeoutMs(stream.getHandle(), 2_000);
         stream.write_timeout_ms = 2_000;
         var conn_ctx = ConnectionContext.init(self.allocator, self.event_bus, &stream);
-        defer conn_ctx.deinit();
+        conn_ctx.auth_enforce = self.config.auth_enforce;
         defer conn.stream.close();
+        defer conn_ctx.deinit();
 
         var handshake: [2]u8 = undefined;
         var handshake_read: usize = 0;
@@ -1068,9 +1080,8 @@ pub const Server = struct {
                     break :blk Response{ .err = msg };
                 };
                 // Replace previous auth state (re-AUTH refreshes the token).
-                conn_ctx.clearAuthState();
-                conn_ctx.auth_state = state;
-                if (conn_ctx.stream) |stream| stream.read_limit_ns = null;
+                conn_ctx.replaceAuthState(state);
+                if (conn_ctx.stream) |stream| stream.read_limit_ns = if (self.config.auth_enforce) state.readDeadlineNs() else null;
                 break :blk .ok;
             },
             .subscribe => |params| blk: {

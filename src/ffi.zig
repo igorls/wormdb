@@ -755,3 +755,39 @@ test "ffi open_sync propagates WAL I/O failures" {
     // Must return ERR (-1) and propagate failure, never reporting success
     try testing.expectEqual(ERR, wormdb_set(db, k.ptr, k.len, v.ptr, v.len));
 }
+
+test "ffi sync failure has uncertain outcome and blocks writes until recovery" {
+    const testing = std.testing;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try wormdb.core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+    const zpath = try testing.allocator.dupeZ(u8, tmp_path);
+    defer testing.allocator.free(zpath);
+
+    const db = wormdb_open_sync(zpath.ptr) orelse return error.OpenFailed;
+    {
+        defer wormdb_close(db);
+        db.store.wal.?.fail_sync_for_test = true;
+        // The entire record is written before the injected sync error.
+        try testing.expectEqual(ERR, wormdb_set_worm(db, "key", 3, "first", 5));
+        try testing.expect(db.store.get("key") == null);
+        db.store.wal.?.fail_sync_for_test = false;
+        // Restoring I/O must not acknowledge an incompatible WORM retry.
+        try testing.expectEqual(ERR, wormdb_set_worm(db, "key", 3, "second", 6));
+        try testing.expectEqual(ERR, wormdb_set(db, "other", 5, "value", 5));
+        try testing.expectError(error.WalNeedsRecovery, db.store.wal.?.appendDelete("key"));
+        try testing.expectError(error.WalNeedsRecovery, db.store.wal.?.appendVinsert("key", "ns", "l2", 0, 1));
+        try testing.expectError(error.WalNeedsRecovery, db.store.wal.?.appendVdelete("key", "ns"));
+    }
+
+    const recovered = wormdb_open_sync(zpath.ptr) orelse return error.OpenFailed;
+    defer wormdb_close(recovered);
+    var value: ?[*]u8 = null;
+    var len: usize = 0;
+    try testing.expectEqual(OK, wormdb_get(recovered, "key", 3, &value, &len));
+    defer wormdb_free(value.?, len);
+    try testing.expectEqualStrings("first", value.?[0..len]);
+    try testing.expectEqual(ERR, wormdb_set_worm(recovered, "key", 3, "second", 6));
+    try testing.expectEqual(OK, wormdb_set(recovered, "other", 5, "value", 5));
+}

@@ -325,25 +325,22 @@ pub const Gateway = struct {
         // stack frame if publishers are mid-deliver during teardown (#91 UAF).
         const conn_ctx = self.allocator.create(ConnContext) catch return;
         conn_ctx.* = ConnContext.init(self.allocator, self.event_bus, &stream);
+        conn_ctx.auth_required = self.auth_required;
         defer conn_ctx.connectionDone();
 
         var cmd_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer cmd_arena.deinit();
 
-        // Per-connection auth state
-        var auth_state: ?auth.TokenState = null;
-        defer if (auth_state) |*state| auth.freeTokenState(self.allocator, state);
-
         while (self.running.load(.acquire)) {
             // Check if token expired mid-session
-            self.expireAuthState(&auth_state, &stream);
+            self.expireAuthState(conn_ctx, &stream);
 
             // Read one WebSocket frame
-            stream.beginRead(self.timeout_ms, !self.auth_required or auth_state != null);
+            stream.beginRead(self.timeout_ms, !self.auth_required or conn_ctx.auth_state != null);
             const ws_frame = readWsFrame(&stream, self.allocator) orelse return;
             defer if (ws_frame.allocated) self.allocator.free(ws_frame.payload);
             // The token can expire while waiting for this frame.
-            self.expireAuthState(&auth_state, &stream);
+            self.expireAuthState(conn_ctx, &stream);
 
             switch (ws_frame.opcode) {
                 0x08 => {
@@ -427,22 +424,14 @@ pub const Gateway = struct {
                         };
                         break :blk Response{ .err = msg };
                     };
-                    // Replace previous auth state
-                    if (auth_state) |*old| {
-                        self.allocator.free(old.subject);
-                        for (old.capabilities) |cap| {
-                            self.allocator.free(cap.pattern);
-                        }
-                        self.allocator.free(old.capabilities);
-                    }
-                    auth_state = state;
-                    stream.read_limit_ns = null;
+                    conn_ctx.replaceAuthState(state);
+                    stream.read_limit_ns = if (self.auth_required) state.readDeadlineNs() else null;
                     break :blk Response.ok;
                 },
                 .subscribe => |params| blk: {
                     // Check capability for subscribe
                     if (self.auth_required) {
-                        if (auth_state) |*state| {
+                        if (conn_ctx.auth_state) |*state| {
                             if (!state.permits(.subscribe, params.channel)) {
                                 break :blk Response{ .err = "permission denied" };
                             }
@@ -472,7 +461,7 @@ pub const Gateway = struct {
                         .event_bus = self.event_bus,
                         .cluster = self.cluster,
                         .auth = if (self.auth_required)
-                            .{ .enforce = if (auth_state) |*s| s else null }
+                            .{ .enforce = if (conn_ctx.auth_state) |*s| s else null }
                         else
                             .disabled,
                         .auth_mint = self.auth_mint,
@@ -497,11 +486,10 @@ pub const Gateway = struct {
         }
     }
 
-    fn expireAuthState(self: *Gateway, state: *?auth.TokenState, stream: *core.compat.net.Stream) void {
-        if (state.*) |*current| {
+    fn expireAuthState(self: *Gateway, conn: *ConnContext, stream: *core.compat.net.Stream) void {
+        if (conn.auth_state) |*current| {
             if (current.isExpired()) {
-                auth.freeTokenState(self.allocator, current);
-                state.* = null;
+                conn.replaceAuthState(null);
                 stream.read_limit_ns = core.compat.nowNs() + @as(i128, self.timeout_ms) * 1_000_000;
             }
         }
@@ -982,6 +970,10 @@ pub const Gateway = struct {
         stream: *core.compat.net.Stream,
         subscriptions: std.StringHashMap(u64),
         write_mutex: core.compat.Mutex,
+        /// Only the connection thread mutates tokens. Event callbacks read them
+        /// under write_mutex, which also guards replacement/free.
+        auth_state: ?auth.TokenState = null,
+        auth_required: bool = false,
         /// Set before unsub/teardown; event writers check this under write_mutex.
         closed: std.atomic.Value(bool) = .init(false),
         /// Ownership refs: 1 for the connection thread + 1 per EventBus retain.
@@ -1003,6 +995,7 @@ pub const Gateway = struct {
         /// in-flight EventBus delivers finish (no UAF if publishers still hold us).
         fn connectionDone(self: *ConnContext) void {
             self.closed.store(true, .release);
+            self.replaceAuthState(null);
             var iter = self.subscriptions.iterator();
             while (iter.next()) |entry| {
                 self.event_bus.unsubscribe(entry.key_ptr.*, entry.value_ptr.*);
@@ -1013,6 +1006,13 @@ pub const Gateway = struct {
             // EventBus delivers finish (replaces bounded in_flight spin from
             // main's 3eea05e — that path could UAF if it timed out mid-deliver).
             self.releaseRef();
+        }
+
+        fn replaceAuthState(self: *ConnContext, next: ?auth.TokenState) void {
+            self.write_mutex.lock();
+            defer self.write_mutex.unlock();
+            if (self.auth_state) |*state| auth.freeTokenState(self.allocator, state);
+            self.auth_state = next;
         }
 
         fn retain(ctx: *anyopaque) void {
@@ -1099,6 +1099,10 @@ pub const Gateway = struct {
             }
             defer self.write_mutex.unlock();
             if (self.closed.load(.acquire)) return;
+            if (self.auth_required) {
+                const state = if (self.auth_state) |*s| s else return;
+                if (state.isExpired() or !state.permits(.subscribe, parsed.channel)) return;
+            }
             Gateway.sendWireResponseFrame(self.stream, self.allocator, .{ .event = .{
                 .channel = parsed.channel,
                 .message = parsed.message,

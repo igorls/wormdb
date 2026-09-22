@@ -272,7 +272,58 @@ test("authenticated idle subscriptions survive; partial frames still expire", ()
   } finally { p.close(); w.close(); }
 }));
 
-test("expiry during an idle read restores the reauthentication deadline", () => withServer(settings({ require_auth: true, public_keys: [publicKey] }), async (tcp, ws) => {
+test("silent subscriptions close at token expiry and stop event delivery", () => withServer(settings({ require_auth: true, public_keys: [publicKey] }), async (tcp, ws) => {
+  const p = await connect(tcp), w = await wsConnect(ws); p.socket.write("WW");
+  const short = token([[255, 255, ""]], 2n);
+  try {
+    assert.equal((await p.request(frame(12, field(short)))).code, 0);
+    assert.equal((await w.ws(frame(12, field(short)))).code, 0);
+    assert.equal((await p.request(frame(6, field("events:")))).code, 0);
+    assert.equal((await w.ws(frame(6, field("events:")))).code, 0);
+    await delay(2200);
+    const publisher = await connect(tcp); publisher.socket.write("WW");
+    try {
+      assert.equal((await publisher.request(frame(12, field(admin)))).code, 0);
+      assert.equal((await publisher.request(frame(8, Buffer.concat([field("events:"), field("after-expiry")])))).code, 0);
+      await delay(100);
+      assert.equal(p.data.length, 0, "expired TCP subscriber received an event");
+      assert.equal(w.data.length, 0, "expired WS subscriber received an event");
+      assert.ok(p.closed && w.closed, "silent expired credentials must release connection slots");
+    } finally { publisher.close(); }
+  } finally { p.close(); w.close(); }
+}));
+
+test("reauth refreshes idle expiry while event delivery uses current capabilities", () => withServer(settings({ require_auth: true, public_keys: [publicKey] }), async (tcp, ws) => {
+  const p = await connect(tcp), w = await wsConnect(ws); p.socket.write("WW");
+  const short = token([[255, 255, ""]], 2n);
+  try {
+    for (const request of [(b: Buffer) => p.request(b), (b: Buffer) => w.ws(b)]) {
+      assert.equal((await request(frame(12, field(short)))).code, 0);
+      assert.equal((await request(frame(6, field("events:")))).code, 0);
+      assert.equal((await request(frame(12, field(admin)))).code, 0);
+    }
+    await delay(2200);
+    assert.ok(!p.closed && !w.closed, "refresh must replace the old expiry deadline");
+    const publish = async () => {
+      const publisher = await connect(tcp); publisher.socket.write("WW");
+      try {
+        assert.equal((await publisher.request(frame(12, field(admin)))).code, 0);
+        assert.equal((await publisher.request(frame(8, Buffer.concat([field("events:"), field("refresh")])))).code, 0);
+      } finally { publisher.close(); }
+    };
+    await publish();
+    assert.equal((await p.response()).code, 4);
+    const h = await w.read(2); assert.equal((await w.read(h[1] & 127))[0], 4);
+    for (const request of [(b: Buffer) => p.request(b), (b: Buffer) => w.ws(b)]) {
+      assert.equal((await request(frame(12, field(scoped)))).code, 0);
+    }
+    await publish(); await delay(100);
+    assert.equal(p.data.length, 0, "old TCP subscription must not retain its previous grant");
+    assert.equal(w.data.length, 0, "old WS subscription must not retain its previous grant");
+  } finally { p.close(); w.close(); }
+}));
+
+test("STATUS and PING cannot extend an authenticated token deadline", () => withServer(settings({ require_auth: true, public_keys: [publicKey] }), async (tcp, ws) => {
   const p = await connect(tcp), w = await wsConnect(ws); p.socket.write("WW");
   const short = token([[255, 255, ""]], 2n);
   let timer: ReturnType<typeof setInterval> | undefined;
@@ -280,11 +331,12 @@ test("expiry during an idle read restores the reauthentication deadline", () => 
     assert.equal((await p.request(frame(12, field(short)))).code, 0);
     assert.equal((await w.ws(frame(12, field(short)))).code, 0);
     assert.equal((await p.request(frame(6, field("events:")))).code, 0);
-    await delay(2200);
-    assert.equal((await p.request(set())).body.toString(), "auth required");
-    assert.equal((await w.ws(set())).body.toString(), "auth required");
-    timer = setInterval(() => { if (!p.closed) p.socket.write(frame(4)); if (!w.closed) w.socket.write(wsFrame(frame(4))); }, 55);
-    await delay(1000); assert.ok(p.closed && w.closed, "expired credentials must not retain workers via public commands");
+    timer = setInterval(() => {
+      if (!p.closed) p.socket.write(frame(4));
+      if (!w.closed) w.socket.write(wsFrame(Buffer.alloc(0), 9));
+    }, 55);
+    await delay(2300);
+    assert.ok(p.closed && w.closed, "public traffic must not renew token expiry");
   } finally { clearInterval(timer); p.close(); w.close(); }
 }));
 

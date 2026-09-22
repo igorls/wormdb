@@ -90,6 +90,13 @@ pub const TokenState = struct {
         const now: u64 = @intCast(@divFloor(compat.nowMs(), 1000));
         return now >= self.exp;
     }
+
+    /// Bind a blocking socket read to this token's absolute expiry. Socket
+    /// deadlines use the monotonic clock; SCT timestamps use wall-clock seconds.
+    pub fn readDeadlineNs(self: *const TokenState) i128 {
+        const remaining = @as(i128, self.exp) * 1_000_000_000 - @as(i128, compat.nowMs()) * 1_000_000;
+        return compat.nowNs() + @max(remaining, 0);
+    }
 };
 
 /// Ed25519 public key (32 bytes).

@@ -25,8 +25,26 @@ the real-daemon quota test, native VerifyOnly and diff checks.
 Gitleaks' one new match was the public fixed WebSocket handshake nonce in the
 live regression test. Its exception is limited to that exact historical
 fingerprint; the full fetched-history scan then passed without suppressing other
-keys or tests. No runtime source changes followed native qualification.
+keys or tests. This records the initial candidate; merge-review changes below
+require a newly qualified consumer artifact.
 
 No running daemon, user store, startup registration or release artifact was
 replaced. Sync-mode WAL growth, hardware power-loss, sustained load, full
 multi-node and optional QUIC qualification remain outside this integration.
+
+## Merge-review follow-up
+
+Hosted review identified silent TCP/WS token expiry and an uncertain WAL sync
+failure outcome. A live regression reproduced post-expiry event delivery on the
+initial candidate. Token-bounded reads and delivery-time authorization now stop
+it; refresh preserves authorized subscriptions and narrower grants take effect.
+Token replacement/free and connection teardown synchronize with event delivery.
+
+The synchronous WAL treats a failed write or sync as an uncertain commit, blocks
+later WAL-backed writes until recovery, and does not claim rollback. A test-only
+post-write sync fault verifies rejection of a contradictory WORM retry and all
+other append forms, then reopens and reconciles the original record.
+
+Windows and Ubuntu WSL passed 304/304 Zig tests, 8/8 build steps and 16/16 live
+security groups. Formatting/diff checks passed. Final independent follow-up
+review and native requalification are pending before merge.

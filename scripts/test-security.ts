@@ -175,7 +175,12 @@ test("client auth cannot be bypassed using the legacy replication preface", asyn
 
 test("explicit cluster-open acknowledgment preserves legacy replication", () => withServer(settings({ require_auth: true }), async tcp => {
   const p = await connect(tcp);
-  try { p.socket.write("WR"); assert.equal((await p.request(set())).code, 0); }
+  try {
+    p.socket.write("WR");
+    await delay(800);
+    assert.ok(!p.closed, "accepted legacy replication must remain idle-capable");
+    assert.equal((await p.request(set())).code, 0);
+  }
   finally { p.close(); }
 }, "none", ["--cluster-open"]));
 

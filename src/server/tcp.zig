@@ -612,7 +612,11 @@ pub const Server = struct {
         var reader = ReadAdapter{ .stream = stream };
 
         while (true) {
-            stream.beginRead(self.config.timeout_ms, peer_org != null);
+            // Both accepted handshakes (legacy WR in explicit open mode and
+            // authenticated W2) are persistent replication sessions. Idle is
+            // valid; once the first frame byte arrives, Stream.read starts the
+            // normal whole-frame deadline so trickled frames still expire.
+            stream.beginRead(self.config.timeout_ms, true);
             const cmd = wire.readFrameAlloc(&reader, self.allocator) catch return;
             defer protocol.deinitCommand(self.allocator, cmd);
 

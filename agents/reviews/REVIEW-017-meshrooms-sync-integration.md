@@ -58,6 +58,12 @@ the Entry and reserves both shard indexes before WAL publication, holding the
 shard through append and infallible install. An injected reserve failure proves
 the WAL size and live state remain unchanged before a later WORM write succeeds.
 
+The final clustering review found accepted legacy `WR` sessions in explicit
+`--cluster-open` mode were not idle-capable. Both accepted WR and authenticated
+W2 sessions now wait indefinitely before a frame, while the first byte starts
+the existing whole-frame deadline. The live cluster-open regression waits past
+the configured timeout before replicating successfully.
+
 Windows and Ubuntu WSL passed 305/305 Zig tests, 8/8 build steps and 17/17 live
 security groups. Formatting/diff checks passed. Native requalification is
 pending before merge.

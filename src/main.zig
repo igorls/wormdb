@@ -14,17 +14,22 @@ const Server = wormdb.server.Server;
 const Cluster = wormdb.cluster.Cluster;
 const NamespaceRegistry = wormdb.vector.NamespaceRegistry;
 const PersistenceMode = wormdb.core.config.PersistenceMode;
+const WormDBConfig = wormdb.core.config.WormDBConfig;
 
 const Args = struct {
-    port: u16 = 6389,
-    data: []const u8 = "./data",
-    persistence: PersistenceMode = .full,
+    config_path: []const u8 = "./wormdb.json",
+    port: ?u16 = null,
+    bind_address: ?[]const u8 = null,
+    data: ?[]const u8 = null,
+    persistence: ?PersistenceMode = null,
     no_sync: bool = false,
     cluster_name: ?[]const u8 = null,
     seed: ?[]const u8 = null,
-    replicas: usize = 0,
-    gossip_port: u16 = 51821,
-    wg_port: u16 = 51830,
+    replicas: ?usize = null,
+    gossip_port: ?u16 = null,
+    wg_port: ?u16 = null,
+    require_auth: ?bool = null,
+    server_auth_enabled: ?bool = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -38,10 +43,18 @@ fn parseArgs(args: []const []const u8) !Args {
     var out = Args{};
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--port")) {
+        if (std.mem.eql(u8, args[i], "--config")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgs;
+            out.config_path = args[i];
+        } else if (std.mem.eql(u8, args[i], "--port")) {
             i += 1;
             if (i >= args.len) return error.InvalidArgs;
             out.port = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--bind")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgs;
+            out.bind_address = args[i];
         } else if (std.mem.eql(u8, args[i], "--data")) {
             i += 1;
             if (i >= args.len) return error.InvalidArgs;
@@ -80,6 +93,14 @@ fn parseArgs(args: []const []const u8) !Args {
             i += 1;
             if (i >= args.len) return error.InvalidArgs;
             out.wg_port = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--require-auth")) {
+            out.require_auth = true;
+        } else if (std.mem.eql(u8, args[i], "--no-auth")) {
+            out.require_auth = false;
+        } else if (std.mem.eql(u8, args[i], "--tcp-auth")) {
+            out.server_auth_enabled = true;
+        } else if (std.mem.eql(u8, args[i], "--no-tcp-auth")) {
+            out.server_auth_enabled = false;
         } else if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
             try printHelp();
             std.process.exit(0);
@@ -92,10 +113,13 @@ fn parseArgs(args: []const []const u8) !Args {
 }
 
 fn runServer(allocator: std.mem.Allocator, args: Args) !void {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    try std.Io.Dir.cwd().createDirPath(io, args.data);
+    var cfg = try wormdb.core.config.loadFromFile(args.config_path, allocator);
+    applyCliOverrides(&cfg, args);
 
-    const wal_path = try std.fmt.allocPrint(allocator, "{s}/wormdb.wal", .{args.data});
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try std.Io.Dir.cwd().createDirPath(io, cfg.data);
+
+    const wal_path = try std.fmt.allocPrint(allocator, "{s}/wormdb.wal", .{cfg.data});
     defer allocator.free(wal_path);
 
     var vector_registry = NamespaceRegistry.init(allocator, .{});
@@ -103,56 +127,79 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
 
     var store = try Store.initWithRegistry(allocator, .{
         .wal_path = wal_path,
-        .sync_writes = !args.no_sync,
-        .persistence = args.persistence,
+        .sync_writes = cfg.store.sync_writes,
+        .persistence = cfg.store.persistence,
     }, &vector_registry);
     defer store.deinit();
 
-    if (args.persistence == .full) try store.startBackgroundTasks();
+    if (cfg.store.persistence == .full) try store.startBackgroundTasks();
 
     var event_bus = EventBus.init(allocator);
     defer event_bus.deinit();
 
     var cluster: ?Cluster = null;
-    if (args.cluster_name != null) {
+    if (cfg.cluster.name != null) {
         if (comptime wormdb.server.is_linux) {
             var seed_slice: [1][]const u8 = undefined;
-            const seeds: []const []const u8 = if (args.seed) |seed| blk: {
+            const seeds: []const []const u8 = if (cfg.cluster.seed) |seed| blk: {
                 seed_slice[0] = seed;
                 break :blk seed_slice[0..1];
             } else &.{};
 
             cluster = Cluster.init(allocator, &store, &event_bus, .{
                 .seed_addrs = seeds,
-                .replication_factor = args.replicas,
-                .peer_port = args.port,
-                .config_dir = args.data,
-                .gossip_port = args.gossip_port,
-                .wg_port = args.wg_port,
+                .replication_factor = cfg.cluster.replication_factor,
+                .peer_port = cfg.server.port,
+                .config_dir = cfg.data,
+                .gossip_port = cfg.cluster.gossip_port,
+                .wg_port = cfg.cluster.wg_port,
             });
             cluster.?.attachVectorRegistry(&vector_registry);
         } else {
-            std.log.warn("cluster '{s}' requested, but clustering is Linux-only; running single-node", .{args.cluster_name.?});
+            std.log.warn("cluster '{s}' requested, but clustering is Linux-only; running single-node", .{cfg.cluster.name.?});
         }
     }
     defer if (cluster != null) cluster.?.deinit();
 
+    const tcp_auth_enforce = cfg.auth.require_auth and cfg.server.auth_enabled;
+    if (!tcp_auth_enforce) {
+        std.log.warn("TCP authentication is disabled; protected commands are unauthenticated on {s}:{d}", .{ cfg.server.bind_address, cfg.server.port });
+    }
+
     var server = Server.init(allocator, &store, &event_bus, .{
-        .port = args.port,
+        .bind_address = cfg.server.bind_address,
+        .port = cfg.server.port,
         .cluster = if (cluster) |*c| c else null,
         .vector_registry = &vector_registry,
+        .auth_enforce = tcp_auth_enforce,
     });
 
     if (cluster) |*c| c.start();
 
-    std.log.info("WormDB starting on port {d}", .{args.port});
-    std.log.info("Data directory: {s}", .{args.data});
-    std.log.info("Persistence: {s}", .{@tagName(args.persistence)});
-    if (args.cluster_name) |name| {
-        std.log.info("Cluster: {s} (replication: {d})", .{ name, args.replicas });
+    std.log.info("WormDB starting on {s}:{d}", .{ cfg.server.bind_address, cfg.server.port });
+    std.log.info("Data directory: {s}", .{cfg.data});
+    std.log.info("Persistence: {s}", .{@tagName(cfg.store.persistence)});
+    std.log.info("TCP auth: {s}", .{if (tcp_auth_enforce) "enforced" else "disabled"});
+    if (cfg.cluster.name) |name| {
+        std.log.info("Cluster: {s} (replication: {d})", .{ name, cfg.cluster.replication_factor });
     }
 
     try server.run();
+}
+
+fn applyCliOverrides(cfg: *WormDBConfig, args: Args) void {
+    if (args.port) |port| cfg.server.port = port;
+    if (args.bind_address) |bind_address| cfg.server.bind_address = bind_address;
+    if (args.data) |data| cfg.data = data;
+    if (args.persistence) |persistence| cfg.store.persistence = persistence;
+    if (args.no_sync) cfg.store.sync_writes = false;
+    if (args.cluster_name) |cluster_name| cfg.cluster.name = cluster_name;
+    if (args.seed) |seed| cfg.cluster.seed = seed;
+    if (args.replicas) |replicas| cfg.cluster.replication_factor = replicas;
+    if (args.gossip_port) |gossip_port| cfg.cluster.gossip_port = gossip_port;
+    if (args.wg_port) |wg_port| cfg.cluster.wg_port = wg_port;
+    if (args.require_auth) |require_auth| cfg.auth.require_auth = require_auth;
+    if (args.server_auth_enabled) |server_auth_enabled| cfg.server.auth_enabled = server_auth_enabled;
 }
 
 fn printHelp() !void {
@@ -163,7 +210,9 @@ fn printHelp() !void {
         \\  wormdb [options]
         \\
         \\Options:
+        \\  --config <path>          JSON config file (default: ./wormdb.json if present)
         \\  --port <port>             TCP port to listen on (default: 6389)
+        \\  --bind <addr>             TCP bind address (default: 0.0.0.0)
         \\  --data <path>             Data directory for WAL/snapshots (default: ./data)
         \\  --persistence <mode>      Persistence mode: full (default), snapshot, none
         \\  --no-sync                 Disable fsync per write
@@ -172,6 +221,10 @@ fn printHelp() !void {
         \\  --replicas <n>            Replication factor (default: 0 = all peers)
         \\  --gossip-port <port>      SWIM gossip UDP port (default: 51821)
         \\  --wg-port <port>          WireGuard listen port (default: 51830)
+        \\  --require-auth           Require auth for protected TCP commands (default)
+        \\  --no-auth                Disable auth globally (trusted networks only)
+        \\  --tcp-auth               Enforce auth on the TCP listener (default)
+        \\  --no-tcp-auth            Disable auth on the TCP listener (trusted networks only)
         \\  --help, -h                Show this help
         \\
         \\Examples:
@@ -180,4 +233,40 @@ fn printHelp() !void {
         \\  wormdb --cluster myapp --seed 10.0.0.1:51821 --port 6390
         \\
     );
+}
+
+test "parseArgs captures config, bind, and TCP auth overrides" {
+    const parsed = try parseArgs(&.{
+        "wormdb",
+        "--config",
+        "secure.json",
+        "--bind",
+        "127.0.0.1",
+        "--port",
+        "7777",
+        "--no-auth",
+        "--no-tcp-auth",
+    });
+
+    try std.testing.expectEqualStrings("secure.json", parsed.config_path);
+    try std.testing.expectEqualStrings("127.0.0.1", parsed.bind_address.?);
+    try std.testing.expectEqual(@as(u16, 7777), parsed.port.?);
+    try std.testing.expectEqual(false, parsed.require_auth.?);
+    try std.testing.expectEqual(false, parsed.server_auth_enabled.?);
+}
+
+test "applyCliOverrides preserves secure config defaults unless explicitly disabled" {
+    var cfg = WormDBConfig{};
+    applyCliOverrides(&cfg, Args{});
+    try std.testing.expectEqual(true, cfg.auth.require_auth);
+    try std.testing.expectEqual(true, cfg.server.auth_enabled);
+
+    applyCliOverrides(&cfg, .{
+        .bind_address = "127.0.0.1",
+        .require_auth = false,
+        .server_auth_enabled = false,
+    });
+    try std.testing.expectEqualStrings("127.0.0.1", cfg.server.bind_address);
+    try std.testing.expectEqual(false, cfg.auth.require_auth);
+    try std.testing.expectEqual(false, cfg.server.auth_enabled);
 }

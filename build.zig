@@ -120,9 +120,16 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "use_libsodium", use_libsodium);
     // WebAssembly has no threads without the atomics/bulk-memory proposals, so a wasm
     // target must not spawn workers or use 64-bit atomics. Exposed as an explicit
-    // option rather than inferred from the target, so a native build can also pick the
-    // single-threaded path deliberately. See src/vector/index.zig and src/event/bus.zig.
-    const single_threaded = b.option(bool, "single-threaded", "Build without worker threads or 64-bit atomics (required for wasm32)") orelse (target.result.cpu.arch.isWasm());
+    // single_threaded is derived above from the same condition the modules use, so the two can
+    // never disagree. See src/vector/index.zig and src/event/bus.zig.
+    // Derived, NOT overridable, and that is a correctness fix rather than tidiness. The flag means
+    // "this build has no threads and no 64-bit atomics" — both facts follow from the target, and
+    // `builtin.single_threaded` (which the module's `.single_threaded` sets below) already derives
+    // from the same place. Exposing it as a free option let a NATIVE build be compiled with
+    // `build_options.single_threaded = true`, which turns `publish_count` into a plain `u64` in
+    // `event/bus.zig` while `std.Thread.spawn` remains legal there: a data race, and no build here
+    // or in CI passed the flag, so nothing would have caught it.
+    const single_threaded = target.result.cpu.arch.isWasm();
     build_options.addOption(bool, "single_threaded", single_threaded);
     const build_options_mod = build_options.createModule();
 
@@ -216,7 +223,7 @@ pub fn build(b: *std.Build) void {
         // is comptime true, which makes std.Io.Threaded's atomic-wait branch dead code and
         // removes the `memory.atomic.wait32` the no-atomics target cannot emit. Without it the
         // wasm build compiles as multi-threaded and reaches the asm.
-        .single_threaded = target.result.cpu.arch.isWasm(),
+        .single_threaded = single_threaded,
         .imports = &.{
             .{ .name = "build_options", .module = build_options_mod },
         },
@@ -227,7 +234,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .single_threaded = target.result.cpu.arch.isWasm(),
+        .single_threaded = single_threaded,
         .imports = &.{
             .{ .name = "wormdb", .module = engine_mod },
         },

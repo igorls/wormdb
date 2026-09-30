@@ -31,3 +31,27 @@ pub const Config = core.config.Config;
 
 // `Server` and `Cluster` are intentionally not exported: both are absent from this root, and
 // naming them here would pull the graph back in.
+
+
+
+// A permanent guard, so this cannot regress. A temporary probe found that `bus.subscribe` (and with
+// it `subscriber_count`/`drop_count`) did NOT compile for wasm: `std.atomic.Value(u64)` needs 64-bit
+// atomics, which the target does not have. It went unnoticed because nothing in the reduced root
+// referenced those paths, so they were never analysed — the browser build would have broken the
+// first time an allowlisted procedure used the event bus. The counters now go through
+// `compat.AtomicU64`, which is inert here. This function keeps those paths IN the graph so that
+// regression is a compile error rather than a surprise at runtime.
+///
+/// Compile-time guard for the event bus on this target. Referenced by `ffi.zig` so it is part of the
+/// build; it is never called from JavaScript.
+export fn wormdb_wasm_graph_guard() void {
+    const std = @import("std");
+    var bus = event.bus.EventBus.init(std.heap.page_allocator);
+    defer bus.deinit();
+    const H = struct {
+        fn h(_: *anyopaque, _: []const u8) void {}
+    };
+    _ = bus.subscribe("guard", H.h, undefined) catch {};
+    _ = bus.subscriberCount();
+    _ = bus.dropCount();
+}

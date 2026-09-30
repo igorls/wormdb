@@ -56,6 +56,15 @@ pub const AtomicU64 = if (narrow_u64_atomics) struct {
     }
 
     /// Returns the value the cell held before the add.
+    pub fn fetchSub(self: *Self, operand: u64, comptime order: std.builtin.AtomicOrder) u64 {
+        _ = order;
+        self.lock.lock();
+        defer self.lock.unlock();
+        const previous = self.value;
+        self.value -%= operand;
+        return previous;
+    }
+
     pub fn fetchAdd(self: *Self, operand: u64, comptime order: std.builtin.AtomicOrder) u64 {
         _ = order;
         self.lock.lock();

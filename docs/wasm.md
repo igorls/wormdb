@@ -29,9 +29,9 @@ This mirrors iOS, which also static-links.
 
 ## Running it in a page
 
-`examples/browser-wormdb/` is a working page. It needs no `wasi_snapshot_preview1` polyfill: a
-~100-line shim implements the clock, RNG, write and exit, and returns `ENOSYS` for everything
-else. That last part is deliberate — an accidental filesystem call fails loudly instead of
+`scripts/wasi-shim.mjs` is the whole host interface. It needs no `wasi_snapshot_preview1`
+polyfill: a ~100-line shim implements the clock, RNG, write and exit, and returns `ENOSYS` for
+everything else. That last part is deliberate — an accidental filesystem call fails loudly instead of
 appearing to work.
 
 The in-memory path is genuinely filesystem-free. `wormdb_open` with `PersistenceMode.none` does
@@ -117,9 +117,13 @@ completion path is not analysed. Three traps sit on top of it:
    unconditionally, including for `PersistenceMode.none`. Harmless natively, fatal for a host that
    has no filesystem: it forces the page to implement one. Skipped when the mode is `.none`.
 
-Ruled out and recorded so it is not retried: there is **no non-atomic `Io` completion mode** in
-Zig 0.16. `Threaded.futexWaitUncancelable` lowers to the asm unconditionally, the wait sits in
-`waitForCancelWithSignaling`, and the wasm branch asserts the atomics feature.
+`std.Io.Threaded` has **no separate non-atomic mode, because `single_threaded` IS the switch.**
+With it set, `futexWaitInner` is unreachable (its first line is `if (builtin.single_threaded)
+unreachable;`, ahead of the `isWasm()` wait32 asm), so the wait is never emitted. The traps were
+never a missing mode — they were code analysed *outside* that guard: `std.Thread.spawn`, which is a
+`@compileError` in single-threaded mode merely by being analysed, and `std.Thread.join`, whose wasm
+path contains the same atomic-wait asm. Reading this as "single-threaded does not work" would be
+the opposite of the finding.
 
 ## The WASI surface the host must provide
 

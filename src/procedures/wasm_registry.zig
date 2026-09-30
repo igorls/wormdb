@@ -1,9 +1,12 @@
 //! Procedure registry for the wasm32 entry root.
 //!
 //! An explicit ALLOWLIST, not a filtered copy of the full registry: a procedure is available
-//! only if it is named here, and the comptime check below makes it a compile error if anything
-//! on the list reaches `cluster` — because that would pull meshguard's locks and sockets back
-//! into a target that cannot compile them.
+//! only if it is named here. Zig cannot inspect another module's imports at comptime, so the
+//! enforcement is the build step `scripts/check-wasm-allowlist.zig` (run by `zig build
+//! wasm`/`wasm-smoke`/`ffi` on a wasm target) — it reads the allowlisted files and fails the build,
+//! naming the file and line, if one reaches the cluster or socket-bearing graph. An earlier version
+//! of this comment claimed a comptime check here; no such check exists, which is exactly why the
+//! build step does.
 //!
 //! Procedures that need clustering are absent rather than stubbed. A caller asking for one gets
 //! "unknown procedure", which is honest; a stub that silently succeeded would pretend to

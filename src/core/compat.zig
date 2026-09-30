@@ -657,8 +657,11 @@ pub const net = if (wasm_target) struct {} else struct {
 /// like a real identity. Reaching any of these means a cluster feature was invoked on a target
 /// that has no clustering, and the caller is told so.
 pub const ClusterStub = struct {
-    pub fn identityPublicKey(_: *const ClusterStub) [32]u8 {
-        @panic("cluster identity requested on a target built without clustering");
+    /// Returns an error like every other method here. It used to `@panic`, which contradicted this
+    /// block's own promise that every method REFUSES: a caller that handled
+    /// `error.ClusterUnsupportedOnThisTarget` would still have been killed by a panic instead.
+    pub fn identityPublicKey(_: *const ClusterStub) ![32]u8 {
+        return error.ClusterUnsupportedOnThisTarget;
     }
     pub fn signWithIdentity(_: *const ClusterStub, _: []const u8) ![64]u8 {
         return error.ClusterUnsupportedOnThisTarget;

@@ -72,6 +72,53 @@ identity.
 | QUIC / WebTransport gateway | requires MsQuic, a C dependency with no wasm target |
 | clustering of the vector index | peers would have to run against a cluster that does not exist here |
 
+## Building it: which configuration, and why the obvious choice does not work
+
+**The no-atomics build does not compile.** `zig build ffi -Dtarget=wasm32-wasi` fails with
+`instruction requires: atomics` (3 errors); `-Dcpu=baseline+atomics` succeeds (0 errors). This is
+counter-intuitive, because a single-threaded database should not need atomics at all, so the
+reason is recorded here.
+
+The wait is **not** in WormDB's own locks. Every lock in the reduced graph is already inert on a
+wasm target. It is `std.Io.Threaded`'s operation-completion path:
+`Thread.futexWaitUncancelable(&num_completed.raw, ...)` at `std/Io/Threaded.zig:618` and `:782`.
+Zig 0.16's blocking `Io` waits for I/O completion that way, and `Threaded.futexWaitUncancelable`
+lowers to `memory.atomic.wait32` on wasm unconditionally — there is no non-atomic variant to
+select (checked: the wait sits in `waitForCancelWithSignaling`, and no alternate completion mode
+is exposed). So any build that uses blocking `std.Io` for file I/O compiles that path.
+
+The three routes, none of them free:
+
+1. **Ship the `+atomics` build with SHARED memory.** Then `wait32` is valid. Cost: a shared
+   memory needs `SharedArrayBuffer`, which the page can only obtain under cross-origin isolation
+   (COOP/COEP). That constrains every cross-origin load on the hosting page.
+   Measured: the artifact does contain atomic operations — 11,316 occurrences of the atomic
+   opcode prefix (0xFE) — so instantiating it with unshared memory would trap on first
+   contention rather than degrade.
+2. **Keep the no-atomics build and remove the engine's blocking `Io` dependency** for file I/O,
+   replacing it with direct WASI file calls. This is the "host-import shim" in its real form and
+   it touches storage, not just the FFI.
+3. **A non-blocking or single-threaded `Io` completion mode** that never waits. Ruled out for
+   Zig 0.16 as shipped (see above).
+
+Until one of these is chosen and implemented, the buildable configuration is route 1, and that is
+the only one documented as working. Do not read this as a recommendation of shared memory for the
+browser deployment — that trade-off belongs to the deployment, not to the database.
+
+## The WASI surface the host must provide
+
+Measured from the built module, so the JS-side shim size is known rather than guessed:
+
+- **33 imports**, all from `wasi_snapshot_preview1`: `args_get`, `args_sizes_get`, `environ_get`,
+  `environ_sizes_get`, `clock_res_get`, `clock_time_get`, `fd_*` (fdstat, filestat, pread,
+  pwrite, read, write, seek, prestat, close, renumber, readdir…), `path_*` (create_directory,
+  filestat, open, remove, rename…), `random_get`, `proc_exit`, `poll_oneoff`, `sched_yield`.
+- **Exports**: `memory` and `_start`.
+
+So a WASI-capable host (wasmtime, or a bun/node WASI host) needs nothing beyond the standard
+preview1 imports; there is no bespoke host interface. That is a smaller shim than the phrase
+"host-import shim" suggests, but it is the whole of the file-I/O dependency in route 2 above.
+
 ## Not yet done
 
 - The smoke test exercising allowlisted procedures end to end through the reduced root.

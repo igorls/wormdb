@@ -34,20 +34,28 @@ try {
 }
 
 const enc = new TextEncoder();
-const dec = new TextDecoder();
 const mem = () => new Uint8Array(ex.memory.buffer);
 const dv = () => new DataView(ex.memory.buffer);
-let sp = 16 << 20;
-const scratch = (n = 4096) => { const p = sp; sp += n; return p; };
+// Host buffers come from the module's own allocator. This used to hand out offsets from 16 MiB up,
+// which the module had never allocated: those bytes were only "free" by accident of what the linker
+// happened to reserve, and a memory.grow during any call can move or reclaim them. Asking for them
+// means the allocator knows they are in use, and the offsets are real.
+// Out-parameters: a length/pointer the callee writes back.
+const scratch = (n = 8) => {
+  const at = ex.wormdb_alloc(n);
+  check(at !== 0, `wormdb_alloc(${n}) for a host buffer`);
+  return at;
+};
 function writeStr(s) {
-  const at = scratch(8192);
   const b = enc.encode(s);
+  const at = ex.wormdb_alloc(b.length + 1);
+  check(at !== 0, `wormdb_alloc(${b.length + 1}) for a host buffer`);
   mem().set(b, at); mem()[at + b.length] = 0;
   return { ptr: at, len: b.length };
 }
 const hex = (ptr, len) => Array.from(mem().subarray(ptr, ptr + len)).map((x) => x.toString(16).padStart(2, "0")).join("");
 
-for (const name of ["wormdb_open", "wormdb_append_log", "wormdb_append_log_verify"]) {
+for (const name of ["wormdb_open", "wormdb_append_log", "wormdb_append_log_verify", "wormdb_alloc", "wormdb_free"]) {
   check(typeof ex[name] === "function", `exports ${name}`);
 }
 

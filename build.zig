@@ -115,6 +115,12 @@ pub fn build(b: *std.Build) void {
     // Consumed by the embedded meshguard source (tunnel.zig/main.zig) so it picks
     // the same backend linkCrypto wires for. Shared with the wormdb module too.
     build_options.addOption(bool, "use_libsodium", use_libsodium);
+    // WebAssembly has no threads without the atomics/bulk-memory proposals, so a wasm
+    // target must not spawn workers or use 64-bit atomics. Exposed as an explicit
+    // option rather than inferred from the target, so a native build can also pick the
+    // single-threaded path deliberately. See src/vector/index.zig and src/event/bus.zig.
+    const single_threaded = b.option(bool, "single-threaded", "Build without worker threads or 64-bit atomics (required for wasm32)") orelse (target.result.cpu.arch.isWasm());
+    build_options.addOption(bool, "single_threaded", single_threaded);
     const build_options_mod = build_options.createModule();
 
     // MeshGuard library module (embedded mesh networking). b.path resolves against THIS package's root,

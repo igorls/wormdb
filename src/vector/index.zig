@@ -26,6 +26,7 @@
 //!     on peers fall back to the BQ prefilter until reindexed.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const hnsw_mod = @import("hnsw.zig");
 const metric_mod = @import("metric.zig");
 const rabitq_mod = @import("rabitq.zig");
@@ -250,6 +251,10 @@ pub const NamespaceIndex = struct {
     /// function serializes its own setup via the AsyncQueue's mutex.
     pub fn enableAsyncMode(self: *NamespaceIndex) !void {
         if (@atomicLoad(bool, &self.async_mode, .acquire)) return;
+
+        // A single-threaded build (wasm32) has no worker to drain the queue, so the
+        // caller falls back to synchronous inserts instead of a queue that never runs.
+        if (build_options.single_threaded) return error.AsyncUnsupported;
 
         const queue = try self.allocator.create(AsyncQueue);
         errdefer self.allocator.destroy(queue);
@@ -671,7 +676,9 @@ pub const NamespaceIndex = struct {
         // ── Stage 2: read tombstone header + bits ──
         var tc_buf: [8]u8 = undefined;
         try readAllExact(reader, &tc_buf);
-        const tombstone_count = std.mem.readInt(u64, tc_buf[0..8], .little);
+        // The format stores the count as u64. On a 32-bit target (wasm32) `usize` is u32, so the
+        // narrowing has to be explicit; the value is bounded by the vector count, far under 2^32.
+        const tombstone_count: usize = @intCast(std.mem.readInt(u64, tc_buf[0..8], .little));
 
         var tombstones: std.DynamicBitSetUnmanaged = if (node_count == 0)
             .{}

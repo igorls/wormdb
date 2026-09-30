@@ -9,6 +9,7 @@
 //! `ctx` while a publisher is still delivering.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const core = @import("../core/mod.zig");
 const compat = core.compat;
 const predicate = core.predicate;
@@ -89,7 +90,9 @@ pub const EventBus = struct {
     stats: Stats,
 
     pub const Stats = struct {
-        publish_count: std.atomic.Value(u64),
+        // A wasm32 build has no 64-bit atomics, and a single-threaded build has nothing to
+        // synchronise with, so the counter is a plain u64 there and an atomic elsewhere.
+        publish_count: if (build_options.single_threaded) u64 else std.atomic.Value(u64),
         subscriber_count: std.atomic.Value(u64),
         /// Events dropped because a subscriber's write path was busy (tryLock fail).
         drop_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -101,7 +104,7 @@ pub const EventBus = struct {
             .channels = std.StringHashMap(*Channel).init(allocator),
             .mutex = .{},
             .stats = .{
-                .publish_count = std.atomic.Value(u64).init(0),
+                .publish_count = if (build_options.single_threaded) @as(u64, 0) else std.atomic.Value(u64).init(0),
                 .subscriber_count = std.atomic.Value(u64).init(0),
                 .drop_count = std.atomic.Value(u64).init(0),
             },
@@ -251,7 +254,7 @@ pub const EventBus = struct {
 
             const n_subs = channel.subscribers.count();
             if (n_subs == 0) {
-                _ = self.stats.publish_count.fetchAdd(1, .monotonic);
+                self.bumpPublishCount();
                 return;
             }
             try deliveries.ensureTotalCapacity(self.allocator, n_subs);
@@ -287,7 +290,7 @@ pub const EventBus = struct {
                 });
             }
 
-            _ = self.stats.publish_count.fetchAdd(1, .monotonic);
+            self.bumpPublishCount();
         }
 
         // Deliver outside all bus/channel locks — head-of-line socket I/O must
@@ -318,7 +321,14 @@ pub const EventBus = struct {
     }
 
     pub fn publishCount(self: *EventBus) u64 {
-        return self.stats.publish_count.load(.monotonic);
+        return if (build_options.single_threaded) self.stats.publish_count else self.stats.publish_count.load(.monotonic);
+    }
+
+    /// One place for the counter bump: wasm32 has no 64-bit atomics without the threads
+    /// proposal, and a single-threaded build has nothing to synchronise with, so the plain
+    /// field is used there. Keeping both call sites on this helper stops them drifting apart.
+    fn bumpPublishCount(self: *EventBus) void {
+        if (build_options.single_threaded) self.stats.publish_count += 1 else _ = self.stats.publish_count.fetchAdd(1, .monotonic);
     }
 
     pub fn dropCount(self: *EventBus) u64 {

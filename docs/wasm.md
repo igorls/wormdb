@@ -1,23 +1,45 @@
 # WormDB on WebAssembly
 
-`zig build ffi -Dtarget=wasm32-wasi` produces a WebAssembly module of the engine. This document
-records what that artifact contains, what it deliberately does not, and why — so nobody
-rediscovers the constraints from a wall of compiler errors.
+WormDB runs in a browser. `zig build wasm -Dtarget=wasm32-wasi` produces the module a page (or
+any WASI host) can load and call. This document records what that artifact contains, what it
+deliberately does not, and why — so nobody rediscovers the constraints from a wall of compiler
+errors.
 
-## Build
+## Build and run
 
 ```sh
-zig build ffi -Dtarget=wasm32-wasi -Dcpu=baseline+atomics
+zig build wasm       -Dtarget=wasm32-wasi -Doptimize=ReleaseSmall   # -> zig-out/bin/wormdb_ffi.wasm
+zig build wasm-smoke -Dtarget=wasm32-wasi -Doptimize=ReleaseSmall   # run the FFI checks against it
 ```
 
-The atomics feature is required: the engine's lock and futex primitives lower to
-`memory.atomic.wait32` / `atomic.notify`, which wasm only has with it. Browsers ship it.
-Building without the feature also compiles — the primitives become inert (see below) — but that
-configuration is not exercised by the smoke test.
+**No atomics feature, no shared memory, no cross-origin isolation.** `-Dcpu=baseline` is the
+configuration; the module is single-threaded and instantiates with ordinary (unshared) memory, so
+a page needs no `SharedArrayBuffer` and therefore no COOP/COEP headers. This is the recommended
+browser configuration and the one the smoke tests exercise.
+
+Two artifact shapes exist and they are not interchangeable:
+
+- `zig build wasm` emits a **reactor** with the FFI entry points as exports (19 exports, `memory`
+  and 18 `wormdb_*` functions; no `_start`). A host cannot link an archive, it needs the exports.
+- `zig build ffi` emits a **static archive** for linking into a native (or iOS) embedding.
 
 The FFI is **static** on wasm. There is no `dlopen`-style shared library for wasm: a `-dynamic`
 build needs position-independent objects and the wasm crt/libc objects are not built that way.
 This mirrors iOS, which also static-links.
+
+## Running it in a page
+
+`examples/browser-wormdb/` is a working page. It needs no `wasi_snapshot_preview1` polyfill: a
+~100-line shim implements the clock, RNG, write and exit, and returns `ENOSYS` for everything
+else. That last part is deliberate — an accidental filesystem call fails loudly instead of
+appearing to work.
+
+The in-memory path is genuinely filesystem-free. `wormdb_open` with `PersistenceMode.none` does
+not even create the data directory, so the engine touches only `clock_time_get`, `random_get`,
+`fd_write` and `proc_exit`. Verified in a real browser: four keys set and read back through
+`wormdb_set`/`get`/`delete`, and three WORM records appended with `wormdb_append_log_verify`
+returning `rc=0, count=3, last_seq=3` and a chain whose `prev_event_hash` links each record to
+its predecessor.
 
 ## Two constraints, not one
 
@@ -72,56 +94,58 @@ identity.
 | QUIC / WebTransport gateway | requires MsQuic, a C dependency with no wasm target |
 | clustering of the vector index | peers would have to run against a cluster that does not exist here |
 
-## Building it: which configuration, and why the obvious choice does not work
+## Why a single-threaded database needed `single_threaded`, and three traps
 
-**The no-atomics build does not compile.** `zig build ffi -Dtarget=wasm32-wasi` fails with
-`instruction requires: atomics` (3 errors); `-Dcpu=baseline+atomics` succeeds (0 errors). This is
-counter-intuitive, because a single-threaded database should not need atomics at all, so the
-reason is recorded here.
+A single-threaded build still reached `instruction requires: atomics` for a long time. The reason
+is not WormDB's own locks — all of them are already inert on a wasm target — but that the wait is
+emitted from *anywhere the atomic-wait asm appears*, and Zig's asm is not guarded the way the
+comments suggest.
 
-The wait is **not** in WormDB's own locks. Every lock in the reduced graph is already inert on a
-wasm target. It is `std.Io.Threaded`'s operation-completion path:
-`Thread.futexWaitUncancelable(&num_completed.raw, ...)` at `std/Io/Threaded.zig:618` and `:782`.
-Zig 0.16's blocking `Io` waits for I/O completion that way, and `Threaded.futexWaitUncancelable`
-lowers to `memory.atomic.wait32` on wasm unconditionally — there is no non-atomic variant to
-select (checked: the wait sits in `waitForCancelWithSignaling`, and no alternate completion mode
-is exposed). So any build that uses blocking `std.Io` for file I/O compiles that path.
+Setting `.single_threaded = true` on the wasm modules (the build.zig form of `-fsingle-threaded`)
+is necessary: with it, `builtin.single_threaded` is comptime true and the `std.Io.Threaded`
+completion path is not analysed. Three traps sit on top of it:
 
-The three routes, none of them free:
+1. **`if (comptime X) return;` is not a terminator for analysis.** `std.Thread.spawn` is a
+   `@compileError` in single-threaded mode, and it fires from *being analysed*, not from being
+   reached. Only moving the call into an `else`-branch keeps it out of the build, which is how
+   `NamespaceIndex.enableAsyncMode` is written.
+2. **`std.Thread.join` carries the same asm.** Its wasm path contains `memory.atomic.wait32`.
+   Joining only happens in a multi-threaded build, so the two join sites in `storage/wal.zig` and
+   `vector/index.zig` are guarded on `single_threaded` as well. That guard was the actual last
+   blocker, and it is not a wait site one would search for.
+3. **A no-op filesystem call still needs a filesystem.** `wormdb_open` created the data directory
+   unconditionally, including for `PersistenceMode.none`. Harmless natively, fatal for a host that
+   has no filesystem: it forces the page to implement one. Skipped when the mode is `.none`.
 
-1. **Ship the `+atomics` build with SHARED memory.** Then `wait32` is valid. Cost: a shared
-   memory needs `SharedArrayBuffer`, which the page can only obtain under cross-origin isolation
-   (COOP/COEP). That constrains every cross-origin load on the hosting page.
-   Measured: the artifact does contain atomic operations — 11,316 occurrences of the atomic
-   opcode prefix (0xFE) — so instantiating it with unshared memory would trap on first
-   contention rather than degrade.
-2. **Keep the no-atomics build and remove the engine's blocking `Io` dependency** for file I/O,
-   replacing it with direct WASI file calls. This is the "host-import shim" in its real form and
-   it touches storage, not just the FFI.
-3. **A non-blocking or single-threaded `Io` completion mode** that never waits. Ruled out for
-   Zig 0.16 as shipped (see above).
-
-Until one of these is chosen and implemented, the buildable configuration is route 1, and that is
-the only one documented as working. Do not read this as a recommendation of shared memory for the
-browser deployment — that trade-off belongs to the deployment, not to the database.
+Ruled out and recorded so it is not retried: there is **no non-atomic `Io` completion mode** in
+Zig 0.16. `Threaded.futexWaitUncancelable` lowers to the asm unconditionally, the wait sits in
+`waitForCancelWithSignaling`, and the wasm branch asserts the atomics feature.
 
 ## The WASI surface the host must provide
 
 Measured from the built module, so the JS-side shim size is known rather than guessed:
 
-- **33 imports**, all from `wasi_snapshot_preview1`: `args_get`, `args_sizes_get`, `environ_get`,
-  `environ_sizes_get`, `clock_res_get`, `clock_time_get`, `fd_*` (fdstat, filestat, pread,
-  pwrite, read, write, seek, prestat, close, renumber, readdir…), `path_*` (create_directory,
-  filestat, open, remove, rename…), `random_get`, `proc_exit`, `poll_oneoff`, `sched_yield`.
-- **Exports**: `memory` and `_start`.
+- **31 imports**, all from `wasi_snapshot_preview1`: `args_get`, `args_sizes_get`, `clock_res_get`,
+  `clock_time_get`, `fd_*` (fdstat, filestat, pread, pwrite, read, write, seek, prestat, sync,
+  readdir, close…), `path_*` (create_directory, filestat, link, open, readlink, remove_directory,
+  rename, symlink, unlink_file…), `random_get`, `proc_exit`, `poll_oneoff`, `sched_yield`.
+- **Exports**: `memory` and 18 `wormdb_*` functions (`open`, `open_sync`, `close`, `set`,
+  `set_worm`, `get`, `get_meta`, `scan_prefix`, `delete`, `exec`, `append_log`,
+  `append_log_verify`, `proof_build_mmr_bundle`, `proof_verify_bundle`, `mmr_proof_verify`,
+  `free`, `version`). No `_start` — this is a reactor.
 
-So a WASI-capable host (wasmtime, or a bun/node WASI host) needs nothing beyond the standard
-preview1 imports; there is no bespoke host interface. That is a smaller shim than the phrase
-"host-import shim" suggests, but it is the whole of the file-I/O dependency in route 2 above.
+There is no bespoke host interface. Only four of those imports are reachable on the in-memory
+path (`clock_time_get`, `random_get`, `fd_write`, `proc_exit`); the rest exist for the
+persistent modes and are stubbed to `ENOSYS`, so a deployment that has no filesystem finds out
+immediately rather than silently. `wormdb_open_sync` is among the exports, which is the symbol
+hosts like Meshrooms look up by name.
 
 ## Not yet done
 
-- The smoke test exercising allowlisted procedures end to end through the reduced root.
-- Verifying the no-atomics build (the inert path) rather than only the atomics one.
-- A browser-side harness: instantiating the module, and the WASM-4 qualification gates
-  (Firefox/OPFS, cold open) that the Meshrooms spike branch defines.
+- **Persistent modes on wasm.** Only `PersistenceMode.none` is exercised end to end. The WAL and
+  snapshot paths compile and their WASI imports are present, but nothing has run them against a
+  real WASI filesystem, so their durability claims are unverified on this target.
+- **Firefox and OPFS**, and the cold-open timing gates the Meshrooms spike branch defines. The
+  demo has been run in Chrome (and headlessly) only.
+- **The vector index and the cluster-free procedures beyond key/value and the append log.**
+  They are in the reduced root and on the allowlist, but the browser run has not touched them.

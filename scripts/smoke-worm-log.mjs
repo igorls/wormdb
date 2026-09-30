@@ -1,6 +1,6 @@
 // Verify the WORM append-log + chain-verification API, then the exact logic goes in the page.
 import { readFileSync } from "node:fs";
-import { createWasi } from "./wasi-shim.mjs";
+import { createWasi } from "../examples/browser-wormdb/wasi-shim.mjs";
 
 const m = await WebAssembly.compile(readFileSync("zig-out/bin/wormdb_ffi.wasm"));
 const memRef = {};

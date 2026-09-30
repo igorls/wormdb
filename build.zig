@@ -212,6 +212,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        // The build.zig equivalent of -fsingle-threaded. With it set, `builtin.single_threaded`
+        // is comptime true, which makes std.Io.Threaded's atomic-wait branch dead code and
+        // removes the `memory.atomic.wait32` the no-atomics target cannot emit. Without it the
+        // wasm build compiles as multi-threaded and reaches the asm.
+        .single_threaded = target.result.cpu.arch.isWasm(),
         .imports = &.{
             .{ .name = "build_options", .module = build_options_mod },
         },
@@ -222,6 +227,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .single_threaded = target.result.cpu.arch.isWasm(),
         .imports = &.{
             .{ .name = "wormdb", .module = engine_mod },
         },
@@ -265,6 +271,53 @@ pub fn build(b: *std.Build) void {
         ffi_step.dependOn(&check.step);
     }
     ffi_step.dependOn(&b.addInstallArtifact(ffi_lib, .{}).step);
+
+    // `zig build wasm` produces the module a browser (or any WASI host) can actually load:
+    // a reactor with the FFI entry points as exports. Distinct from `ffi`, which produces a
+    // static archive: a hosted environment cannot link an archive, it needs the exports.
+    //
+    // `entry = .disabled` is what makes it a reactor rather than a command — the host calls
+    // the exported functions instead of running _start. `rdynamic` exports them by name, which
+    // is the entire interface; there are no JS bindings.
+    //
+    // Gated on the wasm target: a reactor has no `main`, so registering it for a native build
+    // makes the default install step try to compile it as a command and fail.
+    if (target.result.cpu.arch.isWasm()) {
+        const wasm_ffi_mod = b.createModule(.{
+            .root_source_file = b.path("src/ffi.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .single_threaded = true,
+            .imports = &.{
+                .{ .name = "wormdb", .module = engine_mod },
+            },
+        });
+        linkCrypto(b, wasm_ffi_mod, os_tag, abi, use_libsodium);
+        const wasm_exe = b.addExecutable(.{
+            .name = "wormdb_ffi",
+            .root_module = wasm_ffi_mod,
+        });
+        // A field on the Compile step, not on ExecutableOptions.
+        wasm_exe.entry = .disabled;
+        wasm_exe.rdynamic = true;
+
+        const wasm_step = b.step("wasm", "Build the browser-loadable wasm module (exported FFI, reactor)");
+        wasm_step.dependOn(&b.addInstallArtifact(wasm_exe, .{}).step);
+
+        // Reproduce the browser run headlessly. Needs bun or node; kept as its own step so a
+        // machine without either can still build the module.
+        const smoke_kv = b.addSystemCommand(&.{ "bun", "scripts/smoke-kv.mjs" });
+        smoke_kv.setCwd(b.path("."));
+        smoke_kv.has_side_effects = true;
+        const smoke_log = b.addSystemCommand(&.{ "bun", "scripts/smoke-worm-log.mjs" });
+        smoke_log.setCwd(b.path("."));
+        smoke_log.has_side_effects = true;
+        const smoke_step = b.step("wasm-smoke", "Run the FFI smoke tests against the wasm module");
+        smoke_step.dependOn(&b.addInstallArtifact(wasm_exe, .{}).step);
+        smoke_step.dependOn(&smoke_kv.step);
+        smoke_step.dependOn(&smoke_log.step);
+    }
 
     // Unit tests for the engine.
     const test_mod = b.createModule(.{

@@ -2,7 +2,7 @@
 // NOTE: a wasm call can grow memory, which detaches every existing view. Always re-read
 // memory.buffer after a call that can allocate — the browser page must do the same.
 import { readFileSync } from "node:fs";
-import { createWasi } from "./wasi-shim.mjs";
+import { createWasi } from "../examples/browser-wormdb/wasi-shim.mjs";
 
 const m = await WebAssembly.compile(readFileSync("zig-out/bin/wormdb_ffi.wasm"));
 let log = "";

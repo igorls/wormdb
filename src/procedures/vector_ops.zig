@@ -15,7 +15,8 @@
 
 const std = @import("std");
 const Store = @import("../storage/store.zig").Store;
-const Cluster = @import("../cluster/mod.zig").Cluster;
+/// See context.zig: an optional pointer only, stubbed on a narrow-atomics target.
+const Cluster = if (@import("../core/compat.zig").wasm_target) @import("../core/compat.zig").ClusterStub else @import("../cluster/mod.zig").Cluster;
 const EventBus = @import("../event/mod.zig").EventBus;
 const index_mod = @import("../vector/index.zig");
 const NamespaceRegistry = index_mod.NamespaceRegistry;

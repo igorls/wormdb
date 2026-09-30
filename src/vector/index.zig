@@ -26,6 +26,8 @@
 //!     on peers fall back to the BQ prefilter until reindexed.
 
 const std = @import("std");
+const compat = @import("../core/compat.zig");
+const narrow_atomics = compat.narrow_atomics;
 const build_options = @import("build_options");
 const hnsw_mod = @import("hnsw.zig");
 const metric_mod = @import("metric.zig");
@@ -71,22 +73,7 @@ pub const TombstoneResult = enum {
 /// file standalone (no cross-module import path). Zig 0.16's RwLock
 /// requires an Io handle for every operation; we pin it to the global
 /// blocking Io.
-const RwLock = struct {
-    inner: std.Io.RwLock = .init,
-
-    pub fn lock(self: *RwLock) void {
-        self.inner.lockUncancelable(io());
-    }
-    pub fn unlock(self: *RwLock) void {
-        self.inner.unlock(io());
-    }
-    pub fn lockShared(self: *RwLock) void {
-        self.inner.lockSharedUncancelable(io());
-    }
-    pub fn unlockShared(self: *RwLock) void {
-        self.inner.unlockShared(io());
-    }
-};
+const RwLock = compat.RwLock;
 
 inline fn io() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
@@ -116,10 +103,27 @@ const PendingInsert = struct {
 const AsyncQueue = struct {
     items: std.ArrayListUnmanaged(PendingInsert) = .empty,
     scratch: std.ArrayListUnmanaged(PendingInsert) = .empty, // worker-owned swap buffer
-    mutex: std.Io.Mutex = .init,
-    cond: std.Io.Condition = .init,
+    mutex: if (narrow_atomics) struct {} else std.Io.Mutex = if (narrow_atomics) .{} else .init,
+    cond: if (narrow_atomics) struct {} else std.Io.Condition = if (narrow_atomics) .{} else .init,
     shutdown: bool = false,
     pending: std.atomic.Value(usize) = .init(0), // for vstats (lock-free read)
+
+    /// Inert on a narrow-atomics target: no worker thread exists there to contend, and
+    /// std.Io.Mutex lowers to an atomic wait instruction wasm does not have.
+    fn lock(self: *AsyncQueue) void {
+        if (comptime narrow_atomics) return else self.mutex.lockUncancelable(io());
+    }
+    fn unlock(self: *AsyncQueue) void {
+        if (comptime narrow_atomics) return;
+        self.mutex.unlock(io());
+    }
+    fn wait(self: *AsyncQueue) void {
+        if (comptime narrow_atomics) return else self.cond.waitUncancelable(io(), &self.mutex);
+    }
+    fn signal(self: *AsyncQueue) void {
+        if (comptime narrow_atomics) return;
+        self.cond.signal(io());
+    }
 };
 
 pub const NamespaceIndex = struct {
@@ -196,11 +200,10 @@ pub const NamespaceIndex = struct {
     pub fn deinit(self: *NamespaceIndex) void {
         // Shut down the async worker BEFORE tearing down the graph it writes to.
         if (self.async_queue) |q| {
-            const zio = io();
-            q.mutex.lockUncancelable(zio);
+            q.lock();
             q.shutdown = true;
-            q.cond.signal(zio);
-            q.mutex.unlock(zio);
+            q.signal();
+            q.unlock();
 
             if (self.async_worker) |t| t.join();
 
@@ -273,12 +276,11 @@ pub const NamespaceIndex = struct {
     /// insertLocked.
     pub fn enqueueAsync(self: *NamespaceIndex, key: []u8, vector: []u8, timestamp: u64) !void {
         const q = self.async_queue orelse return error.AsyncNotEnabled;
-        const zio = io();
-        q.mutex.lockUncancelable(zio);
-        defer q.mutex.unlock(zio);
+        q.lock();
+        defer q.unlock();
         try q.items.append(self.allocator, .{ .key = key, .vector = vector, .timestamp = timestamp });
         _ = q.pending.fetchAdd(1, .monotonic);
-        q.cond.signal(zio);
+        q.signal();
     }
 
     /// Batch-enqueue for bulk inserts: a single mutex acquisition for N
@@ -289,7 +291,6 @@ pub const NamespaceIndex = struct {
         items: []const @import("../core/mod.zig").types.Command.VbulkinsertParams.BulkItem,
     ) !void {
         const q = self.async_queue orelse return error.AsyncNotEnabled;
-        const zio = io();
 
         // Pre-dupe so we don't hold the queue mutex while allocating.
         var owned: std.ArrayListUnmanaged(PendingInsert) = .empty;
@@ -303,11 +304,11 @@ pub const NamespaceIndex = struct {
             owned.appendAssumeCapacity(.{ .key = key_copy, .vector = vec_copy, .timestamp = item.timestamp });
         }
 
-        q.mutex.lockUncancelable(zio);
-        defer q.mutex.unlock(zio);
+        q.lock();
+        defer q.unlock();
         try q.items.appendSlice(self.allocator, owned.items);
         _ = q.pending.fetchAdd(items.len, .monotonic);
-        q.cond.signal(zio);
+        q.signal();
         owned.clearRetainingCapacity();
     }
 
@@ -320,13 +321,12 @@ pub const NamespaceIndex = struct {
     fn asyncWorkerLoop(self: *NamespaceIndex) void {
         const q = self.async_queue orelse return;
         const distance = @import("distance.zig");
-        const zio = io();
 
         while (true) {
             // Wait for work or shutdown.
-            q.mutex.lockUncancelable(zio);
+            q.lock();
             while (q.items.items.len == 0 and !q.shutdown) {
-                q.cond.waitUncancelable(zio, &q.mutex);
+                q.wait();
             }
             const is_shutdown = q.shutdown;
             // Swap: the worker takes everything queued so producers can
@@ -334,7 +334,7 @@ pub const NamespaceIndex = struct {
             const tmp = q.items;
             q.items = q.scratch;
             q.scratch = tmp;
-            q.mutex.unlock(zio);
+            q.unlock();
 
             if (q.scratch.items.len > 0) {
                 const drained = q.scratch.items.len;

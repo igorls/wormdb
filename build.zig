@@ -84,6 +84,9 @@ pub fn build(b: *std.Build) void {
     // Build option, exposed to source via @import("build_options"). QUIC's C deps (MsQuic/libwtf) are
     // wired in the server build when enabled — see wormdb-server. The engine only carries the flag +
     // the (comptime-gated) Zig code.
+    // wasm32 without the threads proposal: no 64-bit atomics, no atomic wait, no sockets.
+    const narrow_target = target.result.cpu.arch.isWasm() and !target.result.cpu.has(.wasm, .atomics);
+
     const enable_quic = b.option(bool, "quic", "Enable QUIC/WebTransport gateway (requires MsQuic)") orelse false;
 
     // ─── Crypto backend selection (meshguard#102) ───
@@ -201,13 +204,26 @@ pub fn build(b: *std.Build) void {
     // Android/JNI). Single-node, in-process; see src/ffi.zig and ffi/wormdb.h.
     // iOS must static-link (apps cannot dlopen user dylibs); everything else gets
     // a shared library by default.
+    // On a narrow-atomics target (wasm32) the engine comes from the reduced root, which never
+    // imports server/cluster and so never reaches meshguard's locks and sockets. Native keeps
+    // src/lib.zig exactly as it was. See src/wasm_root.zig and docs/wasm.md.
+    const engine_mod = if (narrow_target) b.addModule("wormdb", .{
+        .root_source_file = b.path("src/wasm_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options_mod },
+        },
+    }) else wormdb_mod;
+
     const ffi_mod = b.createModule(.{
         .root_source_file = b.path("src/ffi.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{
-            .{ .name = "wormdb", .module = wormdb_mod },
+            .{ .name = "wormdb", .module = engine_mod },
         },
     });
     linkCrypto(b, ffi_mod, os_tag, abi, use_libsodium);
@@ -215,7 +231,10 @@ pub fn build(b: *std.Build) void {
     const ffi_lib = b.addLibrary(.{
         .name = "wormdb_ffi",
         .root_module = ffi_mod,
-        .linkage = if (os_tag == .ios) .static else .dynamic,
+        // wasm has no dlopen-style shared library: `-dynamic` needs PIC and its crt/libc objects
+        // are not built that way, so a wasm build is a static archive (or a reactor module) that
+        // the host links or instantiates. Same reasoning as iOS, which already static-links.
+        .linkage = if (os_tag == .ios or target.result.cpu.arch.isWasm()) .static else .dynamic,
     });
     b.installArtifact(ffi_lib);
 

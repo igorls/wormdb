@@ -17,7 +17,10 @@ const std = @import("std");
 const compat = @import("../core/compat.zig");
 const Store = @import("../storage/store.zig").Store;
 const Response = @import("../core/types.zig").Response;
-const Cluster = @import("../cluster/mod.zig").Cluster;
+/// Only an optional pointer to this type is ever held. On a narrow-atomics target the cluster
+/// graph is excluded (it needs meshguard's locks and sockets), so the name resolves to a stub
+/// whose methods refuse rather than silently do nothing. Native is unchanged.
+const Cluster = if (@import("../core/compat.zig").wasm_target) @import("../core/compat.zig").ClusterStub else @import("../cluster/mod.zig").Cluster;
 const EventBus = @import("../event/mod.zig").EventBus;
 const NamespaceRegistry = @import("../vector/index.zig").NamespaceRegistry;
 const auth = @import("../server/auth.zig");

@@ -11,7 +11,10 @@ pub const append_log = @import("append_log.zig");
 pub const mmr = @import("mmr.zig");
 pub const witness = @import("witness.zig");
 pub const prefix_root = @import("prefix_root.zig");
-pub const trust_log = @import("trust_log.zig");
+/// trust_log reaches cluster/org_trust, which reaches meshguard's locks and sockets. On a
+/// narrow-atomics target that graph is excluded, so the module is not analysed there. Nothing
+/// in the wasm entry's allowlist uses it.
+pub const trust_log = if (@import("../core/compat.zig").wasm_target) struct {} else @import("trust_log.zig");
 
 pub const AccumulatorKind = checkpoint.AccumulatorKind;
 pub const CheckpointRecord = checkpoint.CheckpointRecord;

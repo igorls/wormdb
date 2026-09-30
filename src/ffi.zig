@@ -523,7 +523,18 @@ export fn wormdb_delete(db: *Db, key: [*]const u8, key_len: usize) c_int {
     return OK;
 }
 
-/// Release a buffer returned by wormdb_get, wormdb_exec, or proof builders.
+/// Allocate a host-visible buffer, released with `wormdb_free`.
+///
+/// A host that needs to write bytes into linear memory must get them from here rather than writing
+/// at a fixed offset. The smoke scripts used to poke at 8 MiB and 16 MiB, which the module never
+/// allocated: those pages exist only as a side effect of the memory the linker happened to reserve,
+/// so they can move or vanish on a grow, and nothing says the bytes are not already the allocator's.
+export fn wormdb_alloc(len: usize) ?[*]u8 {
+    const buf = gpa.alloc(u8, len) catch return null;
+    return buf.ptr;
+}
+
+/// Release a buffer returned by wormdb_get, wormdb_exec, wormdb_alloc, or proof builders.
 export fn wormdb_free(ptr: ?[*]u8, len: usize) void {
     if (ptr) |p| gpa.free(p[0..len]);
 }

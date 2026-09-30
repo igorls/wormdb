@@ -45,14 +45,24 @@ const mem = () => new Uint8Array(ex.memory.buffer);
 const dv = () => new DataView(ex.memory.buffer);
 
 // The export surface the host depends on. A missing entry point is a hard failure, not a warning.
-for (const name of ["wormdb_version", "wormdb_open", "wormdb_set", "wormdb_get", "wormdb_delete", "wormdb_free", "wormdb_close"]) {
+for (const name of ["wormdb_version", "wormdb_open", "wormdb_set", "wormdb_get", "wormdb_delete", "wormdb_alloc", "wormdb_free", "wormdb_close"]) {
   check(typeof ex[name] === "function", `exports ${name}`);
 }
 
-const scratch = (() => { let p = 8 << 20; return () => (p += 4096); })();
+// Host buffers come from the module's own allocator. This used to hand out offsets from 8 MiB up,
+// which the module had never allocated: those bytes were only "free" by accident of what the linker
+// happened to reserve, and a memory.grow during any call can move or reclaim them. Asking for them
+// means the allocator knows they are in use, and the offsets are real.
+// Out-parameters: 8 bytes for a length/pointer the callee writes back.
+const scratch = () => {
+  const at = ex.wormdb_alloc(8);
+  check(at !== 0, "wormdb_alloc(8) for an out-param");
+  return at;
+};
 function writeStr(s) {
-  const at = scratch();
   const b = enc.encode(s);
+  const at = ex.wormdb_alloc(b.length + 1);
+  check(at !== 0, `wormdb_alloc(${b.length + 1}) for a host buffer`);
   mem().set(b, at);
   mem()[at + b.length] = 0;
   return { ptr: at, len: b.length };

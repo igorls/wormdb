@@ -19,8 +19,8 @@ browser configuration and the one the smoke tests exercise.
 
 Two artifact shapes exist and they are not interchangeable:
 
-- `zig build wasm` emits the FFI entry points as exports: **19 exports — `memory`, `_start`, and 17
-  `wormdb_*` functions** (measured from the built module, not counted by hand). A host cannot link an
+- `zig build wasm` emits the FFI entry points as exports: **21 exports — `memory`, `_start`, and
+  19 `wormdb_*` functions** (measured from the built module, not counted by hand). A host cannot link an
   archive, so it needs the exports. Note the `_start` is present even though the module is built with
   `entry = .disabled`: it comes from the libc startup objects, not from a `main` in the FFI root.
 - `zig build ffi` emits a **static archive** for linking into a native (or iOS) embedding.
@@ -173,10 +173,12 @@ Measured from the built module, so the JS-side shim size is known rather than gu
   `clock_time_get`, `fd_*` (fdstat, filestat, pread, pwrite, read, write, seek, prestat, sync,
   readdir, close…), `path_*` (create_directory, filestat, link, open, readlink, remove_directory,
   rename, symlink, unlink_file…), `random_get`, `proc_exit`, `poll_oneoff`, `sched_yield`.
-- **Exports**: `memory`, `_start`, and **17** `wormdb_*` functions: `open`, `open_sync`, `close`,
+- **Exports**: `memory`, `_start`, and **19** `wormdb_*` functions: `open`, `open_sync`, `close`,
   `set`, `set_worm`, `get`, `get_meta`, `scan_prefix`, `delete`, `exec`, `append_log`,
-  `append_log_verify`, `proof_build_mmr_bundle`, `proof_verify_bundle`, `mmr_proof_verify`, `free`,
-  `version`.
+  `append_log_verify`, `proof_build_mmr_bundle`, `proof_verify_bundle`, `mmr_proof_verify`, `alloc`,
+  `free`, `version`, plus the graph guard `wormdb_wasm_graph_guard` (see below). Hosts take buffers
+  from `wormdb_alloc` and release them with `wormdb_free`; nothing should be written at an offset the
+  module did not allocate.
 
 There is no bespoke host interface. Only four of those imports are reachable on the in-memory
 path (`clock_time_get`, `random_get`, `fd_write`, `proc_exit`); the rest exist for the

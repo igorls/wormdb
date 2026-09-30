@@ -101,6 +101,12 @@ pub const Wal = struct {
 
     /// Start background WAL writer for lock-free producer submission.
     /// Producer path becomes enqueue-only; this removes file I/O from request critical path.
+    /// Whether the background writer is used at all. A named constant rather than an inline
+    /// `build_options.single_threaded` so the decision is assertable: a wasm target cannot run
+    /// `zig build test` (the test binary itself needs threads), so a test that only skipped on a
+    /// threaded build would assert nothing anywhere. The test checks this predicate directly.
+    pub const use_background_writer = !build_options.single_threaded;
+
     pub fn startBackground(self: *Wal) !void {
         if (!self.sync_writes or self.writer_started) return;
         // A single-threaded build (wasm32) has no thread to hand the queue to. NOT starting the
@@ -109,7 +115,7 @@ pub const Wal = struct {
         // immediately on every record (2e5a914) and sets `sync_failed` when a write or sync
         // fails so later writes are fenced (a46f517). A queued single-threaded drain would
         // batch and swallow those failures instead, so the queue is not used at all here.
-        if (build_options.single_threaded) return;
+        if (!use_background_writer) return;
         self.writer_running.store(true, .release);
         self.writer_thread = try std.Thread.spawn(.{}, writerLoop, .{self});
         self.writer_started = true;
@@ -690,4 +696,24 @@ fn expectSingleThreadedDurability(comptime _single_threaded: bool) !void {
 
 test "single-threaded direct writes fsync immediately and fence uncertain writes" {
     try expectSingleThreadedDurability(true);
+}
+
+test "the background writer is used exactly when the build has threads" {
+    // The old test passed `true` to a helper that discarded it and never called startBackground, so
+    // it only proved that a Wal whose writer was never started writes directly — it would have kept
+    // passing if startBackground stopped returning early, which is the one behaviour that matters
+    // for wasm.
+    //
+    // It cannot be tested by calling startBackground, because a wasm target cannot run
+    // `zig build test` at all: the test binary itself needs threads (std.Thread.spawn in
+    // std/Thread.zig fails to compile in single-threaded mode). A test that only skipped on a
+    // threaded build would therefore assert nothing on any target. So the DECISION is extracted as
+    // `use_background_writer` and asserted here, which runs and is meaningful on a threaded build:
+    const builtin = @import("builtin");
+    try std.testing.expectEqual(!build_options.single_threaded, Wal.use_background_writer);
+    // And it agrees with the flag the rest of the engine reads. If someone re-points the build at a
+    // different condition, these two must not drift: `builtin.single_threaded` is what std.Io and
+    // compat keys off, so a build where they disagree has some code taking the threaded path and
+    // some the single-threaded one.
+    try std.testing.expectEqual(!builtin.single_threaded, Wal.use_background_writer);
 }

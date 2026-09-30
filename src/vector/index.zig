@@ -114,15 +114,13 @@ const AsyncQueue = struct {
         if (comptime narrow_atomics) return else self.mutex.lockUncancelable(io());
     }
     fn unlock(self: *AsyncQueue) void {
-        if (comptime narrow_atomics) return;
-        self.mutex.unlock(io());
+        if (comptime narrow_atomics) return else self.mutex.unlock(io());
     }
     fn wait(self: *AsyncQueue) void {
         if (comptime narrow_atomics) return else self.cond.waitUncancelable(io(), &self.mutex);
     }
     fn signal(self: *AsyncQueue) void {
-        if (comptime narrow_atomics) return;
-        self.cond.signal(io());
+        if (comptime narrow_atomics) return else self.cond.signal(io());
     }
 };
 

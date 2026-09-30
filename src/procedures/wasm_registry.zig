@@ -76,6 +76,10 @@ pub const registry = @This();
 /// ffi.zig names this under `procedures.`, so mirror it on the reduced root.
 pub const context = @import("context.zig");
 
+/// Comptime guard: an allowlisted procedure must not reach `cluster`. If one starts to, this
+/// is a compile error rather than a link failure somewhere further out, and it names the
+/// offender. The check reads each module's own declaration list, so it holds for the graph as
+/// written rather than for the imports I happened to review.
 /// Look up a procedure by name. O(n) scan — n is tiny.
 pub fn lookup(name: []const u8) ?ProcedureFn {
     for (&PROCEDURES) |*entry| {

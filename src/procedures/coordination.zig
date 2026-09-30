@@ -47,7 +47,7 @@ const MAX_GRANT_ATTEMPTS: usize = 16;
 /// Process-wide hybrid logical clock for coordination events. Procedures run
 /// concurrently — Hlc is a single atomic u64 advanced by a CAS loop, so one
 /// shared instance is safe.
-var claim_clock: hlc_mod.Hlc = .{ .last = std.atomic.Value(u64).init(0) };
+var claim_clock: hlc_mod.Hlc = .{ .last = @import("../core/compat.zig").AtomicU64.init(0) };
 
 // ╔═══════════════════════════════════════════════╗
 // ║  Pure fold                                     ║

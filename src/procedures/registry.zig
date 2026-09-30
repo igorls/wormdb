@@ -16,7 +16,15 @@ pub const scan = @import("scan.zig");
 pub const chat_send = @import("chat_send.zig");
 pub const chat_history = @import("chat_history.zig");
 pub const vsearch = @import("vsearch.zig");
-pub const vsearch_cluster = @import("vsearch_cluster.zig");
+/// Reaches cluster -> meshguard's locks and sockets; excluded on a narrow-atomics target.
+const cluster_on = !@import("../core/compat.zig").wasm_target;
+
+/// Stands in for a cluster procedure on a wasm target, where the cluster graph is excluded.
+/// It refuses loudly: a silent success would claim a replication that never happened.
+fn clusterUnsupported(_: *@import("context.zig").Ctx) anyerror!@import("context.zig").Ctx.Result {
+    return error.ClusterUnsupportedOnThisTarget;
+}
+pub const vsearch_cluster = if (cluster_on) @import("vsearch_cluster.zig") else struct {};
 pub const vsim = @import("vsim.zig");
 pub const vinsert = @import("vinsert.zig");
 pub const vstats = @import("vstats.zig");
@@ -28,9 +36,9 @@ pub const memory = @import("memory.zig");
 pub const auth_mint_scoped = @import("auth_mint_scoped.zig");
 pub const append_log = @import("append_log.zig");
 pub const coordination = @import("coordination.zig");
-pub const cluster_presence = @import("cluster_presence.zig");
+pub const cluster_presence = if (cluster_on) @import("cluster_presence.zig") else struct {};
 pub const proof_prefix_root = @import("proof_prefix_root.zig");
-pub const trust_log = @import("trust_log.zig");
+pub const trust_log = if (cluster_on) @import("trust_log.zig") else struct {};
 // Domain procedures are NOT imported here — each domain lives in its own external
 // package and is registered at startup via registerDomains() from its manifest.
 
@@ -62,7 +70,7 @@ const PROCEDURES = [_]Entry{
     .{ .name = "chat_history", .func = chat_history.execute },
     .{ .name = "vsearch", .func = vsearch.execute },
     .{ .name = "vsearch_local_raw", .func = vsearch.executeLocalRaw },
-    .{ .name = "vsearch_cluster", .func = vsearch_cluster.execute },
+    .{ .name = "vsearch_cluster", .func = if (cluster_on) vsearch_cluster.execute else clusterUnsupported },
     .{ .name = "vsim", .func = vsim.execute },
     .{ .name = "vinsert", .func = vinsert.execute },
     .{ .name = "vstats", .func = vstats.execute },
@@ -86,11 +94,11 @@ const PROCEDURES = [_]Entry{
     .{ .name = "append_log_claim_status", .func = coordination.statusExecute },
     .{ .name = "append_log_claim_release", .func = coordination.releaseExecute },
     .{ .name = "append_log_claim_supersede", .func = coordination.supersedeExecute },
-    .{ .name = "cluster_presence", .func = cluster_presence.execute },
+    .{ .name = "cluster_presence", .func = if (cluster_on) cluster_presence.execute else clusterUnsupported },
     .{ .name = "proof_prefix_root", .func = proof_prefix_root.execute },
-    .{ .name = "trust_grant", .func = trust_log.grantExecute },
-    .{ .name = "trust_revoke", .func = trust_log.revokeExecute },
-    .{ .name = "trust_fold", .func = trust_log.foldExecute },
+    .{ .name = "trust_grant", .func = if (cluster_on) trust_log.grantExecute else clusterUnsupported },
+    .{ .name = "trust_revoke", .func = if (cluster_on) trust_log.revokeExecute else clusterUnsupported },
+    .{ .name = "trust_fold", .func = if (cluster_on) trust_log.foldExecute else clusterUnsupported },
     .{ .name = "mem_init", .func = memory.memInit },
     .{ .name = "mem_add", .func = memory.memAdd },
     .{ .name = "mem_meta_set", .func = memory.memMetaSet },

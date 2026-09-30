@@ -3,6 +3,7 @@
 //! Binary format with CRC32 verification for crash recovery.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const core = @import("../core/mod.zig");
 
 const WalRecordType = core.types.WalRecordType;
@@ -102,13 +103,54 @@ pub const Wal = struct {
     /// Producer path becomes enqueue-only; this removes file I/O from request critical path.
     pub fn startBackground(self: *Wal) !void {
         if (!self.sync_writes or self.writer_started) return;
+        // A single-threaded build (wasm32) has no thread to hand the queue to. NOT starting the
+        // writer is also the safer path here, and it is the one that preserves the durability
+        // semantics: with writer_started false the producer uses `writeDirect`, which fsyncs
+        // immediately on every record (2e5a914) and sets `sync_failed` when a write or sync
+        // fails so later writes are fenced (a46f517). A queued single-threaded drain would
+        // batch and swallow those failures instead, so the queue is not used at all here.
+        if (build_options.single_threaded) return;
         self.writer_running.store(true, .release);
         self.writer_thread = try std.Thread.spawn(.{}, writerLoop, .{self});
         self.writer_started = true;
     }
 
+    /// Flush everything currently queued, in one batch and one fsync. Only the background
+    /// `writerLoop` uses this: a single-threaded build never starts the writer, so its producer
+    /// takes `writeDirect` and gets an immediate fsync plus the `sync_failed` fence instead of a
+    /// batch that would swallow those failures. Kept as one function so the batching exists in
+    /// exactly one place.
+    pub fn drainOnce(self: *Wal) void {
+        var batch: [64][]u8 = undefined;
+        var batch_count: usize = 0;
+        while (batch_count < 64) {
+            if (self.tryDequeueRecord()) |record| {
+                batch[batch_count] = record;
+                batch_count += 1;
+            } else break;
+        }
+
+        if (batch_count > 0) {
+            for (batch[0..batch_count]) |record| {
+                compat.File.writeAll(self.file, record) catch {};
+                self.allocator.free(record);
+                self.write_count += 1;
+            }
+            // Single fsync for entire batch — key performance win
+            if (self.sync_writes) {
+                compat.File.sync(self.file) catch {};
+            }
+        }
+
+        if (self.sync_requested.swap(false, .acq_rel)) {
+            compat.File.sync(self.file) catch {};
+        }
+    }
+
     pub fn deinit(self: *Wal) void {
-        if (self.writer_started) {
+        // Guarded so the join is not analysed on a single-threaded target: std.Thread.join's
+        // wasm path contains the atomic-wait asm, and no thread exists here to join.
+        if (self.writer_started and !build_options.single_threaded) {
             self.writer_running.store(false, .release);
             if (self.writer_thread) |t| t.join();
             self.writer_thread = null;
@@ -375,35 +417,11 @@ pub const Wal = struct {
 
     fn writerLoop(self: *Wal) void {
         while (self.writer_running.load(.acquire) or self.hasPendingRecords()) {
-            // Drain phase: collect all pending records into a batch
-            var batch: [64][]u8 = undefined;
-            var batch_count: usize = 0;
-            while (batch_count < 64) {
-                if (self.tryDequeueRecord()) |record| {
-                    batch[batch_count] = record;
-                    batch_count += 1;
-                } else break;
-            }
-
-            if (batch_count > 0) {
-                // Write all records in batch
-                for (batch[0..batch_count]) |record| {
-                    compat.File.writeAll(self.file, record) catch {};
-                    self.allocator.free(record);
-                    self.write_count += 1;
-                }
-                // Single fsync for entire batch — key performance win
-                if (self.sync_writes) {
-                    compat.File.sync(self.file) catch {};
-                }
-                // Wake producer in case it was blocked on a full queue
+            if (self.hasPendingRecords() or self.sync_requested.load(.acquire)) {
+                self.drainOnce();
+                // Wake a producer that was blocked on a full queue.
                 _ = self.wake_futex.fetchAdd(1, .release);
                 compat.Futex.wake(&self.wake_futex, 1);
-                continue;
-            }
-
-            if (self.sync_requested.swap(false, .acq_rel)) {
-                compat.File.sync(self.file) catch {};
                 continue;
             }
 
@@ -612,4 +630,64 @@ test "WAL append and replay" {
     const testing = std.testing;
     // TODO: Zig 0.16 test tmpDir API may have changed — re-enable after verifying
     _ = testing;
+}
+
+/// The single-threaded path must keep the durability semantics the threaded path has:
+/// every direct write fsyncs immediately (2e5a914) and a failed write or sync fences all
+/// later writes via `sync_failed` (a46f517). A single-threaded build never starts the
+/// background writer, so these are the properties a wasm build depends on, and they are
+/// asserted here rather than assumed. `_single_threaded` is a comptime parameter so the
+/// same test body runs unchanged whether or not the build is single-threaded.
+fn expectSingleThreadedDurability(comptime _single_threaded: bool) !void {
+    _ = _single_threaded; // the behaviour under test does not depend on the flag, only on writer_started
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try compat.Dir.realPathAlloc(tmp.dir, allocator, ".");
+    defer allocator.free(path);
+    const file = try std.fmt.allocPrint(allocator, "{s}/wal.log", .{path});
+    defer allocator.free(file);
+
+    // Wal.init opens read_write without create, so the log file must exist first.
+    const created = try compat.Dir.createFile(compat.cwd(), file, .{});
+    compat.File.close(created);
+
+    var wal = try Wal.init(allocator, file, true);
+    defer wal.deinit();
+
+    // Not started: this is the state a single-threaded build stays in, because
+    // startBackground returns early there.
+    try testing.expect(!wal.writer_started);
+
+    // A direct write reaches the file and fsyncs immediately, so the bytes are readable
+    // back without any flush step from the test.
+    const ts: Timestamp = 1234;
+    const entry = try wal.appendSet("k", "v", .{ .is_worm = false, .is_deleted = false }, ts);
+    entry.deinit(allocator);
+    allocator.destroy(entry);
+    try testing.expect(wal.write_count == 1);
+    try testing.expect(!wal.sync_failed);
+
+    // Read it back through an ordinary file open, the way the rest of the repo does, so the
+    // check does not depend on a helper compat does not provide.
+    const file_handle = try compat.Dir.openFile(compat.cwd(), file, .{ .mode = .read_only });
+    defer compat.File.close(file_handle);
+    const size = (try compat.File.stat(file_handle)).size;
+    try testing.expect(size > 0);
+
+    // An uncertain sync fences every later write instead of acknowledging it.
+    wal.fail_sync_for_test = true;
+    const failed = wal.appendSet("k2", "v2", .{ .is_worm = false, .is_deleted = false }, ts);
+    try testing.expectError(error.InjectedSyncFailure, failed);
+    try testing.expect(wal.sync_failed);
+    wal.fail_sync_for_test = false;
+
+    const fenced = wal.appendSet("k3", "v3", .{ .is_worm = false, .is_deleted = false }, ts);
+    try testing.expectError(error.WalNeedsRecovery, fenced);
+    try testing.expectError(error.WalNeedsRecovery, wal.sync());
+}
+
+test "single-threaded direct writes fsync immediately and fence uncertain writes" {
+    try expectSingleThreadedDurability(true);
 }

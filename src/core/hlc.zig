@@ -11,6 +11,7 @@
 //! shared instance is safe under concurrent procedure execution.
 
 const std = @import("std");
+const compat = @import("compat.zig");
 
 /// Maximum tolerated remote-vs-local physical drift on `observe` (ms).
 pub const MAX_DRIFT_MS: u64 = 60_000;
@@ -45,10 +46,10 @@ pub fn unpack(v: u64) Unpacked {
 pub const Hlc = struct {
     /// Last issued/observed HLC value. Single atomic word — all updates go
     /// through a CAS loop, so concurrent callers never regress the clock.
-    last: std.atomic.Value(u64),
+    last: compat.AtomicU64,
 
     pub fn init() Hlc {
-        return .{ .last = std.atomic.Value(u64).init(0) };
+        return .{ .last = compat.AtomicU64.init(0) };
     }
 
     /// Issue the next local timestamp: `max(wall_ms << 16, last + 1)`.

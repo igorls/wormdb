@@ -177,19 +177,22 @@ fn putProcErr(bytes: []const u8, out_val: *?[*]u8, out_len: *usize) c_int {
 export fn wormdb_open(dir_ptr: [*:0]const u8, persistence: c_int) ?*Db {
     const dir = std.mem.span(dir_ptr);
 
-    // Ensure the data directory exists (app sandbox dir on mobile).
-    std.Io.Dir.cwd().createDirPath(io(), dir) catch {};
-
-    const wal_path = std.fmt.allocPrint(gpa, "{s}/wormdb.wal", .{dir}) catch return null;
-    errdefer gpa.free(wal_path);
-    const snapshot_path = std.fmt.allocPrint(gpa, "{s}/wormdb.snapshot", .{dir}) catch return null;
-    errdefer gpa.free(snapshot_path);
-
     const mode: PersistenceMode = switch (persistence) {
         PERSIST_FULL => .full,
         PERSIST_SNAPSHOT => .snapshot,
         else => .none,
     };
+
+    // Ensure the data directory exists (app sandbox dir on mobile). Skipped for the
+    // in-memory mode: there is nothing to write, and doing filesystem calls anyway is
+    // what forces a hosted environment (a browser) to implement a filesystem shim it
+    // otherwise would not need.
+    if (mode != .none) std.Io.Dir.cwd().createDirPath(io(), dir) catch {};
+
+    const wal_path = std.fmt.allocPrint(gpa, "{s}/wormdb.wal", .{dir}) catch return null;
+    errdefer gpa.free(wal_path);
+    const snapshot_path = std.fmt.allocPrint(gpa, "{s}/wormdb.snapshot", .{dir}) catch return null;
+    errdefer gpa.free(snapshot_path);
 
     const db = gpa.create(Db) catch return null;
     db.* = .{

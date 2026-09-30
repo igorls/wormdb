@@ -6,43 +6,125 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// True on a target with no atomic instructions wider than 32 bits — wasm32 without the
+/// threads proposal is the case that matters here. `std.atomic.Value(u64)` refuses to
+/// compile there, so u64 state (HLC timestamps, proof counters, publish counts) needs a
+/// guarded fallback rather than a compiler error.
+pub const narrow_atomics = builtin.cpu.arch.isWasm() and !builtin.cpu.has(.wasm, .atomics);
+
+/// True when the target cannot do 64-bit atomics. On wasm that is ALWAYS the case: the
+/// threads proposal gives 32-bit atomic ops (and the wait/wake instructions) but Zig does not
+/// expose 64-bit wasm atomics, so `std.atomic.Value(u64)` is a compile error there either way.
+/// Kept separate from `narrow_atomics`, which is about the wait/wake instructions.
+pub const narrow_u64_atomics = builtin.cpu.arch.isWasm();
+
+/// True on any wasm target. Used to exclude the cluster/server graph, which wasm cannot
+/// compile at all (meshguard's sockets and locks), regardless of whether the atomics feature
+/// is enabled. Distinct from `narrow_atomics`, which is only about the wait instructions.
+pub const wasm_target = builtin.cpu.arch.isWasm();
+
+/// A u64 cell that is a real atomic where the target can do 64-bit atomics, and a
+/// mutex-guarded plain value where it cannot.
+///
+/// Every u64 shared between threads goes through this type so a new call site cannot
+/// reintroduce the compile failure: on wasm32 the operations take a lock, on 64-bit
+/// targets they are exactly the atomic they used to be. The API is deliberately the
+/// subset WormDB uses — load, store, add, and a compare-and-swap loop — not all of
+/// std.atomic, so the fallback stays small and auditable.
+pub const AtomicU64 = if (narrow_u64_atomics) struct {
+    value: u64 = 0,
+    lock: Mutex = .{},
+
+    const Self = @This();
+
+    pub fn init(value: u64) Self {
+        return .{ .value = value };
+    }
+
+    pub fn load(self: *Self, comptime order: std.builtin.AtomicOrder) u64 {
+        _ = order;
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.value;
+    }
+
+    pub fn store(self: *Self, value: u64, comptime order: std.builtin.AtomicOrder) void {
+        _ = order;
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.value = value;
+    }
+
+    /// Returns the value the cell held before the add.
+    pub fn fetchAdd(self: *Self, operand: u64, comptime order: std.builtin.AtomicOrder) u64 {
+        _ = order;
+        self.lock.lock();
+        defer self.lock.unlock();
+        const before = self.value;
+        self.value +%= operand;
+        return before;
+    }
+
+    /// `null` on success, the current value on failure, matching std.atomic's contract so
+    /// a CAS loop written against std.atomic.Value works unchanged.
+    pub fn cmpxchgWeak(self: *Self, expected: u64, new: u64, comptime success: std.builtin.AtomicOrder, comptime fail: std.builtin.AtomicOrder) ?u64 {
+        _ = success;
+        _ = fail;
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.value != expected) return self.value;
+        self.value = new;
+        return null;
+    }
+} else std.atomic.Value(u64);
+
 /// A convenience Mutex wrapper using the global single-threaded Io instance.
 /// In 0.16, std.Io.Mutex.lock/unlock require an Io parameter.
 /// This wrapper provides the old `.lock()` / `.unlock()` API that WormDB uses
 /// extensively in shard mutexes and WAL enqueue protection.
 pub const Mutex = struct {
-    inner: std.Io.Mutex = .init,
+    // On a narrow-atomics target there is nothing to serialise against, and std.Io.Mutex
+    // lowers to an atomic wait instruction wasm does not have, so this is inert there.
+    inner: if (narrow_atomics) struct {} else std.Io.Mutex = if (narrow_atomics) .{} else .init,
 
     pub fn lock(self: *Mutex) void {
+        if (comptime narrow_atomics) return;
         self.inner.lockUncancelable(io());
     }
 
     pub fn unlock(self: *Mutex) void {
+        if (comptime narrow_atomics) return;
         self.inner.unlock(io());
     }
 
     pub fn tryLock(self: *Mutex) bool {
+        if (comptime narrow_atomics) return true;
         return self.inner.tryLock();
     }
 };
 
 /// RwLock compatibility wrapper using the global blocking Io instance.
 pub const RwLock = struct {
-    inner: std.Io.RwLock = .init,
+    // Same as Mutex: inert on a narrow-atomics target.
+    inner: if (narrow_atomics) struct {} else std.Io.RwLock = if (narrow_atomics) .{} else .init,
 
     pub fn lock(self: *RwLock) void {
+        if (comptime narrow_atomics) return;
         self.inner.lockUncancelable(io());
     }
 
     pub fn unlock(self: *RwLock) void {
+        if (comptime narrow_atomics) return;
         self.inner.unlock(io());
     }
 
     pub fn lockShared(self: *RwLock) void {
+        if (comptime narrow_atomics) return;
         self.inner.lockSharedUncancelable(io());
     }
 
     pub fn unlockShared(self: *RwLock) void {
+        if (comptime narrow_atomics) return;
         self.inner.unlockShared(io());
     }
 };
@@ -51,19 +133,27 @@ pub const RwLock = struct {
 /// In 0.16, std.Thread.Futex moved to std.Io.futexWait/futexWake.
 pub const Futex = struct {
     pub fn timedWait(ptr: *std.atomic.Value(u32), expected: u32, timeout_ns: anytype) void {
-        const zio = io();
-        const timeout = std.Io.Timeout{
-            .duration = .{
-                .raw = .fromNanoseconds(@intCast(timeout_ns)),
-                .clock = .awake,
-            },
-        };
-        zio.futexWaitTimeout(u32, &ptr.raw, expected, timeout) catch {};
+        // No atomic wait instruction on wasm, and in a single-threaded build there is no other
+        // thread to wait for. The caller re-checks its condition.
+        // `else` rather than an early return: a comptime `return` still leaves the code after
+        // it analysed, and `futexWaitTimeout` is what emits `memory.atomic.wait32`.
+        if (comptime narrow_atomics) return else {
+            const zio = io();
+            const timeout = std.Io.Timeout{
+                .duration = .{
+                    .raw = .fromNanoseconds(@intCast(timeout_ns)),
+                    .clock = .awake,
+                },
+            };
+            zio.futexWaitTimeout(u32, &ptr.raw, expected, timeout) catch {};
+        }
     }
 
     pub fn wake(ptr: *std.atomic.Value(u32), count: u32) void {
-        const zio = io();
-        zio.futexWake(u32, &ptr.raw, count);
+        if (comptime narrow_atomics) return else {
+            const zio = io();
+            zio.futexWake(u32, &ptr.raw, count);
+        }
     }
 };
 
@@ -393,7 +483,11 @@ pub fn getPeerAddress(handle: std.posix.fd_t) ?net.Address {
 
 /// Networking compatibility layer.
 /// Maps the old std.net.* API to the new std.Io.net.* API.
-pub const net = struct {
+///
+/// Excluded entirely on a narrow-atomics target: `std.Io.net` is socket code, and its lock
+/// internals lower to `memory.atomic.wait32`, which wasm32 has no instruction for. Nothing in
+/// the wasm entry root opens sockets — that is the whole point of the reduced root.
+pub const net = if (wasm_target) struct {} else struct {
     /// Compatibility wrapper for std.net.Address → std.Io.net.IpAddress.
     pub const Address = struct {
         inner: std.Io.net.IpAddress,
@@ -484,6 +578,10 @@ pub const net = struct {
                 var iov = [_][]u8{buf};
                 return zio.vtable.netRead(zio.userdata, handle, &iov);
             }
+            // A wasm target has no sockets and std.posix is a hard compile error there, so this
+            // is compiled out rather than left to fail. Reaching it means socket code ran on a
+            // target without sockets.
+            if (comptime narrow_atomics) return error.UnsupportedOnWasm;
             // POSIX: raw read(2) on the socket fd.
             return std.posix.read(handle, buf);
         }
@@ -547,5 +645,43 @@ pub const net = struct {
         const zio = io();
         const stream = try std.Io.net.IpAddress.connect(&addr.inner, zio, .{ .mode = .stream });
         return .{ .inner = stream };
+    }
+};
+
+/// Stand-in for `cluster.Cluster` on a narrow-atomics target, where the cluster graph is
+/// excluded from the build. A caller only ever holds an optional pointer plus a handful of
+/// methods.
+///
+/// Every method REFUSES. None silently succeeds: a no-op `replicateWrite` would report a
+/// successful replication that never happened, and a zeroed `identityPublicKey` would look
+/// like a real identity. Reaching any of these means a cluster feature was invoked on a target
+/// that has no clustering, and the caller is told so.
+pub const ClusterStub = struct {
+    pub fn identityPublicKey(_: *const ClusterStub) [32]u8 {
+        @panic("cluster identity requested on a target built without clustering");
+    }
+    pub fn signWithIdentity(_: *const ClusterStub, _: []const u8) ![64]u8 {
+        return error.ClusterUnsupportedOnThisTarget;
+    }
+    pub fn replicateWrite(_: *ClusterStub, _: []const u8, _: []const u8, _: bool) !void {
+        return error.ClusterUnsupportedOnThisTarget;
+    }
+    pub fn replicateDelete(_: *ClusterStub, _: []const u8) !void {
+        return error.ClusterUnsupportedOnThisTarget;
+    }
+    pub fn replicateVinsert(_: *ClusterStub, _: anytype) !void {
+        return error.ClusterUnsupportedOnThisTarget;
+    }
+    pub fn replicateVbulkinsert(_: *ClusterStub, _: anytype) !void {
+        return error.ClusterUnsupportedOnThisTarget;
+    }
+    pub fn replicateVdelete(_: *ClusterStub, _: []const u8, _: []const u8) !void {
+        return error.ClusterUnsupportedOnThisTarget;
+    }
+    pub fn replicateVrabitqInstall(_: *ClusterStub, _: anytype) !void {
+        return error.ClusterUnsupportedOnThisTarget;
+    }
+    pub fn requestCheckpointWitnesses(_: *ClusterStub, _: []const u8, _: []const u8) !usize {
+        return error.ClusterUnsupportedOnThisTarget;
     }
 };

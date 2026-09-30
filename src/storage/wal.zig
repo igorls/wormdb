@@ -642,10 +642,13 @@ test "WAL append and replay" {
 /// every direct write fsyncs immediately (2e5a914) and a failed write or sync fences all
 /// later writes via `sync_failed` (a46f517). A single-threaded build never starts the
 /// background writer, so these are the properties a wasm build depends on, and they are
-/// asserted here rather than assumed. `_single_threaded` is a comptime parameter so the
-/// same test body runs unchanged whether or not the build is single-threaded.
-fn expectSingleThreadedDurability(comptime _single_threaded: bool) !void {
-    _ = _single_threaded; // the behaviour under test does not depend on the flag, only on writer_started
+/// asserted here rather than assumed.
+///
+/// There is NO `_single_threaded` parameter. There used to be one, and it was discarded in the
+/// body — so the call site read as if both modes were exercised when only one was, which is the
+/// same shape of problem as the tautological assertion below. What the path actually depends on is
+/// `writer_started`, so that is what the body drives.
+fn expectSingleThreadedDurability() !void {
     const testing = std.testing;
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
@@ -695,7 +698,7 @@ fn expectSingleThreadedDurability(comptime _single_threaded: bool) !void {
 }
 
 test "single-threaded direct writes fsync immediately and fence uncertain writes" {
-    try expectSingleThreadedDurability(true);
+    try expectSingleThreadedDurability();
 }
 
 test "the background writer is used exactly when the build has threads" {
@@ -710,10 +713,11 @@ test "the background writer is used exactly when the build has threads" {
     // threaded build would therefore assert nothing on any target. So the DECISION is extracted as
     // `use_background_writer` and asserted here, which runs and is meaningful on a threaded build:
     const builtin = @import("builtin");
-    try std.testing.expectEqual(!build_options.single_threaded, Wal.use_background_writer);
-    // And it agrees with the flag the rest of the engine reads. If someone re-points the build at a
-    // different condition, these two must not drift: `builtin.single_threaded` is what std.Io and
-    // compat keys off, so a build where they disagree has some code taking the threaded path and
-    // some the single-threaded one.
+    // NOTE: `expectEqual(!build_options.single_threaded, Wal.use_background_writer)` used to sit
+    // here and was TAUTOLOGICAL — `use_background_writer` IS defined as that expression, so it
+    // compared a value to its own definition and could never fail. Removed. What is worth asserting
+    // is the DRIFT check below: `builtin.single_threaded` is what std.Io and compat key off, so a
+    // build where the two disagree would have some code taking the threaded path and some the
+    // single-threaded one.
     try std.testing.expectEqual(!builtin.single_threaded, Wal.use_background_writer);
 }

@@ -148,7 +148,9 @@ pub const Wal = struct {
     }
 
     pub fn deinit(self: *Wal) void {
-        if (self.writer_started) {
+        // Guarded so the join is not analysed on a single-threaded target: std.Thread.join's
+        // wasm path contains the atomic-wait asm, and no thread exists here to join.
+        if (self.writer_started and !build_options.single_threaded) {
             self.writer_running.store(false, .release);
             if (self.writer_thread) |t| t.join();
             self.writer_thread = null;

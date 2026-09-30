@@ -28,6 +28,8 @@
 const std = @import("std");
 const compat = @import("../core/compat.zig");
 const narrow_atomics = compat.narrow_atomics;
+/// The canonical signal: with it set, std.Thread.join/spawn are not analysed.
+const single_threaded = @import("build_options").single_threaded;
 const build_options = @import("build_options");
 const hnsw_mod = @import("hnsw.zig");
 const metric_mod = @import("metric.zig");
@@ -203,7 +205,7 @@ pub const NamespaceIndex = struct {
             q.signal();
             q.unlock();
 
-            if (self.async_worker) |t| t.join();
+            if (!single_threaded) if (self.async_worker) |t| t.join();
 
             // Anything still on the queue at shutdown couldn't be drained
             // (crash-like conditions, or worker failed). Free the owned bytes.
@@ -255,18 +257,23 @@ pub const NamespaceIndex = struct {
 
         // A single-threaded build (wasm32) has no worker to drain the queue, so the
         // caller falls back to synchronous inserts instead of a queue that never runs.
-        if (build_options.single_threaded) return error.AsyncUnsupported;
+        // The `else` is load-bearing: std.Thread.spawn below is a COMPILE error in
+        // single-threaded mode merely by being analysed, so a runtime `return` would not
+        // keep it out of the build. Only the else-branch is analysed.
+        if (comptime build_options.single_threaded) {
+            return error.AsyncUnsupported;
+        } else {
+            const queue = try self.allocator.create(AsyncQueue);
+            errdefer self.allocator.destroy(queue);
+            queue.* = .{};
 
-        const queue = try self.allocator.create(AsyncQueue);
-        errdefer self.allocator.destroy(queue);
-        queue.* = .{};
-
-        const worker = try std.Thread.spawn(.{}, asyncWorkerLoop, .{self});
-        // Spawn succeeded — publish queue + flag + handle in one burst, then
-        // flip async_mode last so enqueue paths can read queue without races.
-        self.async_queue = queue;
-        self.async_worker = worker;
-        @atomicStore(bool, &self.async_mode, true, .release);
+            const worker = try std.Thread.spawn(.{}, asyncWorkerLoop, .{self});
+            // Spawn succeeded — publish queue + flag + handle in one burst, then
+            // flip async_mode last so enqueue paths can read queue without races.
+            self.async_queue = queue;
+            self.async_worker = worker;
+            @atomicStore(bool, &self.async_mode, true, .release);
+        }
     }
 
     /// Enqueue a pending insert for the background worker. Caller passes

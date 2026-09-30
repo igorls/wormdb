@@ -219,7 +219,12 @@ int wormdb_exec(wormdb_Db *db,
 /* Delete key (missing keys succeed; WORM keys return WORMDB_ERR). */
 int wormdb_delete(wormdb_Db *db, const unsigned char *key, size_t key_len);
 
-/* Release a buffer returned by wormdb_get, wormdb_exec, or proof builders. */
+/* Allocate a host buffer the engine owns and will not move across a call: the WASM smoke tests use it
+ * so their buffers come from the module's allocator instead of an offset the module never allocated.
+ * Release with wormdb_free. Exported natively too, so a C host can do the same. */
+unsigned char *wormdb_alloc(size_t len);
+
+/* Release a buffer returned by wormdb_get, wormdb_exec, wormdb_alloc, or proof builders. */
 void wormdb_free(unsigned char *ptr, size_t len);
 
 /* Static version string (do not free). */

@@ -79,11 +79,14 @@ pub const registry = @This();
 /// ffi.zig names this under `procedures.`, so mirror it on the reduced root.
 pub const context = @import("context.zig");
 
-/// Comptime guard: an allowlisted procedure must not reach `cluster`. If one starts to, this
-/// is a compile error rather than a link failure somewhere further out, and it names the
-/// offender. The check reads each module's own declaration list, so it holds for the graph as
-/// written rather than for the imports I happened to review.
 /// Look up a procedure by name. O(n) scan — n is tiny.
+///
+/// There is NO comptime cluster guard here, and there should not be a claim of one: Zig cannot inspect
+/// another module's import graph at comptime, which is exactly why `scripts/check-wasm-allowlist.zig`
+/// exists as a BUILD STEP. The allowlist is enforced by that script walking the checked files and
+/// failing the build on a `cluster`/`meshguard`/`net` import; a comment promising a language-level
+/// guard that does not exist is worse than no comment, because it tells a reader the property is
+/// already held. (An earlier draft of this file claimed the guard; it was removed for that reason.)
 pub fn lookup(name: []const u8) ?ProcedureFn {
     for (&PROCEDURES) |*entry| {
         if (std.mem.eql(u8, entry.name, name)) return entry.func;

@@ -82,11 +82,13 @@ identity.
 
 - the key/value engine: put, get, scan, transfer, increment, delete
 - WAL durability, **with a caveat the code states plainly**: on a single-threaded build the
-  group-commit thread is not started and the producer writes directly instead of queueing. The
-  durability of that path is NOT asserted here: `drainOnce` writes with `writeAll(...) catch {}`
-  and never sets the sync-failure flag, so a failed write or sync is swallowed rather than reported
-  (this is pre-existing behaviour, not a wasm-specific problem, and the threaded path shares the
-  swallowing). Treat the wasm WAL as unproven for durability purposes until that is fixed.
+  group-commit thread is not started (`use_background_writer = !build_options.single_threaded`) and the
+  producer writes directly instead of queueing. What the wasm target actually gets is `writeDirect`,
+  which does `try writeAll` and `try sync` and sets `sync_failed` through an `errdefer`, so a failed
+  write or sync IS reported on that path — the swallowed-error behaviour belongs to `drainOnce`, the
+  THREADED path, not this one. The real wasm caveat is narrower and is about the HOST: the WASI shim
+  stubs `fd_sync` to `ENOSYS`, and the WAL has never actually run under wasm, so treat its durability
+  as unproven on that target until a host performs a real sync.
 - snapshots and the storage engine
 - the vector index: insert, search, delete, stats, rebuild
 - the append log and its verification
@@ -109,7 +111,7 @@ procedure") whereas a wrongly-listed one would misbehave at runtime:
 | Omitted | Why |
 | --- | --- |
 | `cluster_presence`, `vsearch_cluster`, `trust_grant`, `trust_revoke`, `trust_fold` | need cluster/meshguard |
-| `append_log_witness*` (4), `append_log_claim*` (5), `append_log_mmr_proof`, `append_log_mmr_verify`, `append_log_proof_bundle`, `append_log_proof_verify`, `append_log_checkpoint`, `auth_mint_scoped`, `proof_prefix_root`, `mem_init`, `mem_add`, `mem_bulk_add`, `mem_meta_set`, `mem_get`, `mem_query`, `std` | unverified on wasm; adding one means proving it does not reach the socket or cluster graph |
+| `append_log_witness*` (4), `append_log_claim*` (4), `append_log_mmr_proof`, `append_log_mmr_verify`, `append_log_proof_bundle`, `append_log_proof_verify`, `append_log_checkpoint`, `auth_mint_scoped`, `proof_prefix_root`, `mem_init`, `mem_add`, `mem_bulk_add`, `mem_meta_set`, `mem_get`, `mem_query` | unverified on wasm; adding one means proving it does not reach the socket or cluster graph (`std` is not a procedure — an earlier draft listed it here, but it is an import, not an entry in either registry) |
 
 That distinction matters: "absent because it needs a cluster" and "absent because nobody has checked
 it yet" are different claims, and only the first is a property of the target.

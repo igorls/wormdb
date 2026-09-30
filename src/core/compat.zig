@@ -144,8 +144,11 @@ pub const Futex = struct {
     pub fn timedWait(ptr: *std.atomic.Value(u32), expected: u32, timeout_ns: anytype) void {
         // No atomic wait instruction on wasm, and in a single-threaded build there is no other
         // thread to wait for. The caller re-checks its condition.
-        // `else` rather than an early return: a comptime `return` still leaves the code after
-        // it analysed, and `futexWaitTimeout` is what emits `memory.atomic.wait32`.
+        // `else` rather than an early return, and that is load-bearing: a RUNTIME `return` would
+        // leave the code after it analysed anyway. What actually keeps `futexWaitTimeout` (which
+        // emits `memory.atomic.wait32`) out of the build is that the condition is `comptime`, so the
+        // else-branch is not analysed at all on this target. The two facts are different — the
+        // `comptime` is the mechanism, the `else` is what makes the choice explicit.
         if (comptime narrow_atomics) return else {
             const zio = io();
             const timeout = std.Io.Timeout{

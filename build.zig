@@ -119,9 +119,7 @@ pub fn build(b: *std.Build) void {
     // the same backend linkCrypto wires for. Shared with the wormdb module too.
     build_options.addOption(bool, "use_libsodium", use_libsodium);
     // WebAssembly has no threads without the atomics/bulk-memory proposals, so a wasm
-    // target must not spawn workers or use 64-bit atomics. Exposed as an explicit
-    // single_threaded is derived above from the same condition the modules use, so the two can
-    // never disagree. See src/vector/index.zig and src/event/bus.zig.
+    // target must not spawn workers or use 64-bit atomics.
     // Derived, NOT overridable, and that is a correctness fix rather than tidiness. The flag means
     // "this build has no threads and no 64-bit atomics" — both facts follow from the target, and
     // `builtin.single_threaded` (which the module's `.single_threaded` sets below) already derives
@@ -313,6 +311,10 @@ pub fn build(b: *std.Build) void {
         wasm_exe.entry = .disabled;
         wasm_exe.rdynamic = true;
         const wasm_install = b.addInstallArtifact(wasm_exe, .{});
+        // The allowlist gate runs BEFORE the artifact is installed, not merely somewhere in the same
+        // step. As siblings (wasm_install and check both hanging off wasm_step) the install could
+        // complete first, so a failing check still left a .wasm in zig-out for a host to load.
+        wasm_install.step.dependOn(&check.step);
 
         const wasm_step = b.step("wasm", "Build the browser-loadable wasm module (exported FFI, reactor)");
         wasm_step.dependOn(&wasm_install.step);

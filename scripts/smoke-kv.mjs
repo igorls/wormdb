@@ -108,7 +108,9 @@ const p3 = scratch(), l3 = scratch();
 check(ex.wormdb_get(db, k.ptr, k.len, p3, l3) === 0 && readOut(p3, l3) === "updated!", "the overwrite is visible");
 check(ex.wormdb_delete(db, k.ptr, k.len) === 0, "wormdb_delete returns 0");
 const p4 = scratch(), l4 = scratch();
-check(ex.wormdb_get(db, k.ptr, k.len, p4, l4) !== 0, "a deleted key is not found");
+// A deleted key must report NOT FOUND specifically. `!== 0` would also pass on an internal error,
+// which is the difference between "the delete worked" and "the store is broken" — so require the code.
+check(ex.wormdb_get(db, k.ptr, k.len, p4, l4) === 1, "a deleted key is not found (NOT_FOUND)", `rc=${ex.wormdb_get(db, k.ptr, k.len, p4, l4)}`);
 
 check((ex.wormdb_close(db), true), "wormdb_close does not throw");
 finish();

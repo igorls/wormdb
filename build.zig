@@ -242,6 +242,21 @@ pub fn build(b: *std.Build) void {
     // targets (iOS) where the standalone exe can't link libSystem without the SDK,
     // but the static lib compiles fine with `--sysroot $(xcrun --show-sdk-path)`.
     const ffi_step = b.step("ffi", "Build only the embedding FFI library (libwormdb_ffi)");
+    // On the reduced (wasm) root, prove the allowlist stays free of the cluster/server graph
+    // before linking. Zig cannot inspect a module's imports at comptime, so this is a build
+    // step; it fails the build and names the file, wired here so it cannot be skipped.
+    if (narrow_target) {
+        const check = b.addRunArtifact(b.addExecutable(.{
+            .name = "check-wasm-allowlist",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("scripts/check-wasm-allowlist.zig"),
+                .target = b.graph.host,
+                .optimize = .Debug,
+            }),
+        }));
+        check.setCwd(b.path("."));
+        ffi_step.dependOn(&check.step);
+    }
     ffi_step.dependOn(&b.addInstallArtifact(ffi_lib, .{}).step);
 
     // Unit tests for the engine.

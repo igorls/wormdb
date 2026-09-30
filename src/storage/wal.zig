@@ -3,6 +3,7 @@
 //! Binary format with CRC32 verification for crash recovery.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const core = @import("../core/mod.zig");
 
 const WalRecordType = core.types.WalRecordType;
@@ -102,9 +103,43 @@ pub const Wal = struct {
     /// Producer path becomes enqueue-only; this removes file I/O from request critical path.
     pub fn startBackground(self: *Wal) !void {
         if (!self.sync_writes or self.writer_started) return;
+        // A single-threaded build (wasm32) has no thread to hand the queue to. The queue is
+        // still flushed — `drainOnce` is called on the producer path — so durability does not
+        // depend on a background thread existing. See `drainOnce`.
+        if (build_options.single_threaded) return;
         self.writer_running.store(true, .release);
         self.writer_thread = try std.Thread.spawn(.{}, writerLoop, .{self});
         self.writer_started = true;
+    }
+
+    /// Flush everything currently queued, in one batch and one fsync. The background
+    /// `writerLoop` runs this in a loop; a single-threaded build calls it directly so the
+    /// WAL still reaches disk without a worker thread.
+    pub fn drainOnce(self: *Wal) void {
+        var batch: [64][]u8 = undefined;
+        var batch_count: usize = 0;
+        while (batch_count < 64) {
+            if (self.tryDequeueRecord()) |record| {
+                batch[batch_count] = record;
+                batch_count += 1;
+            } else break;
+        }
+
+        if (batch_count > 0) {
+            for (batch[0..batch_count]) |record| {
+                compat.File.writeAll(self.file, record) catch {};
+                self.allocator.free(record);
+                self.write_count += 1;
+            }
+            // Single fsync for entire batch — key performance win
+            if (self.sync_writes) {
+                compat.File.sync(self.file) catch {};
+            }
+        }
+
+        if (self.sync_requested.swap(false, .acq_rel)) {
+            compat.File.sync(self.file) catch {};
+        }
     }
 
     pub fn deinit(self: *Wal) void {
@@ -375,35 +410,11 @@ pub const Wal = struct {
 
     fn writerLoop(self: *Wal) void {
         while (self.writer_running.load(.acquire) or self.hasPendingRecords()) {
-            // Drain phase: collect all pending records into a batch
-            var batch: [64][]u8 = undefined;
-            var batch_count: usize = 0;
-            while (batch_count < 64) {
-                if (self.tryDequeueRecord()) |record| {
-                    batch[batch_count] = record;
-                    batch_count += 1;
-                } else break;
-            }
-
-            if (batch_count > 0) {
-                // Write all records in batch
-                for (batch[0..batch_count]) |record| {
-                    compat.File.writeAll(self.file, record) catch {};
-                    self.allocator.free(record);
-                    self.write_count += 1;
-                }
-                // Single fsync for entire batch — key performance win
-                if (self.sync_writes) {
-                    compat.File.sync(self.file) catch {};
-                }
-                // Wake producer in case it was blocked on a full queue
+            if (self.hasPendingRecords() or self.sync_requested.load(.acquire)) {
+                self.drainOnce();
+                // Wake a producer that was blocked on a full queue.
                 _ = self.wake_futex.fetchAdd(1, .release);
                 compat.Futex.wake(&self.wake_futex, 1);
-                continue;
-            }
-
-            if (self.sync_requested.swap(false, .acq_rel)) {
-                compat.File.sync(self.file) catch {};
                 continue;
             }
 

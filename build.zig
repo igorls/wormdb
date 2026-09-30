@@ -245,7 +245,10 @@ pub fn build(b: *std.Build) void {
     // On the reduced (wasm) root, prove the allowlist stays free of the cluster/server graph
     // before linking. Zig cannot inspect a module's imports at comptime, so this is a build
     // step; it fails the build and names the file, wired here so it cannot be skipped.
-    if (narrow_target) {
+    // Keyed on the TARGET being wasm, not on narrow_target: the reduced root is used whenever
+    // the atomics feature is off, and a +atomics build would skip the check entirely if this
+    // were gated on narrow_target.
+    if (target.result.cpu.arch.isWasm()) {
         const check = b.addRunArtifact(b.addExecutable(.{
             .name = "check-wasm-allowlist",
             .root_module = b.createModule(.{
@@ -255,6 +258,10 @@ pub fn build(b: *std.Build) void {
             }),
         }));
         check.setCwd(b.path("."));
+        // The checker reads 23 source files but Zig caches a Run step on its argv alone, so it
+        // would be skipped whenever only a scanned file changed — which is every real
+        // violation. Declaring the side effect forces it to run each time.
+        check.has_side_effects = true;
         ffi_step.dependOn(&check.step);
     }
     ffi_step.dependOn(&b.addInstallArtifact(ffi_lib, .{}).step);

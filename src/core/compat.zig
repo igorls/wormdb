@@ -6,6 +6,67 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// True on a target with no atomic instructions wider than 32 bits — wasm32 without the
+/// threads proposal is the case that matters here. `std.atomic.Value(u64)` refuses to
+/// compile there, so u64 state (HLC timestamps, proof counters, publish counts) needs a
+/// guarded fallback rather than a compiler error.
+pub const narrow_atomics = builtin.cpu.arch.isWasm() and !builtin.cpu.has(.wasm, .atomics);
+
+/// A u64 cell that is a real atomic where the target can do 64-bit atomics, and a
+/// mutex-guarded plain value where it cannot.
+///
+/// Every u64 shared between threads goes through this type so a new call site cannot
+/// reintroduce the compile failure: on wasm32 the operations take a lock, on 64-bit
+/// targets they are exactly the atomic they used to be. The API is deliberately the
+/// subset WormDB uses — load, store, add, and a compare-and-swap loop — not all of
+/// std.atomic, so the fallback stays small and auditable.
+pub const AtomicU64 = if (narrow_atomics) struct {
+    value: u64 = 0,
+    lock: Mutex = .{},
+
+    const Self = @This();
+
+    pub fn init(value: u64) Self {
+        return .{ .value = value };
+    }
+
+    pub fn load(self: *Self, comptime order: std.builtin.AtomicOrder) u64 {
+        _ = order;
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.value;
+    }
+
+    pub fn store(self: *Self, value: u64, comptime order: std.builtin.AtomicOrder) void {
+        _ = order;
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.value = value;
+    }
+
+    /// Returns the value the cell held before the add.
+    pub fn fetchAdd(self: *Self, operand: u64, comptime order: std.builtin.AtomicOrder) u64 {
+        _ = order;
+        self.lock.lock();
+        defer self.lock.unlock();
+        const before = self.value;
+        self.value +%= operand;
+        return before;
+    }
+
+    /// `null` on success, the current value on failure, matching std.atomic's contract so
+    /// a CAS loop written against std.atomic.Value works unchanged.
+    pub fn cmpxchgWeak(self: *Self, expected: u64, new: u64, comptime success: std.builtin.AtomicOrder, comptime fail: std.builtin.AtomicOrder) ?u64 {
+        _ = success;
+        _ = fail;
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.value != expected) return self.value;
+        self.value = new;
+        return null;
+    }
+} else std.atomic.Value(u64);
+
 /// A convenience Mutex wrapper using the global single-threaded Io instance.
 /// In 0.16, std.Io.Mutex.lock/unlock require an Io parameter.
 /// This wrapper provides the old `.lock()` / `.unlock()` API that WormDB uses

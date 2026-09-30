@@ -27,6 +27,7 @@
 //! peer holding the log can independently derive the active capability set.
 
 const std = @import("std");
+const compat = @import("../core/compat.zig");
 const Store = @import("../storage/store.zig").Store;
 const append_log = @import("append_log.zig");
 
@@ -54,7 +55,7 @@ pub const LOG_ID_PREFIX: []const u8 = "trust:";
 /// (see cluster/org_trust.zig DynamicTrust) is invalidated immediately
 /// instead of waiting out the ≤5s TTL — a locally-observed revocation takes
 /// effect on the very next authorization check.
-pub var fold_generation = std.atomic.Value(u64).init(0);
+pub var fold_generation = compat.AtomicU64.init(0);
 
 pub fn foldGeneration() u64 {
     return fold_generation.load(.acquire);

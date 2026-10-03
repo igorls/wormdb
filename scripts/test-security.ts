@@ -2,7 +2,7 @@
 import { strict as assert } from "node:assert";
 import { spawn } from "node:child_process";
 import { generateKeyPairSync, sign } from "node:crypto";
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, writeFile, rm, stat, rename, readFile, mkdir } from "node:fs/promises";
 import { createConnection, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -87,21 +87,43 @@ async function port() {
   await new Promise<void>(r => server.close(() => r()));
   return value;
 }
-async function withServer(config: object, action: (tcp: number, ws: number) => Promise<void>, persistence = "none", extraArgs: string[] = []) {
+async function withServer(config: object, action: (tcp: number, ws: number, dir: string, restart: () => Promise<void>) => Promise<void>, persistence = "none", extraArgs: string[] = [], configOnly = false) {
   const dir = await mkdtemp(join(tmpdir(), "wormdb-security-"));
   const tcp = await port(), ws = await port();
-  await writeFile(join(dir, "config.json"), JSON.stringify(config));
-  const child = spawn(binary, ["--config", join(dir, "config.json"), "--data", join(dir, "data"), "--port", String(tcp), "--gateway-port", String(ws), "--persistence", persistence, ...extraArgs], { cwd: dir, stdio: ["ignore", "ignore", "pipe"] });
-  let logs = ""; child.stderr!.on("data", b => { logs += b; });
+  const fileConfig = configOnly ? {
+    ...config,
+    data: join(dir, "data"),
+    server: { ...(config as any).server, port: tcp },
+    gateway: { ...(config as any).gateway, enabled: true, port: ws },
+    store: { ...(config as any).store, persistence },
+  } : config;
+  await writeFile(join(dir, "config.json"), JSON.stringify(fileConfig));
+  const flags = configOnly ? [] : ["--data", join(dir, "data"), "--port", String(tcp), "--gateway-port", String(ws), "--persistence", persistence];
+  const launch = () => spawn(binary, ["--config", join(dir, "config.json"), ...flags, ...extraArgs], { cwd: dir, stdio: ["ignore", "ignore", "pipe"] });
+  let child = launch();
+  let logs = "";
   let spawnError: Error | undefined;
-  const exited = new Promise<void>(r => { child.once("exit", () => r()); child.once("error", e => { spawnError = e; r(); }); });
-  try {
+  const observe = () => {
+    child.stderr!.on("data", b => { logs += b; });
+    return new Promise<void>(r => { child.once("exit", () => r()); child.once("error", e => { spawnError = e; r(); }); });
+  };
+  let exited = observe();
+  const ready = async () => {
     const end = Date.now() + 6000;
     while (!logs.includes("WormDB listening") || !logs.includes("Gateway listening")) {
       if (spawnError || child.exitCode !== null || Date.now() > end) throw new Error(`startup failed: ${spawnError ?? logs}`);
       await delay(15);
     }
-    try { await action(tcp, ws); } catch (e) { throw new Error(`${e}\nServer: ${logs}`); }
+  };
+  const restart = async () => {
+    child.kill(); await exited;
+    logs = ""; spawnError = undefined;
+    child = launch(); exited = observe();
+    await ready();
+  };
+  try {
+    await ready();
+    try { await action(tcp, ws, dir, restart); } catch (e) { throw new Error(`${e}\nServer: ${logs}`); }
   } finally {
     child.kill(); await exited;
     await rm(dir, { recursive: true, force: true }); // only our mkdtemp fixture
@@ -113,6 +135,96 @@ const settings = (auth: object, server = {}, gateway = {}) => ({
 });
 const tests: Array<[string, () => Promise<void>]> = [];
 function test(name: string, fn: () => Promise<void>) { tests.push([name, fn]); }
+
+for (const mode of ["full", "snapshot"]) test(`config-only ${mode} startup honors paths and restart recovery`, () => withServer({
+  ...settings({ require_auth: true, public_keys: [publicKey] }),
+  store: { wal_path: "logs/custom.wal", snapshot_path: "snapshots/custom.snapshot", max_wal_size: 12345 },
+}, async (tcp, _ws, dir, restart) => {
+  let p = await connect(tcp);
+  try {
+    p.socket.write("WW");
+    assert.equal((await p.request(set())).code, 3);
+    assert.equal((await p.request(frame(12, field(admin)))).code, 0);
+    assert.equal((await p.request(set())).code, 0);
+    assert.equal((await p.request(frame(11))).code, 0);
+    const wal = await stat(join(dir, "data", "logs", "custom.wal")).catch(() => null);
+    assert.equal(wal?.isFile() ?? false, mode === "full");
+    assert.ok((await stat(join(dir, "data", "snapshots", "custom.snapshot"))).size > 0);
+    assert.equal(await stat(join(dir, "wormdb.snapshot")).catch(() => null), null);
+    p.close();
+    await restart();
+    p = await connect(tcp); p.socket.write("WW");
+    assert.equal((await p.request(frame(12, field(admin)))).code, 0);
+    assert.equal((await p.request(frame(1, field("tenant:k")))).body.toString(), "value");
+    if (mode === "snapshot") {
+      // An explicit absolute legacy path remains a supported upgrade route.
+      p.close();
+      const legacy = join(dir, "wormdb.snapshot");
+      await rename(join(dir, "data", "snapshots", "custom.snapshot"), legacy);
+      const configPath = join(dir, "config.json");
+      const updated = JSON.parse(await readFile(configPath, "utf8"));
+      updated.store.snapshot_path = legacy;
+      await writeFile(configPath, JSON.stringify(updated));
+      await restart();
+      p = await connect(tcp); p.socket.write("WW");
+      assert.equal((await p.request(frame(12, field(admin)))).code, 0);
+      assert.equal((await p.request(frame(1, field("tenant:k")))).body.toString(), "value");
+    }
+  } finally { p.close(); }
+}, mode, [], true));
+
+test("CLI TCP opt-out preserves gateway auth and explicit re-enable wins", async () => {
+  for (const enabled of [false, true]) await withServer(settings({ require_auth: true }), async (tcp, ws) => {
+    const p = await connect(tcp), w = await wsConnect(ws);
+    try {
+      p.socket.write("WW");
+      assert.equal((await p.request(set())).code, enabled ? 3 : 0);
+      assert.equal((await w.ws(set())).code, 3);
+    } finally { p.close(); w.close(); }
+  }, "none", enabled ? ["--no-auth", "--no-tcp-auth", "--require-auth", "--tcp-auth"] : ["--no-tcp-auth"]);
+});
+
+test("CLI threadpool overrides an unsupported configured backend", () => withServer(
+  settings({ require_auth: true }, { backend: "epoll" }), async tcp => {
+    const p = await connect(tcp);
+    try { p.socket.write("WW"); assert.equal((await p.request(set())).code, 3); }
+    finally { p.close(); }
+  }, "none", ["--backend", "threadpool"]));
+
+test("unsupported backends and legacy snapshots reject startup before data creation", async () => {
+  const cases = [
+    { backend: "epoll", flags: [] }, { backend: "uring", flags: [] },
+    { backend: "threadpool", flags: ["--backend", "epoll"] },
+    { backend: "threadpool", flags: ["--backend", "uring"] },
+    { backend: "threadpool", flags: [], legacy: true },
+    { backend: "threadpool", flags: [], legacy: true, snapshot: "nested/custom.snapshot" },
+    { backend: "threadpool", flags: [], legacy: true, snapshot: "absolute" },
+    { backend: "threadpool", flags: [], legacyWal: true },
+    { backend: "threadpool", flags: [], legacyWal: true, mode: "snapshot" },
+    { backend: "threadpool", flags: [], legacyWal: true, mode: "none" },
+  ];
+  for (const entry of cases) {
+    const dir = await mkdtemp(join(tmpdir(), "wormdb-startup-invalid-"));
+    const data = join(dir, "must-not-exist");
+    const snapshot_path = entry.snapshot === "absolute" ? join(dir, "custom.snapshot") : entry.snapshot;
+    await writeFile(join(dir, "config.json"), JSON.stringify({ data, server: { backend: entry.backend }, store: { snapshot_path, persistence: entry.mode } }));
+    if (entry.legacy) await writeFile(join(dir, "wormdb.snapshot"), "legacy sentinel");
+    if (entry.legacyWal) {
+      await mkdir(join(dir, "data"));
+      await writeFile(join(dir, "data", "wormdb.wal"), "legacy WAL sentinel");
+    }
+    const child = spawn(binary, ["--config", join(dir, "config.json"), ...entry.flags], { cwd: dir, stdio: ["ignore", "ignore", "pipe"] });
+    let logs = ""; child.stderr!.on("data", b => { logs += b; });
+    const exited = new Promise<number | null>((r, reject) => { child.once("exit", r); child.once("error", reject); });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const code = await Promise.race([exited, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("invalid startup stayed running")), 5000); })]);
+      assert.notEqual(code, 0);
+      assert.match(logs, entry.legacy ? /LegacySnapshotPath/ : entry.mode ? /LegacyWalMode/ : entry.legacyWal ? /LegacyWalPath/ : /UnsupportedBackend/);
+      assert.equal(await stat(data).catch(() => null), null);
+    } finally { clearTimeout(timer); child.kill(); await exited; await rm(dir, { recursive: true, force: true }); }
+  }
+});
 
 test("invalid keys and zero resource limits reject startup", async () => {
   const cases = [

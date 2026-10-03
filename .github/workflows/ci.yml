@@ -65,6 +65,9 @@ jobs:
       - name: zig build wasm-smoke (module + allowlist walk + FFI smoke)
         run: zig build wasm-smoke -Dtarget=wasm32-wasi
 
+      - name: Standalone startup and security regressions
+        run: bun run scripts/test-security.ts zig-out/bin/wormdb${{ runner.os == 'Windows' && '.exe' || '' }}
+
   client:
     name: Bun client
     runs-on: ubuntu-latest

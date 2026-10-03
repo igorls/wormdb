@@ -361,6 +361,8 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_ffi_tests.step);
+    const main_tests = b.addTest(.{ .root_module = exe_mod });
+    test_step.dependOn(&b.addRunArtifact(main_tests).step);
     // The wasm allowlist checker's own tests (gating, comments, resolved paths) run with the rest, on every
     // target, so a change that weakens the checker fails `zig build test` and not only a wasm build.
     const checker_tests = b.addTest(.{ .root_module = b.createModule(.{

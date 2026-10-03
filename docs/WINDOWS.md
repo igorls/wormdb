@@ -37,9 +37,10 @@ zig build test                  # full unit suite
 zig-out\bin\wormdb.exe --config examples/local.json --port 6389 --data .\data
 ```
 
-The stock standalone executable uses the threadpool backend and does not expose
-a `--backend` option. The engine's `io_uring` and `epoll` implementations are
-Linux-only; check the composition root when embedding a different backend.
+The stock standalone executable accepts `--backend threadpool`. Other backends
+are rejected before startup on every platform. The engine's `io_uring` and
+`epoll` implementations are Linux-only and lack TCP AUTH handling; check the
+composition root when embedding a different backend.
 
 ## How the port works
 

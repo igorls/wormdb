@@ -70,9 +70,13 @@ module's imports at comptime**, so there is no language-level check: what enforc
 `scripts/check-wasm-allowlist.zig`, run as a build step by `zig build wasm`, `wasm-smoke` and `ffi`
 on a wasm target, which walks the import graph from `src/wasm_root.zig` and fails the build, naming
 the file and line, if anything the wasm target compiles imports the cluster or socket-bearing files
-(matched on the resolved path) or the `meshguard` module. A gated import,
-`if (…wasm_target) A else B` on one line, is skipped only in the branch a wasm target doesn't compile;
-comments are stripped first, and any other shape is checked in full. Its own tests run in
+(matched on the resolved path) or the `meshguard` module. Zig's parser identifies imports and
+conditional branches, including nested expressions, multiline imports and escaped paths.
+Only `wasm_target`, `compat.wasm_target` and `@import("../core/compat.zig").wasm_target`,
+optionally negated once, select a branch. Other conditions inspect both branches.
+Unreadable files, malformed source and computed import paths fail the check. This is a
+conservative syntax check: the named predicates must retain their existing wasm meaning.
+Its own tests run in
 `zig build test`. Procedures that need clustering are **absent**
 rather than stubbed: asking for one returns "unknown procedure", which is honest. Where the
 shared `context.zig` still needs a `Cluster` type, `compat.ClusterStub` stands in and **every

@@ -13,10 +13,10 @@
 //! GATES ARE RESPECTED PER EDGE. The reduced root exists because some imports are written
 //! `if (@import("../core/compat.zig").wasm_target) A else B` (see procedures/context.zig). On a wasm
 //! target `A` is compiled and `B` is not, so imports in `B` are skipped and imports in the
-//! condition and in `A` are walked and checked. A negated condition (`if (!…wasm_target)`) swaps
-//! the branches. Comments are stripped first, so a comment mentioning `wasm_target` gates nothing.
-//! A line that mentions `wasm_target` in any other shape gates nothing either: its imports are all
-//! checked, which fails closed.
+//! condition and in `A` are walked and checked. Only exact supported predicates (optionally
+//! negated once) select a branch. Zig's parser supplies branch spans and import tokens across
+//! whitespace and newlines; strings and comments cannot impersonate code. Unknown conditions
+//! inspect both branches. Unreadable files, malformed source and computed import paths fail closed.
 //!
 //! FORBIDDEN TARGETS are matched on the RESOLVED path (so `cluster/mod.zig` from `src/` or
 //! `./../cluster/x.zig` can't slip past a string match), plus the `meshguard` module by name.
@@ -44,109 +44,77 @@ const forbidden_files = [_][]const u8{
 /// Named modules (not files) the wasm graph must never import.
 const forbidden_modules = [_][]const u8{"meshguard"};
 
-/// The marker a gated condition carries.
-const gate_marker = "wasm_target";
-
-/// Removes a `//` comment that isn't inside a string literal.
-fn stripComment(line: []const u8) []const u8 {
-    var in_string = false;
-    var i: usize = 0;
-    while (i < line.len) : (i += 1) {
-        const c = line[i];
-        if (in_string) {
-            if (c == '\\') {
-                i += 1;
-            } else if (c == '"') {
-                in_string = false;
-            }
-        } else if (c == '"') {
-            in_string = true;
-        } else if (c == '/' and i + 1 < line.len and line[i + 1] == '/') {
-            return line[0..i];
-        }
-    }
-    return line;
-}
-
-const Span = struct {
-    start: usize,
-    end: usize,
-    fn contains(self: Span, at: usize) bool {
-        return at >= self.start and at < self.end;
-    }
-};
-
-/// A one-line `if (<cond with wasm_target>) <then> else <else>` expression.
-const Gate = struct { cond: Span, then_: Span, else_: Span, negated: bool };
-
-/// Finds the first `if (` whose condition mentions `wasm_target`, with both branches on this line.
-fn findGate(code: []const u8) ?Gate {
-    var search: usize = 0;
-    while (std.mem.indexOfPos(u8, code, search, "if (")) |at| {
-        search = at + 1;
-        // `if` must be a word of its own, not the tail of an identifier.
-        if (at > 0 and (std.ascii.isAlphanumeric(code[at - 1]) or code[at - 1] == '_')) continue;
-        const open = at + 3;
-        const close = matchingParen(code, open) orelse return null;
-        const cond = Span{ .start = open + 1, .end = close };
-        if (std.mem.indexOf(u8, code[cond.start..cond.end], gate_marker) == null) continue;
-        const else_at = std.mem.indexOfPos(u8, code, close, " else ") orelse return null;
-        const end = std.mem.indexOfScalarPos(u8, code, else_at, ';') orelse code.len;
-        const negated = std.mem.startsWith(u8, std.mem.trimStart(u8, code[cond.start..cond.end], " "), "!");
-        return .{ .cond = cond, .then_ = .{ .start = close + 1, .end = else_at }, .else_ = .{ .start = else_at + 6, .end = end }, .negated = negated };
+/// Only these exact predicates have a known value on the wasm target. Treat
+/// comparisons, compound expressions and unrelated identifiers as unknown.
+fn gateNegated(condition: []const u8) ?bool {
+    var predicate = std.mem.trim(u8, condition, " \t\r");
+    const negated = std.mem.startsWith(u8, predicate, "!");
+    if (negated) predicate = std.mem.trimStart(u8, predicate[1..], " \t\r");
+    for ([_][]const u8{
+        "wasm_target",
+        "compat.wasm_target",
+        "@import(\"../core/compat.zig\").wasm_target",
+    }) |supported| {
+        if (std.mem.eql(u8, predicate, supported)) return negated;
     }
     return null;
 }
 
-/// The index of the `)` matching the `(` at `open`, skipping string literals.
-fn matchingParen(code: []const u8, open: usize) ?usize {
-    var depth: usize = 0;
-    var in_string = false;
-    var i = open;
-    while (i < code.len) : (i += 1) {
-        const c = code[i];
-        if (in_string) {
-            if (c == '\\') {
-                i += 1;
-            } else if (c == '"') {
-                in_string = false;
+const Import = struct { target: []const u8, at: usize, compiled: bool };
+
+fn nodeSource(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) []const u8 {
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    return tree.source[tree.tokenStart(first) .. tree.tokenStart(last) + tree.tokenSlice(last).len];
+}
+
+fn containsNode(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index, at: usize) bool {
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    return at >= tree.tokenStart(first) and at < tree.tokenStart(last) + tree.tokenSlice(last).len;
+}
+
+/// Unknown predicates inspect both branches. AST spans match nested else
+/// clauses and ignore strings/comments that happen to contain gate syntax.
+fn compiledOnWasm(tree: *const std.zig.Ast, at: usize) bool {
+    for (0..tree.nodes.len) |i| {
+        const branch = tree.fullIf(@enumFromInt(i)) orelse continue;
+        const negated = gateNegated(nodeSource(tree, branch.ast.cond_expr)) orelse continue;
+        if (negated and containsNode(tree, branch.ast.then_expr, at)) return false;
+        if (!negated) {
+            if (branch.ast.else_expr.unwrap()) |else_expr| {
+                if (containsNode(tree, else_expr, at)) return false;
             }
+        }
+    }
+    return true;
+}
+
+/// Parse whole files so whitespace, newlines and escaped string literals cannot
+/// hide imports. A computed import path cannot be resolved here and fails closed.
+/// All returned storage belongs to the caller's arena.
+fn readImports(allocator: std.mem.Allocator, source: []const u8) ![]Import {
+    const terminated = try allocator.dupeZ(u8, source);
+    var tree = try std.zig.Ast.parse(allocator, terminated, .zig);
+    defer tree.deinit(allocator);
+    if (tree.errors.len != 0) return error.InvalidZigSource;
+    var imports: std.ArrayListUnmanaged(Import) = .empty;
+    for (0..tree.tokens.len) |i| {
+        const t: std.zig.Ast.TokenIndex = @intCast(i);
+        if (tree.tokenTag(t) != .builtin or !std.mem.eql(u8, tree.tokenSlice(t), "@import")) continue;
+        const at = tree.tokenStart(t);
+        const compiled = compiledOnWasm(&tree, at);
+        if (!compiled) {
+            try imports.append(allocator, .{ .target = "", .at = at, .compiled = false });
             continue;
         }
-        switch (c) {
-            '"' => in_string = true,
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if (depth == 0) return i;
-            },
-            else => {},
-        }
+        if (i + 3 >= tree.tokens.len or tree.tokenTag(t + 1) != .l_paren or tree.tokenTag(t + 2) != .string_literal or
+            (tree.tokenTag(t + 3) != .r_paren and !(i + 4 < tree.tokens.len and tree.tokenTag(t + 3) == .comma and tree.tokenTag(t + 4) == .r_paren)))
+            return error.NonLiteralImport;
+        const target = try std.zig.string_literal.parseAlloc(allocator, tree.tokenSlice(t + 2));
+        try imports.append(allocator, .{ .target = target, .at = at, .compiled = true });
     }
-    return null;
-}
-
-/// Whether an import at `at` is compiled on a wasm target, given the line's gate (if any).
-fn compiledOnWasm(gate: ?Gate, at: usize) bool {
-    const g = gate orelse return true;
-    if (g.then_.contains(at)) return !g.negated;
-    if (g.else_.contains(at)) return g.negated;
-    return true; // the condition itself, or anything outside the gated expression
-}
-
-const Import = struct { target: []const u8, at: usize };
-
-/// Finds the next `@import("<target>")` at or after `*from`, advancing `*from` past it.
-fn nextImport(code: []const u8, from: *usize) ?Import {
-    const marker = "@import(\"";
-    const at = std.mem.indexOfPos(u8, code, from.*, marker) orelse return null;
-    const start = at + marker.len;
-    const end = std.mem.indexOfScalarPos(u8, code, start, '"') orelse {
-        from.* = code.len;
-        return null;
-    };
-    from.* = end + 1;
-    return .{ .target = code[start..end], .at = at };
+    return imports.toOwnedSlice(allocator);
 }
 
 /// A relative import is a file path in this tree; `std`, `builtin` and `build_options` are module names.
@@ -213,29 +181,32 @@ const Guard = struct {
             };
             defer self.allocator.free(source);
 
-            var line_no: usize = 0;
-            var lines = std.mem.splitScalar(u8, source, '\n');
-            while (lines.next()) |raw| {
-                line_no += 1;
-                const code = stripComment(raw);
-                const gate = findGate(code);
-                var from: usize = 0;
-                while (nextImport(code, &from)) |import| {
-                    if (!compiledOnWasm(gate, import.at)) {
-                        self.gated += 1;
-                        continue;
-                    }
-                    if (!isFileImport(import.target)) {
-                        if (isForbiddenModule(import.target)) self.fail(path, line_no, import.target);
-                        continue;
-                    }
-                    const resolved = try resolveRelative(self.allocator, path, import.target);
-                    if (isForbiddenPath(resolved)) {
-                        self.fail(path, line_no, resolved);
-                        continue;
-                    }
-                    if (!self.seen.contains(resolved)) try self.queue.append(self.allocator, resolved);
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const imports = readImports(arena.allocator(), source) catch |err| {
+                std.debug.print("check-wasm-allowlist: ERROR cannot inspect {s}: {s}\n", .{ path, @errorName(err) });
+                self.failures += 1;
+                continue;
+            };
+            for (imports) |import| {
+                if (!import.compiled) {
+                    self.gated += 1;
+                    continue;
                 }
+                const line_no = 1 + std.mem.count(u8, source[0..import.at], "\n");
+                if (!isFileImport(import.target)) {
+                    if (isForbiddenModule(import.target)) self.fail(path, line_no, import.target);
+                    continue;
+                }
+                const resolved = try resolveRelative(self.allocator, path, import.target);
+                if (isForbiddenPath(resolved)) {
+                    self.fail(path, line_no, resolved);
+                    self.allocator.free(resolved);
+                    continue;
+                }
+                if (!self.seen.contains(resolved)) {
+                    try self.queue.append(self.allocator, resolved);
+                } else self.allocator.free(resolved);
             }
         }
     }
@@ -257,45 +228,44 @@ pub fn main() !void {
 
 // ── Tests: `zig test scripts/check-wasm-allowlist.zig` ───────────────────────────────────────────
 
-fn compiledTargets(line: []const u8, buf: *[4][]const u8) [][]const u8 {
-    const code = stripComment(line);
-    const gate = findGate(code);
-    var n: usize = 0;
-    var from: usize = 0;
-    while (nextImport(code, &from)) |import| {
-        if (compiledOnWasm(gate, import.at)) {
-            buf[n] = import.target;
-            n += 1;
-        }
+fn compiledTargets(allocator: std.mem.Allocator, source: []const u8) ![][]const u8 {
+    const imports = try readImports(allocator, source);
+    var targets: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (imports) |import| {
+        if (import.compiled) try targets.append(allocator, import.target);
     }
-    return buf[0..n];
+    return targets.toOwnedSlice(allocator);
 }
 
 test "a real gate: the condition and the wasm branch are walked, the cluster branch is skipped" {
-    var buf: [4][]const u8 = undefined;
-    const got = compiledTargets("const Cluster = if (@import(\"../core/compat.zig\").wasm_target) @import(\"../core/compat.zig\").ClusterStub else @import(\"../cluster/mod.zig\").Cluster;", &buf);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const got = try compiledTargets(arena.allocator(), "const Cluster = if (@import(\"../core/compat.zig\").wasm_target) @import(\"../core/compat.zig\").ClusterStub else @import(\"../cluster/mod.zig\").Cluster;");
     try std.testing.expectEqual(@as(usize, 2), got.len);
     for (got) |t| try std.testing.expectEqualStrings("../core/compat.zig", t);
 }
 
 test "a comment mentioning wasm_target gates nothing" {
-    var buf: [4][]const u8 = undefined;
-    const got = compiledTargets("const c = @import(\"../cluster/mod.zig\"); // wasm_target", &buf);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const got = try compiledTargets(arena.allocator(), "const c = @import(\"../cluster/mod.zig\"); // wasm_target");
     try std.testing.expectEqual(@as(usize, 1), got.len);
     try std.testing.expectEqualStrings("../cluster/mod.zig", got[0]);
 }
 
 test "an inverted gate compiles the cluster branch on wasm, so it is checked" {
-    var buf: [4][]const u8 = undefined;
-    const got = compiledTargets("const C = if (@import(\"../core/compat.zig\").wasm_target) @import(\"../cluster/x.zig\") else struct {};", &buf);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const got = try compiledTargets(arena.allocator(), "const C = if (@import(\"../core/compat.zig\").wasm_target) @import(\"../cluster/x.zig\") else struct {};");
     var saw_cluster = false;
     for (got) |t| saw_cluster = saw_cluster or std.mem.eql(u8, t, "../cluster/x.zig");
     try std.testing.expect(saw_cluster);
 }
 
 test "a negated condition swaps the branches" {
-    var buf: [4][]const u8 = undefined;
-    const got = compiledTargets("const C = if (!@import(\"../core/compat.zig\").wasm_target) @import(\"../cluster/x.zig\") else @import(\"stub.zig\");", &buf);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const got = try compiledTargets(arena.allocator(), "const C = if (!@import(\"../core/compat.zig\").wasm_target) @import(\"../cluster/x.zig\") else @import(\"stub.zig\");");
     var saw_cluster = false;
     var saw_stub = false;
     for (got) |t| {
@@ -304,6 +274,47 @@ test "a negated condition swaps the branches" {
     }
     try std.testing.expect(!saw_cluster);
     try std.testing.expect(saw_stub);
+}
+
+test "unsupported predicates inspect both branches" {
+    const predicates = [_][]const u8{
+        "compat.wasm_target == false",
+        "wasm_target and false",
+        "!wasm_target or true",
+        "!!wasm_target",
+        "not_wasm_target",
+        "other.wasm_target",
+        "@import(\"../core/compat.zig\").wasm_target == false",
+        "@import(\"../other.zig\").wasm_target",
+    };
+    for (predicates) |predicate| {
+        const line = try std.fmt.allocPrint(std.testing.allocator, "const C = if ({s}) @import(\"../cluster/then.zig\") else @import(\"../cluster/else.zig\");", .{predicate});
+        defer std.testing.allocator.free(line);
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const got = try compiledTargets(arena.allocator(), line);
+        var saw_then = false;
+        var saw_else = false;
+        for (got) |target| {
+            saw_then = saw_then or std.mem.eql(u8, target, "../cluster/then.zig");
+            saw_else = saw_else or std.mem.eql(u8, target, "../cluster/else.zig");
+        }
+        try std.testing.expect(saw_then and saw_else);
+    }
+}
+
+test "supported named predicates retain branch selection" {
+    for ([_][]const u8{ "wasm_target", "compat.wasm_target" }) |predicate| {
+        for ([_]bool{ false, true }) |negated| {
+            const line = try std.fmt.allocPrint(std.testing.allocator, "const C = if ( {s}{s} ) @import(\"then.zig\") else @import(\"else.zig\");", .{ if (negated) @as([]const u8, "!") else "", predicate });
+            defer std.testing.allocator.free(line);
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const got = try compiledTargets(arena.allocator(), line);
+            try std.testing.expectEqual(@as(usize, 1), got.len);
+            try std.testing.expectEqualStrings(if (negated) "else.zig" else "then.zig", got[0]);
+        }
+    }
 }
 
 test "forbidden targets match on the resolved path, not the spelling" {
@@ -319,4 +330,57 @@ test "forbidden targets match on the resolved path, not the spelling" {
     try std.testing.expect(!isForbiddenPath(r3));
     try std.testing.expect(isForbiddenModule("meshguard"));
     try std.testing.expect(!isForbiddenModule("std"));
+}
+
+test "nested branches cannot impersonate the outer else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "const C = if (compat.wasm_target) (if (false) struct {} else @import(\"../cluster/node.zig\")) else struct {};",
+        "const C = if (wasm_target) if (false) struct {} else @import(\"../cluster/node.zig\") else struct {};",
+        "const C = if (wasm_target) struct { const label = \" else \"; const c = @import(\"../cluster/node.zig\"); } else struct {};",
+    }) |source| {
+        const got = try compiledTargets(a, source);
+        try std.testing.expectEqual(@as(usize, 1), got.len);
+        try std.testing.expectEqualStrings("../cluster/node.zig", got[0]);
+    }
+}
+
+test "imports are tokenized across formatting and escaped paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_][]const u8{
+        "const c = @import( \"../cluster/mod.zig\");",
+        "const c = @import(\n // comment\n \"../cluster/mod.zig\"\n);",
+        "const c = @import(\"../cluster/mod.zig\",);",
+        "const c = @import(\"../clu\\x73ter/mod.zig\");",
+    }) |source| {
+        const got = try compiledTargets(arena.allocator(), source);
+        try std.testing.expectEqual(@as(usize, 1), got.len);
+        try std.testing.expectEqualStrings("../cluster/mod.zig", got[0]);
+    }
+}
+
+test "multiline gates and fake code in comments and strings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const got = try compiledTargets(arena.allocator(),
+        \\const text = "if (wasm_target) Stub else @import(\"../cluster/fake.zig\")";
+        \\// @import("../cluster/comment.zig")
+        \\const c = if (wasm_target)
+        \\    @import("stub.zig")
+        \\else
+        \\    @import("../cluster/mod.zig");
+    );
+    try std.testing.expectEqual(@as(usize, 1), got.len);
+    try std.testing.expectEqualStrings("stub.zig", got[0]);
+}
+
+test "malformed source and computed import paths fail closed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectError(error.InvalidZigSource, readImports(a, "const c = @import(\"std\""));
+    try std.testing.expectError(error.NonLiteralImport, readImports(a, "const c = @import(\"../cluster/\" ++ \"mod.zig\");"));
 }

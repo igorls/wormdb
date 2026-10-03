@@ -76,6 +76,8 @@ All locks are automatically released when the procedure returns — you never ne
 | `ctx.randomHex(n)`     | Generate random hex string of `n` bytes         |
 | `ctx.timestamp()`      | Current server timestamp in milliseconds        |
 | `ctx.identity()`       | Authenticated SCT subject, if present           |
+| `ctx.permits(op, target)` | Check the caller's SCT capability, or true for trusted/internal callers |
+| `ctx.requireNamespace(ns, access)` | Enforce scoped memory namespace access (`read`, `write`, `delete`) |
 | `ctx.publish(c, msg)`  | Best-effort pub/sub event from inside a procedure |
 
 ::: warning
@@ -93,8 +95,10 @@ The registry currently includes several procedure families:
 | Atomic KV | `increment`, `transfer`, `kv_put`, `kv_get`, `kv_stats`, `scan` |
 | Collaboration demos | `chat_send`, `chat_history` |
 | Vector search | `vinsert`, `vsearch`, `vsim`, `vstats`, `vreindex`, `vrabitq`, `vdelete`, `vnsdrop` |
-| Agent memory | `mem_init`, `mem_add`, `mem_get`, `mem_query`, `mem_stats`, `mem_drop`, `mem_reset_index`, `mem_capabilities` |
-| Light-API | `lightapi_*` procedures served through the gateway's HTTP and JSON-RPC routes |
+| Agent memory | `mem_init`, `mem_add`, `mem_meta_set`, `mem_bulk_add`, `mem_get`, `mem_query`, `mem_range`, `mem_stats`, `mem_verify`, `mem_drop`, `mem_reset_index`, `mem_capabilities` |
+| Auth | `auth_mint_scoped` |
+| Verifiable logs | `append_log_append`, `append_log_verify`, `append_log_mmr_proof`, `append_log_mmr_verify`, `append_log_checkpoint`, `append_log_proof_bundle`, `append_log_proof_verify`, `append_log_witness`, `append_log_witness_request`, `append_log_witness_import`, `append_log_witness_verify` |
+| Proof diagnostics | `proof_prefix_root` |
 
 ### `increment`
 
@@ -152,9 +156,23 @@ See [Vector Search](/architecture/vector-search) for the full vector procedure s
 
 See [Agent Memory](/architecture/agent-memory) for the `mem_*` surface. These procedures compose WORM docs, metadata, vector inserts, pub/sub, and embedder-id enforcement for AI memory stores.
 
-### Light-API Procedures
+### Verifiable Log Procedures
 
-The `lightapi_*` procedures are compiled into the same registry and can be called through `EXEC`, but most users reach them through the gateway's `/api/...` routes. See [Gateways & Light-API](/operations/gateways).
+See [Verifiable Append Log](/protocol/append-log) for the canonical envelope and procedure response formats.
+
+- `append_log_append` — append opaque payload bytes to a named WORM log and return sequence/hash metadata.
+- `append_log_verify` — scan a log and verify contiguous sequences, WORM protection, payload hashes, event hashes, and hash-chain links.
+- `append_log_mmr_proof` — return hex-encoded MMR inclusion proof bytes for a stored log sequence.
+- `append_log_mmr_verify` — verify record hash/root/proof bytes without reading the database.
+- `append_log_checkpoint` — create and WORM-store a signed checkpoint over an append-log sequence range.
+- `append_log_witness` / `append_log_witness_request` / `append_log_witness_import` / `append_log_witness_verify` — countersign, request live peer countersignatures, import, and verify WORM witness records for checkpoint roots.
+- `append_log_proof_bundle` — export canonical record bytes, hashes, inclusion paths, and checkpoint metadata as stable JSON.
+- `append_log_proof_verify` — verify a record hash and MMR proof against a stored signed checkpoint.
+- `proof_prefix_root` — compute a deterministic `prefix-sha256-v1` root over sorted key/value/timestamp entries for diagnostics and cluster anti-entropy.
+
+### Domain Procedures
+
+External domain packages register additional procedures at startup via their manifests (`registerDomains()`); they share the same registry and `EXEC` dispatch, and are typically reached through the gateway's `/api/...` routes. See [Gateways](/operations/gateways).
 
 ## Anatomy of a Procedure
 

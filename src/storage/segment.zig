@@ -13,7 +13,7 @@
 //!   * the whole file is **mmap'd** read-only, so resident memory is the working
 //!     set the OS pages in — not the entire dataset — and boot is just `mmap`.
 //!
-//! The file is built offline (see hyperion-tools `wseg-build`) so there is no
+//! The file is built offline by an external builder tool so there is no
 //! write path here: open, look up, close. Small/aggregate values (chain block,
 //! counts, top-N lists) stay in the normal KV store; only the huge per-account
 //! tables live in a segment.
@@ -40,7 +40,7 @@ const DIR_ENTRY: usize = 48;
 const INDEX_ENTRY: usize = 20; // key u64 | off u64 | len u32
 // Tables are addressed by an opaque `u32` table id assigned by the segment builder; the engine attaches
 // no meaning to it. Serving layers own their own id namespaces in disjoint ranges of one shared segment
-// (e.g. Light-API in `lightapi/tables.zig`, AtomicAssets in `atomicassets/binfmt.zig`). The `tables` array
+// (each external domain package defines its own table-id range). The `tables` array
 // is indexed by table id, so MAX_TABLES is the highest addressable id + 1; 32 gives ample headroom at a
 // cost of a few hundred bytes of optional slots per attached segment.
 pub const MAX_TABLES: usize = 32;
@@ -77,7 +77,7 @@ pub const Segment = struct {
         blob: []const u8,
     };
 
-    const Mapped = struct { bytes: []const u8, backing: Backing };
+    pub const Mapped = struct { bytes: []const u8, backing: Backing };
 
     /// Open and validate a segment file. The mapping (or heap buffer) is owned
     /// by the returned Segment until `close`.
@@ -111,8 +111,8 @@ pub const Segment = struct {
             if (index_len != key_count * INDEX_ENTRY) return SegmentError.SegmentBadIndex;
             // A table id beyond MAX_TABLES means the builder wrote a table this engine can't address.
             // Fail CLOSED (loud error) rather than silently dropping it — the MAX_TABLES=16 regression
-            // silently served empty data for AtomicAssets ids 11..=21. A larger namespace is a deliberate
-            // VERSION bump (rejected above), not an out-of-range id at the current version.
+            // silently served empty data for a domain's table ids 11..=21. A larger namespace is a
+            // deliberate VERSION bump (rejected above), not an out-of-range id at the current version.
             if (table_id >= MAX_TABLES) return SegmentError.SegmentTableIdOutOfRange;
 
             seg.tables[table_id] = .{
@@ -177,8 +177,9 @@ pub const Segment = struct {
     }
 
     // --- file mapping ---
+    // (pub: the sorted-string segment in sst.zig shares this mapping layer.)
 
-    fn mapFile(allocator: std.mem.Allocator, path: []const u8) !Mapped {
+    pub fn mapFile(allocator: std.mem.Allocator, path: []const u8) !Mapped {
         if (comptime builtin.os.tag == .windows) {
             // No mmap on the Windows single-node build — read the whole file.
             // (The WAX serving target is Linux; this keeps the reader testable
@@ -230,7 +231,7 @@ pub const Segment = struct {
         }
     }
 
-    fn freeBytes(allocator: std.mem.Allocator, bytes: []const u8, backing: Backing) void {
+    pub fn freeBytes(allocator: std.mem.Allocator, bytes: []const u8, backing: Backing) void {
         if (bytes.len == 0) return;
         switch (backing) {
             .heap => allocator.free(bytes),
@@ -245,8 +246,8 @@ pub const Segment = struct {
 
 // ── Tests ──
 
-/// Minimal in-memory writer used only by the tests below — the production
-/// builder lives in hyperion-tools (Rust). Keeps the format honest from the
+/// Minimal in-memory writer used only by the tests below — production
+/// builders live outside this repo. Keeps the format honest from the
 /// reader's own side and documents the byte layout.
 const TestEntry = struct { key: u64, val: []const u8 };
 
@@ -348,9 +349,9 @@ test "segment round-trip via temp file" {
     try testing.expect(seg.lookup(1, K_A) == null);
 }
 
-test "high table-id (AtomicAssets range) is addressable" {
-    // Regression for the MAX_TABLES=16 showstopper: the AtomicAssets builder uses table ids 11..=21
-    // (SORTED_TMPL=21). Before MAX_TABLES was raised, `open` dropped any id >= 16, so these tables were
+test "high table-id (above 15) is addressable" {
+    // Regression for the MAX_TABLES=16 showstopper: a domain segment builder used table ids 11..=21.
+    // Before MAX_TABLES was raised, `open` dropped any id >= 16, so these tables were
     // silently unreadable. Build a segment with table id 21 and confirm it round-trips.
     const testing = std.testing;
     const AA_SORTED_TMPL: u32 = 21;

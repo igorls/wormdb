@@ -1,0 +1,1061 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+
+<title>WormDB — write once, read many</title>
+<meta name="description" content="An open-source key-value store and embeddable engine in Zig. Write-once records, compiled procedures, pub/sub, and vector search in the same store. MIT licensed." />
+<meta name="theme-color" content="#FAF9F3" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#111413" media="(prefers-color-scheme: dark)" />
+<link rel="canonical" href="https://wormdb.dev/" />
+<link rel="icon" type="image/svg+xml" href="favicon.svg" />
+
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="WormDB" />
+<meta property="og:title" content="WormDB — write once, read many" />
+<meta property="og:description" content="An open-source key-value store and embeddable engine in Zig. Write-once records, compiled procedures, pub/sub, and vector search in the same store. MIT licensed." />
+<meta property="og:url" content="https://wormdb.dev/" />
+<meta property="og:image" content="https://wormdb.dev/og.png" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="630" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="WormDB — write once, read many" />
+<meta name="twitter:description" content="An open-source key-value store and embeddable engine in Zig. Write-once records, compiled procedures, pub/sub, and vector search in the same store. MIT licensed." />
+<meta name="twitter:image" content="https://wormdb.dev/og.png" />
+
+<script>
+/* apply a stored theme before first paint */
+try { var t = localStorage.getItem("wormdb-theme"); if (t) document.documentElement.setAttribute("data-theme", t); } catch (e) {}
+</script>
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "WormDB",
+  "operatingSystem": "Linux, Windows",
+  "applicationCategory": "DeveloperApplication",
+  "description": "An open-source key-value store and embeddable engine in Zig. Write-once records, compiled procedures, pub/sub, and vector search in the same store. MIT licensed.",
+  "url": "https://wormdb.dev/",
+  "license": "https://opensource.org/licenses/MIT",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+}
+</script>
+
+<style>
+/* ---------- fonts (self-hosted, latin subsets) ---------- */
+@font-face {
+  font-family: "Workbench";
+  src: url("assets/fonts/workbench.woff2") format("woff2");
+  font-weight: 400; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  src: url("assets/fonts/plex-sans-var.woff2") format("woff2");
+  font-weight: 400 600; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  src: url("assets/fonts/plex-sans-italic.woff2") format("woff2");
+  font-weight: 400; font-style: italic; font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("assets/fonts/plex-mono-400.woff2") format("woff2");
+  font-weight: 400; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("assets/fonts/plex-mono-500.woff2") format("woff2");
+  font-weight: 500; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("assets/fonts/plex-mono-600.woff2") format("woff2");
+  font-weight: 600; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("assets/fonts/plex-mono-italic-400.woff2") format("woff2");
+  font-weight: 400; font-style: italic; font-display: swap;
+}
+
+/* ---------- tokens: the three inks of a paper ledger ---------- */
+:root {
+  --paper: #FAF9F3;        /* continuous-form stock */
+  --bar: #E9F1E3;          /* greenbar scan band */
+  --form: #FFFFFF;         /* white form blocks */
+  --edge: #D8D5C6;         /* perforations, card edges */
+  --rail: #F1EFE5;         /* sprocket margin */
+
+  --ink: #20241C;          /* ribbon black */
+  --soft: #555C4E;
+  --mut: #6E7563;
+
+  --red: #C9372C;          /* ribbon red — violations, negative amounts */
+  --green: #2E7D4F;        /* ledger green — OK, alive, recorded */
+  --blue: #2F5FA8;         /* stamp blue — annotations, links */
+
+  --s-red: #B3402F;        /* chart series: brute force */
+  --s-blue: #2F5FA8;       /* chart series: BQ prefilter */
+
+  --shadow: #DDE4D2;       /* card offset shadows */
+  --hard: #C4C8B4;         /* button shadows, tear lines */
+  --dots: #B9BDA9;         /* dotted leaders */
+  --hole-face: #FFFFFF;    /* sprocket holes */
+  --hole-rim: #C9C6B6;
+  --margin: #F0D4D0;       /* printer margin rule */
+  --chipbd: #C9D8BF;       /* opcode chip border */
+  --sel: #CFE3C7;
+
+  --sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --dot: "Workbench", var(--mono);
+
+  --w: 1080px;
+  --railw: 46px;
+}
+
+/* ---------- dark mode: the microfiche archive copy ----------
+   Archives photographed their printouts onto film — write-once, like the
+   paper. Silver emulsion on film base; the sprocket holes glow, backlit
+   by the fiche reader. */
+:root[data-theme="dark"] {
+  --paper: #111413;
+  --bar: #171B18;
+  --form: #1B201D;
+  --edge: #343931;
+  --rail: #0C0E0D;
+  --ink: #E8E4D4;
+  --soft: #B1B5A6;
+  --mut: #8D9284;
+  --red: #E86450;
+  --green: #62C288;
+  --blue: #85AAE8;
+  --s-red: #C4523C;
+  --s-blue: #5580C8;
+  --shadow: #0A0C0A;
+  --hard: #3C4139;
+  --dots: #454A41;
+  --hole-face: #EFECDC;
+  --hole-rim: #2A2E29;
+  --margin: #4E312C;
+  --chipbd: #3A4A3C;
+  --sel: #2F4A3A;
+}
+:root[data-theme="dark"] .mode-paper { display: none; }
+:root[data-theme="dark"] .mode-fiche { display: inline; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #111413;
+    --bar: #171B18;
+    --form: #1B201D;
+    --edge: #343931;
+    --rail: #0C0E0D;
+    --ink: #E8E4D4;
+    --soft: #B1B5A6;
+    --mut: #8D9284;
+    --red: #E86450;
+    --green: #62C288;
+    --blue: #85AAE8;
+    --s-red: #C4523C;
+    --s-blue: #5580C8;
+    --shadow: #0A0C0A;
+    --hard: #3C4139;
+    --dots: #454A41;
+    --hole-face: #EFECDC;
+    --hole-rim: #2A2E29;
+    --margin: #4E312C;
+    --chipbd: #3A4A3C;
+    --sel: #2F4A3A;
+  }
+  :root:not([data-theme="light"]) .mode-paper { display: none; }
+  :root:not([data-theme="light"]) .mode-fiche { display: inline; }
+}
+.mode-fiche { display: none; }
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 88px; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+
+body {
+  margin: 0;
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 16.5px;
+  line-height: 1.62;
+  background:
+    repeating-linear-gradient(180deg, var(--bar) 0 34px, var(--paper) 34px 68px);
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection { background: var(--sel); }
+
+a { color: var(--blue); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+a:hover { color: var(--red); }
+:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
+
+code, pre, kbd { font-family: var(--mono); }
+
+/* ---------- the continuous form: sprocket rails ---------- */
+.sheet {
+  position: relative;
+  min-height: 100vh;
+}
+.sheet::before, .sheet::after {
+  content: "";
+  position: absolute; top: 0; bottom: 0;
+  width: var(--railw);
+  background-color: var(--rail);
+  background-image: radial-gradient(circle at 50% 17px, var(--hole-face) 5.5px, var(--hole-rim) 6.5px, transparent 8px);
+  background-size: 100% 34px;
+  z-index: 5;
+  pointer-events: none;
+}
+.sheet::before { left: 0; border-right: 1px dashed var(--edge); }
+.sheet::after { right: 0; border-left: 1px dashed var(--edge); }
+@media (max-width: 860px) {
+  .sheet::before, .sheet::after { display: none; }
+}
+
+.wrap { max-width: var(--w); margin: 0 auto; padding: 0 clamp(24px, 5vw, 40px); }
+@media (min-width: 861px) {
+  .wrap { padding: 0 calc(var(--railw) + 34px); max-width: calc(var(--w) + 2 * var(--railw)); }
+}
+
+/* ---------- nav ---------- */
+.nav {
+  position: sticky; top: 0; z-index: 50;
+  background: color-mix(in srgb, var(--paper) 92%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border-bottom: 2px solid var(--ink);
+}
+.nav-in { display: flex; align-items: center; gap: 26px; height: 60px; }
+.brand {
+  display: flex; align-items: center; gap: 10px;
+  font-family: var(--dot); font-size: 1.02rem; letter-spacing: 0.04em;
+  color: var(--ink); text-decoration: none;
+}
+.brand:hover { color: var(--ink); }
+.brand svg { width: 24px; height: 24px; display: block; }
+.nav-links { display: flex; gap: 16px; margin-left: auto; }
+.nav-links a {
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 500;
+  letter-spacing: 0.07em; color: var(--soft); text-decoration: none;
+}
+.nav-links a:hover { color: var(--red); }
+.nav-gh {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--paper); background: var(--ink);
+  padding: 8px 14px; text-decoration: none;
+  border: 1px solid var(--ink);
+}
+.nav-gh:hover { background: var(--red); border-color: var(--red); color: var(--paper); }
+.nav-gh svg { width: 14px; height: 14px; }
+.nav-mode {
+  background: none; cursor: pointer;
+  border: 1px solid var(--edge);
+  color: var(--soft);
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 500;
+  letter-spacing: 0.07em;
+  padding: 7px 11px;
+  white-space: nowrap;
+}
+.nav-mode:hover { color: var(--red); border-color: var(--red); }
+.nav-mode b { font-weight: 600; color: var(--ink); }
+.nav-mode:hover b { color: var(--red); }
+@media (max-width: 1100px) {
+  html { scroll-padding-top: 170px; }
+  .nav-in { height: auto; min-height: 60px; flex-wrap: wrap; gap: 12px; padding-top: 12px; padding-bottom: 8px; }
+  .nav-links { order: 4; width: 100%; margin: 0; flex-wrap: wrap; gap: 2px 20px; padding: 4px 0; }
+  .nav-links a { flex: none; padding: 6px 0; }
+  .nav-mode { margin-left: auto; }
+}
+@media (max-width: 380px) {
+  .nav-in { gap: 8px; }
+  .nav-gh { padding: 8px; }
+  .nav-mode { padding: 7px; }
+  .mode-prefix { display: none; }
+}
+
+/* ---------- page headers & perforations ---------- */
+.pg { padding: 30px 0 88px; }
+.tear {
+  border: 0; margin: 0;
+  border-top: 2px dashed var(--hard);
+}
+.pghead {
+  display: flex; align-items: baseline; gap: 14px;
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 500;
+  letter-spacing: 0.1em; color: var(--mut);
+  padding: 14px 0 44px;
+  white-space: nowrap; overflow: hidden;
+}
+.pghead .no { color: var(--ink); font-weight: 600; }
+.pghead .fill { flex: 1; min-width: 20px; border-bottom: 1px dotted var(--dots); transform: translateY(-4px); }
+
+h2 {
+  font-family: var(--mono); font-weight: 600;
+  font-size: clamp(1.45rem, 2.9vw, 2.05rem);
+  line-height: 1.2; letter-spacing: 0.005em;
+  text-transform: uppercase;
+  margin: 0 0 18px;
+}
+h2 .rd { color: var(--red); }
+.lede { color: var(--soft); font-size: 1.04rem; max-width: 44rem; margin: 0; }
+.lede code, p code { font-size: 0.88em; background: var(--form); border: 1px solid var(--edge); padding: 0 5px; }
+
+/* ---------- hero ---------- */
+.hero { padding: 74px 0 92px; }
+.tof {
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 500;
+  letter-spacing: 0.1em; color: var(--mut);
+  display: flex; align-items: baseline; gap: 14px;
+  margin: 0 0 46px; white-space: nowrap; overflow: hidden;
+}
+.tof .fill { flex: 1; min-width: 20px; border-bottom: 1px dotted var(--dots); transform: translateY(-4px); }
+.tof b { color: var(--green); font-weight: 600; }
+
+.hero-in {
+  display: grid;
+  grid-template-columns: minmax(0, 1.04fr) minmax(0, 0.96fr);
+  gap: 60px; align-items: start;
+}
+h1 {
+  font-family: var(--dot);
+  font-weight: 400;
+  font-size: clamp(2.5rem, 5.4vw, 4.2rem);
+  line-height: 1.06;
+  letter-spacing: 0.01em;
+  margin: 0 0 28px;
+}
+h1 .l2 { color: var(--red); display: block; }
+.hero-sub { font-size: 1.1rem; color: var(--soft); max-width: 32rem; margin: 0 0 32px; }
+.hero-sub strong { color: var(--ink); font-weight: 600; }
+
+.cta-row { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+.btn {
+  display: inline-flex; align-items: center; gap: 9px;
+  font-family: var(--mono); font-size: 0.85rem; font-weight: 600;
+  letter-spacing: 0.03em;
+  padding: 13px 22px;
+  text-decoration: none;
+  border: 1.5px solid var(--ink);
+  transition: transform 0.1s ease, box-shadow 0.1s ease;
+}
+.btn-solid { background: var(--ink); color: var(--paper); box-shadow: 4px 4px 0 var(--hard); }
+.btn-solid:hover { background: var(--red); border-color: var(--red); color: var(--paper); transform: translate(1px, 1px); box-shadow: 3px 3px 0 var(--hard); }
+.btn-ghost { background: var(--form); color: var(--ink); box-shadow: 4px 4px 0 var(--hard); }
+.btn-ghost:hover { color: var(--red); border-color: var(--red); transform: translate(1px, 1px); box-shadow: 3px 3px 0 var(--hard); }
+.btn svg { width: 15px; height: 15px; }
+.hero-meta {
+  margin-top: 28px;
+  font-family: var(--mono); font-size: 0.75rem; color: var(--mut);
+  letter-spacing: 0.03em;
+}
+.hero-meta b { color: var(--soft); font-weight: 500; }
+.hero-status { margin: 14px 0 0; color: var(--soft); font-size: 0.88rem; }
+.hero-status a { white-space: nowrap; }
+.skip-link { position: absolute; top: 8px; left: 16px; z-index: 100; padding: 10px 16px; background: var(--paper); transform: translateY(-160%); }
+.skip-link:focus { transform: none; }
+.code pre { scrollbar-color: var(--edge) var(--form); }
+.code-status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+.resources { margin: 26px 0 0; padding: 0; list-style: none; }
+.resources li { padding: 14px 0; border-top: 1px solid var(--edge); }
+.resources li:last-child { border-bottom: 1px solid var(--edge); }
+.resources a { font-weight: 600; }
+.resources span { display: block; color: var(--soft); font-size: 0.9rem; margin-top: 3px; }
+.section-note { margin-top: 24px; color: var(--soft); font-size: 0.9rem; }
+.figure-note { margin: 14px 0 0; color: var(--mut); font-size: 0.85rem; }
+
+/* ---------- the printer (audit log demo) ---------- */
+.printer {
+  background: var(--form);
+  border: 1px solid var(--edge);
+  box-shadow: 5px 5px 0 var(--shadow);
+}
+.printer-bar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 2px solid var(--ink);
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 600;
+  letter-spacing: 0.08em; color: var(--ink);
+  white-space: nowrap;
+}
+.printer-bar .lite { color: var(--mut); font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
+.printer-replay {
+  margin-left: auto; background: none; border: 1px solid var(--edge); cursor: pointer;
+  color: var(--soft); font-family: var(--mono); font-size: 0.75rem;
+  padding: 3px 9px;
+}
+.printer-replay:hover { color: var(--red); border-color: var(--red); }
+.printer-body {
+  padding: 20px 20px 22px 26px;
+  min-height: 296px;
+  font-family: var(--mono); font-size: 0.82rem; line-height: 1.9;
+  border-left: 2px solid var(--margin);
+  margin-left: 14px;
+}
+.p-line { margin: 0; white-space: pre-wrap; word-break: break-word; }
+.p-cmd { color: var(--ink); font-weight: 500; }
+.p-cmd::before { content: "wormdb> "; color: var(--mut); font-weight: 400; }
+.p-ok { color: var(--green); }
+.p-ok .m { color: var(--mut); }
+.p-val { color: var(--ink); }
+.p-err { color: var(--red); font-weight: 500; text-shadow: 0.5px 0 0 currentColor; }
+.p-note { color: var(--mut); font-style: italic; }
+@media (max-width: 960px) {
+  .hero-in { grid-template-columns: minmax(0, 1fr); gap: 46px; }
+  .hero { padding-top: 52px; }
+}
+
+/* ---------- job control (procedures) ---------- */
+.split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 58px; align-items: start;
+}
+@media (max-width: 960px) { .split { grid-template-columns: minmax(0, 1fr); gap: 40px; } }
+.split-copy p { color: var(--soft); margin: 0 0 18px; }
+.split-copy p strong { color: var(--ink); font-weight: 600; }
+
+.jobcard {
+  background: var(--form);
+  border: 1px solid var(--edge);
+  box-shadow: 5px 5px 0 var(--shadow);
+  font-family: var(--mono); font-size: 0.8rem;
+}
+.jobcard-hd {
+  padding: 10px 18px;
+  border-bottom: 2px solid var(--ink);
+  font-size: 0.75rem; font-weight: 600; letter-spacing: 0.12em;
+}
+.jobcard-hd .lite { color: var(--mut); font-weight: 500; }
+.jobcard pre { margin: 0; padding: 16px 18px; font-size: 0.76rem; line-height: 1.9; overflow-x: auto; }
+.jc { color: var(--mut); font-style: italic; }
+.jk { color: var(--blue); font-weight: 500; }
+.jg { color: var(--green); }
+.jr { color: var(--red); }
+
+.proc-fams { margin-top: 22px; border-top: 1px solid var(--edge); }
+.proc-fam {
+  display: grid; grid-template-columns: 128px 1fr; gap: 14px;
+  padding: 10px 0; border-bottom: 1px solid var(--edge);
+  font-family: var(--mono); font-size: 0.8rem;
+}
+.proc-fam b { color: var(--ink); font-weight: 600; letter-spacing: 0.06em; }
+.proc-fam span { color: var(--mut); line-height: 1.8; }
+@media (max-width: 560px) { .proc-fam { grid-template-columns: 1fr; gap: 2px; } }
+
+/* ---------- capability report (opcode cards) ---------- */
+.cards {
+  margin-top: 50px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+.fcard {
+  background: var(--form);
+  border: 1px solid var(--edge);
+  border-top: 3px solid var(--ink);
+  padding: 22px 22px 24px;
+}
+.opcode {
+  display: inline-block;
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--ink);
+  background: var(--bar);
+  border: 1px solid var(--chipbd);
+  padding: 3px 8px;
+  margin-bottom: 14px;
+}
+.fcard h3 {
+  font-family: var(--sans); font-weight: 600;
+  font-size: 1.07rem; letter-spacing: -0.005em;
+  margin: 0 0 9px; line-height: 1.3;
+}
+.fcard p { margin: 0; color: var(--soft); font-size: 0.92rem; }
+.fcard p code { font-size: 0.86em; background: var(--paper); }
+@media (max-width: 960px) { .cards { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+@media (max-width: 620px) { .cards { grid-template-columns: minmax(0,1fr); } }
+
+/* ---------- vector search ---------- */
+
+.dispatch { margin: 24px 0 0; padding: 0; list-style: none; counter-reset: d; }
+.dispatch li {
+  counter-increment: d;
+  position: relative;
+  padding: 13px 0 13px 46px;
+  border-top: 1px solid var(--edge);
+}
+.dispatch li:last-child { border-bottom: 1px solid var(--edge); }
+.dispatch li::before {
+  content: "0" counter(d);
+  position: absolute; left: 0; top: 16px;
+  font-family: var(--mono); font-size: 0.78rem; font-weight: 600;
+  color: var(--red);
+}
+.dispatch b { display: block; color: var(--ink); font-weight: 600; margin-bottom: 1px; }
+.dispatch span { color: var(--soft); font-size: 0.92rem; }
+.dispatch span code { font-size: 0.88em; background: var(--form); }
+
+
+
+/* ---------- code forms ---------- */
+.code {
+  margin: 0;
+  position: relative;
+  background: var(--form);
+  border: 1px solid var(--edge);
+  box-shadow: 5px 5px 0 var(--shadow);
+  overflow-x: auto;
+}
+.code pre {
+  margin: 0; padding: 50px 20px 20px;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  font-size: 0.82rem; line-height: 1.8;
+  color: var(--ink);
+}
+.code .c { color: var(--mut); font-style: italic; }
+.code .g { color: var(--green); }
+.code .r { color: var(--red); }
+.copy-btn {
+  position: absolute; top: 8px; right: 8px;
+  background: var(--paper);
+  border: 1px solid var(--edge);
+  color: var(--soft);
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 500;
+  padding: 4px 9px; cursor: pointer;
+}
+.copy-btn:hover { color: var(--red); border-color: var(--red); }
+
+/* ---------- cluster ---------- */
+.mesh-list { margin: 26px 0 0; padding: 0; list-style: none; }
+.mesh-list li { position: relative; padding: 10px 0 10px 26px; color: var(--soft); font-size: 0.95rem; }
+.mesh-list li::before {
+  content: "▸"; position: absolute; left: 0; top: 10px;
+  color: var(--red); font-family: var(--mono); font-size: 0.85rem;
+}
+.mesh-list b { color: var(--ink); font-weight: 600; }
+.mesh-list code { font-size: 0.88em; }
+
+/* ---------- install ---------- */
+.qs-grid {
+  margin-top: 46px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 20px;
+}
+.qs-pane h3 {
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 600;
+  letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--ink); margin: 0 0 12px;
+}
+.qs-note { margin: 14px 0 0; font-size: 0.85rem; color: var(--mut); }
+.qs-note b { color: var(--soft); font-weight: 500; }
+.qs-ctas { margin-top: 44px; display: flex; gap: 16px; flex-wrap: wrap; }
+@media (max-width: 860px) { .qs-grid { grid-template-columns: minmax(0, 1fr); } }
+
+/* ---------- end of job (footer) ---------- */
+footer { padding: 26px 0 60px; }
+.eoj {
+  font-family: var(--dot);
+  font-size: clamp(1.7rem, 4.6vw, 3rem);
+  letter-spacing: 0.02em;
+  margin: 20px 0 8px;
+}
+.eoj-stars { font-family: var(--mono); font-size: 0.8rem; color: var(--mut); letter-spacing: 0.5em; margin: 0 0 48px; }
+.foot-grid {
+  display: grid;
+  grid-template-columns: 1.3fr 1fr 1fr;
+  gap: 44px;
+}
+.foot-tag { margin: 0; color: var(--soft); font-size: 0.92rem; max-width: 26rem; }
+.foot-h {
+  font-family: var(--mono); font-size: 0.75rem; font-weight: 600;
+  letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--mut); margin: 0 0 14px;
+}
+.ports { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 0.76rem; }
+.ports td { padding: 6px 0; color: var(--soft); border-bottom: 1px solid var(--edge); }
+.ports td:first-child { color: var(--ink); font-weight: 600; width: 64px; }
+.ports td:last-child { text-align: right; color: var(--mut); }
+.foot-links { list-style: none; margin: 0; padding: 0; }
+.foot-links li { margin-bottom: 9px; }
+.foot-links a { font-family: var(--mono); font-size: 0.8rem; color: var(--soft); }
+.foot-end {
+  margin-top: 52px; padding-top: 20px;
+  border-top: 2px dashed var(--hard);
+  display: flex; justify-content: space-between; gap: 20px; flex-wrap: wrap;
+  font-family: var(--mono); font-size: 0.75rem; color: var(--mut);
+  letter-spacing: 0.02em;
+}
+@media (max-width: 860px) { .foot-grid { grid-template-columns: 1fr; gap: 34px; } }
+
+/* ---------- reveal ---------- */
+.reveal { opacity: 1; }
+</style>
+</head>
+<body>
+<a class="skip-link" href="#top">Skip to content</a>
+<div class="sheet">
+
+<!-- ============ nav ============ -->
+<header class="nav">
+  <div class="wrap nav-in">
+    <a class="brand" href="#top" aria-label="WormDB home">
+      <svg viewBox="0 0 64 64" aria-hidden="true">
+        <rect x="4" y="6" width="56" height="52" fill="#FFFFFF" stroke="#20241C" stroke-width="3"/>
+        <rect x="4" y="16" width="56" height="9" fill="#E9F1E3"/>
+        <rect x="4" y="34" width="56" height="9" fill="#E9F1E3"/>
+        <circle cx="12" cy="11" r="2.4" fill="#20241C"/>
+        <circle cx="12" cy="29" r="2.4" fill="#20241C"/>
+        <circle cx="12" cy="47" r="2.4" fill="#20241C"/>
+        <rect x="20" y="19" width="30" height="3.4" fill="#20241C"/>
+        <rect x="20" y="28" width="22" height="3.4" fill="#20241C"/>
+        <rect x="20" y="37" width="26" height="3.4" fill="#C9372C"/>
+        <rect x="20" y="46" width="18" height="3.4" fill="#20241C"/>
+      </svg>
+      WORMDB
+    </a>
+    <nav class="nav-links" aria-label="Sections">
+      <a href="#capabilities">FEATURES</a>
+      <a href="#benchmarks">VECTORS</a>
+      <a href="#cluster">CLUSTER</a>
+      <a href="#install">QUICK START</a>
+      <a href="https://meshrooms.wormdb.dev/">MESHROOMS</a>
+    </nav>
+    <button class="nav-mode" id="modeToggle" aria-label="Switch between paper and microfiche view"><span class="mode-prefix">VIEW: </span><b id="modeLabel">PAPER</b></button>
+    <a class="nav-gh" href="https://github.com/igorls/wormdb">
+      <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+      GITHUB
+    </a>
+  </div>
+</header>
+
+<main id="top" tabindex="-1">
+
+<!-- ============ page 001: system log (hero) ============ -->
+<section class="hero">
+  <div class="wrap">
+    <p class="tof">
+      <span><span class="mode-paper">TOP OF FORM</span><span class="mode-fiche">FICHE ARCHIVE COPY</span></span><span class="fill"></span>
+      <span>0x57 0x57 HANDSHAKE <b>OK</b></span><span class="fill"></span>
+      <span>PAGE 001 · SYSTEM LOG</span>
+    </p>
+
+    <div class="hero-in">
+      <div>
+        <h1>WRITE ONCE.<span class="l2">READ MANY.</span></h1>
+        <p class="hero-sub">
+          An <strong>open-source key-value store and embeddable engine in Zig</strong>.
+          Keep selected records write-once, run compiled procedures next to your data,
+          and search vectors in the same store. Start with a local server and a Bun client.
+        </p>
+        <div class="cta-row">
+          <a class="btn btn-solid" href="#install">GET STARTED</a>
+          <a class="btn btn-ghost" href="https://github.com/igorls/wormdb">
+            <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+            VIEW SOURCE
+          </a>
+        </div>
+        <p class="hero-meta"><b>MIT LICENSED</b> · ZIG 0.16.0 · <b>LINUX</b> + <b>WINDOWS</b> · BUN &amp; BROWSER CLIENTS</p>
+        <p class="hero-status">Under active development. <a href="https://github.com/igorls/wormdb/blob/main/SECURITY.md">Read the deployment notes</a> before running beyond localhost.</p>
+      </div>
+
+      <div class="printer" id="printer">
+        <div class="printer-bar">
+          <span>AUDIT LOG</span>
+          <span class="lite">ILLUSTRATIVE SESSION</span>
+          <button class="printer-replay" id="replay" aria-label="Reprint the demo">⟳ REPRINT</button>
+        </div>
+        <div class="printer-body" id="printerBody" aria-live="off">
+          <p class="p-line p-cmd">SET audit:001 ready WORM</p>
+          <p class="p-line p-ok">OK</p>
+          <p class="p-line p-cmd">GET audit:001</p>
+          <p class="p-line p-val">ready</p>
+          <p class="p-line p-cmd">SET audit:001 changed</p>
+          <p class="p-line p-err">ERR WORM violation: key is immutable</p>
+          <p class="p-line p-cmd">DEL audit:001</p>
+          <p class="p-line p-err">ERR WORM violation: key is immutable</p>
+          <p class="p-line p-note">-- 4 statements · 0 rewrites --</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ page 002: job control (procedures) ============ -->
+<hr class="tear" />
+<section class="pg" id="procedures">
+  <div class="wrap">
+    <p class="pghead"><span class="no">PAGE 002</span><span class="fill"></span><span>JOB CONTROL — EXEC</span><span class="fill"></span><span>CONT'D FROM 001</span></p>
+
+    <div class="split">
+      <div class="split-copy">
+        <h2>Bring your logic <span class="rd">to</span> the data.</h2>
+        <p>
+          Stored procedures in WormDB are <strong>native Zig functions compiled into the server
+          binary</strong>. Call them with one <code>EXEC</code> request over WormWire.
+          Handlers can work with keys, publish events, and query vectors without a series of
+          application-to-database round trips.
+        </p>
+        <p>
+          Built-in handlers cover counters, audit proofs, agent memory, coordination, and
+          vector search. Extend the registry or register procedures from an external domain
+          package when embedding the engine.
+        </p>
+        <p>
+          <strong>Locking and durability are explicit.</strong> Some helpers write only to memory
+          until the next snapshot; durable helpers have different locking behavior. Choose the
+          right contract for each handler. <a href="https://github.com/igorls/wormdb/blob/main/docs/architecture/procedures.md">Read the procedure guide</a>.
+        </p>
+      </div>
+
+      <div>
+        <div class="jobcard">
+          <div class="jobcard-hd">COMPILED HANDLERS <span class="lite">· ONE EXEC REQUEST</span></div>
+          <pre><span class="jc"># inspect stored keys and namespace state</span>
+<span class="jk">EXEC scan audit:</span>
+<span class="jk">EXEC vstats vec:articles:</span>
+
+<span class="jc"># rebuild a derived vector index from its keys</span>
+<span class="jk">EXEC vreindex vec:articles:</span></pre>
+        </div>
+
+
+        <div class="proc-fams">
+          <div class="proc-fam"><b>KEYS + COUNTERS</b><span>kv_put · kv_get · kv_stats · scan · transfer · increment</span></div>
+          <div class="proc-fam"><b>AUDIT PROOF</b><span>append_log_append · verify · mmr_proof · checkpoint · witness ×4 · proof_bundle</span></div>
+          <div class="proc-fam"><b>VECTOR</b><span>vinsert · vsearch · vsearch_cluster · vsim · vstats · vreindex · vrabitq · vdelete</span></div>
+          <div class="proc-fam"><b>AGENT MEMORY</b><span>mem_init · mem_add · mem_query · mem_range · mem_verify · mem_stats</span></div>
+          <div class="proc-fam"><b>COORDINATION</b><span>append_log_claim · claim_status · claim_release · claim_supersede</span></div>
+          <div class="proc-fam"><b>TRUST + AUTH</b><span>trust_grant · trust_revoke · trust_fold · auth_mint_scoped · cluster_presence</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ page 003: capability report ============ -->
+<hr class="tear" />
+<section class="pg" id="capabilities">
+  <div class="wrap">
+    <p class="pghead"><span class="no">PAGE 003</span><span class="fill"></span><span>CAPABILITY REPORT</span><span class="fill"></span><span>[1B OPCODE][4B LENGTH][PAYLOAD]</span></p>
+
+    <h2>Keep records. Run logic. Find context.</h2>
+    <p class="lede">
+      Build around an append-only audit history, an application event stream, or searchable
+      agent memory. The same engine provides the storage and the operations around it.
+    </p>
+
+    <div class="cards">
+      <article class="fcard reveal">
+        <span class="opcode">0x02 · SET</span>
+        <h3>Write-once records</h3>
+        <p>Set a key with the WORM flag and normal SET and DEL commands reject changes to it. Use the append-log procedures for Merkle proofs, signed checkpoints, and witness receipts.</p>
+      </article>
+      <article class="fcard reveal">
+        <span class="opcode">0x57 0x57 · HELLO</span>
+        <h3>A compact binary protocol</h3>
+        <p>WormWire uses a two-byte handshake, an opcode, and length-prefixed payloads. The Bun TCP client and browser WebSocket client handle framing for you; Redis and text clients are not compatible.</p>
+      </article>
+      <article class="fcard reveal">
+        <span class="opcode">0x06 · SUB</span>
+        <h3>Pub/sub that matches prefixes</h3>
+        <p>Subscribe to a channel or prefix and receive matching EVENT frames on the same connection. Use it for application events or to follow vector insert notifications by namespace.</p>
+      </article>
+      <article class="fcard reveal">
+        <span class="opcode">0x05 · CLUSTER</span>
+        <h3>Peer discovery and replication</h3>
+        <p>On Linux, MeshGuard provides peer discovery and failure detection. WormDB replicates committed writes and synchronizes joining peers. Configure trust and transport protection for your network.</p>
+      </article>
+      <article class="fcard reveal">
+        <span class="opcode">0x0D · VINSERT</span>
+        <h3>Vectors live with your data</h3>
+        <p>Store embeddings as keys, then query a per-namespace HNSW index, a quantized prefilter, or exact search. Cosine, dot product, and L2 metrics use SIMD distance kernels.</p>
+      </article>
+      <article class="fcard reveal">
+        <span class="opcode">0x09 · EXEC</span>
+        <h3>Procedures compiled into the binary</h3>
+        <p>Run native Zig handlers with access to the store, events, and cluster. Built-in memory and audit procedures give you a starting point; your handler chooses its locking and persistence behavior.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ============ page 004: vector search ============ -->
+<hr class="tear" />
+<section class="pg" id="benchmarks">
+  <div class="wrap">
+    <p class="pghead"><span class="no">PAGE 004</span><span class="fill"></span><span>VECTOR SEARCH</span><span class="fill"></span><span>KEYS + CONTEXT</span></p>
+    <div class="split">
+      <div class="split-copy">
+        <h2>Your vectors belong with your records.</h2>
+        <p>Embeddings are ordinary <code>vec:&lt;ns&gt;:&lt;id&gt;</code> keys backed by the write-ahead log.
+          A derived index accelerates search within each namespace. Native vector inserts and
+          the Bun vector wrapper default to WORM; mutable vectors are an explicit choice.</p>
+        <ol class="dispatch">
+          <li><b>HNSW graph</b><span>Traverse a per-namespace graph and refine candidates with the selected metric.</span></li>
+          <li><b>Quantized prefilter</b><span>Rank a smaller candidate set with binary hashes, then refine using the original vectors.</span></li>
+          <li><b>Exact search</b><span>Scan the vectors directly when requested or when no suitable index is available.</span></li>
+        </ol>
+        <p class="section-note"><code>vsearch</code> searches one node. <code>vsearch_cluster</code>
+          is the separate fan-out procedure. Rebuild derived indexes with <code>vreindex</code>
+          after raw ingestion or WAL recovery beyond the last snapshot.</p>
+      </div>
+      <div>
+        <div class="jobcard">
+          <div class="jobcard-hd">FOLLOW THE DATA</div>
+          <pre><span class="jk">VINSERT / VBULKINSERT</span>
+    <span class="jc">write vector keys through the store</span>
+    KV + WAL
+        |
+    <span class="jg">derived namespace index</span>
+        |
+<span class="jk">EXEC vsearch</span>
+    <span class="jc">query locally, return nearest matches</span></pre>
+        </div>
+        <ul class="resources">
+          <li><a href="https://github.com/igorls/wormdb/blob/main/docs/VECTOR_SEARCH.md">Explore vector search</a><span>Index lifecycle, metrics, and query modes.</span></li>
+          <li><a href="https://github.com/igorls/wormdb/blob/main/docs/AGENT_MEMORY_DEMO.md">Explore agent memory</a><span>Memory procedures, retrieval, and verification.</span></li>
+          <li><a href="https://github.com/igorls/wormdb/blob/main/src/vector/bench.zig">Run the vector benchmark</a><span>Measure your build and hardware with the included harness.</span></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ page 005: replication topology ============ -->
+<hr class="tear" />
+<section class="pg" id="cluster">
+  <div class="wrap">
+    <p class="pghead"><span class="no">PAGE 005</span><span class="fill"></span><span>REPLICATION TOPOLOGY</span><span class="fill"></span><span>0x05 · CLUSTER STATUS</span></p>
+
+    <div class="split">
+      <div class="split-copy">
+        <h2>Start local. Connect peers on Linux.</h2>
+        <p>
+          <a href="https://github.com/igorls/meshguard">MeshGuard</a> supplies SWIM gossip,
+          node identity, and WireGuard integration. WormDB adds best-effort replication and
+          full-state synchronization for joining peers.
+        </p>
+        <ul class="mesh-list">
+          <li><b>Discovery</b> — a new node joins through a seed and learns its peers.</li>
+          <li><b>Trust</b> — configure org-trust grants and node certificates for replication authorization.</li>
+          <li><b>Transport</b> — replication uses TCP; verify that the actual route is protected by a tunnel or another secure transport.</li>
+          <li><b>Write behavior</b> — the local commit is authoritative. Replication failures are logged without failing the client write.</li>
+        </ul>
+        <p class="section-note">Replication does not provide quorum acknowledgements.
+          Windows currently supports single-node operation.</p>
+
+
+      </div>
+
+      <div>
+        <div class="jobcard">
+          <div class="jobcard-hd">FOLLOW A WRITE</div>
+          <pre><span class="jk">Client → local node</span>
+    <span class="jg">local commit: store + write-ahead log</span>
+        |
+    replication attempts → peers
+    <span class="jc">peer failure does not undo local commit</span>
+        |
+    <span class="jk">client response</span></pre>
+        </div>
+        <p class="figure-note">Choose trust and network settings before connecting nodes.
+          <a href="https://github.com/igorls/wormdb/blob/main/docs/architecture/replication-proofs.md">Configure replication trust</a>.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ page 006: installation ============ -->
+<hr class="tear" />
+<section class="pg" id="install">
+  <div class="wrap">
+    <p class="pghead"><span class="no">PAGE 006</span><span class="fill"></span><span>INSTALLATION</span><span class="fill"></span><span>ZIG 0.16.0 + BUN</span></p>
+
+    <h2>Run your first write-once record.</h2>
+    <p class="lede">Build from source, start on localhost, and try the Bun client. You need Git, Zig 0.16.0, and Bun.</p>
+
+    <div class="qs-grid">
+      <div class="qs-pane">
+        <h3>1. Build and start the server</h3>
+        <figure class="code">
+          <button class="copy-btn" data-copy aria-label="Copy build commands">COPY</button>
+          <pre>git clone https://github.com/igorls/wormdb.git
+cd wormdb
+git submodule update --init deps/meshguard
+zig build -Doptimize=ReleaseSmall -Dcrypto-backend=std
+./zig-out/bin/wormdb --config examples/local.json</pre>
+        </figure>
+        <p class="qs-note">The <code>std</code> crypto backend avoids an external libsodium dependency.
+          The example binds to <b>127.0.0.1:6389</b> with authentication and the browser gateway disabled.</p>
+      </div>
+      <div class="qs-pane">
+        <h3>2. In another terminal, from the repo root</h3>
+        <figure class="code">
+          <button class="copy-btn" data-copy aria-label="Copy client commands">COPY</button>
+          <pre>bun run apps/bun/src/bin/client.ts SET audit:001 ready --worm
+bun run apps/bun/src/bin/client.ts GET audit:001
+
+<span class="c"># both commands below return a WORM violation</span>
+bun run apps/bun/src/bin/client.ts SET audit:001 changed
+bun run apps/bun/src/bin/client.ts DEL audit:001</pre>
+        </figure>
+        <p class="qs-note">The first two commands return <b>OK</b> and <b>ready</b>.
+          The next two demonstrate an immutable key. Use a fresh key to repeat the example.</p>
+      </div>
+    </div>
+    <p class="section-note">Linux supports clustering; Windows supports the standalone server.
+      <a href="https://github.com/igorls/wormdb/blob/main/docs/WINDOWS.md">Windows setup</a> ·
+      <a href="https://github.com/igorls/wormdb/blob/main/SECURITY.md">Authentication and deployment limits</a></p>
+
+
+
+    <div class="qs-ctas">
+      <a class="btn btn-solid" href="https://github.com/igorls/wormdb/blob/main/README.md#quick-start">READ THE QUICK START</a>
+      <a class="btn btn-ghost" href="https://github.com/igorls/wormdb/blob/main/CONTRIBUTING.md">CONTRIBUTE ON GITHUB</a>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<!-- ============ trailer page ============ -->
+<hr class="tear" />
+<footer>
+  <div class="wrap">
+    <p class="eoj">*** END OF JOB ***</p>
+    <p class="eoj-stars">* * * * * * * * * * * * * * *</p>
+
+    <div class="foot-grid">
+      <div>
+        <p class="foot-h">WormDB</p>
+        <p class="foot-tag">
+          An open-source engine for write-once records, compiled logic, and vector search.
+          Built in Zig. Released under MIT.
+        </p>
+      </div>
+      <div>
+        <p class="foot-h">Port policy</p>
+        <table class="ports">
+          <tr><td>6389</td><td>WormWire clients</td><td>TCP</td></tr>
+          <tr><td>51821</td><td>SWIM gossip</td><td>UDP</td></tr>
+          <tr><td>51830</td><td>WireGuard tunnels</td><td>UDP</td></tr>
+        </table>
+        <p class="qs-note" style="margin-top:12px">6389 — deliberately not 6379.</p>
+      </div>
+      <div>
+        <p class="foot-h">Elsewhere</p>
+        <ul class="foot-links">
+          <li><a href="https://github.com/igorls/wormdb">github.com/igorls/wormdb</a></li>
+          <li><a href="https://github.com/igorls/meshguard">meshguard (mesh layer)</a></li>
+          <li><a href="https://github.com/igorls/wormdb/tree/main/apps/bun">Bun reference client</a></li>
+          <li><a href="https://meshrooms.wormdb.dev/">Meshrooms</a></li>
+          <li><a href="https://github.com/igorls/wormdb/issues">Issues and feature requests</a></li>
+          <li><a href="https://github.com/igorls/wormdb/security">Report a vulnerability</a></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="foot-end">
+      <span>FANFOLD PAPER FOLDS IN ZIGZAGS · THE SERVER IS WRITTEN IN ZIG · NOT A COINCIDENCE</span>
+      <span>MIT © 2026 IGOR LINS E SILVA</span>
+    </div>
+  </div>
+</footer>
+
+</div><!-- /sheet -->
+
+<p class="code-status" id="copyStatus" role="status"></p>
+<script>
+(function () {
+  var reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+
+
+  /* ---- the line printer: whole lines print one at a time ---- */
+  var body = document.getElementById("printerBody");
+  var finalHTML = body.innerHTML;
+  var lines = [];
+  body.querySelectorAll(".p-line").forEach(function (l) { lines.push(l.outerHTML); });
+  var playing = false;
+
+  function print() {
+    if (reduced || playing) return;
+    playing = true;
+    body.innerHTML = "";
+    var i = 0;
+    (function next() {
+      if (i >= lines.length) { playing = false; body.innerHTML = finalHTML; return; }
+      var d = document.createElement("div");
+      d.innerHTML = lines[i++];
+      var line = d.firstChild;
+      line.style.opacity = "0";
+      body.appendChild(line);
+      /* a line printer slams the whole line at once */
+      setTimeout(function () { line.style.opacity = "1"; }, 30);
+      var isCmd = line.classList.contains("p-cmd");
+      setTimeout(next, isCmd ? 620 : 300 + Math.random() * 120);
+    })();
+  }
+
+  document.getElementById("replay").addEventListener("click", print);
+  if (!reduced) setTimeout(print, 600);
+
+  /* ---- copy buttons ---- */
+  document.querySelectorAll("[data-copy]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var pre = btn.parentElement.querySelector("pre");
+      function copyFailed() {
+        btn.textContent = "SELECT CODE";
+        var selection = window.getSelection();
+        var range = document.createRange();
+        range.selectNodeContents(pre);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        document.getElementById("copyStatus").textContent = "Copy unavailable. Code selected; use your browser's copy command.";
+      }
+      if (!navigator.clipboard) { copyFailed(); return; }
+      navigator.clipboard.writeText(pre.textContent).then(function () {
+        btn.textContent = "COPIED";
+        document.getElementById("copyStatus").textContent = "Commands copied.";
+        setTimeout(function () { btn.textContent = "COPY"; }, 1400);
+      }).catch(copyFailed);
+    });
+  });
+
+  /* ---- paper / fiche toggle ---- */
+  var root = document.documentElement;
+  var label = document.getElementById("modeLabel");
+  var sysDark = window.matchMedia("(prefers-color-scheme: dark)");
+  function isDark() {
+    var t = root.getAttribute("data-theme");
+    return t ? t === "dark" : sysDark.matches;
+  }
+  function renderMode() {
+    label.textContent = isDark() ? "FICHE" : "PAPER";
+    document.querySelectorAll('meta[name="theme-color"]').forEach(function (m) {
+      m.setAttribute("content", isDark() ? "#111413" : "#FAF9F3");
+    });
+  }
+  document.getElementById("modeToggle").addEventListener("click", function () {
+    var next = isDark() ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem("wormdb-theme", next); } catch (e) {}
+    renderMode();
+  });
+  sysDark.addEventListener("change", renderMode);
+  renderMode();
+})();
+</script>
+
+</body>
+</html>

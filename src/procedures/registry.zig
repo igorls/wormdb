@@ -16,6 +16,15 @@ pub const scan = @import("scan.zig");
 pub const chat_send = @import("chat_send.zig");
 pub const chat_history = @import("chat_history.zig");
 pub const vsearch = @import("vsearch.zig");
+/// Reaches cluster -> meshguard's locks and sockets; excluded on a narrow-atomics target.
+const cluster_on = !@import("../core/compat.zig").wasm_target;
+
+/// Stands in for a cluster procedure on a wasm target, where the cluster graph is excluded.
+/// It refuses loudly: a silent success would claim a replication that never happened.
+fn clusterUnsupported(_: *@import("context.zig").Ctx) anyerror!@import("context.zig").Ctx.Result {
+    return error.ClusterUnsupportedOnThisTarget;
+}
+pub const vsearch_cluster = if (cluster_on) @import("vsearch_cluster.zig") else struct {};
 pub const vsim = @import("vsim.zig");
 pub const vinsert = @import("vinsert.zig");
 pub const vstats = @import("vstats.zig");
@@ -24,9 +33,14 @@ pub const vrabitq = @import("vrabitq.zig");
 pub const vdelete = @import("vdelete.zig");
 pub const vnsdrop = @import("vnsdrop.zig");
 pub const memory = @import("memory.zig");
-// Light-API + AtomicAssets procedures are NOT imported here — they live in their own packages
-// (wormdb-domain-lightapi, wormdb-domain-atomicassets) and are registered at startup via
-// registerDomains() from each package's manifest.
+pub const auth_mint_scoped = @import("auth_mint_scoped.zig");
+pub const append_log = @import("append_log.zig");
+pub const coordination = @import("coordination.zig");
+pub const cluster_presence = if (cluster_on) @import("cluster_presence.zig") else struct {};
+pub const proof_prefix_root = @import("proof_prefix_root.zig");
+pub const trust_log = if (cluster_on) @import("trust_log.zig") else struct {};
+// Domain procedures are NOT imported here — each domain lives in its own external
+// package and is registered at startup via registerDomains() from its manifest.
 
 pub const ProcedureFn = domain.ProcFn;
 
@@ -55,6 +69,8 @@ const PROCEDURES = [_]Entry{
     .{ .name = "chat_send", .func = chat_send.execute },
     .{ .name = "chat_history", .func = chat_history.execute },
     .{ .name = "vsearch", .func = vsearch.execute },
+    .{ .name = "vsearch_local_raw", .func = vsearch.executeLocalRaw },
+    .{ .name = "vsearch_cluster", .func = if (cluster_on) vsearch_cluster.execute else clusterUnsupported },
     .{ .name = "vsim", .func = vsim.execute },
     .{ .name = "vinsert", .func = vinsert.execute },
     .{ .name = "vstats", .func = vstats.execute },
@@ -62,11 +78,37 @@ const PROCEDURES = [_]Entry{
     .{ .name = "vrabitq", .func = vrabitq.execute },
     .{ .name = "vdelete", .func = vdelete.execute },
     .{ .name = "vnsdrop", .func = vnsdrop.execute },
+    .{ .name = "auth_mint_scoped", .func = auth_mint_scoped.execute },
+    .{ .name = "append_log_append", .func = append_log.appendExecute },
+    .{ .name = "append_log_verify", .func = append_log.verifyExecute },
+    .{ .name = "append_log_mmr_proof", .func = append_log.mmrProofExecute },
+    .{ .name = "append_log_mmr_verify", .func = append_log.mmrVerifyExecute },
+    .{ .name = "append_log_checkpoint", .func = append_log.checkpointExecute },
+    .{ .name = "append_log_proof_bundle", .func = append_log.proofBundleExecute },
+    .{ .name = "append_log_proof_verify", .func = append_log.proofVerifyExecute },
+    .{ .name = "append_log_witness", .func = append_log.witnessExecute },
+    .{ .name = "append_log_witness_request", .func = append_log.witnessRequestExecute },
+    .{ .name = "append_log_witness_import", .func = append_log.witnessImportExecute },
+    .{ .name = "append_log_witness_verify", .func = append_log.witnessVerifyExecute },
+    .{ .name = "append_log_claim", .func = coordination.claimExecute },
+    .{ .name = "append_log_claim_status", .func = coordination.statusExecute },
+    .{ .name = "append_log_claim_release", .func = coordination.releaseExecute },
+    .{ .name = "append_log_claim_supersede", .func = coordination.supersedeExecute },
+    .{ .name = "cluster_presence", .func = if (cluster_on) cluster_presence.execute else clusterUnsupported },
+    .{ .name = "proof_prefix_root", .func = proof_prefix_root.execute },
+    .{ .name = "trust_grant", .func = if (cluster_on) trust_log.grantExecute else clusterUnsupported },
+    .{ .name = "trust_revoke", .func = if (cluster_on) trust_log.revokeExecute else clusterUnsupported },
+    .{ .name = "trust_fold", .func = if (cluster_on) trust_log.foldExecute else clusterUnsupported },
     .{ .name = "mem_init", .func = memory.memInit },
     .{ .name = "mem_add", .func = memory.memAdd },
+    .{ .name = "mem_meta_set", .func = memory.memMetaSet },
+    .{ .name = "mem_bulk_add", .func = memory.memBulkAdd },
     .{ .name = "mem_get", .func = memory.memGet },
     .{ .name = "mem_query", .func = memory.memQuery },
+    .{ .name = "mem_range", .func = memory.memRange },
     .{ .name = "mem_stats", .func = memory.memStats },
+    .{ .name = "mem_health", .func = memory.memHealth },
+    .{ .name = "mem_verify", .func = memory.memVerify },
     .{ .name = "mem_drop", .func = memory.memDrop },
     .{ .name = "mem_reset_index", .func = memory.memResetIndex },
     .{ .name = "mem_capabilities", .func = memory.memCapabilities },

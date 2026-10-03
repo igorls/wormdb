@@ -14,6 +14,7 @@ pub const is_linux = builtin.os.tag == .linux;
 
 pub const tcp = @import("tcp.zig");
 pub const executor = @import("executor.zig");
+pub const metrics = @import("metrics.zig");
 pub const uring = if (is_linux) @import("uring.zig") else struct {};
 pub const epoll = if (is_linux) @import("epoll.zig") else struct {};
 pub const gateway = @import("gateway.zig");
@@ -22,6 +23,7 @@ pub const auth = @import("auth.zig");
 
 pub const Server = tcp.Server;
 pub const ServerConfig = tcp.ServerConfig;
+pub const ServerMetrics = metrics.ServerMetrics;
 pub const Gateway = gateway.Gateway;
 pub const QuicGateway = if (build_options.quic) quic_gateway.QuicGateway else void;
 

@@ -74,7 +74,11 @@ pub fn parseCommand(allocator: std.mem.Allocator, input: []const u8) ProtocolErr
 
     if (std.mem.eql(u8, cmd, "SUB")) {
         const channel = tokens.next() orelse return error.InvalidArgs;
-        return .{ .subscribe = try allocator.dupe(u8, channel) };
+        const filter = tokens.rest();
+        return .{ .subscribe = .{
+            .channel = try allocator.dupe(u8, channel),
+            .filter = if (filter.len > 0) try allocator.dupe(u8, filter) else null,
+        } };
     }
 
     if (std.mem.eql(u8, cmd, "UNSUB")) {
@@ -107,7 +111,10 @@ pub fn deinitCommand(allocator: std.mem.Allocator, cmd: Command) void {
         .cluster_status => {},
         .cluster_peers => {},
         .save => {},
-        .subscribe => |channel| allocator.free(channel),
+        .subscribe => |params| {
+            allocator.free(params.channel);
+            if (params.filter) |filter| allocator.free(filter);
+        },
         .unsubscribe => |channel| allocator.free(channel),
         .publish => |params| {
             allocator.free(params.channel);

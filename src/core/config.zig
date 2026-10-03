@@ -48,7 +48,7 @@ pub const ServerConfig = struct {
     /// Maximum concurrent connections
     max_connections: usize = 1024,
 
-    /// Connection timeout in milliseconds
+    /// Whole handshake/frame timeout in milliseconds; must be positive.
     timeout_ms: usize = 30000,
 
     /// Server backend
@@ -93,6 +93,13 @@ pub const ClusterConfig = struct {
 
 /// Gateway configuration (WebSocket endpoint for browser-direct access)
 pub const GatewayConfig = struct {
+    /// Global accepted-connection cap, including HTTP handshakes and loopback.
+    /// Must be positive; separate from the optional per-IP limit.
+    max_connections: usize = 256,
+
+    /// Whole handshake/frame timeout in milliseconds; must be positive.
+    timeout_ms: usize = 30000,
+
     /// Enable the WebSocket gateway
     enabled: bool = false,
 
@@ -119,6 +126,17 @@ pub const GatewayConfig = struct {
     /// false only on a trusted network to disable capability checks on the WS listener.
     auth_enabled: bool = true,
 
+    /// Max concurrent WebSocket-gateway connections per client IP. 0 (default) = unlimited.
+    /// NEVER default this to a small number: players behind one NAT and localhost capacity
+    /// benches share a single address (#89). Enforced only when the peer address is
+    /// resolvable on the accept path; rejections are logged and counted in STATUS
+    /// (`gateway_per_ip_rejections`).
+    max_connections_per_ip: u32 = 0,
+
+    /// Exempt loopback peers (127.0.0.0/8, ::1) from `max_connections_per_ip` so local
+    /// benches can open hundreds of sockets from one address (#89).
+    per_ip_exempt_loopback: bool = true,
+
     /// Per-transport auth opt-out for the QUIC/WebTransport gateway. Secure by default (true).
     quic_auth_enabled: bool = true,
 };
@@ -133,12 +151,41 @@ pub const AuthConfig = struct {
 
     /// Maximum token age in seconds. Tokens older than this are rejected.
     token_max_age_s: u64 = 3600,
+
+    /// Optional base64 Ed25519 secret key used by auth_mint_scoped.
+    /// When null, server-side minting is disabled and offline token minting still works.
+    mint_secret_key: ?[]const u8 = null,
+
+    /// Default namespace token lifetime for auth_mint_scoped.
+    namespace_token_ttl_s: u64 = 3600,
+};
+
+/// One org → namespace grant (JSON form). `org_pubkey` is the org's Ed25519
+/// public key, base64 (standard alphabet, 44 chars). Nodes presenting a valid
+/// certificate from that org may replicate keys matching any prefix.
+pub const OrgGrantConfig = struct {
+    org_pubkey: []const u8,
+    name: []const u8 = "",
+    prefixes: []const []const u8 = &.{},
+};
+
+/// Org-trust configuration for the replication channel (issue #63).
+/// Deny-by-default: configuring any grant turns enforcement on regardless of
+/// the `enforce` flag — trust that is configured but not enforced is a trap.
+pub const OrgTrustConfig = struct {
+    /// Force enforcement even with an empty grant list (rejects everything).
+    enforce: bool = false,
+    /// Path to this node's org-signed certificate (binary, 186 bytes,
+    /// as written by meshguard `Org.saveCertificate`). Required for this node
+    /// to authenticate its own outbound replication connections.
+    node_cert_path: ?[]const u8 = null,
+    /// Orgs whose certified nodes may replicate into the listed key prefixes.
+    grants: []const OrgGrantConfig = &.{},
 };
 
 /// One frozen segment mount: a `.wseg` file mmap'd at startup and attached to the
 /// store under `name`. The engine is domain-agnostic — `name` is an opaque string
-/// a serving layer looks up (e.g. "lightapi", "atomicassets"); core assigns it no
-/// meaning.
+/// a serving layer looks up; core assigns it no meaning.
 pub const SegmentMount = struct {
     name: []const u8,
     path: []const u8,
@@ -169,6 +216,11 @@ pub const WormDBConfig = struct {
 
     /// Authentication settings
     auth: AuthConfig = .{},
+
+    /// Org trust for cluster replication (empty = open/legacy replication;
+    /// the composition root refuses to start a cluster without either this
+    /// or an explicit --cluster-open acknowledgement).
+    org_trust: OrgTrustConfig = .{},
 };
 
 /// Load configuration from a JSON file.
@@ -218,6 +270,23 @@ test "loadFromJson: empty object uses defaults" {
     try std.testing.expectEqual(true, cfg.server.auth_enabled);
     try std.testing.expectEqual(true, cfg.gateway.auth_enabled);
     try std.testing.expectEqual(true, cfg.gateway.quic_auth_enabled);
+    // Per-IP cap ships OFF (#89): a default cap breaks NAT'd players and localhost benches.
+    try std.testing.expectEqual(@as(u32, 0), cfg.gateway.max_connections_per_ip);
+    try std.testing.expectEqual(true, cfg.gateway.per_ip_exempt_loopback);
+}
+
+test "loadFromJson: gateway per-IP cap overrides" {
+    const cfg = try loadFromJson(
+        \\{
+        \\  "gateway": {
+        \\    "enabled": true,
+        \\    "max_connections_per_ip": 256,
+        \\    "per_ip_exempt_loopback": false
+        \\  }
+        \\}
+    , std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 256), cfg.gateway.max_connections_per_ip);
+    try std.testing.expectEqual(false, cfg.gateway.per_ip_exempt_loopback);
 }
 
 test "loadFromJson: override specific fields" {
@@ -234,6 +303,39 @@ test "loadFromJson: override specific fields" {
     try std.testing.expectEqual(@as(u16, 7001), cfg.gateway.port);
     try std.testing.expectEqualStrings("/var/lib/wormdb", cfg.data);
     try std.testing.expectEqualStrings("prod", cfg.cluster.name.?);
+}
+
+test "loadFromJson: org_trust section round-trips" {
+    // Defaults: no org trust configured.
+    const bare = try loadFromJson("{}", std.testing.allocator);
+    try std.testing.expectEqual(false, bare.org_trust.enforce);
+    try std.testing.expectEqual(@as(usize, 0), bare.org_trust.grants.len);
+    try std.testing.expect(bare.org_trust.node_cert_path == null);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cfg = try loadFromJson(
+        \\{
+        \\  "org_trust": {
+        \\    "enforce": true,
+        \\    "node_cert_path": "/etc/wormdb/node.cert",
+        \\    "grants": [
+        \\      {
+        \\        "org_pubkey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        \\        "name": "acme",
+        \\        "prefixes": ["acme:", "vec:acme:"]
+        \\      }
+        \\    ]
+        \\  }
+        \\}
+    , arena.allocator());
+    try std.testing.expectEqual(true, cfg.org_trust.enforce);
+    try std.testing.expectEqualStrings("/etc/wormdb/node.cert", cfg.org_trust.node_cert_path.?);
+    try std.testing.expectEqual(@as(usize, 1), cfg.org_trust.grants.len);
+    try std.testing.expectEqualStrings("acme", cfg.org_trust.grants[0].name);
+    try std.testing.expectEqual(@as(usize, 2), cfg.org_trust.grants[0].prefixes.len);
+    try std.testing.expectEqualStrings("acme:", cfg.org_trust.grants[0].prefixes[0]);
+    try std.testing.expectEqualStrings("vec:acme:", cfg.org_trust.grants[0].prefixes[1]);
 }
 
 test "loadFromJson: unknown fields ignored" {

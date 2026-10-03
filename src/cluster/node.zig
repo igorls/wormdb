@@ -11,12 +11,17 @@ const builtin = @import("builtin");
 const meshguard = @import("meshguard");
 const storage = @import("../storage/mod.zig");
 const event = @import("../event/mod.zig");
+const protocol = @import("../protocol/mod.zig");
 const wire = @import("../protocol/wire.zig");
 const core = @import("../core/mod.zig");
 const Command = core.types.Command;
 
 const Store = storage.Store;
 const EventBus = event.EventBus;
+const NamespaceIndex = @import("../vector/index.zig").NamespaceIndex;
+const prefix_root = @import("../proof/prefix_root.zig");
+const org_trust = @import("org_trust.zig");
+const presence = @import("presence.zig");
 
 const Keys = meshguard.identity.Keys;
 const Membership = meshguard.discovery.Membership;
@@ -56,6 +61,10 @@ pub const ClusterConfig = struct {
     gossip_port: u16 = 51821,
     /// WireGuard listen port
     wg_port: u16 = 51830,
+    /// Org trust for replication (#63). When set with a node cert, outbound
+    /// replication connections use the "W2" org handshake (challenge signed
+    /// with the cluster identity key); otherwise legacy "WR" is spoken.
+    org_trust: ?*const org_trust.OrgTrust = null,
 };
 
 pub const ClusterStatus = struct {
@@ -67,6 +76,69 @@ pub const ClusterStatus = struct {
     connected_peers: usize,
     mesh_ip: [4]u8,
     enabled: bool,
+    proof_checkpoint_records: usize,
+    proof_witness_records: usize,
+    proof_last_verified_ms: u64,
+    anti_entropy_mode: []const u8,
+};
+
+/// Parameters for a scatter-gather vector search (#67). Namespace/metric/
+/// mode travel as strings — they are forwarded verbatim as
+/// `vsearch_local_raw` args, whose parsing matches `vsearch` exactly.
+pub const ScatterParams = struct {
+    top_k: usize,
+    namespace: []const u8,
+    metric: []const u8,
+    decay: f32,
+    mode: []const u8,
+    decay_tau_hours: f32,
+    /// Bounded fan-out — at most this many alive peers are queried.
+    max_peers: usize = 16,
+};
+
+/// One remote candidate gathered from a peer's `vsearch_local_raw` reply.
+pub const ScatterItem = struct {
+    key: []const u8,
+    score: f32,
+    timestamp: u64,
+};
+
+/// Result of `Cluster.scatterVsearch`. `items` is deduplicated by key
+/// (max score wins), sorted by descending score and capped at `top_k`;
+/// all memory is owned by the allocator passed to scatterVsearch.
+pub const ScatterResult = struct {
+    items: []ScatterItem,
+    peers_queried: usize,
+    peers_failed: usize,
+};
+
+const RootSyncState = enum {
+    healthy,
+    behind,
+    ahead,
+    diverged,
+    unknown,
+
+    fn name(self: RootSyncState) []const u8 {
+        return switch (self) {
+            .healthy => "healthy",
+            .behind => "behind",
+            .ahead => "ahead",
+            .diverged => "diverged",
+            .unknown => "unknown",
+        };
+    }
+};
+
+const RegSnap = struct {
+    prefix: []const u8,
+    idx: *NamespaceIndex,
+};
+
+const SyncStats = struct {
+    synced_set: usize = 0,
+    synced_vinsert: usize = 0,
+    skipped_bq: usize = 0,
 };
 
 /// A persistent WormWire TCP connection to a peer WormDB node.
@@ -84,11 +156,15 @@ const PeerConnection = struct {
     /// Set by onPeerDead, cleared by onPeerJoin. Prevents blocking TCP connect
     /// attempts to unreachable peers.
     is_dead: bool,
+    root_sync: RootSyncState,
+    root_sync_last_ms: u64,
+    root_sync_missing_ranges: usize,
 
-    fn connect(self: *PeerConnection, port: u16) void {
+    fn connect(self: *PeerConnection, cluster: *const Cluster) void {
         if (self.stream != null) return;
         if (self.is_dead) return;
 
+        const port = cluster.config.peer_port;
         const now = core.compat.nowNs();
         if (now - self.last_connect_attempt_ns < 2_000_000_000) return;
         self.last_connect_attempt_ns = now;
@@ -106,10 +182,15 @@ const PeerConnection = struct {
         if (comptime builtin.os.tag == .linux) {
             const timeval = std.posix.timeval{ .sec = 2, .usec = 0 };
             std.posix.setsockopt(stream.getHandle(), std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeval)) catch {};
+            // The W2 handshake reads the server's challenge — bound that read too.
+            std.posix.setsockopt(stream.getHandle(), std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
         }
 
         var stream_mut = stream;
-        stream_mut.writeAll(&.{ 0x57, 0x52 }) catch {
+        cluster.replOutboundHandshake(&stream_mut) catch |err| {
+            std.log.warn("cluster: replication handshake to {d}.{d}.{d}.{d}:{d} failed: {s}", .{
+                ip[0], ip[1], ip[2], ip[3], port, @errorName(err),
+            });
             stream_mut.close();
             return;
         };
@@ -167,6 +248,15 @@ pub const Cluster = struct {
     discovery_thread: ?std.Thread,
     running: std.atomic.Value(bool),
 
+    // ── Presence deltas (#65) ──
+    /// pubkey → last published SWIM state, diffed by the discovery loop's
+    /// ~1s presence poll to detect transitions that have no SWIM callback
+    /// (alive→suspected, recovery, graceful leave). Guarded by `mutex`
+    /// (written by the discovery thread's poll and the SWIM callbacks).
+    presence_cache: std.AutoHashMap([32]u8, Membership.PeerState),
+    /// Monotonic ns of the last presence poll. Discovery-thread-only.
+    last_presence_poll_ns: i128,
+
     pub fn init(
         allocator: std.mem.Allocator,
         store: *Store,
@@ -204,6 +294,8 @@ pub const Cluster = struct {
             .mutex = .{},
             .discovery_thread = null,
             .running = std.atomic.Value(bool).init(false),
+            .presence_cache = std.AutoHashMap([32]u8, Membership.PeerState).init(allocator),
+            .last_presence_poll_ns = 0,
         };
     }
 
@@ -214,6 +306,7 @@ pub const Cluster = struct {
             entry.value_ptr.disconnect();
         }
         self.peers.deinit();
+        self.presence_cache.deinit();
         self.membership.deinit();
         if (self.gossip_socket) |*s| s.close();
     }
@@ -223,6 +316,46 @@ pub const Cluster = struct {
         registry: *@import("../vector/index.zig").NamespaceRegistry,
     ) void {
         self.vector_registry = registry;
+    }
+
+    pub fn identityPublicKey(self: *const Cluster) [32]u8 {
+        return self.identity.public_key.toBytes();
+    }
+
+    pub fn signWithIdentity(self: *const Cluster, message: []const u8) ![64]u8 {
+        return try Keys.sign(message, self.identity.secret_key);
+    }
+
+    /// Open a replication stream's protocol: write the magic and, when org
+    /// trust + our node cert are configured, complete the "W2" org handshake
+    /// (read the server's 32B challenge, reply [186B cert][64B Ed25519 sig
+    /// over challenge++cert] signed with the cluster identity key — the same
+    /// std Ed25519 detached form as signWithIdentity, which the server-side
+    /// verify expects). Without a cert we speak legacy "WR"; an enforcing
+    /// peer will reject that loudly, which is the intended fail-closed
+    /// behavior rather than a silent identity-less write path.
+    fn replOutboundHandshake(self: *const Cluster, stream: *core.compat.net.Stream) !void {
+        const trust = self.config.org_trust orelse {
+            try stream.writeAll(&wire.REPL_MAGIC);
+            return;
+        };
+        const cert_wire = trust.node_cert_wire orelse {
+            if (trust.enforce) {
+                std.log.warn("cluster: org trust enforced but no node_cert_path configured — speaking legacy replication (enforcing peers will reject)", .{});
+            }
+            try stream.writeAll(&wire.REPL_MAGIC);
+            return;
+        };
+
+        try stream.writeAll(&wire.REPL_MAGIC_V2);
+
+        var challenge: [org_trust.CHALLENGE_LEN]u8 = undefined;
+        try readExactFromStream(stream, &challenge);
+
+        const msg = org_trust.handshakeMessage(&challenge, &cert_wire);
+        const sig = try Keys.sign(&msg, self.identity.secret_key);
+        try stream.writeAll(&cert_wire);
+        try stream.writeAll(&sig);
     }
 
     /// Start the mesh network: bind gossip socket, init SWIM, seed peers, start discovery thread.
@@ -366,6 +499,9 @@ pub const Cluster = struct {
                     .last_connect_attempt_ns = 0,
                     .needs_sync = true,
                     .is_dead = false,
+                    .root_sync = .unknown,
+                    .root_sync_last_ms = 0,
+                    .root_sync_missing_ranges = 0,
                 }) catch {};
                 var ip_buf: [15]u8 = undefined;
                 const ip_str = WgIp.formatIp(swim_peer.mesh_ip, &ip_buf);
@@ -377,7 +513,7 @@ pub const Cluster = struct {
         var iter = self.peers.iterator();
         while (iter.next()) |entry| {
             var peer = entry.value_ptr;
-            peer.connect(self.config.peer_port);
+            peer.connect(self);
 
             if (peer.needs_sync and peer.stream != null) {
                 peer.needs_sync = false;
@@ -385,100 +521,486 @@ pub const Cluster = struct {
                 const ip_str = WgIp.formatIp(peer.mesh_ip, &ip_buf);
                 std.log.info("cluster: anti-entropy sync starting for {s}", .{ip_str});
 
-                // Snapshot the registry's namespaces once so the per-key
-                // callback can do cheap prefix checks. The registry's own
-                // read-lock stays brief; NamespaceIndex pointers remain
-                // valid because nothing removes namespaces during this sync.
-                const RegSnap = struct {
-                    prefix: []const u8,
-                    idx: *@import("../vector/index.zig").NamespaceIndex,
-                };
-                var reg_snap: std.ArrayListUnmanaged(RegSnap) = .empty;
+                var reg_snap = self.snapshotVectorRegistry();
                 defer reg_snap.deinit(self.allocator);
-                if (self.vector_registry) |reg| {
-                    reg.lock.lockShared();
-                    defer reg.lock.unlockShared();
-                    var ri = reg.map.iterator();
-                    while (ri.next()) |e| {
-                        reg_snap.append(self.allocator, .{
-                            .prefix = e.key_ptr.*,
-                            .idx = e.value_ptr.*,
-                        }) catch break;
+
+                if (self.tryRootAntiEntropy(peer, reg_snap.items)) |result| {
+                    switch (result) {
+                        .healthy => {
+                            std.log.info("cluster: root sync healthy for {s}; full sync skipped", .{ip_str});
+                            continue;
+                        },
+                        .repaired => |stats| {
+                            std.log.info("cluster: root sync repaired {s} — {d} SET, {d} VINSERT, {d} bq-skipped", .{
+                                ip_str,
+                                stats.synced_set,
+                                stats.synced_vinsert,
+                                stats.skipped_bq,
+                            });
+                            continue;
+                        },
+                        .fallback => {},
                     }
+                } else |err| {
+                    std.log.debug("cluster: root sync probe failed for {s}: {s}", .{ ip_str, @errorName(err) });
                 }
 
-                const SyncCtx = struct {
-                    p: *PeerConnection,
-                    synced_set: usize = 0,
-                    synced_vinsert: usize = 0,
-                    skipped_bq: usize = 0,
-                    reg_snap: []const RegSnap,
-                    /// Find which registered namespace (if any) owns this key.
-                    fn matchNamespace(ctx: @This(), key: []const u8) ?*RegSnap {
-                        for (ctx.reg_snap) |*r| {
-                            if (std.mem.startsWith(u8, key, r.prefix)) return @constCast(r);
-                        }
-                        return null;
-                    }
+                var sync_ctx = FullSyncCtx{
+                    .cluster = self,
+                    .peer = peer,
+                    .reg_snap = reg_snap.items,
                 };
-                var sync_ctx = SyncCtx{ .p = peer, .reg_snap = reg_snap.items };
-
-                self.store.iterateAll(@ptrCast(&sync_ctx), &struct {
-                    fn cb(raw_ctx: *anyopaque, k: []const u8, v: []const u8, w: bool) void {
-                        const sctx: *SyncCtx = @ptrCast(@alignCast(raw_ctx));
-
-                        // `bq:<ns><id>` companions: skip when the namespace
-                        // is registered — the peer regenerates them from
-                        // VINSERT. Otherwise, SET replicates them.
-                        const BQ_PREFIX = "bq:";
-                        if (std.mem.startsWith(u8, k, BQ_PREFIX)) {
-                            const stripped = k[BQ_PREFIX.len..];
-                            if (sctx.matchNamespace(stripped) != null) {
-                                sctx.skipped_bq += 1;
-                                return;
-                            }
-                        }
-
-                        // Registered-namespace vector keys: emit VINSERT.
-                        if (sctx.matchNamespace(k)) |r| {
-                            r.idx.lock.lockShared();
-                            defer r.idx.lock.unlockShared();
-
-                            if (r.idx.nodeIdFor(k)) |node_id| {
-                                const ts = r.idx.timestamps.items[node_id];
-                                if (sctx.p.sendCommand(.{ .vinsert = .{
-                                    .key = k,
-                                    .vector = v,
-                                    .worm = w,
-                                    .namespace = r.prefix,
-                                    .metric = r.idx.metric.name(),
-                                    .timestamp = ts,
-                                } })) {
-                                    sctx.synced_vinsert += 1;
-                                }
-                                return;
-                            }
-                            // Registered namespace but no HNSW node — this
-                            // key was SET directly. Fall through to SET.
-                        }
-
-                        // Default path: replicate as a raw SET.
-                        if (sctx.p.sendCommand(.{ .set = .{
-                            .key = k,
-                            .value = v,
-                            .worm = w,
-                        } })) {
-                            sctx.synced_set += 1;
-                        }
-                    }
-                }.cb);
+                self.store.iterateAll(@ptrCast(&sync_ctx), fullSyncCallback);
 
                 std.log.info("cluster: sync to {s} — {d} SET, {d} VINSERT, {d} bq-skipped", .{
                     ip_str,
-                    sync_ctx.synced_set,
-                    sync_ctx.synced_vinsert,
-                    sync_ctx.skipped_bq,
+                    sync_ctx.stats.synced_set,
+                    sync_ctx.stats.synced_vinsert,
+                    sync_ctx.stats.skipped_bq,
                 });
+            }
+        }
+    }
+
+    fn snapshotVectorRegistry(self: *Cluster) std.ArrayListUnmanaged(RegSnap) {
+        var reg_snap: std.ArrayListUnmanaged(RegSnap) = .empty;
+        if (self.vector_registry) |reg| {
+            reg.lock.lockShared();
+            defer reg.lock.unlockShared();
+            var ri = reg.map.iterator();
+            while (ri.next()) |e| {
+                reg_snap.append(self.allocator, .{
+                    .prefix = e.key_ptr.*,
+                    .idx = e.value_ptr.*,
+                }) catch break;
+            }
+        }
+        return reg_snap;
+    }
+
+    const FullSyncCtx = struct {
+        cluster: *Cluster,
+        peer: *PeerConnection,
+        reg_snap: []const RegSnap,
+        stats: SyncStats = .{},
+    };
+
+    fn fullSyncCallback(raw_ctx: *anyopaque, key: []const u8, value: []const u8, is_worm: bool) void {
+        const ctx: *FullSyncCtx = @ptrCast(@alignCast(raw_ctx));
+        ctx.cluster.sendStoreEntryToPeer(ctx.peer, ctx.reg_snap, key, value, is_worm, &ctx.stats);
+    }
+
+    fn matchNamespace(reg_snap: []const RegSnap, key: []const u8) ?*const RegSnap {
+        for (reg_snap) |*r| {
+            if (std.mem.startsWith(u8, key, r.prefix)) return r;
+        }
+        return null;
+    }
+
+    fn sendStoreEntryToPeer(
+        self: *Cluster,
+        peer: *PeerConnection,
+        reg_snap: []const RegSnap,
+        key: []const u8,
+        value: []const u8,
+        is_worm: bool,
+        stats: *SyncStats,
+    ) void {
+        _ = self;
+        const BQ_PREFIX = "bq:";
+        if (std.mem.startsWith(u8, key, BQ_PREFIX)) {
+            const stripped = key[BQ_PREFIX.len..];
+            if (matchNamespace(reg_snap, stripped) != null) {
+                stats.skipped_bq += 1;
+                return;
+            }
+        }
+
+        if (matchNamespace(reg_snap, key)) |r| {
+            r.idx.lock.lockShared();
+            defer r.idx.lock.unlockShared();
+
+            if (r.idx.nodeIdFor(key)) |node_id| {
+                const ts = r.idx.timestamps.items[node_id];
+                if (peer.sendCommand(.{ .vinsert = .{
+                    .key = key,
+                    .vector = value,
+                    .worm = is_worm,
+                    .namespace = r.prefix,
+                    .metric = r.idx.metric.name(),
+                    .timestamp = ts,
+                } })) {
+                    stats.synced_vinsert += 1;
+                }
+                return;
+            }
+        }
+
+        if (peer.sendCommand(.{ .set = .{
+            .key = key,
+            .value = value,
+            .worm = is_worm,
+        } })) {
+            stats.synced_set += 1;
+        }
+    }
+
+    const RootAntiEntropyResult = union(enum) {
+        healthy,
+        repaired: SyncStats,
+        fallback,
+    };
+
+    fn tryRootAntiEntropy(
+        self: *Cluster,
+        peer: *PeerConnection,
+        reg_snap: []const RegSnap,
+    ) !RootAntiEntropyResult {
+        const prefix = "";
+        const local = try prefix_root.compute(self.allocator, self.store, prefix, 0);
+        const remote = try self.requestPeerPrefixRoot(peer, prefix, 0);
+        const now_ms: u64 = @intCast(core.compat.nowMs());
+
+        if (local.entry_count == remote.entry_count and std.mem.eql(u8, local.root[0..], remote.root[0..])) {
+            peer.root_sync = .healthy;
+            peer.root_sync_last_ms = now_ms;
+            peer.root_sync_missing_ranges = 0;
+            return .healthy;
+        }
+
+        if (remote.entry_count < local.entry_count) {
+            const local_prefix = try prefix_root.computeFirstN(self.allocator, self.store, prefix, remote.entry_count);
+            if (std.mem.eql(u8, local_prefix.root[0..], remote.root[0..])) {
+                const results = try self.store.scanPrefixFirst(prefix, 0, self.allocator);
+                defer freeScanResults(self.allocator, results);
+                if (remote.entry_count > results.len) {
+                    peer.root_sync = .unknown;
+                    peer.root_sync_last_ms = now_ms;
+                    peer.root_sync_missing_ranges = 0;
+                    return .fallback;
+                }
+
+                var stats: SyncStats = .{};
+                for (results[remote.entry_count..]) |r| {
+                    self.sendStoreEntryToPeer(peer, reg_snap, r.key, r.value, r.is_worm, &stats);
+                }
+
+                peer.root_sync = .behind;
+                peer.root_sync_last_ms = now_ms;
+                peer.root_sync_missing_ranges = 1;
+                return RootAntiEntropyResult{ .repaired = stats };
+            }
+        }
+
+        peer.root_sync = if (remote.entry_count > local.entry_count) .ahead else .diverged;
+        peer.root_sync_last_ms = now_ms;
+        peer.root_sync_missing_ranges = if (peer.root_sync == .diverged) 1 else 0;
+        return .fallback;
+    }
+
+    const PeerRootSummary = struct {
+        entry_count: usize,
+        root: prefix_root.Hash,
+    };
+
+    fn requestPeerPrefixRoot(
+        self: *Cluster,
+        peer: *PeerConnection,
+        prefix: []const u8,
+        first_limit: usize,
+    ) !PeerRootSummary {
+        const ip = peer.real_addr orelse peer.mesh_ip;
+        const addr = core.compat.net.Address.initIp4(ip, self.config.peer_port);
+        var stream = try core.compat.net.tcpConnectToAddress(addr);
+        defer stream.close();
+
+        if (comptime builtin.os.tag == .linux) {
+            const timeval = std.posix.timeval{ .sec = 2, .usec = 0 };
+            std.posix.setsockopt(stream.getHandle(), std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeval)) catch {};
+            std.posix.setsockopt(stream.getHandle(), std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
+        }
+
+        // Same protocol negotiation as persistent peer connections: W2 org
+        // handshake when we can authenticate, legacy WR otherwise.
+        try self.replOutboundHandshake(&stream);
+
+        var limit_buf: [48]u8 = undefined;
+        const limit_arg = try std.fmt.bufPrint(&limit_buf, "limit={d}", .{first_limit});
+        var args = [_][]const u8{ prefix, limit_arg };
+        try wire.writeCommand(&stream, .{ .exec = .{
+            .procedure = "proof_prefix_root",
+            .args = args[0..],
+        } });
+
+        const ReadAdapter = struct {
+            stream: *core.compat.net.Stream,
+
+            pub fn read(adapter: *@This(), dest: []u8) !usize {
+                return adapter.stream.read(dest);
+            }
+        };
+        var reader = ReadAdapter{ .stream = &stream };
+        const response = try wire.readResponseAlloc(&reader, self.allocator);
+        defer protocol.deinitResponse(self.allocator, response);
+
+        return switch (response) {
+            .value => |maybe_value| parsePeerRootSummary(self.allocator, maybe_value orelse return error.Corruption),
+            .err => error.Corruption,
+            else => error.Corruption,
+        };
+    }
+
+    fn parsePeerRootSummary(allocator: std.mem.Allocator, payload: []const u8) !PeerRootSummary {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+
+        const obj = parsed.value.object;
+        const alg = obj.get("root_alg") orelse return error.Corruption;
+        if (alg != .string or !std.mem.eql(u8, alg.string, prefix_root.ROOT_ALG)) return error.Corruption;
+
+        const count_value = obj.get("entry_count") orelse return error.Corruption;
+        if (count_value != .integer or count_value.integer < 0) return error.Corruption;
+
+        const root_value = obj.get("root") orelse return error.Corruption;
+        if (root_value != .string) return error.Corruption;
+        return .{
+            .entry_count = @intCast(count_value.integer),
+            .root = try parseRootHex(root_value.string),
+        };
+    }
+
+    fn parseRootHex(hex: []const u8) !prefix_root.Hash {
+        if (hex.len != prefix_root.HASH_LEN * 2) return error.Corruption;
+        var out: prefix_root.Hash = undefined;
+        for (&out, 0..) |*byte, i| {
+            const hi = try hexNibble(hex[i * 2]);
+            const lo = try hexNibble(hex[i * 2 + 1]);
+            byte.* = (hi << 4) | lo;
+        }
+        return out;
+    }
+
+    fn hexNibble(c: u8) !u8 {
+        return switch (c) {
+            '0'...'9' => c - '0',
+            'a'...'f' => c - 'a' + 10,
+            'A'...'F' => c - 'A' + 10,
+            else => error.Corruption,
+        };
+    }
+
+    fn freeScanResults(allocator: std.mem.Allocator, results: []Store.ScanResult) void {
+        for (results) |r| {
+            allocator.free(r.key);
+            allocator.free(r.value);
+        }
+        allocator.free(results);
+    }
+
+    // ── Scatter-gather vector search (#67) ──
+
+    /// Scatter a vector search to alive peers as `EXEC vsearch_local_raw`
+    /// sub-queries over one-shot replication connections, and gather the
+    /// per-peer top-K lists into a deduplicated global candidate set.
+    ///
+    /// v1 queries peers SEQUENTIALLY (same shape as requestPeerPrefixRoot);
+    /// parallel fan-out is a later optimization. Each connection is bounded
+    /// by 2s send/receive timeouts (Linux; other platforms rely on the OS
+    /// defaults — clustering is Linux-only in practice), so worst case is
+    /// ~2s × peers, capped by `max_peers`.
+    ///
+    /// Per-peer failures (connect, timeout, error response, malformed JSON)
+    /// are counted in `peers_failed` and never fail the whole scatter —
+    /// callers surface partial results.
+    ///
+    /// All returned memory (item keys, items slice) is owned by `allocator`
+    /// (the calling procedure's arena in practice).
+    pub fn scatterVsearch(
+        self: *Cluster,
+        allocator: std.mem.Allocator,
+        query: []align(1) const f32,
+        params: ScatterParams,
+    ) !ScatterResult {
+        // 1. Snapshot up to max_peers ALIVE peers under the membership
+        //    read lock (#65 convention — SWIM thread owns the writes).
+        var mesh_ips: std.ArrayListUnmanaged([4]u8) = .empty;
+        defer mesh_ips.deinit(allocator);
+        {
+            const zio = core.compat.io();
+            self.membership.lock.lockSharedUncancelable(zio);
+            defer self.membership.lock.unlockShared(zio);
+            var iter = self.membership.peers.iterator();
+            while (iter.next()) |entry| {
+                if (mesh_ips.items.len >= params.max_peers) break;
+                if (entry.value_ptr.state != .alive) continue;
+                try mesh_ips.append(allocator, entry.value_ptr.mesh_ip);
+            }
+        }
+
+        // 2. Resolve each mesh IP to the best route — the SWIM-discovered
+        //    real address when known (WG tunnels may not be functional,
+        //    e.g. Docker), falling back to the mesh IP. Same chain as
+        //    requestPeerPrefixRoot / PeerConnection.connect.
+        var targets: std.ArrayListUnmanaged([4]u8) = .empty;
+        defer targets.deinit(allocator);
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            for (mesh_ips.items) |mip| {
+                if (self.peers.getPtr(mip)) |pc| {
+                    if (pc.is_dead) continue;
+                    try targets.append(allocator, pc.real_addr orelse mip);
+                } else {
+                    try targets.append(allocator, mip);
+                }
+            }
+        }
+
+        // 3. Encode the query once: standard base64 of the raw f32 bytes
+        //    (little-endian on every supported target).
+        const query_bytes = std.mem.sliceAsBytes(query);
+        const b64_len = std.base64.standard.Encoder.calcSize(query_bytes.len);
+        const query_b64 = try allocator.alloc(u8, b64_len);
+        _ = std.base64.standard.Encoder.encode(query_b64, query_bytes);
+
+        // 4. Sequential fan-out; merge with dedup-by-key keeping the max
+        //    score. Keys are globally replicated, so most collide — the
+        //    dedup is what turns N per-node top-Ks into one global top-K.
+        var index = std.StringHashMap(usize).init(allocator);
+        defer index.deinit();
+        var items: std.ArrayListUnmanaged(ScatterItem) = .empty;
+        defer items.deinit(allocator);
+
+        var failed: usize = 0;
+        for (targets.items) |ip| {
+            const payload = self.queryPeerVsearchLocalRaw(allocator, ip, query_b64, params) catch {
+                failed += 1;
+                continue;
+            };
+            mergeScatterPayload(allocator, payload, &index, &items) catch {
+                failed += 1;
+                continue;
+            };
+        }
+
+        // 5. Global order + cap. Per-peer k == global k is provably
+        //    sufficient: the global top-K is a subset of the union of
+        //    per-node top-Ks.
+        std.sort.heap(ScatterItem, items.items, {}, struct {
+            fn greater(_: void, a: ScatterItem, b: ScatterItem) bool {
+                return a.score > b.score;
+            }
+        }.greater);
+        const n = @min(items.items.len, params.top_k);
+        const out = try allocator.dupe(ScatterItem, items.items[0..n]);
+
+        return .{
+            .items = out,
+            .peers_queried = targets.items.len,
+            .peers_failed = failed,
+        };
+    }
+
+    /// One-shot `EXEC vsearch_local_raw` against a single peer. Mirrors
+    /// requestPeerPrefixRoot exactly: fresh TCP connection, 2s SND/RCV
+    /// timeouts (Linux), the #63 outbound handshake (W2 org challenge when
+    /// a node cert is configured, legacy WR otherwise), one WormWire exec
+    /// frame, one response. Returns the peer's JSON payload (owned by
+    /// `allocator`).
+    fn queryPeerVsearchLocalRaw(
+        self: *Cluster,
+        allocator: std.mem.Allocator,
+        ip: [4]u8,
+        query_b64: []const u8,
+        params: ScatterParams,
+    ) ![]const u8 {
+        const addr = core.compat.net.Address.initIp4(ip, self.config.peer_port);
+        var stream = try core.compat.net.tcpConnectToAddress(addr);
+        defer stream.close();
+
+        if (comptime builtin.os.tag == .linux) {
+            const timeval = std.posix.timeval{ .sec = 2, .usec = 0 };
+            std.posix.setsockopt(stream.getHandle(), std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeval)) catch {};
+            std.posix.setsockopt(stream.getHandle(), std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
+        }
+
+        // Same protocol negotiation as persistent peer connections: W2 org
+        // handshake when we can authenticate, legacy WR otherwise.
+        try self.replOutboundHandshake(&stream);
+
+        var topk_buf: [24]u8 = undefined;
+        var decay_buf: [48]u8 = undefined;
+        var tau_buf: [48]u8 = undefined;
+        const topk_arg = try std.fmt.bufPrint(&topk_buf, "{d}", .{params.top_k});
+        const decay_arg = try std.fmt.bufPrint(&decay_buf, "{d}", .{params.decay});
+        const tau_arg = try std.fmt.bufPrint(&tau_buf, "{d}", .{params.decay_tau_hours});
+        var args = [_][]const u8{
+            query_b64, topk_arg, params.namespace, params.metric, decay_arg, params.mode, tau_arg,
+        };
+        try wire.writeCommand(&stream, .{ .exec = .{
+            .procedure = "vsearch_local_raw",
+            .args = args[0..],
+        } });
+
+        const ReadAdapter = struct {
+            stream: *core.compat.net.Stream,
+
+            pub fn read(adapter: *@This(), dest: []u8) !usize {
+                return adapter.stream.read(dest);
+            }
+        };
+        var reader = ReadAdapter{ .stream = &stream };
+        const response = try wire.readResponseAlloc(&reader, allocator);
+
+        return switch (response) {
+            .value => |maybe_value| maybe_value orelse error.Corruption,
+            else => blk: {
+                protocol.deinitResponse(allocator, response);
+                break :blk error.Corruption;
+            },
+        };
+    }
+
+    /// Parse one peer's `[{"k","s","ts"},...]` payload and merge it into
+    /// the running dedup set: unknown keys append, known keys keep the
+    /// higher score (strict `>`, so the first-seen entry wins ties).
+    fn mergeScatterPayload(
+        allocator: std.mem.Allocator,
+        payload: []const u8,
+        index: *std.StringHashMap(usize),
+        items: *std.ArrayListUnmanaged(ScatterItem),
+    ) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+        if (parsed.value != .array) return error.Corruption;
+
+        for (parsed.value.array.items) |it| {
+            if (it != .object) return error.Corruption;
+
+            const k = it.object.get("k") orelse return error.Corruption;
+            if (k != .string) return error.Corruption;
+
+            const s = it.object.get("s") orelse return error.Corruption;
+            const score: f32 = switch (s) {
+                .float => @floatCast(s.float),
+                .integer => @floatFromInt(s.integer),
+                else => return error.Corruption,
+            };
+
+            const ts_value = it.object.get("ts") orelse return error.Corruption;
+            if (ts_value != .integer) return error.Corruption;
+            const ts: u64 = if (ts_value.integer < 0) 0 else @intCast(ts_value.integer);
+
+            if (index.get(k.string)) |i| {
+                if (score > items.items[i].score) {
+                    items.items[i].score = score;
+                    items.items[i].timestamp = ts;
+                }
+            } else {
+                // Dupe the key out of the JSON parse tree before it is freed.
+                const key_copy = try allocator.dupe(u8, k.string);
+                try items.append(allocator, .{ .key = key_copy, .score = score, .timestamp = ts });
+                try index.put(key_copy, items.items.len - 1);
             }
         }
     }
@@ -557,6 +1079,34 @@ pub const Cluster = struct {
         }
     }
 
+    /// Ask currently connected/alive peers to countersign an append-log
+    /// checkpoint using their local cluster identity. The peer-side TCP
+    /// replication handler only accepts this one EXEC over REPL_MAGIC.
+    pub fn requestCheckpointWitnesses(
+        self: *Cluster,
+        log_id: []const u8,
+        checkpoint_hash_hex: []const u8,
+    ) !usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.ensurePeersConnectedLocked();
+
+        var requested: usize = 0;
+        var args = [_][]const u8{ log_id, checkpoint_hash_hex };
+        var iter = self.peers.iterator();
+        while (iter.next()) |entry| {
+            var peer = entry.value_ptr;
+            if (peer.sendCommand(.{ .exec = .{
+                .procedure = "append_log_witness",
+                .args = args[0..],
+            } })) {
+                requested += 1;
+            }
+        }
+        return requested;
+    }
+
     /// Replicate a RaBitQ params install (centroid + rotation) to all
     /// alive peers. Issued by `EXEC vrabitq` *before* its re-encode pass
     /// streams the per-vector bq:* SETs, so peers have the params in
@@ -591,7 +1141,7 @@ pub const Cluster = struct {
         var iter = self.peers.iterator();
         while (iter.next()) |entry| {
             var peer = entry.value_ptr;
-            peer.connect(self.config.peer_port);
+            peer.connect(self);
             _ = peer.sendCommand(.{ .delete = key });
         }
     }
@@ -607,6 +1157,12 @@ pub const Cluster = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        var proof_last_verified_ms: u64 = 0;
+        var peer_iter = self.peers.iterator();
+        while (peer_iter.next()) |entry| {
+            proof_last_verified_ms = @max(proof_last_verified_ms, entry.value_ptr.root_sync_last_ms);
+        }
+
         return .{
             .total_nodes = self.membership.count(),
             .alive_nodes = self.membership.countByState(.alive),
@@ -616,6 +1172,10 @@ pub const Cluster = struct {
             .connected_peers = self.peers.count(),
             .mesh_ip = self.mesh_ip,
             .enabled = true,
+            .proof_checkpoint_records = self.store.countPrefix("proof:append-log-checkpoint:v1:"),
+            .proof_witness_records = self.store.countPrefix("proof:append-log-witness:v1:"),
+            .proof_last_verified_ms = proof_last_verified_ms,
+            .anti_entropy_mode = "root",
         };
     }
 
@@ -672,6 +1232,15 @@ pub const Cluster = struct {
             else
                 false;
             try buf.print(allocator, "wormwire={s}\n", .{if (has_conn) "connected" else "disconnected"});
+            if (self.peers.getPtr(peer.mesh_ip)) |pc| {
+                try buf.print(allocator, "root_sync={s}\n", .{pc.root_sync.name()});
+                try buf.print(allocator, "root_sync_last_ms={d}\n", .{pc.root_sync_last_ms});
+                try buf.print(allocator, "root_sync_missing_ranges={d}\n", .{pc.root_sync_missing_ranges});
+            } else {
+                try buf.appendSlice(allocator, "root_sync=unknown\n");
+                try buf.appendSlice(allocator, "root_sync_last_ms=0\n");
+                try buf.appendSlice(allocator, "root_sync_missing_ranges=0\n");
+            }
 
             try buf.appendSlice(allocator, "---\n");
         }
@@ -708,12 +1277,16 @@ pub const Cluster = struct {
                 .last_connect_attempt_ns = 0,
                 .needs_sync = true,
                 .is_dead = false,
+                .root_sync = .unknown,
+                .root_sync_last_ms = 0,
+                .root_sync_missing_ranges = 0,
             }) catch {};
         } else {
             // Peer returning after death — clear dead flag and update address
             if (self.peers.getPtr(peer_mesh_ip)) |conn| {
                 conn.is_dead = false;
                 conn.needs_sync = true;
+                conn.root_sync = .unknown;
                 if (real_addr != null) conn.real_addr = real_addr;
             }
         }
@@ -723,6 +1296,17 @@ pub const Cluster = struct {
             const ra_str = WgIp.formatIp(ra, &ra_buf);
             std.log.info("cluster: peer real addr = {s}", .{ra_str});
         }
+
+        // Presence delta: seed the state-diff cache (so the ~1s poll doesn't
+        // re-emit this transition) and push the join event.
+        self.presence_cache.put(peer.pubkey, .alive) catch {};
+        self.publishPresence(presence.joinJson(
+            self.allocator,
+            peer.pubkey,
+            peer.name,
+            peer_mesh_ip,
+            core.compat.nowMs(),
+        ));
     }
 
     fn onPeerDead(ctx: *anyopaque, pubkey: [32]u8) void {
@@ -746,6 +1330,16 @@ pub const Cluster = struct {
             // Reset connect backoff so we retry promptly when peer returns
             p.last_connect_attempt_ns = 0;
         }
+
+        // Presence delta: record dead in the diff cache (no duplicate emit
+        // from the poll) and push the event.
+        self.presence_cache.put(pubkey, .dead) catch {};
+        self.publishPresence(presence.stateEventJson(
+            self.allocator,
+            .dead,
+            pubkey,
+            core.compat.nowMs(),
+        ));
     }
 
     fn onPeerPunched(ctx: *anyopaque, peer: *const Membership.Peer, endpoint: messages.Endpoint) void {
@@ -766,6 +1360,72 @@ pub const Cluster = struct {
             const ip_str = WgIp.formatIp(endpoint.addr, &ip_buf);
             std.log.info("cluster: peer punched, real IP = {s}:{d}", .{ ip_str, endpoint.port });
         }
+
+        // Presence delta: NAT hole punched — publish the discovered endpoint.
+        self.publishPresence(presence.punchedJson(
+            self.allocator,
+            peer.pubkey,
+            endpoint.addr,
+            endpoint.port,
+            core.compat.nowMs(),
+        ));
+    }
+
+    // ── Presence deltas (#65) ──
+
+    /// Publish a presence delta built by one of the presence.zig JSON
+    /// builders. Best-effort: build/publish failures are swallowed (the bus
+    /// copies the message, so the slice is freed immediately after).
+    fn publishPresence(self: *Cluster, msg_or_err: anyerror![]u8) void {
+        const msg = msg_or_err catch return;
+        defer self.allocator.free(msg);
+        self.event_bus.publish(presence.CHANNEL, msg) catch {};
+    }
+
+    /// Minimum interval between membership state-diff polls (~1s).
+    const PRESENCE_POLL_INTERVAL_NS: i128 = 1_000_000_000;
+
+    /// Poll SWIM membership and publish presence deltas for state transitions
+    /// that have no SWIM callback (alive→suspected, suspected→alive recovery,
+    /// dead→alive rejoin, graceful leave). Time-gated so the tick loop's hot
+    /// path stays cheap; the snapshot is taken under the membership table's
+    /// shared lock (required for readers outside the SWIM thread's writes),
+    /// and the diff cache is updated under the cluster mutex.
+    fn pollPresenceTransitions(self: *Cluster) void {
+        const now = core.compat.nowNs();
+        if (now - self.last_presence_poll_ns < PRESENCE_POLL_INTERVAL_NS) return;
+        self.last_presence_poll_ns = now;
+
+        // Snapshot (pubkey, state) pairs under the membership read lock.
+        var snapshot: std.ArrayListUnmanaged(presence.PeerSnapshot) = .empty;
+        defer snapshot.deinit(self.allocator);
+        {
+            const zio = core.compat.io();
+            self.membership.lock.lockSharedUncancelable(zio);
+            defer self.membership.lock.unlockShared(zio);
+            snapshot.ensureTotalCapacity(self.allocator, self.membership.peers.count()) catch return;
+            var iter = self.membership.peers.iterator();
+            while (iter.next()) |entry| {
+                snapshot.appendAssumeCapacity(.{
+                    .pubkey = entry.key_ptr.*,
+                    .state = entry.value_ptr.state,
+                });
+            }
+        }
+
+        // Diff against the cached states under the cluster mutex.
+        var events: [64]presence.StateEvent = undefined;
+        var count: usize = 0;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            count = presence.diffStates(&self.presence_cache, snapshot.items, &events);
+        }
+
+        const ts = core.compat.nowMs();
+        for (events[0..count]) |ev| {
+            self.publishPresence(presence.stateEventJson(self.allocator, ev.kind, ev.pubkey, ts));
+        }
     }
 
     // ── Discovery loop (background thread) ──
@@ -777,9 +1437,20 @@ pub const Cluster = struct {
                     std.log.warn("cluster: swim tick error: {s}", .{@errorName(err)});
                 };
             }
+            self.pollPresenceTransitions();
         }
     }
 };
+
+/// Read exactly `buf.len` bytes from a raw stream (pre-framing handshake I/O).
+fn readExactFromStream(stream: *core.compat.net.Stream, buf: []u8) !void {
+    var done: usize = 0;
+    while (done < buf.len) {
+        const n = try stream.read(buf[done..]);
+        if (n == 0) return error.EndOfStream;
+        done += n;
+    }
+}
 
 /// Resolve a "host:port" seed string into a meshguard Endpoint.
 /// Tries IP parsing first, then falls back to libc getaddrinfo for hostname resolution.

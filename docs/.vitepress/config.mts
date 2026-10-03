@@ -37,7 +37,7 @@ export default defineConfig({
             { text: 'Overview', link: '/operations/' },
             { text: 'Persistence Modes', link: '/operations/persistence' },
             { text: 'Clustering', link: '/operations/clustering' },
-            { text: 'Gateways & Light-API', link: '/operations/gateways' },
+            { text: 'Gateways', link: '/operations/gateways' },
             { text: 'Troubleshooting', link: '/operations/troubleshooting' },
           ]
         }
@@ -48,10 +48,12 @@ export default defineConfig({
           items: [
             { text: 'System Design', link: '/architecture/' },
             { text: 'WORM Semantics', link: '/architecture/worm-semantics' },
+            { text: 'Replication Proofs', link: '/architecture/replication-proofs' },
             { text: 'Server Backends', link: '/architecture/server-backends' },
             { text: 'Stored Procedures', link: '/architecture/procedures' },
             { text: 'Vector Search', link: '/architecture/vector-search' },
             { text: 'Agent Memory', link: '/architecture/agent-memory' },
+            { text: 'Scoped Auth Tokens', link: '/AUTH_SCOPED' },
             { text: 'Pub/Sub', link: '/architecture/pubsub' },
             { text: 'Benchmarks', link: '/architecture/benchmarks' },
           ]
@@ -63,6 +65,8 @@ export default defineConfig({
           items: [
             { text: 'WormWire v1', link: '/protocol/' },
             { text: 'Command Reference', link: '/protocol/commands' },
+            { text: 'Verifiable Append Log', link: '/protocol/append-log' },
+            { text: 'Verifiable Proof Bundles', link: '/protocol/proofs' },
           ]
         }
       ],

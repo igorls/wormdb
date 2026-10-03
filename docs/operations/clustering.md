@@ -40,6 +40,10 @@ cluster_alive=3
 cluster_suspected=0
 cluster_dead=0
 replication_factor=0
+proof_checkpoint_records=0
+proof_witness_records=0
+proof_last_verified_ms=0
+anti_entropy_mode=full
 ```
 
 For detailed per-peer information:
@@ -56,11 +60,17 @@ mesh_ip=10.0.0.2
 state=alive
 gossip_endpoint=10.0.0.2:51821
 wormwire=connected
+root_sync=healthy
+root_sync_last_ms=1780957400000
+root_sync_missing_ranges=0
 ---
 mesh_ip=10.0.0.3
 state=alive
 gossip_endpoint=10.0.0.3:51821
 wormwire=connected
+root_sync=unknown
+root_sync_last_ms=0
+root_sync_missing_ranges=0
 ```
 
 ## How Replication Works
@@ -84,6 +94,10 @@ Replication happens **after local commit**. The client receives `OK` once the or
 ::: warning
 This is an **eventually consistent** model. If a node crashes after local commit but before replication completes, other nodes may be missing the latest write. There is no quorum or consensus protocol.
 :::
+
+For WORM append logs, the proof layer can store meshguard/WormDB identity-backed checkpoint witnesses as WORM data. `EXEC append_log_witness_request <log_id> <checkpoint_hash_hex>` asks live peers to countersign a local checkpoint over the replication connection; the peer stores the witness through the durable WORM path and it replicates back like any other proof record.
+
+Reconnect anti-entropy now probes a compact deterministic prefix root before sending a full-state scan. If local and peer roots match, the full sync is skipped. If the peer is a verified sorted-prefix subset of local state, WormDB sends only the missing tail entries using the same vector-aware replication frames as full sync. Diverged, ahead, or unverifiable roots fall back to the existing full-state sync path. See [Replication Proofs](/architecture/replication-proofs).
 
 ## Cluster Flags
 

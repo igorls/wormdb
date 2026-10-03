@@ -84,6 +84,9 @@ pub fn build(b: *std.Build) void {
     // Build option, exposed to source via @import("build_options"). QUIC's C deps (MsQuic/libwtf) are
     // wired in the server build when enabled — see wormdb-server. The engine only carries the flag +
     // the (comptime-gated) Zig code.
+    // wasm32 without the threads proposal: no 64-bit atomics, no atomic wait, no sockets.
+    const narrow_target = target.result.cpu.arch.isWasm() and !target.result.cpu.has(.wasm, .atomics);
+
     const enable_quic = b.option(bool, "quic", "Enable QUIC/WebTransport gateway (requires MsQuic)") orelse false;
 
     // ─── Crypto backend selection (meshguard#102) ───
@@ -115,6 +118,12 @@ pub fn build(b: *std.Build) void {
     // Consumed by the embedded meshguard source (tunnel.zig/main.zig) so it picks
     // the same backend linkCrypto wires for. Shared with the wormdb module too.
     build_options.addOption(bool, "use_libsodium", use_libsodium);
+    // WebAssembly has no threads without the atomics/bulk-memory proposals, so a wasm
+    // target must not spawn workers or use 64-bit atomics. Exposed as an explicit
+    // option rather than inferred from the target, so a native build can also pick the
+    // single-threaded path deliberately. See src/vector/index.zig and src/event/bus.zig.
+    const single_threaded = b.option(bool, "single-threaded", "Build without worker threads or 64-bit atomics (required for wasm32)") orelse (target.result.cpu.arch.isWasm());
+    build_options.addOption(bool, "single_threaded", single_threaded);
     const build_options_mod = build_options.createModule();
 
     // MeshGuard library module (embedded mesh networking). b.path resolves against THIS package's root,
@@ -173,12 +182,9 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the basic WormDB server");
     run_step.dependOn(&run_exe.step);
 
-    // Embedding FFI library — a C ABI over the engine for native apps (iOS/Swift,
-    // Android/JNI). Single-node, in-process; see src/ffi.zig and ffi/wormdb.h.
-    // iOS must static-link (apps cannot dlopen user dylibs); everything else gets
-    // a shared library by default.
-    const ffi_mod = b.createModule(.{
-        .root_source_file = b.path("src/ffi.zig"),
+    // wormdb-sst — offline builder: snapshot → frozen sorted-string segment.
+    const sst_tool_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/sst_build.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -186,12 +192,55 @@ pub fn build(b: *std.Build) void {
             .{ .name = "wormdb", .module = wormdb_mod },
         },
     });
+    linkCrypto(b, sst_tool_mod, os_tag, abi, use_libsodium);
+    if (enable_quic) linkQuic(b, sst_tool_mod);
+    const sst_tool = b.addExecutable(.{
+        .name = "wormdb-sst",
+        .root_module = sst_tool_mod,
+    });
+    b.installArtifact(sst_tool);
+
+    // Embedding FFI library — a C ABI over the engine for native apps (iOS/Swift,
+    // Android/JNI). Single-node, in-process; see src/ffi.zig and ffi/wormdb.h.
+    // iOS must static-link (apps cannot dlopen user dylibs); everything else gets
+    // a shared library by default.
+    // On a narrow-atomics target (wasm32) the engine comes from the reduced root, which never
+    // imports server/cluster and so never reaches meshguard's locks and sockets. Native keeps
+    // src/lib.zig exactly as it was. See src/wasm_root.zig and docs/wasm.md.
+    const engine_mod = if (narrow_target) b.addModule("wormdb", .{
+        .root_source_file = b.path("src/wasm_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        // The build.zig equivalent of -fsingle-threaded. With it set, `builtin.single_threaded`
+        // is comptime true, which makes std.Io.Threaded's atomic-wait branch dead code and
+        // removes the `memory.atomic.wait32` the no-atomics target cannot emit. Without it the
+        // wasm build compiles as multi-threaded and reaches the asm.
+        .single_threaded = target.result.cpu.arch.isWasm(),
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options_mod },
+        },
+    }) else wormdb_mod;
+
+    const ffi_mod = b.createModule(.{
+        .root_source_file = b.path("src/ffi.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .single_threaded = target.result.cpu.arch.isWasm(),
+        .imports = &.{
+            .{ .name = "wormdb", .module = engine_mod },
+        },
+    });
     linkCrypto(b, ffi_mod, os_tag, abi, use_libsodium);
     if (enable_quic) linkQuic(b, ffi_mod);
     const ffi_lib = b.addLibrary(.{
         .name = "wormdb_ffi",
         .root_module = ffi_mod,
-        .linkage = if (os_tag == .ios) .static else .dynamic,
+        // wasm has no dlopen-style shared library: `-dynamic` needs PIC and its crt/libc objects
+        // are not built that way, so a wasm build is a static archive (or a reactor module) that
+        // the host links or instantiates. Same reasoning as iOS, which already static-links.
+        .linkage = if (os_tag == .ios or target.result.cpu.arch.isWasm()) .static else .dynamic,
     });
     b.installArtifact(ffi_lib);
 
@@ -199,7 +248,76 @@ pub fn build(b: *std.Build) void {
     // targets (iOS) where the standalone exe can't link libSystem without the SDK,
     // but the static lib compiles fine with `--sysroot $(xcrun --show-sdk-path)`.
     const ffi_step = b.step("ffi", "Build only the embedding FFI library (libwormdb_ffi)");
+    // On the reduced (wasm) root, prove the allowlist stays free of the cluster/server graph
+    // before linking. Zig cannot inspect a module's imports at comptime, so this is a build
+    // step; it fails the build and names the file, wired here so it cannot be skipped.
+    // Keyed on the TARGET being wasm, not on narrow_target: the reduced root is used whenever
+    // the atomics feature is off, and a +atomics build would skip the check entirely if this
+    // were gated on narrow_target.
+    if (target.result.cpu.arch.isWasm()) {
+        const check = b.addRunArtifact(b.addExecutable(.{
+            .name = "check-wasm-allowlist",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("scripts/check-wasm-allowlist.zig"),
+                .target = b.graph.host,
+                .optimize = .Debug,
+            }),
+        }));
+        check.setCwd(b.path("."));
+        // The checker reads 23 source files but Zig caches a Run step on its argv alone, so it
+        // would be skipped whenever only a scanned file changed — which is every real
+        // violation. Declaring the side effect forces it to run each time.
+        check.has_side_effects = true;
+        ffi_step.dependOn(&check.step);
+    }
     ffi_step.dependOn(&b.addInstallArtifact(ffi_lib, .{}).step);
+
+    // `zig build wasm` produces the module a browser (or any WASI host) can actually load:
+    // a reactor with the FFI entry points as exports. Distinct from `ffi`, which produces a
+    // static archive: a hosted environment cannot link an archive, it needs the exports.
+    //
+    // `entry = .disabled` is what makes it a reactor rather than a command — the host calls
+    // the exported functions instead of running _start. `rdynamic` exports them by name, which
+    // is the entire interface; there are no JS bindings.
+    //
+    // Gated on the wasm target: a reactor has no `main`, so registering it for a native build
+    // makes the default install step try to compile it as a command and fail.
+    if (target.result.cpu.arch.isWasm()) {
+        const wasm_ffi_mod = b.createModule(.{
+            .root_source_file = b.path("src/ffi.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .single_threaded = true,
+            .imports = &.{
+                .{ .name = "wormdb", .module = engine_mod },
+            },
+        });
+        linkCrypto(b, wasm_ffi_mod, os_tag, abi, use_libsodium);
+        const wasm_exe = b.addExecutable(.{
+            .name = "wormdb_ffi",
+            .root_module = wasm_ffi_mod,
+        });
+        // A field on the Compile step, not on ExecutableOptions.
+        wasm_exe.entry = .disabled;
+        wasm_exe.rdynamic = true;
+
+        const wasm_step = b.step("wasm", "Build the browser-loadable wasm module (exported FFI, reactor)");
+        wasm_step.dependOn(&b.addInstallArtifact(wasm_exe, .{}).step);
+
+        // Reproduce the browser run headlessly. Needs bun or node; kept as its own step so a
+        // machine without either can still build the module.
+        const smoke_kv = b.addSystemCommand(&.{ "bun", "scripts/smoke-kv.mjs" });
+        smoke_kv.setCwd(b.path("."));
+        smoke_kv.has_side_effects = true;
+        const smoke_log = b.addSystemCommand(&.{ "bun", "scripts/smoke-worm-log.mjs" });
+        smoke_log.setCwd(b.path("."));
+        smoke_log.has_side_effects = true;
+        const smoke_step = b.step("wasm-smoke", "Run the FFI smoke tests against the wasm module");
+        smoke_step.dependOn(&b.addInstallArtifact(wasm_exe, .{}).step);
+        smoke_step.dependOn(&smoke_kv.step);
+        smoke_step.dependOn(&smoke_log.step);
+    }
 
     // Unit tests for the engine.
     const test_mod = b.createModule(.{
@@ -217,6 +335,11 @@ pub fn build(b: *std.Build) void {
 
     const unit_tests = b.addTest(.{ .root_module = test_mod });
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    const ffi_unit_tests = b.addTest(.{ .root_module = ffi_mod });
+    const run_ffi_tests = b.addRunArtifact(ffi_unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_ffi_tests.step);
+    const main_tests = b.addTest(.{ .root_module = exe_mod });
+    test_step.dependOn(&b.addRunArtifact(main_tests).step);
 }

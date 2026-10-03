@@ -95,11 +95,12 @@ Clustering is optional and enabled with `--cluster <name>`:
 - **Replication**: mutating commands (`SET`, `DEL`, native vector frames, and durable procedure writes) replicate to peers over persistent WormWire TCP connections after local commit
 - **No external coordinator** — no ZooKeeper, no etcd, no Raft leader election
 
-See [Clustering](/operations/clustering) for deployment patterns.
+See [Clustering](/operations/clustering) for deployment patterns. For the planned WORM-log proof layer over replication, see [Replication Proofs](/architecture/replication-proofs).
 
 ## Related Pages
 
 - [WORM Semantics](/architecture/worm-semantics) — how immutability works and when to use it
+- [Replication Proofs](/architecture/replication-proofs) — checkpoint witnessing and Merkle/root anti-entropy for replicated WORM logs
 - [Server Backends](/architecture/server-backends) — threadpool vs. epoll vs. io_uring tradeoffs
 - [Stored Procedures](/architecture/procedures) — the embedded procedure execution model
 - [Vector Search](/architecture/vector-search) — HNSW, RaBitQ, native vector frames, and rebuild paths

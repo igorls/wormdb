@@ -17,11 +17,21 @@ const std = @import("std");
 const compat = @import("../core/compat.zig");
 const Store = @import("../storage/store.zig").Store;
 const Response = @import("../core/types.zig").Response;
-const Cluster = @import("../cluster/mod.zig").Cluster;
+/// Only an optional pointer to this type is ever held. On a narrow-atomics target the cluster
+/// graph is excluded (it needs meshguard's locks and sockets), so the name resolves to a stub
+/// whose methods refuse rather than silently do nothing. Native is unchanged.
+const Cluster = if (@import("../core/compat.zig").wasm_target) @import("../core/compat.zig").ClusterStub else @import("../cluster/mod.zig").Cluster;
 const EventBus = @import("../event/mod.zig").EventBus;
 const NamespaceRegistry = @import("../vector/index.zig").NamespaceRegistry;
+const auth = @import("../server/auth.zig");
 
 const shardIndexFn = @import("../storage/store.zig").shardIndex;
+
+pub const AuthMintConfig = struct {
+    secret_key: *const [64]u8,
+    default_ttl_s: u64,
+    max_ttl_s: u64,
+};
 
 pub const Ctx = struct {
     store: *Store,
@@ -29,6 +39,11 @@ pub const Ctx = struct {
     allocator: std.mem.Allocator,
     /// Authenticated identity (SCT subject). Null if unauthenticated.
     _identity: ?[]const u8,
+    /// Full auth decision for namespace-aware procedures. Defaults to
+    /// trusted so unit tests and internal callers preserve existing behavior.
+    auth_context: auth.AuthContext = .trusted,
+    /// Optional signing config for auth_mint_scoped.
+    auth_mint: ?AuthMintConfig = null,
     /// Cluster handle — when present, `setDurable`/`setDurableWorm` replicate
     /// their writes to peers (matches wire-level SET semantics). Null in
     /// single-node mode or tests.
@@ -51,6 +66,7 @@ pub const Ctx = struct {
     const MAX_LOCKS = 16;
 
     pub const Result = Response;
+    pub const NamespaceAccess = enum { read, write, delete };
 
     /// Held-lock snapshot. Returned by saveAndReleaseAllHeldShards so the
     /// procedure can re-acquire after an operation (store.set + replicate)
@@ -75,6 +91,29 @@ pub const Ctx = struct {
             .args = args,
             .allocator = allocator,
             ._identity = id,
+            .cluster = cluster,
+            .event_bus = event_bus,
+            .vector_registry = vector_registry,
+        };
+    }
+
+    pub fn initWithAuth(
+        store: *Store,
+        args: []const []const u8,
+        allocator: std.mem.Allocator,
+        auth_context: auth.AuthContext,
+        auth_mint: ?AuthMintConfig,
+        cluster: ?*Cluster,
+        event_bus: ?*EventBus,
+        vector_registry: ?*NamespaceRegistry,
+    ) Ctx {
+        return .{
+            .store = store,
+            .args = args,
+            .allocator = allocator,
+            ._identity = auth_context.identity(),
+            .auth_context = auth_context,
+            .auth_mint = auth_mint,
             .cluster = cluster,
             .event_bus = event_bus,
             .vector_registry = vector_registry,
@@ -159,6 +198,15 @@ pub const Ctx = struct {
         self.lock_count += 1;
     }
 
+    fn assertNoHeldShardLocks(self: *const Ctx, op: []const u8) void {
+        if (std.debug.runtime_safety and self.lock_count != 0) {
+            std.debug.panic(
+                "Ctx.{s} cannot be called while holding shard locks; call scan/getCopy/countKeys before lockKey/lockKeys2",
+                .{op},
+            );
+        }
+    }
+
     /// Internal: release a specific shard lock. Used by setDurable/setDurableWorm.
     fn releaseShard(self: *Ctx, si: usize) void {
         for (0..self.lock_count) |i| {
@@ -222,8 +270,13 @@ pub const Ctx = struct {
     // ╚═══════════════════════════════════════════════╝
 
     /// Get the raw value for a key. Caller must hold the key's shard lock.
+    /// Falls through to the frozen sst overlay on a live miss (lock-free —
+    /// frozen slices are immutable and outlive the store).
     pub fn get(self: *Ctx, key: []const u8) ?[]const u8 {
-        const entry = self.store.getUnsafe(key) orelse return null;
+        const entry = self.store.getUnsafe(key) orelse {
+            if (self.store.sstHit(key)) |hit| return hit.value;
+            return null;
+        };
         return entry.value;
     }
 
@@ -231,7 +284,9 @@ pub const Ctx = struct {
     /// internally — safe to call without holding any locks, and the returned
     /// slice remains valid after subsequent scans/writes. Use this when the
     /// value must outlive operations that re-lock shards (e.g. scanPrefix).
+    /// Must be called before acquiring any Ctx shard locks.
     pub fn getCopy(self: *Ctx, key: []const u8) !?[]const u8 {
+        self.assertNoHeldShardLocks("getCopy");
         return self.store.getValueDupe(key, self.allocator);
     }
 
@@ -285,6 +340,22 @@ pub const Ctx = struct {
         }
     }
 
+    /// Set a WORM key durably with caller-supplied metadata timestamp.
+    /// Used by proof procedures whose canonical bytes already include the
+    /// receipt/observation timestamp and need WAL + replication semantics.
+    pub fn setDurableWormWithTimestamp(self: *Ctx, key: []const u8, val: []const u8, entry_timestamp: u64) !void {
+        const held = self.saveAndReleaseAllHeldShards();
+        defer self.reacquireAllHeldShards(held);
+
+        try self.store.setWithTimestamp(key, val, true, entry_timestamp);
+
+        if (self.cluster) |c| {
+            c.replicateWrite(key, val, true) catch |e| {
+                std.log.warn("procedure replication failed: {s}", .{@errorName(e)});
+            };
+        }
+    }
+
     /// Delete a key durably — goes through the WAL and replicates to peers.
     /// Returns `error.WormViolation` when the target key is immutable; the
     /// store's WORM check is authoritative. Lock dance mirrors `setDurable`.
@@ -315,17 +386,18 @@ pub const Ctx = struct {
     /// Delete a key. Caller must hold the key's shard lock.
     /// Note: this is the unsafe internal delete (no WORM check, no WAL).
     /// For procedures this is appropriate since the lock is already held.
+    /// Routed through the store so the ordered key index stays in sync.
     pub fn del(self: *Ctx, key: []const u8) void {
-        const si = shardIndexFn(key);
-        const shard = &self.store.shards[si];
-        if (shard.data.fetchRemove(key)) |removed| {
-            self.store.destroyEntry(removed.value);
-        }
+        self.store.deleteUnsafe(key);
     }
 
-    /// Get entry metadata (timestamp).
+    /// Get entry metadata (timestamp). Frozen sst entries report their
+    /// segment's build timestamp.
     pub fn getTimestamp(self: *Ctx, key: []const u8) ?u64 {
-        const entry = self.store.getUnsafe(key) orelse return null;
+        const entry = self.store.getUnsafe(key) orelse {
+            if (self.store.sstHit(key)) |hit| return hit.timestamp;
+            return null;
+        };
         return entry.timestamp;
     }
 
@@ -382,11 +454,53 @@ pub const Ctx = struct {
         return self._identity;
     }
 
+    pub fn permits(self: *const Ctx, op: auth.Operation, target: []const u8) bool {
+        return switch (self.auth_context) {
+            .trusted, .disabled => true,
+            .enforce => |maybe_state| blk: {
+                const state = maybe_state orelse break :blk false;
+                break :blk state.permits(op, target);
+            },
+        };
+    }
+
+    pub fn requireNamespace(self: *Ctx, ns: []const u8, access: NamespaceAccess) !void {
+        const mem_prefix = try std.fmt.allocPrint(self.allocator, "mem:{s}:", .{ns});
+        defer self.allocator.free(mem_prefix);
+        const vec_prefix = try std.fmt.allocPrint(self.allocator, "vec:mem:{s}:", .{ns});
+        defer self.allocator.free(vec_prefix);
+        const bq_prefix = try std.fmt.allocPrint(self.allocator, "bq:vec:mem:{s}:", .{ns});
+        defer self.allocator.free(bq_prefix);
+        const config_prefix = try std.fmt.allocPrint(self.allocator, "__meta:mem:{s}:", .{ns});
+        defer self.allocator.free(config_prefix);
+
+        const op: auth.Operation = switch (access) {
+            .read => .get,
+            .write => .set,
+            .delete => .delete,
+        };
+
+        if (!self.permits(op, mem_prefix)) return error.PermissionDenied;
+        if (!self.permits(op, vec_prefix)) return error.PermissionDenied;
+        if (!self.permits(op, bq_prefix)) return error.PermissionDenied;
+        if (!self.permits(op, config_prefix)) return error.PermissionDenied;
+    }
+
+    pub fn authMintConfig(self: *const Ctx) ?AuthMintConfig {
+        return self.auth_mint;
+    }
+
     /// Publish an event to all subscribers of `channel`. No-op if the event
     /// bus is unattached (tests, single-node builds). Errors are logged and
     /// swallowed — pub/sub is best-effort from the procedure's perspective.
+    ///
+    /// Releases all held shard locks for the duration of the fanout (same
+    /// dance as `setDurable`). Event delivery may do socket I/O; holding a
+    /// store shard across that would wedge STATUS/GET on that shard (#84).
     pub fn publish(self: *Ctx, channel: []const u8, message: []const u8) void {
         const bus = self.event_bus orelse return;
+        const held = self.saveAndReleaseAllHeldShards();
+        defer self.reacquireAllHeldShards(held);
         bus.publish(channel, message) catch |e| {
             std.log.warn("procedure publish to '{s}' failed: {s}", .{ channel, @errorName(e) });
         };
@@ -414,10 +528,20 @@ pub const Ctx = struct {
     // ╚═══════════════════════════════════════════════╝
 
     /// Scan for keys matching a prefix. Returns arena-allocated copies sorted by key (ascending).
-    /// Locks each shard independently — does NOT require the caller to hold any locks.
-    /// O(N) over total keys; cap with `limit` to bound cost.
+    /// Locks each shard independently — caller MUST NOT hold any Ctx shard locks.
+    /// O(log n) seek per shard via the ordered key index + O(matches) copying;
+    /// `limit` keeps the LAST N in ascending order and bounds the copies.
     pub fn scan(self: *Ctx, prefix: []const u8, limit: usize) ![]Store.ScanResult {
+        self.assertNoHeldShardLocks("scan");
         return self.store.scanPrefix(prefix, limit, self.allocator);
+    }
+
+    /// Like `scan`, but the limit keeps the FIRST N matches in ascending order
+    /// — the natural cut for autocomplete and forward pagination. Caller MUST
+    /// NOT hold any Ctx shard locks.
+    pub fn scanFirst(self: *Ctx, prefix: []const u8, limit: usize) ![]Store.ScanResult {
+        self.assertNoHeldShardLocks("scanFirst");
+        return self.store.scanPrefixFirst(prefix, limit, self.allocator);
     }
 
     /// Callback-based prefix scan — yields borrowed key/value slices (no
@@ -437,11 +561,14 @@ pub const Ctx = struct {
             is_worm: bool,
         ) Store.ScanAction,
     ) void {
+        self.assertNoHeldShardLocks("scanCallback");
         self.store.scanPrefixCallback(prefix, context, callback);
     }
 
-    /// Count keys matching a prefix. Lightweight — no allocation.
+    /// Count keys matching a prefix. Lightweight — no allocation. Caller MUST
+    /// NOT hold any Ctx shard locks.
     pub fn countKeys(self: *Ctx, prefix: []const u8) usize {
+        self.assertNoHeldShardLocks("countKeys");
         return self.store.countPrefix(prefix);
     }
 };
@@ -461,4 +588,47 @@ test "Ctx arg helpers" {
     try testing.expect(ctx.argInt(i64, 99) == null); // out of bounds
     try testing.expectEqual(@as(usize, 3), ctx.argCount());
     try testing.expect(ctx.identity() == null); // no identity
+}
+
+test "Ctx.publish releases shard locks during fanout" {
+    const testing = std.testing;
+    const Config = @import("../core/config.zig").Config;
+
+    var store = try Store.init(testing.allocator, Config{ .persistence = .none });
+    defer store.deinit();
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    const Probe = struct {
+        store: *Store,
+        saw_unlocked_shard: bool = false,
+
+        fn write(raw: *anyopaque, _: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // If publish released locks, tryLock on every shard should succeed.
+            var all_free = true;
+            for (&self.store.shards) |*shard| {
+                if (!shard.mutex.tryLock()) {
+                    all_free = false;
+                    break;
+                }
+                shard.mutex.unlock();
+            }
+            self.saw_unlocked_shard = all_free;
+        }
+    };
+
+    var probe = Probe{ .store = &store };
+    _ = try bus.subscribe("ch", Probe.write, @ptrCast(&probe));
+
+    var ctx = Ctx.init(&store, &.{}, testing.allocator, null, null, &bus, null);
+    defer ctx.deinit();
+
+    ctx.lockKey("some-key");
+    try testing.expect(ctx.lock_count >= 1);
+    ctx.publish("ch", "hello");
+    // Locks re-acquired after fanout.
+    try testing.expect(ctx.lock_count >= 1);
+    try testing.expect(probe.saw_unlocked_shard);
 }

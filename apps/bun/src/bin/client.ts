@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { WormClient } from "../lib/client";
+import { WormDB } from "../lib/wormdb";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 6389;
@@ -83,8 +83,9 @@ async function main() {
   selectedHost = args.host;
   selectedPort = args.port;
   const command = buildCommand(args.commandParts);
-  const client = new WormClient({ host: args.host, port: args.port });
-  const response = await client.send(command);
+  // One-shot CLI: reconnect off so a dead server fails fast instead of retrying.
+  const client = new WormDB({ host: args.host, port: args.port, reconnect: { enabled: false } });
+  const response = await client.send(command).finally(() => client.close());
 
   if (response.type === "error") {
     console.error(`ERR: ${response.message}`);

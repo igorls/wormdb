@@ -3,6 +3,7 @@
 //! Binary format with CRC32 verification for crash recovery.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const core = @import("../core/mod.zig");
 
 const WalRecordType = core.types.WalRecordType;
@@ -50,6 +51,11 @@ pub const Wal = struct {
     writer_started: bool,
     sync_requested: std.atomic.Value(bool),
     wake_futex: std.atomic.Value(u32),
+    /// Direct synchronous I/O failures have an uncertain commit outcome. Do
+    /// not acknowledge later writes against a live view that may differ from
+    /// replay. Store serializes these fields with wal_enqueue_mutex.
+    sync_failed: bool = false,
+    fail_sync_for_test: if (@import("builtin").is_test) bool else void = if (@import("builtin").is_test) false else {},
 
     // Power-of-two ring capacity for mask indexing.
     const WAL_QUEUE_CAP: usize = 1 << 16;
@@ -63,6 +69,8 @@ pub const Wal = struct {
 
     const SET_PAYLOAD_OVERHEAD = 2 + 4 + 1 + 8;
     const DEL_PAYLOAD_OVERHEAD = 2;
+    const VINSERT_PAYLOAD_OVERHEAD = 2 + 2 + 2 + 1 + 8;
+    const VDELETE_PAYLOAD_OVERHEAD = 2 + 2;
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8, sync_writes: bool) !Wal {
         const file = try compat.Dir.openFile(compat.cwd(), path, .{ .mode = .read_write });
@@ -95,13 +103,54 @@ pub const Wal = struct {
     /// Producer path becomes enqueue-only; this removes file I/O from request critical path.
     pub fn startBackground(self: *Wal) !void {
         if (!self.sync_writes or self.writer_started) return;
+        // A single-threaded build (wasm32) has no thread to hand the queue to. NOT starting the
+        // writer is also the safer path here, and it is the one that preserves the durability
+        // semantics: with writer_started false the producer uses `writeDirect`, which fsyncs
+        // immediately on every record (2e5a914) and sets `sync_failed` when a write or sync
+        // fails so later writes are fenced (a46f517). A queued single-threaded drain would
+        // batch and swallow those failures instead, so the queue is not used at all here.
+        if (build_options.single_threaded) return;
         self.writer_running.store(true, .release);
         self.writer_thread = try std.Thread.spawn(.{}, writerLoop, .{self});
         self.writer_started = true;
     }
 
+    /// Flush everything currently queued, in one batch and one fsync. Only the background
+    /// `writerLoop` uses this: a single-threaded build never starts the writer, so its producer
+    /// takes `writeDirect` and gets an immediate fsync plus the `sync_failed` fence instead of a
+    /// batch that would swallow those failures. Kept as one function so the batching exists in
+    /// exactly one place.
+    pub fn drainOnce(self: *Wal) void {
+        var batch: [64][]u8 = undefined;
+        var batch_count: usize = 0;
+        while (batch_count < 64) {
+            if (self.tryDequeueRecord()) |record| {
+                batch[batch_count] = record;
+                batch_count += 1;
+            } else break;
+        }
+
+        if (batch_count > 0) {
+            for (batch[0..batch_count]) |record| {
+                compat.File.writeAll(self.file, record) catch {};
+                self.allocator.free(record);
+                self.write_count += 1;
+            }
+            // Single fsync for entire batch — key performance win
+            if (self.sync_writes) {
+                compat.File.sync(self.file) catch {};
+            }
+        }
+
+        if (self.sync_requested.swap(false, .acq_rel)) {
+            compat.File.sync(self.file) catch {};
+        }
+    }
+
     pub fn deinit(self: *Wal) void {
-        if (self.writer_started) {
+        // Guarded so the join is not analysed on a single-threaded target: std.Thread.join's
+        // wasm path contains the atomic-wait asm, and no thread exists here to join.
+        if (self.writer_started and !build_options.single_threaded) {
             self.writer_running.store(false, .release);
             if (self.writer_thread) |t| t.join();
             self.writer_thread = null;
@@ -119,6 +168,7 @@ pub const Wal = struct {
 
     /// Flush WAL to durable storage. Called by the group-commit background thread.
     pub fn sync(self: *Wal) !void {
+        if (self.sync_failed) return error.WalNeedsRecovery;
         if (self.writer_started) {
             self.sync_requested.store(true, .release);
             return;
@@ -133,41 +183,87 @@ pub const Wal = struct {
         const record = try self.serializeSetRecord(key, value, flags, timestamp);
         errdefer self.allocator.free(record);
 
-        if (self.writer_started) {
-            self.enqueueRecordBlocking(record);
-        } else {
-            try compat.File.writeAll(self.file, record);
-            self.allocator.free(record);
-            self.write_count += 1;
-        }
-
+        // Finish every fallible live-entry allocation before publishing the
+        // durable record. Once the append succeeds, returning the Entry cannot
+        // fail and the caller can install the exact acknowledged bytes.
         const entry = try self.allocator.create(Entry);
         errdefer self.allocator.destroy(entry);
-
         const entry_key = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(entry_key);
-
         const entry_value = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(entry_value);
         entry.* = .{
             .key = entry_key,
             .value = entry_value,
             .timestamp = timestamp,
             .flags = flags,
         };
+
+        if (self.writer_started) {
+            self.enqueueRecordBlocking(record);
+        } else {
+            try self.writeDirect(record);
+            self.allocator.free(record);
+        }
         return entry;
     }
 
     pub fn appendDelete(self: *Wal, key: []const u8) !void {
         const record = try self.serializeDeleteRecord(key);
-        errdefer self.allocator.free(record);
 
         if (self.writer_started) {
             self.enqueueRecordBlocking(record);
         } else {
-            try compat.File.writeAll(self.file, record);
+            errdefer self.allocator.free(record);
+            try self.writeDirect(record);
             self.allocator.free(record);
-            self.write_count += 1;
         }
+    }
+
+    pub fn appendVinsert(
+        self: *Wal,
+        key: []const u8,
+        namespace: []const u8,
+        metric: []const u8,
+        flags: u8,
+        timestamp: Timestamp,
+    ) !void {
+        const record = try self.serializeVinsertRecord(key, namespace, metric, flags, timestamp);
+
+        if (self.writer_started) {
+            self.enqueueRecordBlocking(record);
+        } else {
+            errdefer self.allocator.free(record);
+            try self.writeDirect(record);
+            self.allocator.free(record);
+        }
+    }
+
+    pub fn appendVdelete(self: *Wal, key: []const u8, namespace: []const u8) !void {
+        const record = try self.serializeVdeleteRecord(key, namespace);
+
+        if (self.writer_started) {
+            self.enqueueRecordBlocking(record);
+        } else {
+            errdefer self.allocator.free(record);
+            try self.writeDirect(record);
+            self.allocator.free(record);
+        }
+    }
+
+    fn writeDirect(self: *Wal, record: []const u8) !void {
+        if (self.sync_failed) return error.WalNeedsRecovery;
+        errdefer if (self.sync_writes) {
+            self.sync_failed = true;
+        };
+        try compat.File.writeAll(self.file, record);
+        if (self.sync_writes) {
+            if (@import("builtin").is_test) {
+                if (self.fail_sync_for_test) return error.InjectedSyncFailure;
+            }
+            try compat.File.sync(self.file);
+        }
+        self.write_count += 1;
     }
 
     fn serializeSetRecord(self: *Wal, key: []const u8, value: []const u8, flags: EntryFlags, timestamp: Timestamp) ![]u8 {
@@ -218,6 +314,69 @@ pub const Wal = struct {
         return buf;
     }
 
+    fn serializeVinsertRecord(
+        self: *Wal,
+        key: []const u8,
+        namespace: []const u8,
+        metric: []const u8,
+        flags: u8,
+        timestamp: Timestamp,
+    ) ![]u8 {
+        const payload_len = VINSERT_PAYLOAD_OVERHEAD + key.len + namespace.len + metric.len;
+        const total_len = @sizeOf(RecordHeader) + payload_len;
+        const buf = try self.allocator.alloc(u8, total_len);
+
+        var pos: usize = @sizeOf(RecordHeader);
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(key.len), .little);
+        pos += 2;
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(namespace.len), .little);
+        pos += 2;
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(metric.len), .little);
+        pos += 2;
+        buf[pos] = flags;
+        pos += 1;
+        std.mem.writeInt(u64, buf[pos..][0..8], timestamp, .little);
+        pos += 8;
+        @memcpy(buf[pos..][0..key.len], key);
+        pos += key.len;
+        @memcpy(buf[pos..][0..namespace.len], namespace);
+        pos += namespace.len;
+        @memcpy(buf[pos..][0..metric.len], metric);
+
+        const payload_slice = buf[@sizeOf(RecordHeader)..total_len];
+        const header = RecordHeader{
+            .crc = crc32(payload_slice),
+            .record_type = @intFromEnum(WalRecordType.vinsert),
+            .length = @intCast(payload_len),
+        };
+        @memcpy(buf[0..@sizeOf(RecordHeader)], std.mem.asBytes(&header));
+        return buf;
+    }
+
+    fn serializeVdeleteRecord(self: *Wal, key: []const u8, namespace: []const u8) ![]u8 {
+        const payload_len = VDELETE_PAYLOAD_OVERHEAD + key.len + namespace.len;
+        const total_len = @sizeOf(RecordHeader) + payload_len;
+        const buf = try self.allocator.alloc(u8, total_len);
+
+        var pos: usize = @sizeOf(RecordHeader);
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(key.len), .little);
+        pos += 2;
+        std.mem.writeInt(u16, buf[pos..][0..2], @intCast(namespace.len), .little);
+        pos += 2;
+        @memcpy(buf[pos..][0..key.len], key);
+        pos += key.len;
+        @memcpy(buf[pos..][0..namespace.len], namespace);
+
+        const payload_slice = buf[@sizeOf(RecordHeader)..total_len];
+        const header = RecordHeader{
+            .crc = crc32(payload_slice),
+            .record_type = @intFromEnum(WalRecordType.vdelete),
+            .length = @intCast(payload_len),
+        };
+        @memcpy(buf[0..@sizeOf(RecordHeader)], std.mem.asBytes(&header));
+        return buf;
+    }
+
     /// Single-producer enqueue (producer currently runs under Store global write lock).
     fn enqueueRecordBlocking(self: *Wal, record: []u8) void {
         while (!self.tryEnqueueRecord(record)) {
@@ -258,35 +417,11 @@ pub const Wal = struct {
 
     fn writerLoop(self: *Wal) void {
         while (self.writer_running.load(.acquire) or self.hasPendingRecords()) {
-            // Drain phase: collect all pending records into a batch
-            var batch: [64][]u8 = undefined;
-            var batch_count: usize = 0;
-            while (batch_count < 64) {
-                if (self.tryDequeueRecord()) |record| {
-                    batch[batch_count] = record;
-                    batch_count += 1;
-                } else break;
-            }
-
-            if (batch_count > 0) {
-                // Write all records in batch
-                for (batch[0..batch_count]) |record| {
-                    compat.File.writeAll(self.file, record) catch {};
-                    self.allocator.free(record);
-                    self.write_count += 1;
-                }
-                // Single fsync for entire batch — key performance win
-                if (self.sync_writes) {
-                    compat.File.sync(self.file) catch {};
-                }
-                // Wake producer in case it was blocked on a full queue
+            if (self.hasPendingRecords() or self.sync_requested.load(.acquire)) {
+                self.drainOnce();
+                // Wake a producer that was blocked on a full queue.
                 _ = self.wake_futex.fetchAdd(1, .release);
                 compat.Futex.wake(&self.wake_futex, 1);
-                continue;
-            }
-
-            if (self.sync_requested.swap(false, .acq_rel)) {
-                compat.File.sync(self.file) catch {};
                 continue;
             }
 
@@ -321,12 +456,35 @@ pub const Wal = struct {
 pub const WalRecord = union(enum) {
     set: SetRecord,
     delete: []const u8,
+    vinsert: VinsertRecord,
+    vdelete: VdeleteRecord,
 
     pub const SetRecord = struct {
         key: []const u8,
         value: []const u8,
         flags: EntryFlags,
         timestamp: Timestamp,
+    };
+
+    pub const VinsertRecord = struct {
+        key: []const u8,
+        namespace: []const u8,
+        metric: []const u8,
+        flags: u8,
+        timestamp: Timestamp,
+
+        pub fn isWorm(self: VinsertRecord) bool {
+            return (self.flags & 0x01) != 0;
+        }
+
+        pub fn isAsync(self: VinsertRecord) bool {
+            return (self.flags & 0x02) != 0;
+        }
+    };
+
+    pub const VdeleteRecord = struct {
+        key: []const u8,
+        namespace: []const u8,
     };
 };
 
@@ -367,6 +525,8 @@ pub const WalIterator = struct {
         return switch (record_type) {
             .set => try self.parseSet(payload),
             .delete => try self.parseDelete(payload),
+            .vinsert => try self.parseVinsert(payload),
+            .vdelete => try self.parseVdelete(payload),
         };
     }
 
@@ -398,6 +558,54 @@ pub const WalIterator = struct {
         return .{ .delete = key };
     }
 
+    fn parseVinsert(self: *WalIterator, payload: []const u8) !WalRecord {
+        if (payload.len < Wal.VINSERT_PAYLOAD_OVERHEAD) return error.Corruption;
+        var pos: usize = 0;
+        const key_len: usize = @intCast(std.mem.readInt(u16, payload[pos..][0..2], .little));
+        pos += 2;
+        const namespace_len: usize = @intCast(std.mem.readInt(u16, payload[pos..][0..2], .little));
+        pos += 2;
+        const metric_len: usize = @intCast(std.mem.readInt(u16, payload[pos..][0..2], .little));
+        pos += 2;
+        const flags = payload[pos];
+        pos += 1;
+        if ((flags & 0b1111_1100) != 0) return error.Corruption;
+        const timestamp: Timestamp = std.mem.readInt(u64, payload[pos..][0..8], .little);
+        pos += 8;
+        if (pos + key_len + namespace_len + metric_len != payload.len) return error.Corruption;
+
+        const key = try self.allocator.dupe(u8, payload[pos..][0..key_len]);
+        errdefer self.allocator.free(key);
+        pos += key_len;
+        const namespace = try self.allocator.dupe(u8, payload[pos..][0..namespace_len]);
+        errdefer self.allocator.free(namespace);
+        pos += namespace_len;
+        const metric = try self.allocator.dupe(u8, payload[pos..][0..metric_len]);
+
+        return .{ .vinsert = .{
+            .key = key,
+            .namespace = namespace,
+            .metric = metric,
+            .flags = flags,
+            .timestamp = timestamp,
+        } };
+    }
+
+    fn parseVdelete(self: *WalIterator, payload: []const u8) !WalRecord {
+        if (payload.len < Wal.VDELETE_PAYLOAD_OVERHEAD) return error.Corruption;
+        var pos: usize = 0;
+        const key_len: usize = @intCast(std.mem.readInt(u16, payload[pos..][0..2], .little));
+        pos += 2;
+        const namespace_len: usize = @intCast(std.mem.readInt(u16, payload[pos..][0..2], .little));
+        pos += 2;
+        if (pos + key_len + namespace_len != payload.len) return error.Corruption;
+        const key = try self.allocator.dupe(u8, payload[pos..][0..key_len]);
+        errdefer self.allocator.free(key);
+        pos += key_len;
+        const namespace = try self.allocator.dupe(u8, payload[pos..][0..namespace_len]);
+        return .{ .vdelete = .{ .key = key, .namespace = namespace } };
+    }
+
     pub fn deinitRecord(self: *WalIterator, record: WalRecord) void {
         switch (record) {
             .set => |set| {
@@ -405,6 +613,15 @@ pub const WalIterator = struct {
                 self.allocator.free(set.value);
             },
             .delete => |key| self.allocator.free(key),
+            .vinsert => |vinsert| {
+                self.allocator.free(vinsert.key);
+                self.allocator.free(vinsert.namespace);
+                self.allocator.free(vinsert.metric);
+            },
+            .vdelete => |vdelete| {
+                self.allocator.free(vdelete.key);
+                self.allocator.free(vdelete.namespace);
+            },
         }
     }
 };
@@ -413,4 +630,64 @@ test "WAL append and replay" {
     const testing = std.testing;
     // TODO: Zig 0.16 test tmpDir API may have changed — re-enable after verifying
     _ = testing;
+}
+
+/// The single-threaded path must keep the durability semantics the threaded path has:
+/// every direct write fsyncs immediately (2e5a914) and a failed write or sync fences all
+/// later writes via `sync_failed` (a46f517). A single-threaded build never starts the
+/// background writer, so these are the properties a wasm build depends on, and they are
+/// asserted here rather than assumed. `_single_threaded` is a comptime parameter so the
+/// same test body runs unchanged whether or not the build is single-threaded.
+fn expectSingleThreadedDurability(comptime _single_threaded: bool) !void {
+    _ = _single_threaded; // the behaviour under test does not depend on the flag, only on writer_started
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try compat.Dir.realPathAlloc(tmp.dir, allocator, ".");
+    defer allocator.free(path);
+    const file = try std.fmt.allocPrint(allocator, "{s}/wal.log", .{path});
+    defer allocator.free(file);
+
+    // Wal.init opens read_write without create, so the log file must exist first.
+    const created = try compat.Dir.createFile(compat.cwd(), file, .{});
+    compat.File.close(created);
+
+    var wal = try Wal.init(allocator, file, true);
+    defer wal.deinit();
+
+    // Not started: this is the state a single-threaded build stays in, because
+    // startBackground returns early there.
+    try testing.expect(!wal.writer_started);
+
+    // A direct write reaches the file and fsyncs immediately, so the bytes are readable
+    // back without any flush step from the test.
+    const ts: Timestamp = 1234;
+    const entry = try wal.appendSet("k", "v", .{ .is_worm = false, .is_deleted = false }, ts);
+    entry.deinit(allocator);
+    allocator.destroy(entry);
+    try testing.expect(wal.write_count == 1);
+    try testing.expect(!wal.sync_failed);
+
+    // Read it back through an ordinary file open, the way the rest of the repo does, so the
+    // check does not depend on a helper compat does not provide.
+    const file_handle = try compat.Dir.openFile(compat.cwd(), file, .{ .mode = .read_only });
+    defer compat.File.close(file_handle);
+    const size = (try compat.File.stat(file_handle)).size;
+    try testing.expect(size > 0);
+
+    // An uncertain sync fences every later write instead of acknowledging it.
+    wal.fail_sync_for_test = true;
+    const failed = wal.appendSet("k2", "v2", .{ .is_worm = false, .is_deleted = false }, ts);
+    try testing.expectError(error.InjectedSyncFailure, failed);
+    try testing.expect(wal.sync_failed);
+    wal.fail_sync_for_test = false;
+
+    const fenced = wal.appendSet("k3", "v3", .{ .is_worm = false, .is_deleted = false }, ts);
+    try testing.expectError(error.WalNeedsRecovery, fenced);
+    try testing.expectError(error.WalNeedsRecovery, wal.sync());
+}
+
+test "single-threaded direct writes fsync immediately and fence uncertain writes" {
+    try expectSingleThreadedDurability(true);
 }

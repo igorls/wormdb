@@ -19,6 +19,7 @@ const cluster_mod = @import("../cluster/mod.zig");
 const executor = @import("executor.zig");
 const config = core.config;
 const auth = @import("auth.zig");
+const AuthMintConfig = @import("../procedures/context.zig").AuthMintConfig;
 
 const Store = storage.Store;
 const EventBus = event_mod.EventBus;
@@ -58,6 +59,7 @@ pub const QuicGateway = struct {
     public_keys: []const auth.PublicKey,
     max_token_age: u64,
     auth_required: bool,
+    auth_mint: ?AuthMintConfig,
 
     // libwtf handles
     context: ?*wtf.wtf_context_t,
@@ -84,6 +86,7 @@ pub const QuicGateway = struct {
             .public_keys = &.{},
             .max_token_age = 0,
             .auth_required = false,
+            .auth_mint = null,
             .context = null,
             .server = null,
         };
@@ -361,6 +364,7 @@ pub const QuicGateway = struct {
                         .{ .enforce = if (session_ctx.auth_state) |*s| s else null }
                     else
                         .disabled,
+                    .auth_mint = gw.auth_mint,
                 }, cmd) catch |err| {
                     const err_msg: []const u8 = switch (err) {
                         error.WormViolation => "WORM violation",

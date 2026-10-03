@@ -1,6 +1,9 @@
 # Server Backends
 
-WormDB's transport layer is decoupled from command execution. The `--backend` flag selects which IO strategy handles TCP connections, while the same executor processes commands identically regardless of the choice.
+WormDB's transport layer is decoupled from command execution. The standalone
+binary supports `threadpool`. The engine also exposes Linux `epoll` and `uring`
+APIs, which currently lack TCP AUTH handling and the standalone listener's
+resource-limit and replication integration.
 
 ## Available Backends
 
@@ -26,13 +29,11 @@ Uses Linux's `io_uring` interface for asynchronous IO submission and completion.
 
 ```bash
 ./zig-out/bin/wormdb --backend threadpool --port 6389 --data ./data
-./zig-out/bin/wormdb --backend epoll --port 6389 --data ./data
-./zig-out/bin/wormdb --backend uring --port 6389 --data ./data
 ```
 
-::: tip
-Start with `threadpool`. Profile your actual workload with the scripts in `scripts/` before switching. The backend affects only IO handling — command semantics, response format, and durability behavior are identical across all three.
-:::
+Selecting `epoll` or `uring` through the standalone CLI or JSON config returns
+`UnsupportedBackend`. Embedded applications can use those Linux APIs directly,
+but must account for their missing authentication and listener features.
 
 ## Decision Guide
 

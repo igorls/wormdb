@@ -17,7 +17,7 @@ services:
     devices: ["/dev/net/tun:/dev/net/tun"]
     ports: ["26389:6389"]
     volumes: [node-a-data:/data]
-    command: ["--port", "6389", "--data", "/data", "--cluster", "notepad-demo", "--seed", "node-b:51821", "--persistence", "snapshot"]
+    command: ["--port", "6389", "--data", "/data", "--cluster", "notepad-demo", "--seed", "node-b:51821", "--persistence", "snapshot", "--cluster-open"]
     networks: [demo]
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "6389"]
@@ -34,7 +34,7 @@ services:
     devices: ["/dev/net/tun:/dev/net/tun"]
     ports: ["26390:6389"]
     volumes: [node-b-data:/data]
-    command: ["--port", "6389", "--data", "/data", "--cluster", "notepad-demo", "--seed", "node-a:51821", "--persistence", "snapshot"]
+    command: ["--port", "6389", "--data", "/data", "--cluster", "notepad-demo", "--seed", "node-a:51821", "--persistence", "snapshot", "--cluster-open"]
     depends_on:
       node-a:
         condition: service_healthy

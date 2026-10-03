@@ -90,6 +90,13 @@ pub const TokenState = struct {
         const now: u64 = @intCast(@divFloor(compat.nowMs(), 1000));
         return now >= self.exp;
     }
+
+    /// Bind a blocking socket read to this token's absolute expiry. Socket
+    /// deadlines use the monotonic clock; SCT timestamps use wall-clock seconds.
+    pub fn readDeadlineNs(self: *const TokenState) i128 {
+        const remaining = @as(i128, self.exp) * 1_000_000_000 - @as(i128, compat.nowMs()) * 1_000_000;
+        return compat.nowNs() + @max(remaining, 0);
+    }
 };
 
 /// Ed25519 public key (32 bytes).
@@ -99,6 +106,7 @@ pub const PublicKey = [32]u8;
 pub const Signature = [64]u8;
 
 const SIGNATURE_LEN = 64;
+pub const SECRET_KEY_LEN = 64;
 
 fn verifyDetached(sig_bytes: [64]u8, payload: []const u8, public_key_bytes: *const PublicKey) bool {
     const sig = Ed25519.Signature.fromBytes(sig_bytes);
@@ -298,6 +306,90 @@ pub fn decodePublicKey(b64: []const u8) !PublicKey {
     return pk;
 }
 
+/// Decode a base64-encoded Ed25519 secret key into the 64-byte std.crypto form.
+pub fn decodeSecretKey(b64: []const u8) ![SECRET_KEY_LEN]u8 {
+    var sk: [SECRET_KEY_LEN]u8 = undefined;
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(b64) catch return error.InvalidSecretKey;
+    if (decoded_len != SECRET_KEY_LEN) return error.InvalidSecretKey;
+    std.base64.standard.Decoder.decode(&sk, b64) catch return error.InvalidSecretKey;
+    return sk;
+}
+
+pub const NamespaceMode = enum {
+    read,
+    write,
+    readwrite,
+};
+
+pub fn namespaceModeFromStr(s: []const u8) ?NamespaceMode {
+    if (std.mem.eql(u8, s, "read")) return .read;
+    if (std.mem.eql(u8, s, "write")) return .write;
+    if (std.mem.eql(u8, s, "readwrite")) return .readwrite;
+    return null;
+}
+
+pub fn namespaceCapabilityCount(mode: NamespaceMode) usize {
+    return switch (mode) {
+        .read => 6,
+        .write => 10,
+        .readwrite => 16,
+    };
+}
+
+pub fn appendNamespaceCapabilities(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(Capability),
+    namespace: []const u8,
+    mode: NamespaceMode,
+) !void {
+    if (mode == .read or mode == .readwrite) {
+        try appendCap(allocator, list, .get, "mem:{s}:", .{namespace});
+        try appendCap(allocator, list, .get, "vec:mem:{s}:", .{namespace});
+        try appendCap(allocator, list, .get, "bq:vec:mem:{s}:", .{namespace});
+        try appendCap(allocator, list, .get, "__meta:mem:{s}:", .{namespace});
+        try appendCapLiteral(allocator, list, .exec, .prefix, "mem_");
+        try appendCap(allocator, list, .subscribe, "mem:{s}:", .{namespace});
+    }
+
+    if (mode == .write or mode == .readwrite) {
+        try appendCap(allocator, list, .set, "mem:{s}:", .{namespace});
+        try appendCap(allocator, list, .set, "vec:mem:{s}:", .{namespace});
+        try appendCap(allocator, list, .set, "bq:vec:mem:{s}:", .{namespace});
+        try appendCap(allocator, list, .set, "__meta:mem:{s}:", .{namespace});
+        try appendCap(allocator, list, .delete, "mem:{s}:", .{namespace});
+        try appendCap(allocator, list, .delete, "vec:mem:{s}:", .{namespace});
+        try appendCap(allocator, list, .delete, "bq:vec:mem:{s}:", .{namespace});
+        try appendCap(allocator, list, .delete, "__meta:mem:{s}:", .{namespace});
+        try appendCap(allocator, list, .publish, "mem:{s}:", .{namespace});
+        try appendCapLiteral(allocator, list, .exec, .prefix, "mem_");
+    }
+}
+
+fn appendCap(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(Capability),
+    op: Operation,
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    const pattern = try std.fmt.allocPrint(allocator, fmt, args);
+    try list.append(allocator, .{ .op = op, .match_type = .prefix, .pattern = pattern });
+}
+
+fn appendCapLiteral(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(Capability),
+    op: Operation,
+    match_type: MatchType,
+    pattern: []const u8,
+) !void {
+    try list.append(allocator, .{
+        .op = op,
+        .match_type = match_type,
+        .pattern = try allocator.dupe(u8, pattern),
+    });
+}
+
 // ╔═══════════════════════════════════════════════╗
 // ║  Command-level capability enforcement          ║
 // ╚═══════════════════════════════════════════════╝
@@ -312,11 +404,12 @@ pub fn commandToOperation(cmd_id: u8) ?Operation {
         0x07 => .subscribe, // UNSUB uses same permission as SUB
         0x08 => .publish,
         0x09 => .exec,
+        0x0B => .all, // SAVE requires universal administrative authority
         0x0D => .set, // VINSERT writes a vector key
         0x0E => .delete, // VDELETE deletes a vector key
         0x0F => .set, // VBULKINSERT writes every item key
         0x10 => .set, // VRABITQ_INSTALL mutates vector namespace state
-        else => null, // STATUS, CLUSTER_STATUS, SAVE, AUTH, etc. — always permitted
+        else => null, // STATUS, CLUSTER_STATUS, AUTH, etc. — always permitted
     };
 }
 
@@ -330,10 +423,11 @@ pub fn commandTarget(cmd: Command) ?[]const u8 {
         .get => |key| key,
         .set => |p| p.key,
         .delete => |key| key,
-        .subscribe => |ch| ch,
+        .subscribe => |p| p.channel,
         .unsubscribe => |ch| ch,
         .publish => |p| p.channel,
         .exec => |p| p.procedure,
+        .save => "", // global operation; commandPermittedUnion checks universal scope
         .vinsert => |p| p.key,
         .vdelete => |p| p.key,
         .vbulkinsert => null, // multi-target; authorized per-item in commandPermittedUnion
@@ -344,7 +438,7 @@ pub fn commandTarget(cmd: Command) ?[]const u8 {
 
 /// Map a parsed `Command` (union tag) to its auth `Operation`. The executor's gate keys on
 /// this instead of the wire `cmd_id` byte (the executor only has the parsed command). `null`
-/// ⇒ a public command (STATUS / CLUSTER_STATUS / CLUSTER_PEERS / SAVE / AUTH).
+/// ⇒ a public command (STATUS / CLUSTER_STATUS / CLUSTER_PEERS / AUTH).
 pub fn operationForCommand(cmd: Command) ?Operation {
     return switch (cmd) {
         .get => .get,
@@ -355,7 +449,8 @@ pub fn operationForCommand(cmd: Command) ?Operation {
         .exec => .exec,
         .vinsert, .vbulkinsert, .vrabitq_install => .set,
         .vdelete => .delete,
-        else => null, // status, cluster_status, cluster_peers, save, auth
+        .save => .all,
+        else => null, // status, cluster_status, cluster_peers, auth
     };
 }
 
@@ -365,6 +460,15 @@ pub fn operationForCommand(cmd: Command) ?Operation {
 pub fn commandPermittedUnion(state: *const TokenState, cmd: Command) bool {
     const op = operationForCommand(cmd) orelse return true; // public command
     switch (cmd) {
+        .save => {
+            // Exact-empty authority only names the empty key. It must not
+            // become database-wide authority through this targetless command.
+            for (state.capabilities) |cap| {
+                if (cap.op == .all and (cap.match_type == .wildcard or
+                    (cap.match_type == .prefix and cap.pattern.len == 0))) return true;
+            }
+            return false;
+        },
         .vbulkinsert => |p| {
             for (p.items) |item| {
                 if (!state.permits(op, item.key)) return false;
@@ -505,10 +609,11 @@ test "operationForCommand agrees with commandToOperation for every Command id" {
         .{ T.Command{ .get = "k" }, T.CommandId.get },
         .{ T.Command{ .set = .{ .key = "k", .value = "v" } }, T.CommandId.set },
         .{ T.Command{ .delete = "k" }, T.CommandId.delete },
-        .{ T.Command{ .subscribe = "c" }, T.CommandId.subscribe },
+        .{ T.Command{ .subscribe = .{ .channel = "c" } }, T.CommandId.subscribe },
         .{ T.Command{ .unsubscribe = "c" }, T.CommandId.unsubscribe },
         .{ T.Command{ .publish = .{ .channel = "c", .message = "m" } }, T.CommandId.publish },
         .{ T.Command{ .exec = .{ .procedure = "p", .args = &.{} } }, T.CommandId.exec },
+        .{ T.Command.save, T.CommandId.save },
         .{ T.Command{ .vinsert = .{ .key = "vec:n:1", .vector = "\x00\x00\x00\x00", .namespace = "vec:n:", .metric = "l2", .timestamp = 0 } }, T.CommandId.vinsert },
         .{ T.Command{ .vdelete = .{ .key = "vec:n:1", .namespace = "vec:n:" } }, T.CommandId.vdelete },
         .{ T.Command{ .vbulkinsert = .{ .namespace = "vec:n:", .metric = "l2", .items = &.{} } }, T.CommandId.vbulkinsert },
@@ -519,7 +624,7 @@ test "operationForCommand agrees with commandToOperation for every Command id" {
     }
     // Public commands map to no operation on both keyings.
     try testing.expectEqual(@as(?Operation, null), operationForCommand(.status));
-    try testing.expectEqual(@as(?Operation, null), operationForCommand(.save));
+    try testing.expectEqual(@as(?Operation, .all), operationForCommand(.save));
     try testing.expectEqual(@as(?Operation, null), operationForCommand(.{ .auth = "x" }));
 }
 
@@ -557,6 +662,35 @@ test "commandPermittedUnion: per-item bulk, targetless deny, public pass" {
 
     // Op-mapped command whose target the token lacks — denied.
     try testing.expect(!commandPermittedUnion(&state, .{ .set = .{ .key = "other:1", .value = "v" } }));
+}
+
+test "namespace capability expansion scopes memory access" {
+    const testing = std.testing;
+
+    var caps: std.ArrayListUnmanaged(Capability) = .empty;
+    defer {
+        for (caps.items) |cap| testing.allocator.free(cap.pattern);
+        caps.deinit(testing.allocator);
+    }
+    try appendNamespaceCapabilities(testing.allocator, &caps, "astrid", .read);
+    try testing.expectEqual(namespaceCapabilityCount(.read), caps.items.len);
+
+    const state = TokenState{
+        .subject = "mem:astrid",
+        .iat = 0,
+        .exp = 0,
+        .jti = 0,
+        .capabilities = caps.items,
+    };
+
+    try testing.expect(state.permits(.get, "mem:astrid:doc-1"));
+    try testing.expect(state.permits(.get, "vec:mem:astrid:doc-1"));
+    try testing.expect(state.permits(.get, "__meta:mem:astrid:config"));
+    try testing.expect(state.permits(.subscribe, "mem:astrid:added"));
+    try testing.expect(state.permits(.exec, "mem_query"));
+    try testing.expect(!state.permits(.get, "mem:raven:doc-1"));
+    try testing.expect(!state.permits(.set, "mem:astrid:doc-1"));
+    try testing.expect(!state.permits(.exec, "auth:mint:astrid"));
 }
 
 test {

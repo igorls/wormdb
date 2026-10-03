@@ -2,6 +2,7 @@
   "name": "wormdb",
   "type": "module",
   "private": true,
+  "license": "MIT",
   "scripts": {
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",

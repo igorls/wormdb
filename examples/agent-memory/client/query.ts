@@ -2,7 +2,7 @@
 // Query an already-ingested agent-memory namespace.
 //
 // Usage:
-//   bun run examples/agent-memory/client/query.ts "kyoto cherry blossoms" [--ns demo] [-k 5] [--lambda 0.3]
+//   bun run examples/agent-memory/client/query.ts "kyoto cherry blossoms" [--ns demo] [-k 5] [--lambda 0.3] [--filter 'category="trip"']
 
 import { connect } from "./mem";
 import { embed } from "../fixtures/embedder";
@@ -12,12 +12,14 @@ function parseArgs(argv: string[]): {
   ns: string;
   k: number;
   lambda: number;
+  filter?: string;
   host: string;
   port: number;
 } {
   let ns = "demo";
   let k = 5;
   let lambda = 0;
+  let filter: string | undefined;
   let host = "127.0.0.1";
   let port = 6389;
   const positional: string[] = [];
@@ -27,17 +29,18 @@ function parseArgs(argv: string[]): {
     if (t === "--ns") ns = next();
     else if (t === "-k" || t === "--k") k = Number(next());
     else if (t === "--lambda") lambda = Number(next());
+    else if (t === "--filter") filter = next();
     else if (t === "--host") host = next();
     else if (t === "--port") port = Number(next());
     else positional.push(t);
   }
-  return { text: positional.join(" "), ns, k, lambda, host, port };
+  return { text: positional.join(" "), ns, k, lambda, filter, host, port };
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.text.length === 0) {
-    console.error("usage: query.ts \"<query text>\" [--ns ns] [-k 5] [--lambda 0..1]");
+    console.error("usage: query.ts \"<query text>\" [--ns ns] [-k 5] [--lambda 0..1] [--filter 'field=\"value\"']");
     process.exit(2);
   }
 
@@ -47,6 +50,7 @@ async function main() {
     const hits = await mem.query(args.ns, qvec, args.k, {
       lambda: args.lambda,
       snippetChars: 140,
+      filter: args.filter,
     });
     for (const h of hits) {
       const sessionTag = (h.meta as { session_id?: string } | null)?.session_id ?? "?";

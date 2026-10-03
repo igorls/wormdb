@@ -17,21 +17,48 @@ const Response = core.types.Response;
 const Cluster = cluster_mod.Cluster;
 const vector_ops = @import("../procedures/vector_ops.zig");
 const Metric = @import("../vector/metric.zig").Metric;
+const AuthMintConfig = @import("../procedures/context.zig").AuthMintConfig;
+const auth = @import("auth.zig");
+const org_trust_mod = @import("../cluster/org_trust.zig");
+const ServerMetrics = @import("metrics.zig").ServerMetrics;
+const ConnectionLimit = @import("connection_limit.zig").ConnectionLimit;
+
+/// Fallback trust when no org_trust is configured: enforce=false, zero grants.
+/// A W2 handshake verified against it always fails OrgNotTrusted (deny-by-default).
+const EMPTY_ORG_TRUST = org_trust_mod.OrgTrust{};
 
 pub const ServerConfig = struct {
     bind_address: []const u8 = "0.0.0.0",
     port: u16 = 6389,
     max_connections: usize = 1024,
+    /// Whole handshake/frame deadline, including time in the accept queue.
+    timeout_ms: usize = 30000,
     cluster: ?*Cluster = null,
     vector_registry: ?*@import("../vector/index.zig").NamespaceRegistry = null,
     /// Number of worker threads. 0 = auto (cpu_count * 2, capped at 64).
     worker_count: usize = 0,
     /// Whether this binary listener enforces auth. Set by the composition root to
-    /// `cfg.auth.require_auth && cfg.server.auth_enabled`. Phase 1 has no AUTH-frame handling on
-    /// the binary path, so enforce ⇒ every protected command fails closed (use the WS/QUIC
-    /// gateways for authenticated access, or disable auth on a trusted network). Default false
-    /// keeps unit tests (which never authenticate) working; the composition root sets the secure value.
+    /// `cfg.auth.require_auth && cfg.server.auth_enabled`. Binary connections authenticate with
+    /// an AUTH frame (verified against `auth_public_keys`); enforce ⇒ protected commands fail
+    /// closed until a valid token is presented. Default false keeps unit tests (which never
+    /// authenticate) working; the composition root sets the secure value.
     auth_enforce: bool = false,
+    /// Ed25519 public keys for SCT verification on the binary path. Empty means AUTH cannot
+    /// succeed ("auth not configured", mirroring the WS gateway); it does NOT disable
+    /// enforcement — commands are still rejected while `auth_enforce` is true (fail closed).
+    auth_public_keys: []const auth.PublicKey = &.{},
+    /// Maximum token lifetime in seconds (0 = no limit).
+    auth_max_token_age: u64 = 0,
+    /// Optional server-side SCT minting config.
+    auth_mint: ?AuthMintConfig = null,
+    /// Optional shared liveness/concurrency counters surfaced by STATUS.
+    metrics: ?*ServerMetrics = null,
+    /// Org trust for the replication channel (#63). Null or `enforce=false`
+    /// keeps legacy behavior: unauthenticated "WR" connections are accepted.
+    /// When enforcing: "WR" is rejected loudly, "W2" requires the org-cert
+    /// challenge handshake, and every replicated key is checked against the
+    /// peer org's granted prefixes.
+    org_trust: ?*const org_trust_mod.OrgTrust = null,
 };
 
 pub const Server = struct {
@@ -40,11 +67,13 @@ pub const Server = struct {
     event_bus: *EventBus,
     cluster: ?*Cluster,
     config: ServerConfig,
+    metrics: ?*ServerMetrics,
     running: std.atomic.Value(bool),
 
     // Thread pool infrastructure
     conn_queue: ConnQueue,
     workers: []std.Thread,
+    connection_limit: ConnectionLimit = .{},
 
     const CONN_QUEUE_CAP = 1024;
 
@@ -79,6 +108,12 @@ pub const Server = struct {
             self.count -= 1;
             return conn;
         }
+
+        fn len(self: *ConnQueue) usize {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.count;
+        }
     };
 
     const TEXT_READ_BUF_SIZE = 16384;
@@ -91,6 +126,12 @@ pub const Server = struct {
         write_mutex: core.compat.Mutex,
         subscriptions: std.StringHashMap(u64),
         binary_mode: bool,
+        /// Verified SCT token state, set by an AUTH frame. Heap-allocated from
+        /// `allocator` (NOT the per-command arena — it must outlive commands).
+        auth_state: ?auth.TokenState,
+        auth_enforce: bool = false,
+        closed: std.atomic.Value(bool) = .init(false),
+        in_flight: std.atomic.Value(u32) = .init(0),
 
         fn init(allocator: std.mem.Allocator, event_bus: *EventBus, stream: ?*core.compat.net.Stream) ConnectionContext {
             return .{
@@ -101,6 +142,7 @@ pub const Server = struct {
                 .write_mutex = .{},
                 .subscriptions = std.StringHashMap(u64).init(allocator),
                 .binary_mode = false,
+                .auth_state = null,
             };
         }
 
@@ -118,10 +160,12 @@ pub const Server = struct {
                 .write_mutex = .{},
                 .subscriptions = std.StringHashMap(u64).init(allocator),
                 .binary_mode = false,
+                .auth_state = null,
             };
         }
 
         fn deinit(self: *ConnectionContext) void {
+            self.closed.store(true, .release);
             var iter = self.subscriptions.iterator();
             while (iter.next()) |entry| {
                 const channel = entry.key_ptr.*;
@@ -130,9 +174,36 @@ pub const Server = struct {
                 self.allocator.free(channel);
             }
             self.subscriptions.deinit();
+            self.clearAuthState();
+            while (self.in_flight.load(.acquire) != 0) {
+                std.Thread.yield() catch {};
+            }
         }
 
-        fn subscribe(self: *ConnectionContext, channel: []const u8) !void {
+        fn retain(ctx: *anyopaque) void {
+            const self: *ConnectionContext = @ptrCast(@alignCast(ctx));
+            _ = self.in_flight.fetchAdd(1, .acquire);
+        }
+
+        fn release(ctx: *anyopaque) void {
+            const self: *ConnectionContext = @ptrCast(@alignCast(ctx));
+            _ = self.in_flight.fetchSub(1, .release);
+        }
+
+        fn clearAuthState(self: *ConnectionContext) void {
+            self.replaceAuthState(null);
+        }
+
+        fn replaceAuthState(self: *ConnectionContext, next: ?auth.TokenState) void {
+            self.write_mutex.lock();
+            defer self.write_mutex.unlock();
+            if (self.auth_state) |*state| {
+                auth.freeTokenState(self.allocator, state);
+            }
+            self.auth_state = next;
+        }
+
+        fn subscribe(self: *ConnectionContext, channel: []const u8, filter: ?[]const u8) !void {
             if (self.subscriptions.contains(channel)) {
                 return;
             }
@@ -140,7 +211,17 @@ pub const Server = struct {
             const channel_copy = try self.allocator.dupe(u8, channel);
             errdefer self.allocator.free(channel_copy);
 
-            const sub_id = try self.event_bus.subscribe(channel_copy, ConnectionContext.writeEvent, @ptrCast(self));
+            const sub_id = try self.event_bus.subscribeFilteredHooks(
+                channel_copy,
+                filter,
+                null,
+                @ptrCast(self),
+                .{
+                    .retain_fn = ConnectionContext.retain,
+                    .release_fn = ConnectionContext.release,
+                    .event_fn = ConnectionContext.writeExactEvent,
+                },
+            );
             errdefer self.event_bus.unsubscribe(channel_copy, sub_id);
 
             try self.subscriptions.put(channel_copy, sub_id);
@@ -166,57 +247,31 @@ pub const Server = struct {
             }
         }
 
-        fn writeEvent(ctx: *anyopaque, data: []const u8) void {
+        fn writeExactEvent(ctx: *anyopaque, channel: []const u8, message: []const u8) void {
             const self: *ConnectionContext = @ptrCast(@alignCast(ctx));
+            if (self.closed.load(.acquire)) return;
+            if (!self.write_mutex.tryLock()) {
+                self.event_bus.recordDrop();
+                return;
+            }
+            defer self.write_mutex.unlock();
+            if (self.closed.load(.acquire)) return;
+            if (self.auth_enforce) {
+                const state = if (self.auth_state) |*s| s else return;
+                if (state.isExpired() or !state.permits(.subscribe, channel)) return;
+            }
 
             if (self.binary_mode) {
-                const parsed = parseTextEventPayload(data) orelse return;
-
-                self.write_mutex.lock();
-                defer self.write_mutex.unlock();
-
-                if (self.write_capture) |capture| {
-                    capture.appendSlice(self.allocator, data) catch {};
-                }
-
                 if (self.stream) |stream| {
-                    wire.writeResponse(stream, .{ .event = .{
-                        .channel = parsed.channel,
-                        .message = parsed.message,
-                    } }) catch {};
+                    wire.writeResponse(stream, .{ .event = .{ .channel = channel, .message = message } }) catch {};
                 }
                 return;
             }
 
-            self.writeAllLocked(data);
-        }
-
-        const ParsedTextEvent = struct {
-            channel: []const u8,
-            message: []const u8,
-        };
-
-        fn parseTextEventPayload(data: []const u8) ?ParsedTextEvent {
-            const prefix = ">EVENT ";
-            if (!std.mem.startsWith(u8, data, prefix)) return null;
-
-            const channel_start = prefix.len;
-            const channel_end_rel = std.mem.indexOf(u8, data[channel_start..], "\r\n") orelse return null;
-            const channel_end = channel_start + channel_end_rel;
-
-            const message_start = channel_end + 2;
-            if (message_start > data.len) return null;
-
-            if (data.len < message_start + 2) return null;
-            if (!std.mem.endsWith(u8, data, "\r\n")) return null;
-
-            const message_end = data.len - 2;
-            if (message_end < message_start) return null;
-
-            return .{
-                .channel = data[channel_start..channel_end],
-                .message = data[message_start..message_end],
-            };
+            const data = std.fmt.allocPrint(self.allocator, ">EVENT {s}\r\n{s}\r\n", .{ channel, message }) catch return;
+            defer self.allocator.free(data);
+            if (self.write_capture) |capture| capture.appendSlice(self.allocator, data) catch {};
+            if (self.stream) |stream| stream.writeAll(data) catch {};
         }
     };
 
@@ -232,6 +287,7 @@ pub const Server = struct {
             .event_bus = event_bus,
             .cluster = config.cluster,
             .config = config,
+            .metrics = config.metrics,
             .running = std.atomic.Value(bool).init(false),
             .conn_queue = .{},
             .workers = &.{},
@@ -239,10 +295,11 @@ pub const Server = struct {
     }
 
     pub fn run(self: *Server) !void {
+        if (self.config.max_connections == 0 or self.config.timeout_ms == 0) return error.InvalidConnectionLimits;
         self.running.store(true, .release);
 
         const addr = try core.compat.net.Address.parseIp(self.config.bind_address, self.config.port);
-        var listener = try addr.listen(.{ .reuse_address = true });
+        var listener = try addr.listen(.{ .reuse_address = true, .kernel_backlog = 1024 });
         defer listener.deinit();
 
         // Start worker pool
@@ -260,16 +317,26 @@ pub const Server = struct {
         std.log.info("WormDB listening on {s}:{d} ({d} workers)", .{ self.config.bind_address, self.config.port, num_workers });
 
         while (self.running.load(.acquire)) {
-            const conn = listener.accept() catch |err| {
+            var conn = listener.accept() catch |err| {
                 std.log.err("Accept error: {}", .{err});
                 continue;
             };
 
+            if (!self.connection_limit.acquire(self.config.max_connections)) {
+                conn.stream.close();
+                continue;
+            }
+            // Preserve accept time through the queue and all pre-AUTH frames.
+            conn.stream.read_limit_ns = core.compat.nowNs() + @as(i128, self.config.timeout_ms) * 1_000_000;
             if (!self.conn_queue.push(conn)) {
                 // Queue full — reject connection
                 std.log.warn("Connection queue full, rejecting", .{});
+                if (self.metrics) |metrics| metrics.setTcpConnectionQueueDepth(self.conn_queue.len());
                 conn.stream.close();
+                self.connection_limit.release();
+                continue;
             }
+            if (self.metrics) |metrics| metrics.setTcpConnectionQueueDepth(self.conn_queue.len());
         }
 
         // Shutdown: wake all workers so they exit
@@ -285,6 +352,7 @@ pub const Server = struct {
     fn workerLoop(self: *Server) void {
         while (self.running.load(.acquire)) {
             if (self.conn_queue.pop()) |conn| {
+                if (self.metrics) |metrics| metrics.setTcpConnectionQueueDepth(self.conn_queue.len());
                 self.handleConnection(conn);
             } else {
                 // Wait for new connections
@@ -293,6 +361,7 @@ pub const Server = struct {
         }
         // Drain remaining connections on shutdown
         while (self.conn_queue.pop()) |conn| {
+            if (self.metrics) |metrics| metrics.setTcpConnectionQueueDepth(self.conn_queue.len());
             self.handleConnection(conn);
         }
     }
@@ -302,14 +371,22 @@ pub const Server = struct {
     }
 
     fn handleConnection(self: *Server, conn: core.compat.net.ServerCompat.Connection) void {
+        defer self.connection_limit.release();
         var stream = conn.stream;
+        stream.beginRead(self.config.timeout_ms, false);
+        if (self.metrics) |metrics| metrics.beginTcpConnection();
+        defer if (self.metrics) |metrics| metrics.endTcpConnection();
 
         // Disable Nagle's algorithm — critical for low-latency request/response.
         // Without this, small response packets get buffered for up to 40ms.
         core.compat.setNoDelay(stream.getHandle());
+        // Bound sends so a slow peer cannot pin an EventBus publisher (#84).
+        core.compat.setSendTimeoutMs(stream.getHandle(), 2_000);
+        stream.write_timeout_ms = 2_000;
         var conn_ctx = ConnectionContext.init(self.allocator, self.event_bus, &stream);
-        defer conn_ctx.deinit();
+        conn_ctx.auth_enforce = self.config.auth_enforce;
         defer conn.stream.close();
+        defer conn_ctx.deinit();
 
         var handshake: [2]u8 = undefined;
         var handshake_read: usize = 0;
@@ -323,15 +400,38 @@ pub const Server = struct {
         }
 
         if (std.mem.eql(u8, &handshake, &wire.WIRE_MAGIC)) {
+            if (!self.config.auth_enforce) stream.read_limit_ns = null;
             conn_ctx.binary_mode = true;
             self.handleBinaryConnection(&stream, &conn_ctx);
             return;
         }
 
-        // Replication connections: same binary protocol but skip re-replication (anti-echo)
+        // Replication connections: same binary protocol but skip re-replication (anti-echo).
+        // Legacy "WR" carries no peer identity, so it is only acceptable while org
+        // trust is NOT enforced — an enforcing node must fail closed and loudly.
         if (std.mem.eql(u8, &handshake, &wire.REPL_MAGIC)) {
+            if (self.config.org_trust) |trust| {
+                if (trust.enforce) {
+                    std.log.warn("replication: legacy replication rejected: org trust enforced (peer must use W2 handshake)", .{});
+                    wire.writeResponse(&stream, .{ .err = "unauthorized: legacy replication rejected (org trust enforced)" }) catch {};
+                    return;
+                }
+            }
             conn_ctx.binary_mode = true;
-            self.handleReplicationConnection(&stream);
+            stream.read_limit_ns = null;
+            self.handleReplicationConnection(&stream, null);
+            return;
+        }
+
+        // Org-authenticated replication ("W2", #63): challenge/response handshake
+        // before any frame is accepted. Verified against the configured org trust;
+        // with no trust configured this always rejects (deny-by-default) — an open
+        // node's peers speak legacy "WR", so a W2 arrival means misconfiguration.
+        if (std.mem.eql(u8, &handshake, &wire.REPL_MAGIC_V2)) {
+            conn_ctx.binary_mode = true;
+            const peer_org = self.replicationOrgHandshake(&stream) orelse return;
+            stream.read_limit_ns = null;
+            self.handleReplicationConnection(&stream, peer_org);
             return;
         }
 
@@ -392,9 +492,13 @@ pub const Server = struct {
             _ = cmd_arena.reset(.retain_capacity);
             const arena_alloc = cmd_arena.allocator();
 
+            self.expireAuthState(conn_ctx);
+            const may_idle = conn_ctx.subscriptions.count() > 0 and
+                (!self.config.auth_enforce or conn_ctx.auth_state != null);
+            stream.beginRead(self.config.timeout_ms, may_idle);
             const cmd = wire.readFrameZeroCopy(&reader, arena_alloc) catch |err| {
                 switch (err) {
-                    error.EndOfStream => return,
+                    error.EndOfStream, error.Timeout => return,
                     error.PayloadTooLarge => {
                         wire.writeResponse(&w, .{ .err = "request too large" }) catch {};
                         w.flush() catch {};
@@ -409,6 +513,9 @@ pub const Server = struct {
             };
             // No need for deinitCommand — arena reset handles cleanup
 
+            if (self.metrics) |metrics| metrics.beginTcpCommand();
+            defer if (self.metrics) |metrics| metrics.endTcpCommand();
+
             const response = self.executeForConnectionWithAlloc(cmd, conn_ctx, arena_alloc) catch |err| {
                 const err_msg: []const u8 = switch (err) {
                     error.WormViolation => "WORM violation",
@@ -416,23 +523,84 @@ pub const Server = struct {
                     error.IoError => "I/O error",
                     error.KeyNotFound => "key not found",
                     error.Corruption => "data corruption",
+                    error.InvalidPredicate => "invalid filter predicate",
                 };
-                wire.writeResponse(&w, .{ .err = err_msg }) catch {};
-                w.flush() catch {};
+                wire.writeResponse(&w, .{ .err = err_msg }) catch return;
+                w.flush() catch return;
+                if (self.metrics) |metrics| metrics.completeTcpCommand(false);
                 continue;
             };
             // No defer deinitResponse needed — arena reset handles cleanup
 
             wire.writeResponse(&w, response) catch return;
             w.flush() catch return;
+            if (self.metrics) |metrics| metrics.completeTcpCommand(responseSucceeded(response));
         }
+    }
+
+    /// Server side of the W2 org handshake: send a fresh 32-byte challenge,
+    /// read the peer's [186B cert][64B signature] reply, verify it against the
+    /// configured org trust. Returns the proven org pubkey, or null after
+    /// writing an err response and logging the reason (caller closes).
+    fn replicationOrgHandshake(self: *Server, stream: *core.compat.net.Stream) ?[32]u8 {
+        var challenge: [org_trust_mod.CHALLENGE_LEN]u8 = undefined;
+        core.compat.randomBytes(&challenge);
+        stream.writeAll(&challenge) catch return null;
+
+        var reply: [org_trust_mod.HANDSHAKE_REPLY_LEN]u8 = undefined;
+        readExactFromStream(stream, &reply) catch {
+            std.log.warn("replication: org handshake failed: peer closed before sending cert+signature", .{});
+            return null;
+        };
+
+        const trust = self.config.org_trust orelse &EMPTY_ORG_TRUST;
+        const peer = org_trust_mod.verifyPeerHandshake(
+            trust,
+            &challenge,
+            reply[0..org_trust_mod.CERT_WIRE_LEN],
+            reply[org_trust_mod.CERT_WIRE_LEN..][0..org_trust_mod.SIG_LEN],
+        ) catch |err| {
+            std.log.warn("replication: org handshake rejected: {s}", .{@errorName(err)});
+            wire.writeResponse(stream, .{ .err = "unauthorized: replication handshake rejected" }) catch {};
+            return null;
+        };
+        return peer.org_pubkey;
+    }
+
+    /// True when the replicated key is allowed for this connection. Only
+    /// meaningful while org trust is enforced; open mode allows everything.
+    ///
+    /// Two layers, both deny-by-default:
+    ///   1. static grants from config (#63) — member orgs;
+    ///   2. dynamic delegated-org authorization (#66) — a cached fold of OUR
+    ///      org's trust log ("trust:<our_org_hex>"). Consulted only after the
+    ///      static check fails, and only when the composition root wired
+    ///      `trust.dynamic` (enforcement on AND this node has a cert). Every
+    ///      mutating replication frame (set/delete/vinsert/vdelete/
+    ///      vbulkinsert) requires the WRITE capability; revocation lands via
+    ///      the trust log within the cache TTL (≤5s) — or immediately, when
+    ///      the revoke was appended locally (generation bump).
+    fn replicationKeyAuthorized(self: *Server, peer_org: ?[32]u8, key: []const u8) bool {
+        const trust = self.config.org_trust orelse return true;
+        if (!trust.enforce) return true;
+        const org = peer_org orelse return false; // enforcing ⇒ only W2 connections reach the loop
+        if (trust.keyAuthorized(org, key)) return true;
+        const dynamic = trust.dynamic orelse return false;
+        return dynamic.authorized(org, key, org_trust_mod.CAP_WRITE);
     }
 
     /// Handle a replication connection from another WormDB node.
     /// Applies SET/DEL directly to the store without re-replicating (anti-echo).
     /// Emits local PUB/SUB events for replicated writes so local subscribers
     /// (e.g. WebSocket-connected clients) get real-time notifications.
-    fn handleReplicationConnection(self: *Server, stream: *core.compat.net.Stream) void {
+    ///
+    /// `peer_org` is the org pubkey proven by the W2 handshake (null on a
+    /// legacy "WR" connection, which only exists while enforcement is off).
+    /// When org trust is enforced, every mutating frame's key must fall in a
+    /// prefix granted to `peer_org`; violations get an err response and the
+    /// frame is skipped (connection stays up — one bad key must not sever an
+    /// otherwise healthy replication stream).
+    fn handleReplicationConnection(self: *Server, stream: *core.compat.net.Stream, peer_org: ?[32]u8) void {
         const ReadAdapter = struct {
             stream: *core.compat.net.Stream,
 
@@ -444,11 +612,20 @@ pub const Server = struct {
         var reader = ReadAdapter{ .stream = stream };
 
         while (true) {
+            // Both accepted handshakes (legacy WR in explicit open mode and
+            // authenticated W2) are persistent replication sessions. Idle is
+            // valid; once the first frame byte arrives, Stream.read starts the
+            // normal whole-frame deadline so trickled frames still expire.
+            stream.beginRead(self.config.timeout_ms, true);
             const cmd = wire.readFrameAlloc(&reader, self.allocator) catch return;
             defer protocol.deinitCommand(self.allocator, cmd);
 
             switch (cmd) {
                 .set => |params| {
+                    if (!self.replicationKeyAuthorized(peer_org, params.key)) {
+                        wire.writeResponse(stream, .{ .err = "unauthorized: namespace" }) catch return;
+                        continue;
+                    }
                     self.store.set(params.key, params.value, params.worm) catch {};
                     // No replication — this IS the replication
 
@@ -497,6 +674,10 @@ pub const Server = struct {
                     wire.writeResponse(stream, .ok) catch return;
                 },
                 .delete => |key| {
+                    if (!self.replicationKeyAuthorized(peer_org, key)) {
+                        wire.writeResponse(stream, .{ .err = "unauthorized: namespace" }) catch return;
+                        continue;
+                    }
                     self.store.delete(key) catch {};
 
                     // Emit local PUB/SUB event for note deletions
@@ -518,6 +699,10 @@ pub const Server = struct {
                     wire.writeResponse(stream, .ok) catch return;
                 },
                 .vinsert => |params| {
+                    if (!self.replicationKeyAuthorized(peer_org, params.key)) {
+                        wire.writeResponse(stream, .{ .err = "unauthorized: namespace" }) catch return;
+                        continue;
+                    }
                     const metric_enum = Metric.fromStr(params.metric) orelse {
                         wire.writeResponse(stream, .{ .err = "vinsert: unknown metric" }) catch return;
                         continue;
@@ -544,6 +729,10 @@ pub const Server = struct {
                     wire.writeResponse(stream, .ok) catch return;
                 },
                 .vdelete => |params| {
+                    if (!self.replicationKeyAuthorized(peer_org, params.key)) {
+                        wire.writeResponse(stream, .{ .err = "unauthorized: namespace" }) catch return;
+                        continue;
+                    }
                     vector_ops.applyVdelete(
                         self.store,
                         null,
@@ -559,6 +748,18 @@ pub const Server = struct {
                     wire.writeResponse(stream, .ok) catch return;
                 },
                 .vbulkinsert => |params| {
+                    // Every item key must be authorized — reject the whole frame
+                    // atomically rather than half-applying a bulk insert.
+                    const bulk_authorized = blk: {
+                        for (params.items) |item| {
+                            if (!self.replicationKeyAuthorized(peer_org, item.key)) break :blk false;
+                        }
+                        break :blk true;
+                    };
+                    if (!bulk_authorized) {
+                        wire.writeResponse(stream, .{ .err = "unauthorized: namespace" }) catch return;
+                        continue;
+                    }
                     const metric_enum = Metric.fromStr(params.metric) orelse {
                         wire.writeResponse(stream, .{ .err = "vbulkinsert: unknown metric" }) catch return;
                         continue;
@@ -580,10 +781,62 @@ pub const Server = struct {
                     };
                     wire.writeResponse(stream, .ok) catch return;
                 },
+                .exec => |params| {
+                    if (!isAllowedReplicationProcedure(params.procedure)) {
+                        wire.writeResponse(stream, .{ .err = "unsupported replication command" }) catch return;
+                        continue;
+                    }
+                    // Proof-layer procedures (witness/prefix-root) take no per-key
+                    // grant check, but under enforcement they still require an
+                    // org-authenticated connection (proven by the W2 handshake).
+                    if (self.config.org_trust) |trust| {
+                        if (trust.enforce and peer_org == null) {
+                            wire.writeResponse(stream, .{ .err = "unauthorized: org handshake required" }) catch return;
+                            continue;
+                        }
+                    }
+
+                    var arena = std.heap.ArenaAllocator.init(self.allocator);
+                    defer arena.deinit();
+                    const response = executor.execute(.{
+                        .store = self.store,
+                        .event_bus = self.event_bus,
+                        .allocator = arena.allocator(),
+                        .cluster = self.cluster,
+                        .auth = .trusted,
+                        .auth_mint = self.config.auth_mint,
+                        .vector_registry = self.config.vector_registry,
+                    }, cmd) catch |e| {
+                        std.log.warn("replication: EXEC {s} failed: {s}", .{ params.procedure, @errorName(e) });
+                        wire.writeResponse(stream, .{ .err = "replication EXEC failed" }) catch return;
+                        continue;
+                    };
+                    wire.writeResponse(stream, response) catch return;
+                },
                 else => {
                     wire.writeResponse(stream, .{ .err = "unsupported replication command" }) catch return;
                 },
             }
+        }
+    }
+
+    fn isAllowedReplicationProcedure(name: []const u8) bool {
+        // NOTE: vsearch_cluster is deliberately NOT allowed here — peers may
+        // only be asked for the local sub-query (vsearch_local_raw), which
+        // never re-scatters, so replication-channel fan-out loops are
+        // impossible by construction.
+        return std.mem.eql(u8, name, "append_log_witness") or
+            std.mem.eql(u8, name, "proof_prefix_root") or
+            std.mem.eql(u8, name, "vsearch_local_raw");
+    }
+
+    /// Read exactly `buf.len` bytes from a raw stream (pre-framing handshake I/O).
+    fn readExactFromStream(stream: *core.compat.net.Stream, buf: []u8) !void {
+        var done: usize = 0;
+        while (done < buf.len) {
+            const n = try stream.read(buf[done..]);
+            if (n == 0) return error.EndOfStream;
+            done += n;
         }
     }
 
@@ -685,18 +938,28 @@ pub const Server = struct {
         };
         defer protocol.deinitCommand(self.allocator, cmd);
 
+        if (self.metrics) |metrics| metrics.beginTcpCommand();
+        defer if (self.metrics) |metrics| metrics.endTcpCommand();
+
         switch (cmd) {
-            .subscribe => |channel| {
-                conn_ctx.subscribe(channel) catch {
-                    conn_ctx.writeAllLocked("-ERR out of memory\r\n");
+            .subscribe => |params| {
+                conn_ctx.subscribe(params.channel, params.filter) catch |err| {
+                    const err_msg = switch (err) {
+                        error.InvalidPredicate => "-ERR invalid filter\r\n",
+                        else => "-ERR out of memory\r\n",
+                    };
+                    conn_ctx.writeAllLocked(err_msg);
+                    if (self.metrics) |metrics| metrics.completeTcpCommand(false);
                     return;
                 };
                 conn_ctx.writeAllLocked("+OK\r\n");
+                if (self.metrics) |metrics| metrics.completeTcpCommand(true);
                 return;
             },
             .unsubscribe => |channel| {
                 conn_ctx.unsubscribe(channel);
                 conn_ctx.writeAllLocked("+OK\r\n");
+                if (self.metrics) |metrics| metrics.completeTcpCommand(true);
                 return;
             },
             else => {},
@@ -710,9 +973,11 @@ pub const Server = struct {
                 error.IoError => "I/O error",
                 error.KeyNotFound => "key not found",
                 error.Corruption => "data corruption",
+                error.InvalidPredicate => "invalid filter",
             };
             const msg = std.fmt.bufPrint(&buf, "-ERR {s}\r\n", .{err_msg}) catch "-ERR internal\r\n";
             conn_ctx.writeAllLocked(msg);
+            if (self.metrics) |metrics| metrics.completeTcpCommand(false);
             return;
         };
         defer protocol.deinitResponse(self.allocator, response);
@@ -729,30 +994,80 @@ pub const Server = struct {
         };
 
         conn_ctx.writeAllLocked(resp_str);
+        if (self.metrics) |metrics| metrics.completeTcpCommand(responseSucceeded(response));
     }
 
     fn executeForConnection(self: *Server, cmd: Command, conn_ctx: *ConnectionContext) !Response {
         return self.executeForConnectionWithAlloc(cmd, conn_ctx, self.allocator);
     }
 
-    fn executeForConnectionWithAlloc(self: *Server, cmd: Command, conn_ctx: *ConnectionContext, alloc: std.mem.Allocator) !Response {
-        // Secure-by-default: when this binary listener enforces auth it has no way to carry a
-        // token in Phase 1, so every protected command fails closed. SUBSCRIBE/UNSUBSCRIBE are
-        // handled locally (they need conn_ctx) and so bypass the executor gate — reject them here
-        // too. Note: peer replication uses REPL_MAGIC → handleReplicationConnection, which never
-        // reaches this client path, so it is unaffected.
-        if (self.config.auth_enforce) {
-            switch (cmd) {
-                .subscribe, .unsubscribe => return Response{ .err = "auth required" },
-                else => {},
+    fn expireAuthState(self: *Server, conn_ctx: *ConnectionContext) void {
+        if (conn_ctx.auth_state) |*state| {
+            if (state.isExpired()) {
+                conn_ctx.clearAuthState();
+                if (conn_ctx.stream) |stream| {
+                    stream.read_limit_ns = core.compat.nowNs() + @as(i128, self.config.timeout_ms) * 1_000_000;
+                }
             }
         }
+    }
+
+    fn executeForConnectionWithAlloc(self: *Server, cmd: Command, conn_ctx: *ConnectionContext, alloc: std.mem.Allocator) !Response {
+        // Revoke expired tokens mid-session — forces re-AUTH instead of letting a
+        // long-lived connection outlive its token (mirrors the WS gateway).
+        self.expireAuthState(conn_ctx);
+
+        // AUTH is handled at the connection level (the executor has no per-connection
+        // state to attach the token to). Semantics mirror gateway.zig: verify regardless
+        // of `auth_enforce`, fail with "auth not configured" when no keys are set.
+        // Note: peer replication uses REPL_MAGIC → handleReplicationConnection, which
+        // never reaches this client path, so it is unaffected.
         return switch (cmd) {
-            .subscribe => |channel| blk: {
-                try conn_ctx.subscribe(channel);
+            .auth => |token| blk: {
+                if (self.config.auth_public_keys.len == 0) {
+                    break :blk Response{ .err = "auth not configured" };
+                }
+                // Token state must outlive this command: allocate from the server
+                // allocator, NOT the per-command arena `alloc`.
+                const state = auth.verifyAndParse(
+                    token,
+                    self.config.auth_public_keys,
+                    self.allocator,
+                    self.config.auth_max_token_age,
+                ) catch |err| {
+                    const msg: []const u8 = switch (err) {
+                        error.InvalidSignature => "invalid signature",
+                        error.TokenExpired => "token expired",
+                        error.TokenNotYetValid => "token not yet valid",
+                        error.TokenTooLongLived => "token lifetime exceeds max",
+                        error.TokenTooShort, error.MalformedToken => "malformed token",
+                        else => "auth failed",
+                    };
+                    break :blk Response{ .err = msg };
+                };
+                // Replace previous auth state (re-AUTH refreshes the token).
+                conn_ctx.replaceAuthState(state);
+                if (conn_ctx.stream) |stream| stream.read_limit_ns = if (self.config.auth_enforce) state.readDeadlineNs() else null;
+                break :blk .ok;
+            },
+            .subscribe => |params| blk: {
+                // SUBSCRIBE is handled locally (it needs conn_ctx) and so bypasses the
+                // executor's capability gate — enforce it here, like the gateway does.
+                if (self.config.auth_enforce) {
+                    if (conn_ctx.auth_state) |*state| {
+                        if (!state.permits(.subscribe, params.channel)) {
+                            break :blk Response{ .err = "permission denied" };
+                        }
+                    } else {
+                        break :blk Response{ .err = "auth required" };
+                    }
+                }
+                try conn_ctx.subscribe(params.channel, params.filter);
                 break :blk .ok;
             },
             .unsubscribe => |channel| blk: {
+                // Dropping your own subscription is harmless — no capability required
+                // (matches the gateway).
                 conn_ctx.unsubscribe(channel);
                 break :blk .ok;
             },
@@ -762,11 +1077,23 @@ pub const Server = struct {
                 .event_bus = self.event_bus,
                 .cluster = self.cluster,
                 .vector_registry = self.config.vector_registry,
-                .auth = if (self.config.auth_enforce) .{ .enforce = null } else .disabled,
+                .auth = if (self.config.auth_enforce)
+                    .{ .enforce = if (conn_ctx.auth_state) |*s| s else null }
+                else
+                    .disabled,
+                .auth_mint = self.config.auth_mint,
+                .metrics = self.metrics,
             }, cmd),
         };
     }
 };
+
+fn responseSucceeded(response: Response) bool {
+    return switch (response) {
+        .err => false,
+        else => true,
+    };
+}
 
 test "Server SUB/UNSUB command wiring updates subscriber count" {
     const testing = std.testing;
@@ -808,6 +1135,15 @@ test "Server SUB/UNSUB command wiring updates subscriber count" {
 
     try server.processLine("UNSUB updates", &conn_ctx);
     try testing.expectEqual(@as(u64, 0), bus.subscriberCount());
+
+    var capture: std.ArrayListUnmanaged(u8) = .empty;
+    defer capture.deinit(testing.allocator);
+    var bad_ctx = Server.ConnectionContext.initWithCapture(testing.allocator, &bus, null, &capture);
+    defer bad_ctx.deinit();
+
+    try server.processLine("SUB updates filter='meta.user.name=\"x\"'", &bad_ctx);
+    try testing.expectEqual(@as(u64, 0), bus.subscriberCount());
+    try testing.expect(std.mem.containsAtLeast(u8, capture.items, 1, "-ERR invalid filter"));
 }
 
 test "Server connection cleanup auto-unsubscribes remaining subscriptions" {
@@ -1006,6 +1342,155 @@ test "TCP framing preserves buffered tail across mixed full and partial reads" {
 
     const e4 = store.get("k4") orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("v4", e4.value);
+}
+
+test "binary AUTH: verify, enforce capabilities, replace and free token state" {
+    const testing = std.testing;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_tcp_auth.wal", .{tmp_path});
+    defer testing.allocator.free(wal_path);
+
+    const wal_file = try core.compat.Dir.createFile(tmp_dir.dir, "test_tcp_auth.wal", .{});
+    core.compat.File.close(wal_file);
+
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_tcp_auth.snapshot", .{tmp_path});
+    defer testing.allocator.free(snapshot_path);
+
+    var store = try Store.init(testing.allocator, .{
+        .wal_path = wal_path,
+        .snapshot_path = snapshot_path,
+        .sync_writes = false,
+    });
+    defer store.deinit();
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    const kp = auth.generateKeypair();
+    const pks = [_]auth.PublicKey{kp.public_key};
+
+    var server = Server.init(testing.allocator, &store, &bus, .{
+        .auth_enforce = true,
+        .auth_public_keys = &pks,
+        .auth_max_token_age = 7200,
+    });
+
+    var conn_ctx = Server.ConnectionContext.init(testing.allocator, &bus, null);
+    defer conn_ctx.deinit();
+
+    // Unauthenticated: protected command fails closed.
+    {
+        const resp = try server.executeForConnectionWithAlloc(
+            .{ .set = .{ .key = "ok:1", .value = "v" } },
+            &conn_ctx,
+            testing.allocator,
+        );
+        try testing.expect(resp == .err);
+        try testing.expectEqualStrings("auth required", resp.err);
+    }
+
+    // Garbage token: rejected, no state stored.
+    {
+        const resp = try server.executeForConnectionWithAlloc(.{ .auth = "junk" }, &conn_ctx, testing.allocator);
+        try testing.expect(resp == .err);
+        try testing.expect(conn_ctx.auth_state == null);
+    }
+
+    // Valid token scoped to "ok:" set access.
+    const now: u64 = @intCast(@divFloor(core.compat.nowMs(), 1000));
+    const caps = &[_]auth.Capability{
+        .{ .op = .set, .match_type = .prefix, .pattern = "ok:" },
+        .{ .op = .subscribe, .match_type = .prefix, .pattern = "ok:" },
+    };
+    const token = try auth.encode("alice", now, now + 3600, 7, caps, &kp.secret_key, testing.allocator);
+    defer testing.allocator.free(token);
+
+    {
+        const resp = try server.executeForConnectionWithAlloc(.{ .auth = token }, &conn_ctx, testing.allocator);
+        try testing.expect(resp == .ok);
+        try testing.expect(conn_ctx.auth_state != null);
+        try testing.expectEqualStrings("alice", conn_ctx.auth_state.?.subject);
+    }
+
+    // Authenticated: in-scope write permitted, out-of-scope denied.
+    {
+        const ok_resp = try server.executeForConnectionWithAlloc(
+            .{ .set = .{ .key = "ok:1", .value = "v" } },
+            &conn_ctx,
+            testing.allocator,
+        );
+        try testing.expect(ok_resp == .ok);
+
+        const denied = try server.executeForConnectionWithAlloc(
+            .{ .set = .{ .key = "no:1", .value = "v" } },
+            &conn_ctx,
+            testing.allocator,
+        );
+        try testing.expect(denied == .err);
+        try testing.expectEqualStrings("permission denied", denied.err);
+    }
+
+    // SUBSCRIBE is capability-gated at the connection layer.
+    {
+        const ok_sub = try server.executeForConnectionWithAlloc(.{ .subscribe = .{ .channel = "ok:events" } }, &conn_ctx, testing.allocator);
+        try testing.expect(ok_sub == .ok);
+        try testing.expectEqual(@as(u64, 1), bus.subscriberCount());
+
+        const denied_sub = try server.executeForConnectionWithAlloc(.{ .subscribe = .{ .channel = "no:events" } }, &conn_ctx, testing.allocator);
+        try testing.expect(denied_sub == .err);
+        try testing.expectEqualStrings("permission denied", denied_sub.err);
+    }
+
+    // Re-AUTH replaces the previous state without leaking it (leak check via testing allocator).
+    {
+        const token2 = try auth.encode("bob", now, now + 3600, 8, caps, &kp.secret_key, testing.allocator);
+        defer testing.allocator.free(token2);
+        const resp = try server.executeForConnectionWithAlloc(.{ .auth = token2 }, &conn_ctx, testing.allocator);
+        try testing.expect(resp == .ok);
+        try testing.expectEqualStrings("bob", conn_ctx.auth_state.?.subject);
+    }
+}
+
+test "binary AUTH without configured keys reports auth not configured" {
+    const testing = std.testing;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_tcp_auth_nokeys.wal", .{tmp_path});
+    defer testing.allocator.free(wal_path);
+
+    const wal_file = try core.compat.Dir.createFile(tmp_dir.dir, "test_tcp_auth_nokeys.wal", .{});
+    core.compat.File.close(wal_file);
+
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/test_tcp_auth_nokeys.snapshot", .{tmp_path});
+    defer testing.allocator.free(snapshot_path);
+
+    var store = try Store.init(testing.allocator, .{
+        .wal_path = wal_path,
+        .snapshot_path = snapshot_path,
+        .sync_writes = false,
+    });
+    defer store.deinit();
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    var server = Server.init(testing.allocator, &store, &bus, .{});
+
+    var conn_ctx = Server.ConnectionContext.init(testing.allocator, &bus, null);
+    defer conn_ctx.deinit();
+
+    const resp = try server.executeForConnectionWithAlloc(.{ .auth = "whatever" }, &conn_ctx, testing.allocator);
+    try testing.expect(resp == .err);
+    try testing.expectEqualStrings("auth not configured", resp.err);
 }
 
 test "TCP framing rejects oversized line and recovers for next valid command" {

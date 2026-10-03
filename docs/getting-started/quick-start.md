@@ -1,37 +1,53 @@
 # Quick Start
 
-This walkthrough gets a local WormDB instance running and verified in under five minutes.
+This walkthrough uses a local, unauthenticated development server. Use Zig
+**0.16.0**, Git, and Bun. Linux is the primary target; Windows supports standalone
+use with the threadpool backend.
 
 ## 1. Build the Binary
 
 Fetch the in-tree dependencies first. `deps/meshguard` is required for the normal build.
 
 ```bash
-git submodule update --init --recursive
+git clone https://github.com/igorls/wormdb.git
+cd wormdb
+git submodule update --init deps/meshguard
 ```
 
 ```bash
-zig build -Doptimize=ReleaseSmall
+zig build -Doptimize=ReleaseSmall -Dcrypto-backend=std
+zig build test -Dcrypto-backend=std
 ```
 
-This produces a statically linked binary at `./zig-out/bin/wormdb`.
+The executable is `zig-out/bin/wormdb` (`wormdb.exe` on Windows). The `std` crypto
+backend avoids the external libsodium dependency. The default Linux build uses
+shared libsodium; optional QUIC builds have additional dependencies.
 
 ## 2. Start the Server
 
 ```bash
-./zig-out/bin/wormdb --port 6389 --data ./data
+./zig-out/bin/wormdb --config examples/local.json --port 6389 --data ./data
 ```
 
-You should see startup output confirming the server is listening:
+On Windows:
 
-```
-[wormdb] listening on 0.0.0.0:6389 (threadpool)
-[wormdb] persistence: full
-[wormdb] data path: ./data
+```powershell
+.\zig-out\bin\wormdb.exe --config examples/local.json --port 6389 --data .\data
 ```
 
 ::: tip
-The default backend is `threadpool` and the default persistence mode is `full` (WAL-backed). Both are safe defaults for getting started. See [Server Backends](/architecture/server-backends) and [Persistence](/operations/persistence) when you're ready to tune.
+The example binds TCP to `127.0.0.1`, disables the WebSocket gateway, and explicitly
+disables authentication. Use it only on your own machine. The stock executable
+takes port, data directory, and persistence mode from CLI arguments. Use `--help`
+to check its supported options.
+:::
+
+::: warning Remote access
+Do not expose this development configuration to an untrusted network. In the
+standalone server, `auth.require_auth: true` keeps protected commands locked until
+a valid SCT is supplied. Configure verification keys; an empty key list never
+disables enforcement. Plain TCP has no TLS. See
+[Scoped authentication](/AUTH_SCOPED) before configuring remote access.
 :::
 
 ## 3. Write and Read a Key
@@ -70,7 +86,10 @@ bun run apps/bun/src/bin/client.ts DEL audit
 ```
 
 ::: warning
-WORM is irreversible. Once a key is written with the WORM flag, there is no administrative override — the immutability guarantee is enforced at the storage layer. Choose WORM keys deliberately.
+WORM is enforced by the storage APIs used by these commands. It does not prevent
+an operator from modifying data files or compiling custom procedures. Procedure
+authors must understand the low-level helpers described in
+[Stored Procedures](/architecture/procedures).
 :::
 
 ## 5. Check Server Status
@@ -99,7 +118,10 @@ bun run apps/bun/src/bin/client.ts EXEC increment counter 5
 # → 6
 ```
 
-See [Stored Procedures](/architecture/procedures) for the full procedure model.
+Procedure durability depends on the helpers used: `ctx.set()`/`setInt()` changes
+are not WAL-backed even in `full` persistence mode. See
+[Persistence](/operations/persistence) and [Stored Procedures](/architecture/procedures)
+before relying on crash recovery.
 
 ## 7. Check Recent Procedure Families
 
@@ -125,4 +147,4 @@ Open [http://localhost:8099](http://localhost:8099) for a visual dashboard showi
 - **Use the client in detail** → [Clients & Commands](/getting-started/clients)
 - **Understand the internals** → [Architecture](/architecture/)
 - **Deploy with persistence and clustering** → [Operations](/operations/)
-- **Expose browser and Light-API routes** → [Gateways & Light-API](/operations/gateways)
+- **Expose browser and HTTP routes** → [Gateways](/operations/gateways)

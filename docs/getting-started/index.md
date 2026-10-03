@@ -6,7 +6,9 @@ Financial ledgers, audit trails, compliance records, sensor logs — in all of t
 
 ## Why Zig?
 
-Zig gives WormDB explicit control over memory allocation, no hidden allocators, no garbage collection pauses, and no runtime surprises. Every allocation is visible, every error is handled, and the server ships as a small static binary with `libsodium` linked for crypto, auth, and cluster identity.
+Zig gives WormDB explicit control over memory allocation without a garbage
+collector. The normal build produces a standalone executable. Linux defaults to
+shared libsodium for mesh crypto; `-Dcrypto-backend=std` avoids that dependency.
 
 ## Key Capabilities
 
@@ -18,7 +20,7 @@ Zig gives WormDB explicit control over memory allocation, no hidden allocators, 
 
 **Agent Memory** — The `mem_*` procedure family stores document chunks, metadata, embeddings, and pub/sub notifications in one round-trip, with optional embedder-id enforcement for model swaps.
 
-**Browser Gateways** — The optional gateway exposes WormWire over WebSocket and plain HTTP Light-API routes backed by compiled procedures. QUIC/WebTransport is available only in binaries built with `-Dquic=true` and configured with TLS material.
+**Browser Gateways** — The optional gateway exposes WormWire over WebSocket and plain HTTP routes backed by compiled procedures. QUIC/WebTransport is available only in binaries built with `-Dquic=true` and configured with TLS material.
 
 **Mesh Clustering** — Nodes find each other through SWIM gossip over UDP and replicate writes over persistent TCP connections using the same WormWire framing. No external coordinator (ZooKeeper, etcd) is needed.
 
@@ -39,7 +41,7 @@ Zig gives WormDB explicit control over memory allocation, no hidden allocators, 
 
 ## Prerequisites
 
-- **Zig 0.16+** — the build toolchain
-- **libsodium** — used for crypto, auth, and cluster identity
+- **Zig 0.16.0** — the tested build toolchain
+- **libsodium** — optional crypto backend, selected by default on Linux
 - **Bun** — runs the reference client, admin UI, browser demo tooling, and docs site
 - **Git submodules** — `deps/meshguard` is required; QUIC builds also need `deps/msquic` and `deps/libwtf`

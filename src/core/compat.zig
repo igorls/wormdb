@@ -6,43 +6,125 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// True on a target with no atomic instructions wider than 32 bits — wasm32 without the
+/// threads proposal is the case that matters here. `std.atomic.Value(u64)` refuses to
+/// compile there, so u64 state (HLC timestamps, proof counters, publish counts) needs a
+/// guarded fallback rather than a compiler error.
+pub const narrow_atomics = builtin.cpu.arch.isWasm() and !builtin.cpu.has(.wasm, .atomics);
+
+/// True when the target cannot do 64-bit atomics. On wasm that is ALWAYS the case: the
+/// threads proposal gives 32-bit atomic ops (and the wait/wake instructions) but Zig does not
+/// expose 64-bit wasm atomics, so `std.atomic.Value(u64)` is a compile error there either way.
+/// Kept separate from `narrow_atomics`, which is about the wait/wake instructions.
+pub const narrow_u64_atomics = builtin.cpu.arch.isWasm();
+
+/// True on any wasm target. Used to exclude the cluster/server graph, which wasm cannot
+/// compile at all (meshguard's sockets and locks), regardless of whether the atomics feature
+/// is enabled. Distinct from `narrow_atomics`, which is only about the wait instructions.
+pub const wasm_target = builtin.cpu.arch.isWasm();
+
+/// A u64 cell that is a real atomic where the target can do 64-bit atomics, and a
+/// mutex-guarded plain value where it cannot.
+///
+/// Every u64 shared between threads goes through this type so a new call site cannot
+/// reintroduce the compile failure: on wasm32 the operations take a lock, on 64-bit
+/// targets they are exactly the atomic they used to be. The API is deliberately the
+/// subset WormDB uses — load, store, add, and a compare-and-swap loop — not all of
+/// std.atomic, so the fallback stays small and auditable.
+pub const AtomicU64 = if (narrow_u64_atomics) struct {
+    value: u64 = 0,
+    lock: Mutex = .{},
+
+    const Self = @This();
+
+    pub fn init(value: u64) Self {
+        return .{ .value = value };
+    }
+
+    pub fn load(self: *Self, comptime order: std.builtin.AtomicOrder) u64 {
+        _ = order;
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.value;
+    }
+
+    pub fn store(self: *Self, value: u64, comptime order: std.builtin.AtomicOrder) void {
+        _ = order;
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.value = value;
+    }
+
+    /// Returns the value the cell held before the add.
+    pub fn fetchAdd(self: *Self, operand: u64, comptime order: std.builtin.AtomicOrder) u64 {
+        _ = order;
+        self.lock.lock();
+        defer self.lock.unlock();
+        const before = self.value;
+        self.value +%= operand;
+        return before;
+    }
+
+    /// `null` on success, the current value on failure, matching std.atomic's contract so
+    /// a CAS loop written against std.atomic.Value works unchanged.
+    pub fn cmpxchgWeak(self: *Self, expected: u64, new: u64, comptime success: std.builtin.AtomicOrder, comptime fail: std.builtin.AtomicOrder) ?u64 {
+        _ = success;
+        _ = fail;
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.value != expected) return self.value;
+        self.value = new;
+        return null;
+    }
+} else std.atomic.Value(u64);
+
 /// A convenience Mutex wrapper using the global single-threaded Io instance.
 /// In 0.16, std.Io.Mutex.lock/unlock require an Io parameter.
 /// This wrapper provides the old `.lock()` / `.unlock()` API that WormDB uses
 /// extensively in shard mutexes and WAL enqueue protection.
 pub const Mutex = struct {
-    inner: std.Io.Mutex = .init,
+    // On a narrow-atomics target there is nothing to serialise against, and std.Io.Mutex
+    // lowers to an atomic wait instruction wasm does not have, so this is inert there.
+    inner: if (narrow_atomics) struct {} else std.Io.Mutex = if (narrow_atomics) .{} else .init,
 
     pub fn lock(self: *Mutex) void {
+        if (comptime narrow_atomics) return;
         self.inner.lockUncancelable(io());
     }
 
     pub fn unlock(self: *Mutex) void {
+        if (comptime narrow_atomics) return;
         self.inner.unlock(io());
     }
 
     pub fn tryLock(self: *Mutex) bool {
+        if (comptime narrow_atomics) return true;
         return self.inner.tryLock();
     }
 };
 
 /// RwLock compatibility wrapper using the global blocking Io instance.
 pub const RwLock = struct {
-    inner: std.Io.RwLock = .init,
+    // Same as Mutex: inert on a narrow-atomics target.
+    inner: if (narrow_atomics) struct {} else std.Io.RwLock = if (narrow_atomics) .{} else .init,
 
     pub fn lock(self: *RwLock) void {
+        if (comptime narrow_atomics) return;
         self.inner.lockUncancelable(io());
     }
 
     pub fn unlock(self: *RwLock) void {
+        if (comptime narrow_atomics) return;
         self.inner.unlock(io());
     }
 
     pub fn lockShared(self: *RwLock) void {
+        if (comptime narrow_atomics) return;
         self.inner.lockSharedUncancelable(io());
     }
 
     pub fn unlockShared(self: *RwLock) void {
+        if (comptime narrow_atomics) return;
         self.inner.unlockShared(io());
     }
 };
@@ -50,16 +132,28 @@ pub const RwLock = struct {
 /// Futex compatibility wrapper.
 /// In 0.16, std.Thread.Futex moved to std.Io.futexWait/futexWake.
 pub const Futex = struct {
-    pub fn timedWait(ptr: *std.atomic.Value(u32), expected: u32, _timeout_ns: anytype) void {
-        _ = _timeout_ns;
-        // Use uncancelable futex wait (non-blocking / no io param needed for cancel)
-        const zio = io();
-        zio.futexWaitUncancelable(u32, &ptr.raw, expected);
+    pub fn timedWait(ptr: *std.atomic.Value(u32), expected: u32, timeout_ns: anytype) void {
+        // No atomic wait instruction on wasm, and in a single-threaded build there is no other
+        // thread to wait for. The caller re-checks its condition.
+        // `else` rather than an early return: a comptime `return` still leaves the code after
+        // it analysed, and `futexWaitTimeout` is what emits `memory.atomic.wait32`.
+        if (comptime narrow_atomics) return else {
+            const zio = io();
+            const timeout = std.Io.Timeout{
+                .duration = .{
+                    .raw = .fromNanoseconds(@intCast(timeout_ns)),
+                    .clock = .awake,
+                },
+            };
+            zio.futexWaitTimeout(u32, &ptr.raw, expected, timeout) catch {};
+        }
     }
 
     pub fn wake(ptr: *std.atomic.Value(u32), count: u32) void {
-        const zio = io();
-        zio.futexWake(u32, &ptr.raw, count);
+        if (comptime narrow_atomics) return else {
+            const zio = io();
+            zio.futexWake(u32, &ptr.raw, count);
+        }
     }
 };
 
@@ -241,9 +335,159 @@ pub fn setNoDelay(handle: std.posix.fd_t) void {
     }
 }
 
+/// Bound socket send so slow/dead peers cannot block a writer forever.
+/// Best-effort; failures are ignored.
+///
+/// Windows: `SO_SNDTIMEO` is a DWORD in milliseconds.
+/// POSIX: `struct timeval`.
+pub fn setSendTimeoutMs(handle: std.posix.fd_t, timeout_ms: u32) void {
+    if (builtin.os.tag == .windows) {
+        const setsockopt = @extern(
+            *const fn (usize, c_int, c_int, [*]const u8, c_int) callconv(.c) c_int,
+            .{ .name = "setsockopt", .library_name = "ws2_32" },
+        );
+        // winsock2.h
+        const SOL_SOCKET: c_int = 0xffff;
+        const SO_SNDTIMEO: c_int = 0x1005;
+        var ms: u32 = timeout_ms;
+        _ = setsockopt(@intFromPtr(handle), SOL_SOCKET, SO_SNDTIMEO, @ptrCast(&ms), @sizeOf(u32));
+    } else {
+        const sec: i64 = @intCast(timeout_ms / 1000);
+        const usec: i64 = @as(i64, @intCast(timeout_ms % 1000)) * 1000;
+        const timeval = std.posix.timeval{ .sec = @intCast(sec), .usec = @intCast(usec) };
+        std.posix.setsockopt(
+            handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.SNDTIMEO,
+            std.mem.asBytes(&timeval),
+        ) catch {};
+    }
+}
+
+/// Windows sockets created by Zig use AFD directly and are not Winsock socket
+/// objects. Submit the same AFD read/write as std.Io, but wait on a private event
+/// with a deadline. Always cancel AND drain a pending request before its stack
+/// buffers or the destination can go out of scope.
+fn socketWindowsBefore(comptime reading: bool, handle: std.posix.fd_t, buf: if (reading) []u8 else []const u8, deadline_ns: i128) !usize {
+    const win = std.os.windows;
+    if (deadline_ns <= nowNs()) return error.Timeout;
+    var event: win.HANDLE = undefined;
+    const event_all_access: win.ACCESS_MASK = @bitCast(@as(u32, 0x001f0003));
+    if (win.ntdll.NtCreateEvent(&event, event_all_access, null, .Notification, .FALSE) != .SUCCESS) return error.SystemResources;
+    defer win.CloseHandle(event);
+    var iovec = win.AFD.WSABUF(if (reading) .@"var" else .@"const"){ .len = @intCast(@min(buf.len, std.math.maxInt(u32))), .buf = buf.ptr };
+    const request: if (reading) win.AFD.RECV_INFO else win.AFD.SEND_INFO = .{
+        .BufferArray = @ptrCast(&iovec),
+        .BufferCount = 1,
+        .AfdFlags = .{ .NO_FAST_IO = true, .OVERLAPPED = true },
+        .TdiFlags = if (reading) .{ .NORMAL = true } else .{},
+    };
+    var iosb: win.IO_STATUS_BLOCK = undefined;
+    const status = win.ntdll.NtDeviceIoControlFile(handle, event, null, null, &iosb, if (reading) win.IOCTL.AFD.RECEIVE else win.IOCTL.AFD.SEND, &request, @sizeOf(@TypeOf(request)), null, 0);
+    switch (status) {
+        .SUCCESS => {},
+        .PENDING => {
+            const remaining = @max(deadline_ns - nowNs(), 0);
+            const timeout: i64 = -@as(i64, @intCast(@min(@divTrunc(remaining + 99, 100), std.math.maxInt(i64))));
+            const waited = win.ntdll.NtWaitForSingleObject(event, .FALSE, &timeout);
+            if (waited != .SUCCESS) {
+                var cancel_iosb: win.IO_STATUS_BLOCK = undefined;
+                _ = win.ntdll.NtCancelIoFileEx(handle, &iosb, &cancel_iosb);
+                _ = win.ntdll.NtWaitForSingleObject(event, .FALSE, null);
+                return if (waited == .TIMEOUT) error.Timeout else error.SocketIoFailed;
+            }
+        },
+        else => return error.SocketIoFailed,
+    }
+    if (iosb.u.Status != .SUCCESS) return error.SocketIoFailed;
+    return iosb.Information;
+}
+
+/// POSIX readiness wait before a single-reader socket read. Never extend the
+/// absolute deadline on EINTR or when the peer drips another byte.
+fn waitReadable(handle: std.posix.fd_t, deadline_ns: i128) !void {
+    while (true) {
+        const remaining = deadline_ns - nowNs();
+        if (remaining <= 0) return error.Timeout;
+        const ms: c_int = @intCast(@min(@divTrunc(remaining + 999_999, 1_000_000), std.math.maxInt(c_int)));
+        var pfd = std.posix.pollfd{ .fd = handle, .events = std.posix.POLL.IN, .revents = 0 };
+        const rc = std.c.poll(@ptrCast(&pfd), 1, ms);
+        if (rc < 0) {
+            if (std.posix.errno(rc) == .INTR) continue;
+            return error.SocketPollFailed;
+        }
+        if ((pfd.revents & std.posix.POLL.NVAL) != 0) return error.SocketPollFailed;
+        if (rc > 0) return;
+    }
+}
+
+/// Best-effort peer IP of a connected socket via getpeername(2).
+/// Returns null when the peer address is unavailable (getpeername failure or a
+/// non-IP family) — callers must treat null as "cannot attribute this
+/// connection to an IP", never as an error (#89: per-IP policies are enforced
+/// only when the peer address is available on the accept path).
+///
+/// `std.posix.getpeername` is a hard `@compileError` on Windows, so the
+/// Windows path calls Winsock's `getpeername` directly (same pattern as
+/// `setNoDelay` above) and parses the raw sockaddr bytes.
+pub fn getPeerAddress(handle: std.posix.fd_t) ?net.Address {
+    if (builtin.os.tag == .windows) {
+        const getpeername_fn = @extern(
+            *const fn (usize, [*]u8, *c_int) callconv(.c) c_int,
+            .{ .name = "getpeername", .library_name = "ws2_32" },
+        );
+        var buf: [128]u8 align(8) = undefined;
+        var len: c_int = buf.len;
+        if (getpeername_fn(@intFromPtr(handle), &buf, &len) != 0) return null;
+        const family = std.mem.bytesToValue(u16, buf[0..2]);
+        switch (family) {
+            2 => { // AF_INET
+                if (len < 8) return null;
+                return .{ .inner = .{ .ip4 = .{
+                    .bytes = buf[4..8].*,
+                    .port = std.mem.readInt(u16, buf[2..4], .big),
+                } } };
+            },
+            23 => { // AF_INET6
+                if (len < 24) return null;
+                return .{ .inner = .{ .ip6 = .{
+                    .bytes = buf[8..24].*,
+                    .port = std.mem.readInt(u16, buf[2..4], .big),
+                } } };
+            },
+            else => return null,
+        }
+    } else {
+        var storage_buf = std.mem.zeroes(std.posix.sockaddr.storage);
+        var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+        std.posix.getpeername(handle, @ptrCast(&storage_buf), &len) catch return null;
+        switch (storage_buf.family) {
+            std.posix.AF.INET => {
+                const sa: *const std.posix.sockaddr.in = @ptrCast(&storage_buf);
+                return .{ .inner = .{ .ip4 = .{
+                    .bytes = @bitCast(sa.addr),
+                    .port = std.mem.bigToNative(u16, sa.port),
+                } } };
+            },
+            std.posix.AF.INET6 => {
+                const sa: *const std.posix.sockaddr.in6 = @ptrCast(&storage_buf);
+                return .{ .inner = .{ .ip6 = .{
+                    .bytes = sa.addr,
+                    .port = std.mem.bigToNative(u16, sa.port),
+                } } };
+            },
+            else => return null,
+        }
+    }
+}
+
 /// Networking compatibility layer.
 /// Maps the old std.net.* API to the new std.Io.net.* API.
-pub const net = struct {
+///
+/// Excluded entirely on a narrow-atomics target: `std.Io.net` is socket code, and its lock
+/// internals lower to `memory.atomic.wait32`, which wasm32 has no instruction for. Nothing in
+/// the wasm entry root opens sockets — that is the whole point of the reduced root.
+pub const net = if (wasm_target) struct {} else struct {
     /// Compatibility wrapper for std.net.Address → std.Io.net.IpAddress.
     pub const Address = struct {
         inner: std.Io.net.IpAddress,
@@ -260,10 +504,15 @@ pub const net = struct {
             } } };
         }
 
-        pub fn listen(self: Address, _opts: struct { reuse_address: bool = false }) !ServerCompat {
-            _ = _opts;
+        pub fn listen(self: Address, opts: struct {
+            reuse_address: bool = true,
+            /// Kernel accept queue depth. Join storms under multiplayer load
+            /// need more than the Zig default (128) or clients see connect drops.
+            kernel_backlog: u31 = 1024,
+        }) !ServerCompat {
             const server = try std.Io.net.IpAddress.listen(&self.inner, io(), .{
-                .reuse_address = true,
+                .reuse_address = opts.reuse_address,
+                .kernel_backlog = opts.kernel_backlog,
             });
             return .{ .inner = server };
         }
@@ -291,25 +540,57 @@ pub const net = struct {
     /// Provides the old read/writeAll/close API over std.Io.net.Stream.
     pub const Stream = struct {
         inner: std.Io.net.Stream,
+        read_timeout_ms: usize = 0,
+        read_deadline_ns: ?i128 = null,
+        /// Optional session deadline (e.g. accept-to-AUTH). Message boundaries
+        /// cannot extend it. The owner clears it only after authentication.
+        read_limit_ns: ?i128 = null,
+        write_timeout_ms: usize = 0,
+
+        pub fn beginRead(self: *Stream, timeout_ms: usize, allow_idle: bool) void {
+            self.read_timeout_ms = timeout_ms;
+            self.read_deadline_ns = if (allow_idle) null else nowNs() + @as(i128, timeout_ms) * 1_000_000;
+        }
 
         pub fn read(self: *Stream, buf: []u8) !usize {
+            if (buf.len == 0) return 0;
+            var deadline = self.read_deadline_ns;
+            if (self.read_limit_ns) |limit| deadline = if (deadline) |d| @min(d, limit) else limit;
+            const handle = self.inner.socket.handle;
+            const n = if (deadline) |d| blk: {
+                if (builtin.os.tag == .windows) break :blk try socketWindowsBefore(true, handle, buf, d);
+                try waitReadable(handle, d);
+                break :blk try self.readAvailable(buf);
+            } else try self.readAvailable(buf);
+            if (n > 0 and self.read_deadline_ns == null and self.read_timeout_ms > 0) {
+                self.read_deadline_ns = nowNs() + @as(i128, self.read_timeout_ms) * 1_000_000;
+            }
+            return n;
+        }
+
+        fn readAvailable(self: *Stream, buf: []u8) !usize {
             const handle = self.inner.socket.handle;
             if (builtin.os.tag == .windows) {
                 // Winsock SOCKETs are not CRT file descriptors, so the POSIX
                 // read(2) path below is invalid on Windows. Route through the
-                // Io net vtable (Winsock recv under the hood).
+                // Io net vtable (AFD receive under the hood).
                 const zio = io();
                 var iov = [_][]u8{buf};
                 return zio.vtable.netRead(zio.userdata, handle, &iov);
             }
+            // A wasm target has no sockets and std.posix is a hard compile error there, so this
+            // is compiled out rather than left to fail. Reaching it means socket code ran on a
+            // target without sockets.
+            if (comptime narrow_atomics) return error.UnsupportedOnWasm;
             // POSIX: raw read(2) on the socket fd.
             return std.posix.read(handle, buf);
         }
 
         pub fn writeAll(self: *Stream, data: []const u8) !void {
             const handle = self.inner.socket.handle;
+            const deadline: ?i128 = if (self.write_timeout_ms > 0) nowNs() + @as(i128, self.write_timeout_ms) * 1_000_000 else null;
             if (builtin.os.tag == .windows) {
-                // Winsock send via the Io net vtable; loop on partial writes.
+                // AFD send; use a cancellable request when a deadline is set.
                 // netWrite treats `data[data.len-1]` as the splat pattern, so
                 // `data` must be non-empty: pass the payload as a one-element
                 // vector with splat=1 and an empty header (an empty `data`
@@ -319,7 +600,10 @@ pub const net = struct {
                 var written: usize = 0;
                 while (written < data.len) {
                     const chunk = [_][]const u8{data[written..]};
-                    const n = try zio.vtable.netWrite(zio.userdata, handle, empty_header, &chunk, 1);
+                    const n = if (deadline) |d|
+                        try socketWindowsBefore(false, handle, data[written..], d)
+                    else
+                        try zio.vtable.netWrite(zio.userdata, handle, empty_header, &chunk, 1);
                     if (n == 0) return error.BrokenPipe;
                     written += n;
                 }
@@ -327,12 +611,13 @@ pub const net = struct {
             }
             var written: usize = 0;
             while (written < data.len) {
+                if (deadline) |d| if (nowNs() >= d) return error.Timeout;
                 const rc = std.c.write(handle, data[written..].ptr, data.len - written);
                 if (rc < 0) {
                     const errno = std.posix.errno(rc);
                     switch (errno) {
                         .INTR => continue,
-                        .AGAIN => continue,
+                        .AGAIN => return error.WouldBlock, // respect SO_SNDTIMEO
                         .PIPE => return error.BrokenPipe,
                         .CONNRESET => return error.ConnectionResetByPeer,
                         .BADF => return error.NotOpenForWriting,
@@ -363,3 +648,40 @@ pub const net = struct {
     }
 };
 
+/// Stand-in for `cluster.Cluster` on a narrow-atomics target, where the cluster graph is
+/// excluded from the build. A caller only ever holds an optional pointer plus a handful of
+/// methods.
+///
+/// Every method REFUSES. None silently succeeds: a no-op `replicateWrite` would report a
+/// successful replication that never happened, and a zeroed `identityPublicKey` would look
+/// like a real identity. Reaching any of these means a cluster feature was invoked on a target
+/// that has no clustering, and the caller is told so.
+pub const ClusterStub = struct {
+    pub fn identityPublicKey(_: *const ClusterStub) [32]u8 {
+        @panic("cluster identity requested on a target built without clustering");
+    }
+    pub fn signWithIdentity(_: *const ClusterStub, _: []const u8) ![64]u8 {
+        return error.ClusterUnsupportedOnThisTarget;
+    }
+    pub fn replicateWrite(_: *ClusterStub, _: []const u8, _: []const u8, _: bool) !void {
+        return error.ClusterUnsupportedOnThisTarget;
+    }
+    pub fn replicateDelete(_: *ClusterStub, _: []const u8) !void {
+        return error.ClusterUnsupportedOnThisTarget;
+    }
+    pub fn replicateVinsert(_: *ClusterStub, _: anytype) !void {
+        return error.ClusterUnsupportedOnThisTarget;
+    }
+    pub fn replicateVbulkinsert(_: *ClusterStub, _: anytype) !void {
+        return error.ClusterUnsupportedOnThisTarget;
+    }
+    pub fn replicateVdelete(_: *ClusterStub, _: []const u8, _: []const u8) !void {
+        return error.ClusterUnsupportedOnThisTarget;
+    }
+    pub fn replicateVrabitqInstall(_: *ClusterStub, _: anytype) !void {
+        return error.ClusterUnsupportedOnThisTarget;
+    }
+    pub fn requestCheckpointWitnesses(_: *ClusterStub, _: []const u8, _: []const u8) !usize {
+        return error.ClusterUnsupportedOnThisTarget;
+    }
+};

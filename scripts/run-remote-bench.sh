@@ -4,15 +4,17 @@ set -euo pipefail
 # Runs Bun benchmark from a remote Tailscale host against this machine.
 #
 # Usage:
-#   scripts/run-remote-bench.sh [user@host] [extra bench args...]
+#   scripts/run-remote-bench.sh user@host [extra bench args...]
 #
 # Example:
-#   scripts/run-remote-bench.sh igorls@z590-vision-d --test exec-transfer --ops 50000 --warmup-ops 2000 --concurrency 96 --pool-size 96 --inflight 64 --keyspace 100000 --bank-initial-balance 10000000 --bank-min-amount 1 --bank-max-amount 1
+#   scripts/run-remote-bench.sh user@bench-host --test exec-transfer --ops 50000
 
-REMOTE="${1:-igorls@z590-vision-d}"
-if [[ $# -gt 0 ]]; then
-  shift || true
+if [[ $# -eq 0 || -z "$1" || "$1" == -* ]]; then
+  echo "Usage: $0 user@host [extra bench args...]" >&2
+  exit 2
 fi
+REMOTE="$1"
+shift
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"

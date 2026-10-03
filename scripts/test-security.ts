@@ -200,12 +200,14 @@ test("unsupported backends and legacy snapshots reject startup before data creat
     { backend: "threadpool", flags: [], legacy: true, snapshot: "nested/custom.snapshot" },
     { backend: "threadpool", flags: [], legacy: true, snapshot: "absolute" },
     { backend: "threadpool", flags: [], legacyWal: true },
+    { backend: "threadpool", flags: [], legacyWal: true, mode: "snapshot" },
+    { backend: "threadpool", flags: [], legacyWal: true, mode: "none" },
   ];
   for (const entry of cases) {
     const dir = await mkdtemp(join(tmpdir(), "wormdb-startup-invalid-"));
     const data = join(dir, "must-not-exist");
     const snapshot_path = entry.snapshot === "absolute" ? join(dir, "custom.snapshot") : entry.snapshot;
-    await writeFile(join(dir, "config.json"), JSON.stringify({ data, server: { backend: entry.backend }, store: { snapshot_path } }));
+    await writeFile(join(dir, "config.json"), JSON.stringify({ data, server: { backend: entry.backend }, store: { snapshot_path, persistence: entry.mode } }));
     if (entry.legacy) await writeFile(join(dir, "wormdb.snapshot"), "legacy sentinel");
     if (entry.legacyWal) {
       await mkdir(join(dir, "data"));
@@ -218,7 +220,7 @@ test("unsupported backends and legacy snapshots reject startup before data creat
     try {
       const code = await Promise.race([exited, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("invalid startup stayed running")), 5000); })]);
       assert.notEqual(code, 0);
-      assert.match(logs, entry.legacy ? /LegacySnapshotPath/ : entry.legacyWal ? /LegacyWalPath/ : /UnsupportedBackend/);
+      assert.match(logs, entry.legacy ? /LegacySnapshotPath/ : entry.mode ? /LegacyWalMode/ : entry.legacyWal ? /LegacyWalPath/ : /UnsupportedBackend/);
       assert.equal(await stat(data).catch(() => null), null);
     } finally { clearTimeout(timer); child.kill(); await exited; await rm(dir, { recursive: true, force: true }); }
   }

@@ -90,6 +90,13 @@ by `wormdb.wal`). If honoring configured paths or `data` would skip that file,
 startup reports `LegacyWalPath`. Migrate the old WAL or set `store.wal_path` to
 its absolute existing path before restarting.
 
+Older binaries also ignored `store.persistence`. If honoring it would change
+the prior CLI/default `full` mode to `snapshot` or `none` while a legacy WAL
+exists, startup reports `LegacyWalMode`. Recover the data in full mode first,
+save any snapshot needed, and migrate or archive the old WAL before changing
+the configured mode. An explicit `--persistence` override keeps its existing
+meaning.
+
 Authentication stays enabled by default even with no verification keys. Supply
 `auth.public_keys` and a signed token for protected commands. Authentication
 opt-outs are intended only for explicitly trusted deployments; `--no-auth`

@@ -376,11 +376,24 @@ fn resolveStoragePath(allocator: std.mem.Allocator, data: []const u8, path: []co
 // Older standalone binaries ignored configured paths and cfg.data. Refuse to
 // silently skip durable data when the effective storage location changes.
 fn checkLegacyStorage(allocator: std.mem.Allocator, args: Args, cfg: WormDBConfig, store_cfg: wormdb.core.config.Config) !void {
-    if (cfg.store.persistence == .none) return;
-    try checkLegacyPath(allocator, "wormdb.snapshot", store_cfg.snapshot_path, "snapshot_path", error.LegacySnapshotPath);
-    if (cfg.store.persistence == .full) {
+    if (cfg.store.persistence != .none) {
+        try checkLegacyPath(allocator, "wormdb.snapshot", store_cfg.snapshot_path, "snapshot_path", error.LegacySnapshotPath);
+    }
+    // The old executable used only the CLI/default mode. A newly honored
+    // snapshot/none config must not discard a WAL that the old full mode wrote.
+    if ((args.persistence orelse .full) == .full) {
         const legacy_wal = try std.fs.path.join(allocator, &.{ args.data orelse "./data", "wormdb.wal" });
         defer allocator.free(legacy_wal);
+        if (cfg.store.persistence != .full) {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            const legacy = std.Io.Dir.cwd().openFile(io, legacy_wal, .{}) catch |err| switch (err) {
+                error.FileNotFound => return,
+                else => return err,
+            };
+            legacy.close(io);
+            std.log.err("legacy full-mode WAL exists at {s}; recover in full mode and migrate or archive it before selecting {s}", .{ legacy_wal, @tagName(cfg.store.persistence) });
+            return error.LegacyWalMode;
+        }
         try checkLegacyPath(allocator, legacy_wal, store_cfg.wal_path, "wal_path", error.LegacyWalPath);
     }
 }

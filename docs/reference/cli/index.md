@@ -80,10 +80,15 @@ when their persistence mode needs them. Other store settings, including
 `max_wal_size`, `compaction_threshold` and `sync_writes`, are preserved.
 
 Older standalone binaries used `wormdb.snapshot` in the working directory.
-If that legacy file exists and the new default points elsewhere, startup stops
+If that legacy file exists and the configured snapshot path points elsewhere, startup stops
 with `LegacySnapshotPath`. Move the snapshot to the configured data directory,
 or set `store.snapshot_path` to its absolute existing path before restarting.
 This prevents silently reopening without the old snapshot.
+
+The same check applies to the old WAL location (`--data` or `./data`, followed
+by `wormdb.wal`). If honoring configured paths or `data` would skip that file,
+startup reports `LegacyWalPath`. Migrate the old WAL or set `store.wal_path` to
+its absolute existing path before restarting.
 
 Authentication stays enabled by default even with no verification keys. Supply
 `auth.public_keys` and a signed token for protected commands. Authentication

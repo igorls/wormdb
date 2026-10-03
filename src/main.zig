@@ -177,7 +177,7 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
     const store_cfg = try resolveStoreConfig(allocator, cfg);
     defer allocator.free(store_cfg.wal_path);
     defer allocator.free(store_cfg.snapshot_path);
-    try checkLegacySnapshot(allocator, cfg, store_cfg.snapshot_path);
+    try checkLegacyStorage(allocator, args, cfg, store_cfg);
     try std.Io.Dir.cwd().createDirPath(io, cfg.data);
     if (store_cfg.persistence == .full) {
         if (std.fs.path.dirname(store_cfg.wal_path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
@@ -373,15 +373,24 @@ fn resolveStoragePath(allocator: std.mem.Allocator, data: []const u8, path: []co
     return std.fs.path.join(allocator, &.{ data, path });
 }
 
-// Older standalone binaries used a CWD snapshot even when --data pointed
-// elsewhere. Refuse to silently skip that data after changing the path policy.
-fn checkLegacySnapshot(allocator: std.mem.Allocator, cfg: WormDBConfig, snapshot_path: []const u8) !void {
-    if (cfg.store.persistence == .none or !std.mem.eql(u8, cfg.store.snapshot_path, "wormdb.snapshot")) return;
+// Older standalone binaries ignored configured paths and cfg.data. Refuse to
+// silently skip durable data when the effective storage location changes.
+fn checkLegacyStorage(allocator: std.mem.Allocator, args: Args, cfg: WormDBConfig, store_cfg: wormdb.core.config.Config) !void {
+    if (cfg.store.persistence == .none) return;
+    try checkLegacyPath(allocator, "wormdb.snapshot", store_cfg.snapshot_path, "snapshot_path", error.LegacySnapshotPath);
+    if (cfg.store.persistence == .full) {
+        const legacy_wal = try std.fs.path.join(allocator, &.{ args.data orelse "./data", "wormdb.wal" });
+        defer allocator.free(legacy_wal);
+        try checkLegacyPath(allocator, legacy_wal, store_cfg.wal_path, "wal_path", error.LegacyWalPath);
+    }
+}
+
+fn checkLegacyPath(allocator: std.mem.Allocator, previous: []const u8, desired: []const u8, setting: []const u8, migration_error: anyerror) !void {
     const cwd_path = try wormdb.core.compat.Dir.realPathAlloc(std.Io.Dir.cwd(), allocator, ".");
     defer allocator.free(cwd_path);
-    const old_path = try std.fs.path.resolve(allocator, &.{ cwd_path, "wormdb.snapshot" });
+    const old_path = try std.fs.path.resolve(allocator, &.{ cwd_path, previous });
     defer allocator.free(old_path);
-    const new_path = try std.fs.path.resolve(allocator, &.{ cwd_path, snapshot_path });
+    const new_path = try std.fs.path.resolve(allocator, &.{ cwd_path, desired });
     defer allocator.free(new_path);
     if (std.mem.eql(u8, old_path, new_path)) return;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -390,8 +399,8 @@ fn checkLegacySnapshot(allocator: std.mem.Allocator, cfg: WormDBConfig, snapshot
         else => return err,
     };
     legacy.close(io);
-    std.log.err("legacy snapshot exists at {s}; move it to {s} or set store.snapshot_path to its absolute path before starting", .{ old_path, new_path });
-    return error.LegacySnapshotPath;
+    std.log.err("legacy storage exists at {s}; migrate it to {s} or set store.{s} to its absolute path before starting", .{ old_path, new_path, setting });
+    return migration_error;
 }
 
 fn printHelp() !void {

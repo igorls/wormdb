@@ -42,9 +42,13 @@ export function createWasi(memoryRef, { onStdout = () => {} } = {}) {
     },
 
     random_get(buf, len) {
+      // Never fall back to Math.random: the engine uses this for signing keys and nonces, and a
+      // silent weak source would produce keys that look fine and are guessable. Fail loudly.
+      const g = globalThis.crypto;
+      if (!g?.getRandomValues) throw new Error("no WebCrypto available: the engine needs a CSPRNG for random_get, and substituting Math.random would silently weaken key material");
       const view = u8().subarray(buf, buf + len);
-      if (globalThis.crypto?.getRandomValues) globalThis.crypto.getRandomValues(view);
-      else for (let i = 0; i < len; i++) view[i] = (Math.random() * 256) | 0;
+      // getRandomValues throws above 65536 bytes, so fill in chunks.
+      for (let at = 0; at < view.length; at += 65536) g.getRandomValues(view.subarray(at, Math.min(at + 65536, view.length)));
       return 0;
     },
 

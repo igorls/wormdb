@@ -1,9 +1,12 @@
 //! Procedure registry for the wasm32 entry root.
 //!
 //! An explicit ALLOWLIST, not a filtered copy of the full registry: a procedure is available
-//! only if it is named here, and the comptime check below makes it a compile error if anything
-//! on the list reaches `cluster` — because that would pull meshguard's locks and sockets back
-//! into a target that cannot compile them.
+//! only if it is named here. Zig cannot inspect another module's imports at comptime, so the
+//! enforcement is the build step `scripts/check-wasm-allowlist.zig` (run by `zig build
+//! wasm`/`wasm-smoke`/`ffi` on a wasm target): it walks the import graph from the wasm root and fails
+//! the build, naming the file and line, if anything compiled reaches the cluster or socket-bearing graph. An earlier version
+//! of this comment claimed a comptime check here; no such check exists, which is exactly why the
+//! build step does.
 //!
 //! Procedures that need clustering are absent rather than stubbed. A caller asking for one gets
 //! "unknown procedure", which is honest; a stub that silently succeeded would pretend to
@@ -76,11 +79,15 @@ pub const registry = @This();
 /// ffi.zig names this under `procedures.`, so mirror it on the reduced root.
 pub const context = @import("context.zig");
 
-/// Comptime guard: an allowlisted procedure must not reach `cluster`. If one starts to, this
-/// is a compile error rather than a link failure somewhere further out, and it names the
-/// offender. The check reads each module's own declaration list, so it holds for the graph as
-/// written rather than for the imports I happened to review.
 /// Look up a procedure by name. O(n) scan — n is tiny.
+///
+/// There is NO comptime cluster guard here, and there should not be a claim of one: Zig cannot inspect
+/// another module's import graph at comptime, which is exactly why `scripts/check-wasm-allowlist.zig`
+/// exists as a BUILD STEP. The allowlist is enforced by that script walking the import graph and
+/// failing the build on a compiled import of `src/cluster/`, the socket-bearing `src/server/` files or the
+/// `meshguard` module; a comment promising a language-level
+/// guard that does not exist is worse than no comment, because it tells a reader the property is
+/// already held. (An earlier draft of this file claimed the guard; it was removed for that reason.)
 pub fn lookup(name: []const u8) ?ProcedureFn {
     for (&PROCEDURES) |*entry| {
         if (std.mem.eql(u8, entry.name, name)) return entry.func;

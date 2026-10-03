@@ -119,10 +119,15 @@ pub fn build(b: *std.Build) void {
     // the same backend linkCrypto wires for. Shared with the wormdb module too.
     build_options.addOption(bool, "use_libsodium", use_libsodium);
     // WebAssembly has no threads without the atomics/bulk-memory proposals, so a wasm
-    // target must not spawn workers or use 64-bit atomics. Exposed as an explicit
-    // option rather than inferred from the target, so a native build can also pick the
-    // single-threaded path deliberately. See src/vector/index.zig and src/event/bus.zig.
-    const single_threaded = b.option(bool, "single-threaded", "Build without worker threads or 64-bit atomics (required for wasm32)") orelse (target.result.cpu.arch.isWasm());
+    // target must not spawn workers or use 64-bit atomics.
+    // Derived, NOT overridable, and that is a correctness fix rather than tidiness. The flag means
+    // "this build has no threads and no 64-bit atomics" — both facts follow from the target, and
+    // `builtin.single_threaded` (which the module's `.single_threaded` sets below) already derives
+    // from the same place. Exposing it as a free option let a NATIVE build be compiled with
+    // `build_options.single_threaded = true`, which turns `publish_count` into a plain `u64` in
+    // `event/bus.zig` while `std.Thread.spawn` remains legal there: a data race, and no build here
+    // or in CI passed the flag, so nothing would have caught it.
+    const single_threaded = target.result.cpu.arch.isWasm();
     build_options.addOption(bool, "single_threaded", single_threaded);
     const build_options_mod = build_options.createModule();
 
@@ -216,7 +221,7 @@ pub fn build(b: *std.Build) void {
         // is comptime true, which makes std.Io.Threaded's atomic-wait branch dead code and
         // removes the `memory.atomic.wait32` the no-atomics target cannot emit. Without it the
         // wasm build compiles as multi-threaded and reaches the asm.
-        .single_threaded = target.result.cpu.arch.isWasm(),
+        .single_threaded = single_threaded,
         .imports = &.{
             .{ .name = "build_options", .module = build_options_mod },
         },
@@ -227,7 +232,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .single_threaded = target.result.cpu.arch.isWasm(),
+        .single_threaded = single_threaded,
         .imports = &.{
             .{ .name = "wormdb", .module = engine_mod },
         },
@@ -254,20 +259,24 @@ pub fn build(b: *std.Build) void {
     // Keyed on the TARGET being wasm, not on narrow_target: the reduced root is used whenever
     // the atomics feature is off, and a +atomics build would skip the check entirely if this
     // were gated on narrow_target.
+    //
+    // Declared HERE, outside the wasm branch, because `wasm_step` and `smoke_step` below depend on
+    // it too. Gating only the ffi step left the browser artifact — the thing that actually ships —
+    // built without the allowlist ever being checked.
+    const check = b.addRunArtifact(b.addExecutable(.{
+        .name = "check-wasm-allowlist",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/check-wasm-allowlist.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    }));
+    check.setCwd(b.path("."));
+    // The checker reads the allowlisted sources but Zig caches a Run step on its argv alone, so it
+    // would be skipped whenever only a scanned file changed — which is every real violation.
+    // Declaring the side effect forces it to run each time.
+    check.has_side_effects = true;
     if (target.result.cpu.arch.isWasm()) {
-        const check = b.addRunArtifact(b.addExecutable(.{
-            .name = "check-wasm-allowlist",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("scripts/check-wasm-allowlist.zig"),
-                .target = b.graph.host,
-                .optimize = .Debug,
-            }),
-        }));
-        check.setCwd(b.path("."));
-        // The checker reads 23 source files but Zig caches a Run step on its argv alone, so it
-        // would be skipped whenever only a scanned file changed — which is every real
-        // violation. Declaring the side effect forces it to run each time.
-        check.has_side_effects = true;
         ffi_step.dependOn(&check.step);
     }
     ffi_step.dependOn(&b.addInstallArtifact(ffi_lib, .{}).step);
@@ -301,20 +310,32 @@ pub fn build(b: *std.Build) void {
         // A field on the Compile step, not on ExecutableOptions.
         wasm_exe.entry = .disabled;
         wasm_exe.rdynamic = true;
+        const wasm_install = b.addInstallArtifact(wasm_exe, .{});
+        // The allowlist gate runs BEFORE the artifact is installed, not merely somewhere in the same
+        // step. As siblings (wasm_install and check both hanging off wasm_step) the install could
+        // complete first, so a failing check still left a .wasm in zig-out for a host to load.
+        wasm_install.step.dependOn(&check.step);
 
         const wasm_step = b.step("wasm", "Build the browser-loadable wasm module (exported FFI, reactor)");
-        wasm_step.dependOn(&b.addInstallArtifact(wasm_exe, .{}).step);
+        wasm_step.dependOn(&wasm_install.step);
+        // The allowlist gate guards THIS artifact too. It used to depend only on the ffi step,
+        // so `zig build wasm` — the module a browser actually loads — was built unchecked.
+        wasm_step.dependOn(&check.step);
 
-        // Reproduce the browser run headlessly. Needs bun or node; kept as its own step so a
-        // machine without either can still build the module.
+        // Reproduce the browser run headlessly. Needs bun (or an equivalent host) and the MODULE
+        // ITSELF, so the smoke steps depend on the install rather than being its siblings: as
+        // siblings they could run before the wasm existed and read a missing or stale file.
         const smoke_kv = b.addSystemCommand(&.{ "bun", "scripts/smoke-kv.mjs" });
         smoke_kv.setCwd(b.path("."));
         smoke_kv.has_side_effects = true;
+        smoke_kv.addFileArg(wasm_exe.getEmittedBin());
         const smoke_log = b.addSystemCommand(&.{ "bun", "scripts/smoke-worm-log.mjs" });
         smoke_log.setCwd(b.path("."));
         smoke_log.has_side_effects = true;
+        smoke_log.addFileArg(wasm_exe.getEmittedBin());
         const smoke_step = b.step("wasm-smoke", "Run the FFI smoke tests against the wasm module");
-        smoke_step.dependOn(&b.addInstallArtifact(wasm_exe, .{}).step);
+        smoke_step.dependOn(&wasm_install.step);
+        smoke_step.dependOn(&check.step);
         smoke_step.dependOn(&smoke_kv.step);
         smoke_step.dependOn(&smoke_log.step);
     }
@@ -340,4 +361,12 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_ffi_tests.step);
+    // The wasm allowlist checker's own tests (gating, comments, resolved paths) run with the rest, on every
+    // target, so a change that weakens the checker fails `zig build test` and not only a wasm build.
+    const checker_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("scripts/check-wasm-allowlist.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(checker_tests).step);
 }

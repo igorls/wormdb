@@ -63,14 +63,14 @@ pub const Channel = struct {
     name: []const u8,
     subscribers: std.AutoHashMap(u64, Subscriber),
     mutex: compat.Mutex,
-    next_sub_id: std.atomic.Value(u64),
+    next_sub_id: compat.AtomicU64,
 
     pub fn init(allocator: std.mem.Allocator, name: []const u8) Channel {
         return .{
             .name = name,
             .subscribers = std.AutoHashMap(u64, Subscriber).init(allocator),
             .mutex = .{},
-            .next_sub_id = std.atomic.Value(u64).init(1),
+            .next_sub_id = compat.AtomicU64.init(1),
         };
     }
 
@@ -92,10 +92,10 @@ pub const EventBus = struct {
     pub const Stats = struct {
         // A wasm32 build has no 64-bit atomics, and a single-threaded build has nothing to
         // synchronise with, so the counter is a plain u64 there and an atomic elsewhere.
-        publish_count: if (build_options.single_threaded) u64 else std.atomic.Value(u64),
-        subscriber_count: std.atomic.Value(u64),
+        publish_count: if (build_options.single_threaded) u64 else compat.AtomicU64,
+        subscriber_count: compat.AtomicU64,
         /// Events dropped because a subscriber's write path was busy (tryLock fail).
-        drop_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        drop_count: compat.AtomicU64 = compat.AtomicU64.init(0),
     };
 
     pub fn init(allocator: std.mem.Allocator) EventBus {
@@ -104,9 +104,9 @@ pub const EventBus = struct {
             .channels = std.StringHashMap(*Channel).init(allocator),
             .mutex = .{},
             .stats = .{
-                .publish_count = if (build_options.single_threaded) @as(u64, 0) else std.atomic.Value(u64).init(0),
-                .subscriber_count = std.atomic.Value(u64).init(0),
-                .drop_count = std.atomic.Value(u64).init(0),
+                .publish_count = if (build_options.single_threaded) @as(u64, 0) else compat.AtomicU64.init(0),
+                .subscriber_count = compat.AtomicU64.init(0),
+                .drop_count = compat.AtomicU64.init(0),
             },
         };
     }

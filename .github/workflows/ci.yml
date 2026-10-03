@@ -49,6 +49,22 @@ jobs:
       - name: Build the standalone server and tools
         run: zig build -Doptimize=ReleaseSmall
 
+      # The browser-loadable module and its smoke tests. These were MANUAL gates before: nothing in
+      # CI ran them, so a change could break the wasm build or its allowlist and still go green here.
+      # `zig build wasm-smoke` depends on both the allowlist walk and the module install, so this one
+      # step covers building the module, walking the import graph, and running the FFI smoke tests
+      # against it.
+      #
+      # bun, not node: the smoke steps in build.zig invoke `bun` BY NAME and hardcode it, so the host
+      # has to be bun on PATH. (They use no Bun-specific API, so a node path is possible — that is the
+      # `--host`/node work item, not something to assume here.)
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+
+      - name: zig build wasm-smoke (module + allowlist walk + FFI smoke)
+        run: zig build wasm-smoke -Dtarget=wasm32-wasi
+
   client:
     name: Bun client
     runs-on: ubuntu-latest

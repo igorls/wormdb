@@ -82,3 +82,7 @@ apps/browser/demo/fingerprint.txt
 
 # Playwright MCP screenshot/console scratch artifacts
 .playwright-mcp/
+
+# Compile-probe object files: probes belong in a scratch dir, never the repo, and
+# these embed absolute paths (the cache dir, the Homebrew zig path) in a PUBLIC repo.
+*.o

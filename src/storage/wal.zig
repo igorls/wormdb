@@ -99,6 +99,12 @@ pub const Wal = struct {
         };
     }
 
+    /// Whether the background writer is used at all. A named constant rather than an inline
+    /// `build_options.single_threaded` so the decision is assertable: a wasm target cannot run
+    /// `zig build test` (the test binary itself needs threads), so a test that only skipped on a
+    /// threaded build would assert nothing anywhere. The test checks this predicate directly.
+    pub const use_background_writer = !build_options.single_threaded;
+
     /// Start background WAL writer for lock-free producer submission.
     /// Producer path becomes enqueue-only; this removes file I/O from request critical path.
     pub fn startBackground(self: *Wal) !void {
@@ -109,7 +115,7 @@ pub const Wal = struct {
         // immediately on every record (2e5a914) and sets `sync_failed` when a write or sync
         // fails so later writes are fenced (a46f517). A queued single-threaded drain would
         // batch and swallow those failures instead, so the queue is not used at all here.
-        if (build_options.single_threaded) return;
+        if (!use_background_writer) return;
         self.writer_running.store(true, .release);
         self.writer_thread = try std.Thread.spawn(.{}, writerLoop, .{self});
         self.writer_started = true;
@@ -636,10 +642,13 @@ test "WAL append and replay" {
 /// every direct write fsyncs immediately (2e5a914) and a failed write or sync fences all
 /// later writes via `sync_failed` (a46f517). A single-threaded build never starts the
 /// background writer, so these are the properties a wasm build depends on, and they are
-/// asserted here rather than assumed. `_single_threaded` is a comptime parameter so the
-/// same test body runs unchanged whether or not the build is single-threaded.
-fn expectSingleThreadedDurability(comptime _single_threaded: bool) !void {
-    _ = _single_threaded; // the behaviour under test does not depend on the flag, only on writer_started
+/// asserted here rather than assumed.
+///
+/// There is NO `_single_threaded` parameter. There used to be one, and it was discarded in the
+/// body — so the call site read as if both modes were exercised when only one was, which is the
+/// same shape of problem as the tautological assertion below. What the path actually depends on is
+/// `writer_started`, so that is what the body drives.
+fn expectSingleThreadedDurability() !void {
     const testing = std.testing;
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
@@ -689,5 +698,26 @@ fn expectSingleThreadedDurability(comptime _single_threaded: bool) !void {
 }
 
 test "single-threaded direct writes fsync immediately and fence uncertain writes" {
-    try expectSingleThreadedDurability(true);
+    try expectSingleThreadedDurability();
+}
+
+test "the background writer is used exactly when the build has threads" {
+    // The old test passed `true` to a helper that discarded it and never called startBackground, so
+    // it only proved that a Wal whose writer was never started writes directly — it would have kept
+    // passing if startBackground stopped returning early, which is the one behaviour that matters
+    // for wasm.
+    //
+    // It cannot be tested by calling startBackground, because a wasm target cannot run
+    // `zig build test` at all: the test binary itself needs threads (std.Thread.spawn in
+    // std/Thread.zig fails to compile in single-threaded mode). A test that only skipped on a
+    // threaded build would therefore assert nothing on any target. So the DECISION is extracted as
+    // `use_background_writer` and asserted here, which runs and is meaningful on a threaded build:
+    const builtin = @import("builtin");
+    // NOTE: `expectEqual(!build_options.single_threaded, Wal.use_background_writer)` used to sit
+    // here and was TAUTOLOGICAL — `use_background_writer` IS defined as that expression, so it
+    // compared a value to its own definition and could never fail. Removed. What is worth asserting
+    // is the DRIFT check below: `builtin.single_threaded` is what std.Io and compat key off, so a
+    // build where the two disagree would have some code taking the threaded path and some the
+    // single-threaded one.
+    try std.testing.expectEqual(!builtin.single_threaded, Wal.use_background_writer);
 }

@@ -56,6 +56,15 @@ pub const AtomicU64 = if (narrow_u64_atomics) struct {
     }
 
     /// Returns the value the cell held before the add.
+    pub fn fetchSub(self: *Self, operand: u64, comptime order: std.builtin.AtomicOrder) u64 {
+        _ = order;
+        self.lock.lock();
+        defer self.lock.unlock();
+        const previous = self.value;
+        self.value -%= operand;
+        return previous;
+    }
+
     pub fn fetchAdd(self: *Self, operand: u64, comptime order: std.builtin.AtomicOrder) u64 {
         _ = order;
         self.lock.lock();
@@ -135,8 +144,9 @@ pub const Futex = struct {
     pub fn timedWait(ptr: *std.atomic.Value(u32), expected: u32, timeout_ns: anytype) void {
         // No atomic wait instruction on wasm, and in a single-threaded build there is no other
         // thread to wait for. The caller re-checks its condition.
-        // `else` rather than an early return: a comptime `return` still leaves the code after
-        // it analysed, and `futexWaitTimeout` is what emits `memory.atomic.wait32`.
+        // What keeps `futexWaitTimeout` (which emits `memory.atomic.wait32`) out of the build is that
+        // the condition is `comptime`, so the other branch isn't analysed on this target; a RUNTIME
+        // condition would leave it analysed. The `else` only makes the two paths explicit.
         if (comptime narrow_atomics) return else {
             const zio = io();
             const timeout = std.Io.Timeout{
@@ -657,8 +667,11 @@ pub const net = if (wasm_target) struct {} else struct {
 /// like a real identity. Reaching any of these means a cluster feature was invoked on a target
 /// that has no clustering, and the caller is told so.
 pub const ClusterStub = struct {
-    pub fn identityPublicKey(_: *const ClusterStub) [32]u8 {
-        @panic("cluster identity requested on a target built without clustering");
+    /// Returns an error like every other method here. It used to `@panic`, which contradicted this
+    /// block's own promise that every method REFUSES: a caller that handled
+    /// `error.ClusterUnsupportedOnThisTarget` would still have been killed by a panic instead.
+    pub fn identityPublicKey(_: *const ClusterStub) ![32]u8 {
+        return error.ClusterUnsupportedOnThisTarget;
     }
     pub fn signWithIdentity(_: *const ClusterStub, _: []const u8) ![64]u8 {
         return error.ClusterUnsupportedOnThisTarget;

@@ -19,8 +19,10 @@ browser configuration and the one the smoke tests exercise.
 
 Two artifact shapes exist and they are not interchangeable:
 
-- `zig build wasm` emits a **reactor** with the FFI entry points as exports (19 exports, `memory`
-  and 18 `wormdb_*` functions; no `_start`). A host cannot link an archive, it needs the exports.
+- `zig build wasm` emits the FFI entry points as exports: **21 exports — `memory`, `_start`, and
+  19 `wormdb_*` functions** (measured from the built module, not counted by hand). A host cannot link an
+  archive, so it needs the exports. Note the `_start` is present even though the module is built with
+  `entry = .disabled`: it comes from the libc startup objects, not from a `main` in the FFI root.
 - `zig build ffi` emits a **static archive** for linking into a native (or iOS) embedding.
 
 The FFI is **static** on wasm. There is no `dlopen`-style shared library for wasm: a `-dynamic`
@@ -63,8 +65,19 @@ The wasm target compiles **`src/wasm_root.zig`**, not `src/lib.zig`. It never im
 `cluster`, or anything under them. `src/lib.zig` and the native public API are unchanged.
 
 The procedure registry for this root is **`src/procedures/wasm_registry.zig`**, an explicit
-allowlist. A procedure is available only if it is named there, and a comptime check fails the
-build if an allowlisted procedure reaches cluster. Procedures that need clustering are **absent**
+allowlist. A procedure is available only if it is named there. **Zig cannot inspect another
+module's imports at comptime**, so there is no language-level check: what enforces the allowlist is
+`scripts/check-wasm-allowlist.zig`, run as a build step by `zig build wasm`, `wasm-smoke` and `ffi`
+on a wasm target, which walks the import graph from `src/wasm_root.zig` and fails the build, naming
+the file and line, if anything the wasm target compiles imports the cluster or socket-bearing files
+(matched on the resolved path) or the `meshguard` module. Zig's parser identifies imports and
+conditional branches, including nested expressions, multiline imports and escaped paths.
+Only `wasm_target`, `compat.wasm_target` and `@import("../core/compat.zig").wasm_target`,
+optionally negated once, select a branch. Other conditions inspect both branches.
+Unreadable files, malformed source and computed import paths fail the check. This is a
+conservative syntax check: the named predicates must retain their existing wasm meaning.
+Its own tests run in
+`zig build test`. Procedures that need clustering are **absent**
 rather than stubbed: asking for one returns "unknown procedure", which is honest. Where the
 shared `context.zig` still needs a `Cluster` type, `compat.ClusterStub` stands in and **every
 method refuses** (`error.ClusterUnsupportedOnThisTarget`) — a no-op `replicateWrite` would report
@@ -74,14 +87,40 @@ identity.
 ## What the wasm artifact has
 
 - the key/value engine: put, get, scan, transfer, increment, delete
-- WAL durability. On a single-threaded build the group-commit thread is not started and the
-  producer writes directly, fsyncing each record and fencing later writes after an uncertain
-  sync. That is the same guarantee the threaded path gives, not a reduced one.
+- WAL durability, **with a caveat the code states plainly**: on a single-threaded build the
+  group-commit thread is not started (`use_background_writer = !build_options.single_threaded`) and the
+  producer writes directly instead of queueing. What the wasm target actually gets is `writeDirect`,
+  which does `try writeAll` and `try sync` and sets `sync_failed` through an `errdefer`, so a failed
+  write or sync IS reported on that path — the swallowed-error behaviour belongs to `drainOnce`, the
+  THREADED path, not this one. The real wasm caveat is narrower and is about the HOST: the WASI shim
+  stubs `fd_sync` to `ENOSYS`, and the WAL has never actually run under wasm, so treat its durability
+  as unproven on that target until a host performs a real sync.
 - snapshots and the storage engine
 - the vector index: insert, search, delete, stats, rebuild
 - the append log and its verification
 - the memory/introspection procedures
 - the event bus
+
+### The allowlist, exactly
+
+The reduced root allows **26 procedures** (measured from `src/procedures/wasm_registry.zig`):
+`append_log_append`, `append_log_verify`, `chat_history`, `chat_send`, `increment`, `kv_get`,
+`kv_put`, `kv_stats`, `mem_capabilities`, `mem_drop`, `mem_health`, `mem_range`, `mem_reset_index`,
+`mem_stats`, `mem_verify`, `scan`, `transfer`, `vdelete`, `vinsert`, `vnsdrop`, `vrabitq`,
+`vreindex`, `vsearch`, `vsearch_local_raw`, `vsim`, `vstats`.
+
+The full registry also exposes these, and the wasm root OMITS them. The first group cannot work
+here; the second is **unlisted, not impossible** — a deliberate omission because nothing has proven
+they are cluster-free on this target, and an unlisted procedure fails honestly ("unknown
+procedure") whereas a wrongly-listed one would misbehave at runtime:
+
+| Omitted | Why |
+| --- | --- |
+| `cluster_presence`, `vsearch_cluster`, `trust_grant`, `trust_revoke`, `trust_fold` | need cluster/meshguard |
+| `append_log_witness*` (4), `append_log_claim*` (4), `append_log_mmr_proof`, `append_log_mmr_verify`, `append_log_proof_bundle`, `append_log_proof_verify`, `append_log_checkpoint`, `auth_mint_scoped`, `proof_prefix_root`, `mem_init`, `mem_add`, `mem_bulk_add`, `mem_meta_set`, `mem_get`, `mem_query` | unverified on wasm; adding one means proving it does not reach the socket or cluster graph (`std` is not a procedure — an earlier draft listed it here, but it is an import, not an entry in either registry) |
+
+That distinction matters: "absent because it needs a cluster" and "absent because nobody has checked
+it yet" are different claims, and only the first is a property of the target.
 
 ## What it does not have, and why
 
@@ -105,10 +144,19 @@ Setting `.single_threaded = true` on the wasm modules (the build.zig form of `-f
 is necessary: with it, `builtin.single_threaded` is comptime true and the `std.Io.Threaded`
 completion path is not analysed. Three traps sit on top of it:
 
-1. **`if (comptime X) return;` is not a terminator for analysis.** `std.Thread.spawn` is a
-   `@compileError` in single-threaded mode, and it fires from *being analysed*, not from being
-   reached. Only moving the call into an `else`-branch keeps it out of the build, which is how
-   `NamespaceIndex.enableAsyncMode` is written.
+1. **`std.Thread.spawn` is a `@compileError` in single-threaded mode, and it fires from being
+   ANALYSED, not from being reached** — so a call that can never execute still breaks the build.
+   An earlier version of this section claimed `if (comptime X) return;` does not stop that analysis.
+   **That was wrong, and it was settled by experiment rather than argument:** with `comptime x =
+   true`, an `export fn` whose body is `if (comptime x) return; T.noSuchMethod();` COMPILES, while
+   the same body with `x = false` fails — so the early return does suppress analysis of what follows
+   it, and both spellings (early return, or an `else`-branch) keep the spawn out. The claim is
+   corrected here because it contradicted `storage/wal.zig` and the `compat` locks, which rely on
+   exactly the pattern it said did not work.
+   The experiment used an invalid METHOD CALL as the probe, and an earlier attempt used an invalid
+   free-function call, which proves nothing: a function that is never referenced is not analysed at
+   all. The probe has to be reachable, which is why the final one was `export`ed and paired with a
+   `false` control that fails as expected.
 2. **`std.Thread.join` carries the same asm.** Its wasm path contains `memory.atomic.wait32`.
    Joining only happens in a multi-threaded build, so the two join sites in `storage/wal.zig` and
    `vector/index.zig` are guarded on `single_threaded` as well. That guard was the actual last
@@ -133,23 +181,25 @@ Measured from the built module, so the JS-side shim size is known rather than gu
   `clock_time_get`, `fd_*` (fdstat, filestat, pread, pwrite, read, write, seek, prestat, sync,
   readdir, close…), `path_*` (create_directory, filestat, link, open, readlink, remove_directory,
   rename, symlink, unlink_file…), `random_get`, `proc_exit`, `poll_oneoff`, `sched_yield`.
-- **Exports**: `memory` and 18 `wormdb_*` functions (`open`, `open_sync`, `close`, `set`,
-  `set_worm`, `get`, `get_meta`, `scan_prefix`, `delete`, `exec`, `append_log`,
-  `append_log_verify`, `proof_build_mmr_bundle`, `proof_verify_bundle`, `mmr_proof_verify`,
-  `free`, `version`). No `_start` — this is a reactor.
+- **Exports**: `memory`, `_start`, and **19** `wormdb_*` functions: `open`, `open_sync`, `close`,
+  `set`, `set_worm`, `get`, `get_meta`, `scan_prefix`, `delete`, `exec`, `append_log`,
+  `append_log_verify`, `proof_build_mmr_bundle`, `proof_verify_bundle`, `mmr_proof_verify`, `alloc`,
+  `free`, `version`, plus the graph guard `wormdb_wasm_graph_guard` (see below). Hosts take buffers
+  from `wormdb_alloc` and release them with `wormdb_free`; nothing should be written at an offset the
+  module did not allocate.
 
 There is no bespoke host interface. Only four of those imports are reachable on the in-memory
 path (`clock_time_get`, `random_get`, `fd_write`, `proc_exit`); the rest exist for the
 persistent modes and are stubbed to `ENOSYS`, so a deployment that has no filesystem finds out
 immediately rather than silently. `wormdb_open_sync` is among the exports, which is the symbol
-hosts like Meshrooms look up by name.
+hosts look up by name.
 
 ## Not yet done
 
 - **Persistent modes on wasm.** Only `PersistenceMode.none` is exercised end to end. The WAL and
   snapshot paths compile and their WASI imports are present, but nothing has run them against a
   real WASI filesystem, so their durability claims are unverified on this target.
-- **Firefox and OPFS**, and the cold-open timing gates the Meshrooms spike branch defines. The
-  demo has been run in Chrome (and headlessly) only.
+- **Firefox and OPFS**, and any cold-open timing budget for a hosting page. The module has been
+  run in Chrome (and headlessly) only.
 - **The vector index and the cluster-free procedures beyond key/value and the append log.**
   They are in the reduced root and on the allowlist, but the browser run has not touched them.

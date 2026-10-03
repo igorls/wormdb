@@ -68,10 +68,12 @@ The procedure registry for this root is **`src/procedures/wasm_registry.zig`**, 
 allowlist. A procedure is available only if it is named there. **Zig cannot inspect another
 module's imports at comptime**, so there is no language-level check: what enforces the allowlist is
 `scripts/check-wasm-allowlist.zig`, run as a build step by `zig build wasm`, `wasm-smoke` and `ffi`
-on a wasm target, which reads the allowlisted files and fails the build naming the file and line if
-one imports the cluster or socket-bearing graph ungated. The list of files it scans is maintained by
-hand, so a NEW file that reaches cluster is caught only once it is added to that list — the guard is
-a strong check over a reviewed set, not a proof over the whole graph. Procedures that need clustering are **absent**
+on a wasm target, which walks the import graph from `src/wasm_root.zig` and fails the build, naming
+the file and line, if anything the wasm target compiles imports the cluster or socket-bearing files
+(matched on the resolved path) or the `meshguard` module. A gated import,
+`if (…wasm_target) A else B` on one line, is skipped only in the branch a wasm target doesn't compile;
+comments are stripped first, and any other shape is checked in full. Its own tests run in
+`zig build test`. Procedures that need clustering are **absent**
 rather than stubbed: asking for one returns "unknown procedure", which is honest. Where the
 shared `context.zig` still needs a `Cluster` type, `compat.ClusterStub` stands in and **every
 method refuses** (`error.ClusterUnsupportedOnThisTarget`) — a no-op `replicateWrite` would report

@@ -3,8 +3,8 @@
 //! An explicit ALLOWLIST, not a filtered copy of the full registry: a procedure is available
 //! only if it is named here. Zig cannot inspect another module's imports at comptime, so the
 //! enforcement is the build step `scripts/check-wasm-allowlist.zig` (run by `zig build
-//! wasm`/`wasm-smoke`/`ffi` on a wasm target) — it reads the allowlisted files and fails the build,
-//! naming the file and line, if one reaches the cluster or socket-bearing graph. An earlier version
+//! wasm`/`wasm-smoke`/`ffi` on a wasm target): it walks the import graph from the wasm root and fails
+//! the build, naming the file and line, if anything compiled reaches the cluster or socket-bearing graph. An earlier version
 //! of this comment claimed a comptime check here; no such check exists, which is exactly why the
 //! build step does.
 //!
@@ -83,8 +83,9 @@ pub const context = @import("context.zig");
 ///
 /// There is NO comptime cluster guard here, and there should not be a claim of one: Zig cannot inspect
 /// another module's import graph at comptime, which is exactly why `scripts/check-wasm-allowlist.zig`
-/// exists as a BUILD STEP. The allowlist is enforced by that script walking the checked files and
-/// failing the build on a `cluster`/`meshguard`/`net` import; a comment promising a language-level
+/// exists as a BUILD STEP. The allowlist is enforced by that script walking the import graph and
+/// failing the build on a compiled import of `src/cluster/`, the socket-bearing `src/server/` files or the
+/// `meshguard` module; a comment promising a language-level
 /// guard that does not exist is worse than no comment, because it tells a reader the property is
 /// already held. (An earlier draft of this file claimed the guard; it was removed for that reason.)
 pub fn lookup(name: []const u8) ?ProcedureFn {

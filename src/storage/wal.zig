@@ -99,14 +99,14 @@ pub const Wal = struct {
         };
     }
 
-    /// Start background WAL writer for lock-free producer submission.
-    /// Producer path becomes enqueue-only; this removes file I/O from request critical path.
     /// Whether the background writer is used at all. A named constant rather than an inline
     /// `build_options.single_threaded` so the decision is assertable: a wasm target cannot run
     /// `zig build test` (the test binary itself needs threads), so a test that only skipped on a
     /// threaded build would assert nothing anywhere. The test checks this predicate directly.
     pub const use_background_writer = !build_options.single_threaded;
 
+    /// Start background WAL writer for lock-free producer submission.
+    /// Producer path becomes enqueue-only; this removes file I/O from request critical path.
     pub fn startBackground(self: *Wal) !void {
         if (!self.sync_writes or self.writer_started) return;
         // A single-threaded build (wasm32) has no thread to hand the queue to. NOT starting the

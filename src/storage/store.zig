@@ -490,68 +490,184 @@ pub const Store = struct {
         const si = shardIndex(key);
         const shard = &self.shards[si];
 
-        // Durable path: hold the key shard through validation, capacity
-        // reservation, WAL append and map insert.
-        // WAL enqueue uses wal_enqueue_mutex alone so snapshot+truncate can
-        // exclude concurrent durable writers (see maybeSnapshotAndTruncate).
-        //
-        // Order: optional early WORM check → wal_enqueue → (append) → shard
-        // re-check+put → release wal_enqueue → maybeSnapshot.
-        // Holding wal_enqueue across append+put prevents a WORM race from
-        // acknowledging failure after a durable WAL append was published to
-        // concurrent snapshot truncation (#92 review).
+        // Lock hierarchy:
+        //   wal_enqueue_mutex (compaction / direct-WAL exclusion)
+        //     -> snapshot_mutex
+        //       -> shards[si].mutex
+        //         -> wal.queue_mutex (leaf mutex for background ring enqueue)
         if (self.config.persistence == .full) {
-            // Manual unlock (not defer): maybeSnapshotAndTruncate also takes
-            // wal_enqueue_mutex — must not hold it across that call.
-            self.wal_enqueue_mutex.lock();
+            const flags = EntryFlags{ .is_worm = is_worm, .is_deleted = false };
+            // Pre-serialize and CRC32C-hash the WAL record outside all locks so
+            // concurrent producer threads parallelize allocation and hashing.
+            const record = self.wal.?.serializeSetRecord(key, value, flags, timestamp) catch return error.OutOfMemory;
 
-            shard.mutex.lock();
-            if (shard.data.get(key)) |existing| {
-                if (existing.flags.is_worm) {
-                    shard.mutex.unlock();
-                    self.wal_enqueue_mutex.unlock();
-                    return error.WormViolation;
+            if (self.wal.?.writer_started) {
+                // Background WAL writer mode (sync_writes=true, truncation disabled):
+                // Lock only shard.mutex -> leaf wal.queue_mutex (inside commitSerializedRecord).
+                // Never acquire wal_enqueue_mutex after shard.mutex.
+                shard.mutex.lock();
+                defer shard.mutex.unlock();
+
+                const existing = shard.data.get(key);
+                if (existing) |ex| {
+                    if (ex.flags.is_worm) {
+                        self.wal.?.freeRecord(record);
+                        return error.WormViolation;
+                    }
+                } else if (self.sstHit(key)) |frozen| {
+                    if (frozen.is_worm) {
+                        self.wal.?.freeRecord(record);
+                        return error.WormViolation;
+                    }
                 }
-            } else if (self.sstHit(key)) |frozen| {
-                if (frozen.is_worm) {
-                    shard.mutex.unlock();
-                    self.wal_enqueue_mutex.unlock();
-                    return error.WormViolation;
-                }
+
+                const prepared = self.prepareUpsertLocked(shard, existing, key, value, is_worm, timestamp) catch |err| {
+                    self.wal.?.freeRecord(record);
+                    return err;
+                };
+                self.wal.?.commitSerializedRecord(record) catch {
+                    self.abortPreparedUpsert(prepared);
+                    self.wal.?.freeRecord(record);
+                    return error.IoError;
+                };
+                self.commitPreparedUpsertLocked(shard, prepared, value, is_worm, timestamp);
+                return;
             }
 
-            // Reserve both indexes while the shard is locked. Keep that lock
-            // through WAL append + in-memory publish so no concurrent unsafe
-            // writer can consume the reservation after the durable commit.
-            self.shardReservePutLocked(shard, key) catch |err| {
-                shard.mutex.unlock();
-                self.wal_enqueue_mutex.unlock();
-                return err;
-            };
-            const entry = self.wal.?.appendSet(key, value, .{ .is_worm = is_worm, .is_deleted = false }, timestamp) catch {
-                shard.mutex.unlock();
-                self.wal_enqueue_mutex.unlock();
-                return error.IoError;
-            };
-            self.shardPutAssumeCapacityLocked(shard, entry);
-            shard.mutex.unlock();
+            // Direct WAL file mode (!writer_started): hold wal_enqueue_mutex -> shard.mutex
+            // across reserve + direct WAL write + live map commit so maybeSnapshotAndTruncate
+            // cannot interleave (#92).
+            self.wal_enqueue_mutex.lock();
+            {
+                shard.mutex.lock();
+                defer shard.mutex.unlock();
+
+                const existing = shard.data.get(key);
+                if (existing) |ex| {
+                    if (ex.flags.is_worm) {
+                        self.wal_enqueue_mutex.unlock();
+                        self.wal.?.freeRecord(record);
+                        return error.WormViolation;
+                    }
+                } else if (self.sstHit(key)) |frozen| {
+                    if (frozen.is_worm) {
+                        self.wal_enqueue_mutex.unlock();
+                        self.wal.?.freeRecord(record);
+                        return error.WormViolation;
+                    }
+                }
+
+                const prepared = self.prepareUpsertLocked(shard, existing, key, value, is_worm, timestamp) catch |err| {
+                    self.wal_enqueue_mutex.unlock();
+                    self.wal.?.freeRecord(record);
+                    return err;
+                };
+                self.wal.?.commitSerializedRecord(record) catch {
+                    self.abortPreparedUpsert(prepared);
+                    self.wal_enqueue_mutex.unlock();
+                    self.wal.?.freeRecord(record);
+                    return error.IoError;
+                };
+                self.commitPreparedUpsertLocked(shard, prepared, value, is_worm, timestamp);
+            }
             self.wal_enqueue_mutex.unlock();
         } else {
             shard.mutex.lock();
             defer shard.mutex.unlock();
-            if (shard.data.get(key)) |existing| {
-                if (existing.flags.is_worm) return error.WormViolation;
+            const existing = shard.data.get(key);
+            if (existing) |ex| {
+                if (ex.flags.is_worm) return error.WormViolation;
             } else if (self.sstHit(key)) |frozen| {
                 if (frozen.is_worm) return error.WormViolation;
             }
-            const entry = try self.createMemoryEntry(key, value, is_worm, timestamp);
-            errdefer self.destroyEntry(entry);
-            try self.shardPutLocked(shard, entry);
+            try self.upsertShardLocked(shard, existing, key, value, is_worm, timestamp);
         }
 
         if (self.config.persistence == .full) {
             self.maybeSnapshotAndTruncate() catch {};
         }
+    }
+
+    const PreparedUpsert = union(enum) {
+        in_place_same_len: *Entry,
+        in_place_new_val: struct { entry: *Entry, new_val: []u8 },
+        put_entry: *Entry,
+    };
+
+    /// Reserve all memory and shard capacity needed for an upsert before publishing
+    /// a WAL record. If this succeeds, `commitPreparedUpsertLocked` is infallible.
+    fn prepareUpsertLocked(
+        self: *Store,
+        shard: *Shard,
+        existing_opt: ?*Entry,
+        key: []const u8,
+        value: []const u8,
+        is_worm: bool,
+        timestamp: u64,
+    ) StoreError!PreparedUpsert {
+        if (@import("builtin").is_test and self.fail_put_reserve_for_test) return error.OutOfMemory;
+        if (existing_opt) |existing| {
+            if (!existing.flags.arena_owned) {
+                if (existing.value.len == value.len) {
+                    return .{ .in_place_same_len = existing };
+                }
+                const new_val = self.allocator.dupe(u8, value) catch return error.OutOfMemory;
+                return .{ .in_place_new_val = .{ .entry = existing, .new_val = new_val } };
+            }
+        }
+        try self.shardReservePutLocked(shard, key);
+        const entry = try self.createMemoryEntry(key, value, is_worm, timestamp);
+        return .{ .put_entry = entry };
+    }
+
+    fn abortPreparedUpsert(self: *Store, prepared: PreparedUpsert) void {
+        switch (prepared) {
+            .in_place_same_len => {},
+            .in_place_new_val => |p| self.allocator.free(p.new_val),
+            .put_entry => |e| self.destroyEntry(e),
+        }
+    }
+
+    fn commitPreparedUpsertLocked(
+        self: *Store,
+        shard: *Shard,
+        prepared: PreparedUpsert,
+        value: []const u8,
+        is_worm: bool,
+        timestamp: u64,
+    ) void {
+        switch (prepared) {
+            .in_place_same_len => |existing| {
+                @memcpy(@constCast(existing.value), value);
+                existing.timestamp = timestamp;
+                existing.flags = .{ .is_worm = is_worm, .is_deleted = false };
+            },
+            .in_place_new_val => |p| {
+                self.allocator.free(p.entry.value);
+                p.entry.value = p.new_val;
+                p.entry.timestamp = timestamp;
+                p.entry.flags = .{ .is_worm = is_worm, .is_deleted = false };
+            },
+            .put_entry => |entry| {
+                self.shardPutAssumeCapacityLocked(shard, entry);
+            },
+        }
+    }
+
+    /// Update an existing non-arena Entry in-place when overwriting, or allocate
+    /// and insert a new Entry when the key is new or snapshot-arena-owned.
+    /// Caller must hold `shard.mutex` and have already checked WORM constraints.
+    fn upsertShardLocked(
+        self: *Store,
+        shard: *Shard,
+        existing_opt: ?*Entry,
+        key: []const u8,
+        value: []const u8,
+        is_worm: bool,
+        timestamp: u64,
+    ) StoreError!void {
+        const prepared = try self.prepareUpsertLocked(shard, existing_opt, key, value, is_worm, timestamp);
+        self.commitPreparedUpsertLocked(shard, prepared, value, is_worm, timestamp);
     }
 
     /// Append a vector-insert metadata record to the WAL. The vector bytes
@@ -572,9 +688,12 @@ pub const Store = struct {
         if (is_worm) flags |= 0x01;
         if (is_async) flags |= 0x02;
 
-        self.wal_enqueue_mutex.lock();
-        defer self.wal_enqueue_mutex.unlock();
-        self.wal.?.appendVinsert(key, namespace, metric, flags, timestamp) catch return error.IoError;
+        const record = self.wal.?.serializeVinsertRecord(key, namespace, metric, flags, timestamp) catch return error.OutOfMemory;
+        errdefer self.wal.?.freeRecord(record);
+
+        if (!self.wal.?.writer_started) self.wal_enqueue_mutex.lock();
+        defer if (!self.wal.?.writer_started) self.wal_enqueue_mutex.unlock();
+        self.wal.?.commitSerializedRecord(record) catch return error.IoError;
     }
 
     /// Append a vector-delete metadata record to the WAL. The KV deletion is
@@ -583,9 +702,12 @@ pub const Store = struct {
         if (self.config.persistence != .full) return;
         if (self.wal == null) return;
 
-        self.wal_enqueue_mutex.lock();
-        defer self.wal_enqueue_mutex.unlock();
-        self.wal.?.appendVdelete(key, namespace) catch return error.IoError;
+        const record = self.wal.?.serializeVdeleteRecord(key, namespace) catch return error.OutOfMemory;
+        errdefer self.wal.?.freeRecord(record);
+
+        if (!self.wal.?.writer_started) self.wal_enqueue_mutex.lock();
+        defer if (!self.wal.?.writer_started) self.wal_enqueue_mutex.unlock();
+        self.wal.?.commitSerializedRecord(record) catch return error.IoError;
     }
 
     /// Lock two keys atomically in stable shard order to avoid deadlocks.
@@ -616,17 +738,16 @@ pub const Store = struct {
         const shard = &self.shards[si];
         const timestamp: u64 = @intCast(compat.nowMs());
 
-        if (shard.data.get(key)) |existing| {
-            if (existing.flags.is_worm) return error.WormViolation;
+        const existing = shard.data.get(key);
+        if (existing) |ex| {
+            if (ex.flags.is_worm) return error.WormViolation;
         } else if (self.sstHit(key)) |frozen| {
             // A frozen WORM key may not be shadowed by a live write — that
             // would silently serve the new value over the immutable one.
             if (frozen.is_worm) return error.WormViolation;
         }
 
-        const entry = try self.createMemoryEntry(key, value, is_worm, timestamp);
-        errdefer self.destroyEntry(entry);
-        try self.shardPutLocked(shard, entry);
+        try self.upsertShardLocked(shard, existing, key, value, is_worm, timestamp);
     }
 
     /// Allocate an Entry that is not backed by a WAL record (snapshot/none
@@ -648,10 +769,10 @@ pub const Store = struct {
         const si = shardIndex(key);
         var did_exist = false;
         {
-            // Match SET's wal_enqueue -> shard order and keep append+remove
-            // together, so compaction cannot truncate an unapplied deletion.
-            if (self.config.persistence == .full) self.wal_enqueue_mutex.lock();
-            defer if (self.config.persistence == .full) self.wal_enqueue_mutex.unlock();
+            // Lock order: wal_enqueue_mutex (when compaction is possible) -> shard.mutex -> wal.queue_mutex.
+            const need_compaction_lock = self.config.persistence == .full and !self.wal.?.writer_started;
+            if (need_compaction_lock) self.wal_enqueue_mutex.lock();
+            defer if (need_compaction_lock) self.wal_enqueue_mutex.unlock();
             const shard = &self.shards[si];
             shard.mutex.lock();
             defer shard.mutex.unlock();
@@ -2656,4 +2777,55 @@ test "sst overlay: get, shadow, scan merge, worm enforcement" {
 
     // A frozen WORM key may not be shadowed by a live write.
     try testing.expectError(error.WormViolation, store.set("worm:x", "overwrite", false));
+}
+
+test "background WAL writer: concurrent SET, DELETE, and save preserve lock order" {
+    const testing = std.testing;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/bg_lock_order.wal", .{tmp_path});
+    defer testing.allocator.free(wal_path);
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/bg_lock_order.snapshot", .{tmp_path});
+    defer testing.allocator.free(snapshot_path);
+
+    var store = try Store.init(testing.allocator, .{
+        .wal_path = wal_path,
+        .snapshot_path = snapshot_path,
+        .persistence = .full,
+        .sync_writes = true,
+    });
+    defer store.deinit();
+    try store.startBackgroundTasks();
+
+    const Worker = struct {
+        fn setLoop(s: *Store, tid: usize) void {
+            var kbuf: [32]u8 = undefined;
+            var vbuf: [32]u8 = undefined;
+            for (0..200) |i| {
+                const key = std.fmt.bufPrint(&kbuf, "k:{d}:{d}", .{ tid, i % 16 }) catch unreachable;
+                const val = std.fmt.bufPrint(&vbuf, "val-{d:0>6}", .{i}) catch unreachable;
+                s.set(key, val, false) catch {};
+            }
+        }
+        fn delAndSnapLoop(s: *Store) void {
+            var kbuf: [32]u8 = undefined;
+            for (0..40) |i| {
+                const key = std.fmt.bufPrint(&kbuf, "k:0:{d}", .{i % 16}) catch unreachable;
+                s.delete(key) catch {};
+                if (i % 10 == 0) s.save() catch {};
+            }
+        }
+    };
+
+    var t1 = try std.Thread.spawn(.{}, Worker.setLoop, .{ &store, 0 });
+    var t2 = try std.Thread.spawn(.{}, Worker.setLoop, .{ &store, 1 });
+    var t3 = try std.Thread.spawn(.{}, Worker.delAndSnapLoop, .{&store});
+    t1.join();
+    t2.join();
+    t3.join();
+
+    try testing.expect(store.count() >= 16);
 }

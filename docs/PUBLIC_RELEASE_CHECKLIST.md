@@ -31,7 +31,7 @@ disclosure boundary, reproducible onboarding, and accurate claims.
 
 - Resolve the exact MeshGuard submodule commit anonymously; do the same for
   optional QUIC dependencies when shipping that build.
-- Build and test Linux and Windows from a fresh checkout with Zig 0.16.0.
+- Build and test Linux and Windows from a fresh checkout with Zig 0.17.0.
   Test the crypto backend actually included in each artifact.
 - Install the Bun client with its frozen lockfile and run its tests.
 - Follow the README from a clean checkout: start with `examples/local.json`,

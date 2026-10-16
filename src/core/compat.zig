@@ -284,8 +284,9 @@ pub fn randomBytes(buf: []u8) void {
 /// Returns `error.InvalidEnumTag` if `tag` does not correspond to a valid field.
 pub fn intToEnum(comptime E: type, tag: anytype) error{InvalidEnumTag}!E {
     const tag_int: @typeInfo(E).@"enum".tag_type = @intCast(tag);
-    inline for (@typeInfo(E).@"enum".fields) |f| {
-        if (f.value == tag_int) return @as(E, @enumFromInt(tag_int));
+    const info = @typeInfo(E).@"enum";
+    inline for (info.field_values) |val| {
+        if (val == tag_int) return @as(E, @fromBackingInt(tag_int));
     }
     return error.InvalidEnumTag;
 }
@@ -586,7 +587,11 @@ pub const net = if (wasm_target) struct {} else struct {
                 // Io net vtable (AFD receive under the hood).
                 const zio = io();
                 var iov = [_][]u8{buf};
-                return zio.vtable.netRead(zio.userdata, handle, &iov);
+                const res = try zio.operate(.{ .net_read = .{
+                    .socket_handle = handle,
+                    .data = &iov,
+                } });
+                return (try res.net_read).data_len;
             }
             // A wasm target has no sockets and std.posix is a hard compile error there, so this
             // is compiled out rather than left to fail. Reaching it means socket code ran on a
@@ -613,7 +618,12 @@ pub const net = if (wasm_target) struct {} else struct {
                     const n = if (deadline) |d|
                         try socketWindowsBefore(false, handle, data[written..], d)
                     else
-                        try zio.vtable.netWrite(zio.userdata, handle, empty_header, &chunk, 1);
+                        try (try zio.operate(.{ .net_write = .{
+                            .socket_handle = handle,
+                            .header = empty_header,
+                            .data = &chunk,
+                            .splat = 1,
+                        } })).net_write;
                     if (n == 0) return error.BrokenPipe;
                     written += n;
                 }

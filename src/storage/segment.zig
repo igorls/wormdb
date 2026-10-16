@@ -67,7 +67,7 @@ fn rd64(b: []const u8, off: usize) u64 {
 pub const Segment = struct {
     bytes: []const u8,
     backing: Backing,
-    tables: [MAX_TABLES]?Table = [_]?Table{null} ** MAX_TABLES,
+    tables: [MAX_TABLES]?Table = @splat(null),
 
     pub const Backing = enum { mmap, heap };
 
@@ -127,7 +127,7 @@ pub const Segment = struct {
     pub fn close(self: *Segment, allocator: std.mem.Allocator) void {
         freeBytes(allocator, self.bytes, self.backing);
         self.bytes = &.{};
-        self.tables = [_]?Table{null} ** MAX_TABLES;
+        self.tables = @splat(null);
     }
 
     pub fn has(self: *const Segment, table: u32) bool {
@@ -402,7 +402,7 @@ test "rejects a bad-magic file" {
     defer testing.allocator.free(seg_path);
 
     const f = try compat.Dir.createFile(tmp.dir, "bad.wseg", .{});
-    try compat.File.writeAll(f, "NOTASEG!" ++ ([_]u8{0} ** 40));
+    try compat.File.writeAll(f, "NOTASEG!" ++ @as([40]u8, @splat(0)));
     compat.File.close(f);
 
     try testing.expectError(SegmentError.SegmentBadMagic, Segment.open(testing.allocator, seg_path));

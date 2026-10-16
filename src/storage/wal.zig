@@ -293,7 +293,7 @@ pub const Wal = struct {
         const payload_slice = buf[@sizeOf(RecordHeader)..total_len];
         const header = RecordHeader{
             .crc = crc32(payload_slice),
-            .record_type = @intFromEnum(WalRecordType.set),
+            .record_type = @backingInt(WalRecordType.set),
             .length = @intCast(payload_len),
         };
         @memcpy(buf[0..@sizeOf(RecordHeader)], std.mem.asBytes(&header));
@@ -313,7 +313,7 @@ pub const Wal = struct {
         const payload_slice = buf[@sizeOf(RecordHeader)..total_len];
         const header = RecordHeader{
             .crc = crc32(payload_slice),
-            .record_type = @intFromEnum(WalRecordType.delete),
+            .record_type = @backingInt(WalRecordType.delete),
             .length = @intCast(payload_len),
         };
         @memcpy(buf[0..@sizeOf(RecordHeader)], std.mem.asBytes(&header));
@@ -352,7 +352,7 @@ pub const Wal = struct {
         const payload_slice = buf[@sizeOf(RecordHeader)..total_len];
         const header = RecordHeader{
             .crc = crc32(payload_slice),
-            .record_type = @intFromEnum(WalRecordType.vinsert),
+            .record_type = @backingInt(WalRecordType.vinsert),
             .length = @intCast(payload_len),
         };
         @memcpy(buf[0..@sizeOf(RecordHeader)], std.mem.asBytes(&header));
@@ -376,7 +376,7 @@ pub const Wal = struct {
         const payload_slice = buf[@sizeOf(RecordHeader)..total_len];
         const header = RecordHeader{
             .crc = crc32(payload_slice),
-            .record_type = @intFromEnum(WalRecordType.vdelete),
+            .record_type = @backingInt(WalRecordType.vdelete),
             .length = @intCast(payload_len),
         };
         @memcpy(buf[0..@sizeOf(RecordHeader)], std.mem.asBytes(&header));
@@ -527,7 +527,7 @@ pub const WalIterator = struct {
 
         if (crc32(payload) != header.crc) return error.Corruption;
 
-        const record_type: WalRecordType = @enumFromInt(header.record_type);
+        const record_type: WalRecordType = @fromBackingInt(@intCast(header.record_type));
         return switch (record_type) {
             .set => try self.parseSet(payload),
             .delete => try self.parseDelete(payload),

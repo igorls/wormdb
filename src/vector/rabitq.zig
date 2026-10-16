@@ -822,7 +822,7 @@ test "rabitq: cosine path — d² estimator on unit sphere converts to cosine" {
     try testing.expect(cos_est > 0.5); // identical input → strong agreement
 
     // Query orthogonal to v: cosine should be near 0 (within estimator noise).
-    var q_orth: [32]f32 = .{0} ** 32;
+    var q_orth: [32]f32 = @splat(0);
     q_orth[0] = -v_unit[1];
     q_orth[1] = v_unit[0];
     // Normalize q_orth (won't be quite unit since we're in 32-D and

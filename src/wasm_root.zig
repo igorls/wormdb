@@ -32,8 +32,6 @@ pub const Config = core.config.Config;
 // `Server` and `Cluster` are intentionally not exported: both are absent from this root, and
 // naming them here would pull the graph back in.
 
-
-
 // A permanent guard, so this cannot regress. A temporary probe found that `bus.subscribe` (and with
 // it `subscriber_count`/`drop_count`) did NOT compile for wasm: `std.atomic.Value(u64)` needs 64-bit
 // atomics, which the target does not have. It went unnoticed because nothing in the reduced root

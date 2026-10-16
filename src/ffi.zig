@@ -131,12 +131,12 @@ fn reportFromVerifyReport(report: append_log.VerifyReport) AppendLogReport {
 
 fn proofBundleInfoFromCore(info: proof.BundleInfo) ProofBundleInfo {
     return .{
-        .kind = @intFromEnum(info.kind),
+        .kind = @backingInt(info.kind),
         .from_seq = info.from_seq,
         .to_seq = info.to_seq,
         .record_count = info.record_count,
         .checkpoint_count = info.checkpoint_count,
-        .accumulator_kind = @intFromEnum(info.accumulator_kind),
+        .accumulator_kind = @backingInt(info.accumulator_kind),
         .accumulator_root = info.accumulator_root,
         .checkpoint_hash = info.checkpoint_hash,
     };
@@ -553,7 +553,7 @@ test "ffi append-log proof bundle round trip" {
 
     const tmp_path = try wormdb.core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
     defer testing.allocator.free(tmp_path);
-    const zpath = try testing.allocator.dupeZ(u8, tmp_path);
+    const zpath = try testing.allocator.dupeSentinel(u8, tmp_path, 0);
     defer testing.allocator.free(zpath);
 
     const db = wormdb_open(zpath.ptr, PERSIST_NONE) orelse return error.OpenFailed;
@@ -624,8 +624,8 @@ test "ffi append-log proof bundle round trip" {
     defer wormdb_free(bundle_ptr, bundle_len);
     try testing.expect(bundle_ptr != null);
     try testing.expect(bundle_len > 0);
-    try testing.expectEqual(@as(c_int, @intFromEnum(proof.BundleKind.range)), build_info.kind);
-    try testing.expectEqual(@as(c_int, @intFromEnum(checkpoint.AccumulatorKind.mmr_sha256_v1)), build_info.accumulator_kind);
+    try testing.expectEqual(@as(c_int, @backingInt(proof.BundleKind.range)), build_info.kind);
+    try testing.expectEqual(@as(c_int, @backingInt(checkpoint.AccumulatorKind.mmr_sha256_v1)), build_info.accumulator_kind);
 
     var verify_info: ProofBundleInfo = undefined;
     try testing.expectEqual(OK, wormdb_proof_verify_bundle(bundle_ptr.?, bundle_len, &verify_info));
@@ -673,7 +673,7 @@ test "ffi exec runs stored procedures and returns owned values" {
 
     const tmp_path = try wormdb.core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
     defer testing.allocator.free(tmp_path);
-    const zpath = try testing.allocator.dupeZ(u8, tmp_path);
+    const zpath = try testing.allocator.dupeSentinel(u8, tmp_path, 0);
     defer testing.allocator.free(zpath);
 
     const db = wormdb_open(zpath.ptr, PERSIST_NONE) orelse return error.OpenFailed;
@@ -716,7 +716,7 @@ test "ffi open_sync provides immediate synchronous WAL durability" {
 
     const tmp_path = try wormdb.core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
     defer testing.allocator.free(tmp_path);
-    const zpath = try testing.allocator.dupeZ(u8, tmp_path);
+    const zpath = try testing.allocator.dupeSentinel(u8, tmp_path, 0);
     defer testing.allocator.free(zpath);
 
     const db = wormdb_open_sync(zpath.ptr) orelse return error.OpenFailed;
@@ -753,7 +753,7 @@ test "ffi open_sync propagates WAL I/O failures" {
 
     const tmp_path = try wormdb.core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
     defer testing.allocator.free(tmp_path);
-    const zpath = try testing.allocator.dupeZ(u8, tmp_path);
+    const zpath = try testing.allocator.dupeSentinel(u8, tmp_path, 0);
     defer testing.allocator.free(zpath);
 
     const db = wormdb_open_sync(zpath.ptr) orelse return error.OpenFailed;
@@ -776,7 +776,7 @@ test "ffi sync failure has uncertain outcome and blocks writes until recovery" {
     defer tmp_dir.cleanup();
     const tmp_path = try wormdb.core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
     defer testing.allocator.free(tmp_path);
-    const zpath = try testing.allocator.dupeZ(u8, tmp_path);
+    const zpath = try testing.allocator.dupeSentinel(u8, tmp_path, 0);
     defer testing.allocator.free(zpath);
 
     const db = wormdb_open_sync(zpath.ptr) orelse return error.OpenFailed;

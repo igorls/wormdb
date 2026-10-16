@@ -94,11 +94,11 @@ pub const WitnessRecord = struct {
         try appendLenBytes(&out, allocator, self.log_id);
         try appendU64(&out, allocator, self.from_seq);
         try appendU64(&out, allocator, self.to_seq);
-        try appendU8(&out, allocator, @intFromEnum(self.accumulator_kind));
+        try appendU8(&out, allocator, @backingInt(self.accumulator_kind));
         try appendFixed(&out, allocator, self.accumulator_root[0..]);
         try appendFixed(&out, allocator, self.checkpoint_hash[0..]);
         try appendLenBytes(&out, allocator, self.witness_identity);
-        try appendU8(&out, allocator, @intFromEnum(self.signature_scheme));
+        try appendU8(&out, allocator, @backingInt(self.signature_scheme));
         try appendU64(&out, allocator, self.observed_at_ms);
         try appendLenBytes(&out, allocator, self.extension_bytes);
 

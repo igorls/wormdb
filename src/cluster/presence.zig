@@ -291,7 +291,16 @@ pub fn appendJsonString(
 const testing = std.testing;
 
 fn pk(fill: u8) [32]u8 {
-    return .{fill} ** 32;
+    return @splat(fill);
+}
+
+fn hexPk(comptime pair: *const [2]u8) [64]u8 {
+    var out: [64]u8 = undefined;
+    for (0..32) |i| {
+        out[i * 2] = pair[0];
+        out[i * 2 + 1] = pair[1];
+    }
+    return out;
 }
 
 test "classify: full transition matrix" {
@@ -429,7 +438,7 @@ test "diffStates: event overflow is capped, states still cached" {
 test "joinJson shape" {
     const msg = try joinJson(testing.allocator, pk(0xab), "node-1", .{ 10, 99, 0, 7 }, 1234);
     defer testing.allocator.free(msg);
-    const expected = "{\"event\":\"join\",\"node\":\"" ++ ("ab" ** 32) ++ "\",\"name\":\"node-1\",\"mesh_ip\":\"10.99.0.7\",\"state\":\"alive\",\"ts\":1234}";
+    const expected = "{\"event\":\"join\",\"node\":\"" ++ hexPk("ab") ++ "\",\"name\":\"node-1\",\"mesh_ip\":\"10.99.0.7\",\"state\":\"alive\",\"ts\":1234}";
     try testing.expectEqualStrings(expected, msg);
 }
 
@@ -437,21 +446,21 @@ test "stateEventJson shapes" {
     const suspect = try stateEventJson(testing.allocator, .suspect, pk(0x01), 99);
     defer testing.allocator.free(suspect);
     try testing.expectEqualStrings(
-        "{\"event\":\"suspect\",\"node\":\"" ++ ("01" ** 32) ++ "\",\"state\":\"suspected\",\"ts\":99}",
+        "{\"event\":\"suspect\",\"node\":\"" ++ hexPk("01") ++ "\",\"state\":\"suspected\",\"ts\":99}",
         suspect,
     );
 
     const recover = try stateEventJson(testing.allocator, .recover, pk(0x02), 100);
     defer testing.allocator.free(recover);
     try testing.expectEqualStrings(
-        "{\"event\":\"recover\",\"node\":\"" ++ ("02" ** 32) ++ "\",\"state\":\"alive\",\"ts\":100}",
+        "{\"event\":\"recover\",\"node\":\"" ++ hexPk("02") ++ "\",\"state\":\"alive\",\"ts\":100}",
         recover,
     );
 
     const dead = try stateEventJson(testing.allocator, .dead, pk(0x03), 101);
     defer testing.allocator.free(dead);
     try testing.expectEqualStrings(
-        "{\"event\":\"dead\",\"node\":\"" ++ ("03" ** 32) ++ "\",\"state\":\"dead\",\"ts\":101}",
+        "{\"event\":\"dead\",\"node\":\"" ++ hexPk("03") ++ "\",\"state\":\"dead\",\"ts\":101}",
         dead,
     );
 }
@@ -460,7 +469,7 @@ test "punchedJson shape" {
     const msg = try punchedJson(testing.allocator, pk(0xcd), .{ 192, 168, 1, 5 }, 51821, 777);
     defer testing.allocator.free(msg);
     try testing.expectEqualStrings(
-        "{\"event\":\"punched\",\"node\":\"" ++ ("cd" ** 32) ++ "\",\"endpoint\":\"192.168.1.5:51821\",\"ts\":777}",
+        "{\"event\":\"punched\",\"node\":\"" ++ hexPk("cd") ++ "\",\"endpoint\":\"192.168.1.5:51821\",\"ts\":777}",
         msg,
     );
 }
@@ -479,9 +488,9 @@ test "appendPeerJson: full and null-optional variants" {
         .incarnation = 7,
         .org_pubkey = pk(0x22),
     });
-    const expected_full = "{\"node\":\"" ++ ("11" ** 32) ++
+    const expected_full = "{\"node\":\"" ++ hexPk("11") ++
         "\",\"name\":\"peer \\\"a\\\"\",\"state\":\"suspected\",\"mesh_ip\":\"10.99.3.4\"," ++
-        "\"age_ms\":1500,\"rtt_us\":250,\"incarnation\":7,\"org\":\"" ++ ("22" ** 32) ++ "\"}";
+        "\"age_ms\":1500,\"rtt_us\":250,\"incarnation\":7,\"org\":\"" ++ hexPk("22") ++ "\"}";
     try testing.expectEqualStrings(expected_full, json.items);
 
     json.clearRetainingCapacity();
@@ -495,7 +504,7 @@ test "appendPeerJson: full and null-optional variants" {
         .incarnation = 0,
         .org_pubkey = null,
     });
-    const expected_null = "{\"node\":\"" ++ ("11" ** 32) ++
+    const expected_null = "{\"node\":\"" ++ hexPk("11") ++
         "\",\"name\":\"\",\"state\":\"alive\",\"mesh_ip\":\"10.99.0.1\"," ++
         "\"age_ms\":0,\"rtt_us\":null,\"incarnation\":0,\"org\":null}";
     try testing.expectEqualStrings(expected_null, json.items);

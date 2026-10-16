@@ -978,7 +978,9 @@ test "claim: winner grants deterministically, loser sees the winner" {
 
     // worker-a's claim.request is already on the log with a very low HLC —
     // it is the deterministic winner regardless of who arbitrates first.
-    _ = try injectEvent(allocator, &store,
+    _ = try injectEvent(
+        allocator,
+        &store,
         "coord:test",
         "{\"t\":\"claim.request\",\"task\":\"task-1\",\"hlc\":\"0000000000000010\",\"by\":\"worker-a\",\"lease_ms\":3600000}",
     );
@@ -1023,11 +1025,15 @@ test "claim: expired lease reopens the task for a new claim" {
     const allocator = arena.allocator();
 
     // worker-a held the task, but the lease expired long ago (epoch ms 1).
-    _ = try injectEvent(allocator, &store,
+    _ = try injectEvent(
+        allocator,
+        &store,
         "coord:test",
         "{\"t\":\"claim.request\",\"task\":\"task-2\",\"hlc\":\"0000000000000010\",\"by\":\"worker-a\",\"lease_ms\":1}",
     );
-    _ = try injectEvent(allocator, &store,
+    _ = try injectEvent(
+        allocator,
+        &store,
         "coord:test",
         "{\"t\":\"claim.grant\",\"task\":\"task-2\",\"winner\":\"worker-a\",\"winner_hlc\":\"0000000000000010\",\"granted_seq\":1,\"lease_expires_ms\":1,\"hlc\":\"0000000000000011\"}",
     );
@@ -1092,11 +1098,15 @@ test "supersede: stale grant is marked, active grant is protected" {
 
     // A grant whose lease expired at epoch ms 1 — a worker rejoining from a
     // partition would still believe it holds this claim.
-    _ = try injectEvent(allocator, &store,
+    _ = try injectEvent(
+        allocator,
+        &store,
         "coord:test",
         "{\"t\":\"claim.request\",\"task\":\"task-4\",\"hlc\":\"0000000000000010\",\"by\":\"worker-a\",\"lease_ms\":1}",
     );
-    const stale_grant_seq = try injectEvent(allocator, &store,
+    const stale_grant_seq = try injectEvent(
+        allocator,
+        &store,
         "coord:test",
         "{\"t\":\"claim.grant\",\"task\":\"task-4\",\"winner\":\"worker-a\",\"winner_hlc\":\"0000000000000010\",\"granted_seq\":1,\"lease_expires_ms\":1,\"hlc\":\"0000000000000011\"}",
     );

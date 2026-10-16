@@ -22,7 +22,7 @@ pub const ACCUMULATOR_STATE_PREFIX: []const u8 = "proof:append-log-mmr-state:v1:
 pub const ACCUMULATOR_STATE_SUFFIX: []const u8 = ":state:";
 pub const ACCUMULATOR_STATE_MAGIC: []const u8 = "WDBMMRS1";
 pub const ACCUMULATOR_STATE_VERSION: u16 = 1;
-pub const ZERO_HASH: Hash = [_]u8{0} ** HASH_LEN;
+pub const ZERO_HASH: Hash = @splat(0);
 
 const LOG_ID_MAX: usize = std.math.maxInt(u32);
 const PAYLOAD_MAX: usize = std.math.maxInt(u32);

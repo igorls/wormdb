@@ -33,7 +33,7 @@ const OpType = enum(u8) {
 };
 
 fn encodeUserData(slot: u16, op: OpType) u64 {
-    return @as(u64, slot) | (@as(u64, @intFromEnum(op)) << 16);
+    return @as(u64, slot) | (@as(u64, @backingInt(op)) << 16);
 }
 
 fn decodeSlot(user_data: u64) u16 {
@@ -41,7 +41,7 @@ fn decodeSlot(user_data: u64) u16 {
 }
 
 fn decodeOp(user_data: u64) OpType {
-    return @enumFromInt(@as(u8, @truncate((user_data >> 16) & 0xFF)));
+    return @fromBackingInt(@intCast(@as(u8, @truncate((user_data >> 16) & 0xFF))));
 }
 
 // ── Per-connection state ──

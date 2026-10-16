@@ -543,7 +543,7 @@ test "trust EXEC lifecycle: grant → fold shows it, revoke → fold hides it" {
     try testing.expect(std.mem.containsAtLeast(u8, folded_value, 1, "\"verified\":true"));
 
     // Fold filtered to a different to_org is empty.
-    const other_hex = try hexOf(allocator, &([_]u8{0x33} ** 32));
+    const other_hex = try hexOf(allocator, &@as([32]u8, @splat(0x33)));
     const filtered = try runProc(&store, foldExecute, &.{ a_hex, other_hex }, allocator);
     try testing.expect(std.mem.containsAtLeast(u8, filtered.value.?, 1, "\"capabilities\":[]"));
 

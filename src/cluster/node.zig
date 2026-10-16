@@ -379,11 +379,7 @@ pub const Cluster = struct {
         wg_private[31] &= 127;
         wg_private[31] |= 64;
 
-        const wg_public = std.crypto.dh.X25519.recoverPublicKey(wg_private) catch {
-            std.log.err("cluster: failed to derive WG public key", .{});
-            self.running.store(false, .release);
-            return;
-        };
+        const wg_public = std.crypto.dh.X25519.recoverPublicKey(wg_private);
 
         // Setup WireGuard kernel interface (Linux-only: meshguard manages the
         // interface via netlink, which has no Windows/macOS equivalent here).
@@ -1470,13 +1466,34 @@ fn resolveSeedEndpoint(seed_str: []const u8) ?messages.Endpoint {
     // @cImport of netdb.h/arpa/inet.h is POSIX-only; clustering is disabled off
     // Linux, so an unresolved hostname seed simply fails there.
     if (comptime builtin.os.tag == .linux) {
-        const c = @cImport({
-            @cInclude("netdb.h");
-            @cInclude("arpa/inet.h");
-        });
+        const c = struct {
+            const AF_INET: c_int = 2;
+            const SOCK_DGRAM: c_int = 2;
+            const in_addr = extern struct {
+                s_addr: u32,
+            };
+            const struct_sockaddr_in = extern struct {
+                sin_family: u16,
+                sin_port: u16,
+                sin_addr: in_addr,
+                sin_zero: [8]u8,
+            };
+            const struct_addrinfo = extern struct {
+                ai_flags: c_int,
+                ai_family: c_int,
+                ai_socktype: c_int,
+                ai_protocol: c_int,
+                ai_addrlen: u32,
+                ai_addr: ?*anyopaque,
+                ai_canonname: ?[*:0]u8,
+                ai_next: ?*@This(),
+            };
+            extern "c" fn getaddrinfo(node: [*:0]const u8, service: ?[*:0]const u8, hints: ?*const struct_addrinfo, res: *?*struct_addrinfo) c_int;
+            extern "c" fn freeaddrinfo(res: *struct_addrinfo) void;
+        };
 
         // Null-terminate the hostname for C
-        var host_buf: [256]u8 = undefined;
+        var host_buf: [256:0]u8 = undefined;
         if (host.len >= host_buf.len) return null;
         @memcpy(host_buf[0..host.len], host);
         host_buf[host.len] = 0;

@@ -32,6 +32,16 @@ fn linkCrypto(b: *std.Build, mod: *std.Build.Module, os_tag: std.Target.Os.Tag, 
 /// `bin/Release/libmsquic.so`). The binary then needs libmsquic.so at runtime (set LD_LIBRARY_PATH or an
 /// rpath to deps/msquic/build/bin/Release). Build/verify on Linux (see docker/build-linux.sh).
 fn linkQuic(b: *std.Build, mod: *std.Build.Module) void {
+    const wtf_c = b.addTranslateC(.{
+        .root_source_file = b.path("deps/libwtf/include/wtf.h"),
+        .target = mod.resolved_target.?,
+        .optimize = mod.optimize orelse .Debug,
+    });
+    wtf_c.addIncludePath(b.path("deps/msquic/src/inc"));
+    wtf_c.addIncludePath(b.path("deps/libwtf/include"));
+    wtf_c.addIncludePath(b.path("deps/libwtf/build/include"));
+    mod.addImport("wtf_c", wtf_c.createModule());
+
     // MsQuic's default build is a shared library — link libmsquic.so from its build output dir.
     mod.addLibraryPath(b.path("deps/msquic/build/bin/Release"));
     mod.linkSystemLibrary("msquic", .{});
@@ -183,7 +193,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     const run_exe = b.addRunArtifact(exe);
-    if (b.args) |args| run_exe.addArgs(args);
+    run_exe.addPassthruArgs();
     const run_step = b.step("run", "Run the basic WormDB server");
     run_step.dependOn(&run_exe.step);
 

@@ -140,7 +140,7 @@ pub const NamespaceIndex = struct {
     /// Tombstone bitset: bit i set ⇔ node i is logically deleted.
     /// Length tracks hnsw.len() — grown on every insertLocked. Search
     /// traversal skips tombstoned neighbors entirely.
-    tombstones: std.DynamicBitSetUnmanaged,
+    tombstones: std.bit_set.Dynamic,
     /// Running count of set bits in `tombstones`, kept in sync as a cache
     /// so `vstats` can report deletion density without re-scanning.
     tombstone_count: usize,
@@ -477,7 +477,7 @@ pub const NamespaceIndex = struct {
         hnsw_scratch: []hnsw_mod.SearchResult,
     ) !usize {
         if (hnsw_scratch.len < k) return error.ScratchTooSmall;
-        const filter: ?*const std.DynamicBitSetUnmanaged =
+        const filter: ?*const std.bit_set.Dynamic =
             if (self.tombstone_count > 0) &self.tombstones else null;
         const n = try self.hnsw.search(query, k, ef, hnsw_scratch[0..k], filter);
         for (0..n) |i| {
@@ -685,10 +685,10 @@ pub const NamespaceIndex = struct {
         // narrowing has to be explicit; the value is bounded by the vector count, far under 2^32.
         const tombstone_count: usize = @intCast(std.mem.readInt(u64, tc_buf[0..8], .little));
 
-        var tombstones: std.DynamicBitSetUnmanaged = if (node_count == 0)
+        var tombstones: std.bit_set.Dynamic = if (node_count == 0)
             .{}
         else
-            try std.DynamicBitSetUnmanaged.initEmpty(allocator, node_count);
+            try std.bit_set.Dynamic.initEmpty(allocator, node_count);
         errdefer tombstones.deinit(allocator);
 
         const tomb_bytes = (node_count + 7) / 8;
@@ -1280,7 +1280,6 @@ test "namespace index: clearLocked resets dim for rebuild under new dim" {
     _ = try idx.insertLocked("vec:b", v3_align, 2);
     try testing.expectEqual(@as(?usize, 3), idx.dim);
 }
-
 
 // ╔═══════════════════════════════════════════════════╗
 // ║  Registry serialization tests                      ║

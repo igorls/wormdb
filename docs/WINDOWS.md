@@ -20,7 +20,7 @@ build, what works, the limitations, and what a clustering port would take.
 
 ## Prerequisites
 
-- **Zig 0.16.0**. The native target resolves to `x86_64-windows-gnu` (MinGW ABI).
+- **Zig 0.17.0**. The native target resolves to `x86_64-windows-gnu` (MinGW ABI).
 - **Crypto backend** — Windows defaults to Zig's `std.crypto`, with no libsodium
   dependency. `-Dcrypto-backend=sodium` explicitly selects the static MinGW build
   at `deps/lib/windows-x86_64/libsodium.a`. See [build.zig](../build.zig).
@@ -48,7 +48,7 @@ Almost all platform-specific code is funnelled through
 [src/core/compat.zig](../src/core/compat.zig). The Windows-relevant pieces:
 
 - **Time** — `nowMs`/`nowNs` use `std.Io.Timestamp.now(.real / .awake)` (the
-  cross-platform 0.16 clock vtable) instead of `std.c.clock_gettime`.
+  cross-platform 0.17 clock vtable) instead of `std.c.clock_gettime`.
 - **Socket I/O** — `net.Stream.read`/`writeAll` keep the raw POSIX path on
   Linux but route through the `std.Io` net vtable on Windows, because Winsock
   `SOCKET`s are not CRT file descriptors (so `std.posix.read`/`write` are

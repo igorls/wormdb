@@ -557,18 +557,18 @@ pub fn writeResponse(writer: anytype, response: Response) !void {
     var w = writer;
     switch (response) {
         .ok => {
-            try writeHeader(w, @intFromEnum(ResponseCode.ok), 0);
+            try writeHeader(w, @backingInt(ResponseCode.ok), 0);
         },
         .value => |maybe_val| {
             if (maybe_val) |val| {
-                try writeHeader(w, @intFromEnum(ResponseCode.value), @intCast(val.len));
+                try writeHeader(w, @backingInt(ResponseCode.value), @intCast(val.len));
                 if (val.len > 0) try w.writeAll(val);
             } else {
-                try writeHeader(w, @intFromEnum(ResponseCode.null_value), 0);
+                try writeHeader(w, @backingInt(ResponseCode.null_value), 0);
             }
         },
         .err => |msg| {
-            try writeHeader(w, @intFromEnum(ResponseCode.err), @intCast(msg.len));
+            try writeHeader(w, @backingInt(ResponseCode.err), @intCast(msg.len));
             if (msg.len > 0) try w.writeAll(msg);
         },
         .event => |evt| {
@@ -577,7 +577,7 @@ pub fn writeResponse(writer: anytype, response: Response) !void {
             payload_len += 4 + evt.message.len;
             if (payload_len > MAX_PAYLOAD_LENGTH) return error.PayloadTooLarge;
 
-            try writeHeader(w, @intFromEnum(ResponseCode.event), @intCast(payload_len));
+            try writeHeader(w, @backingInt(ResponseCode.event), @intCast(payload_len));
             try writeLenPrefixed(w, evt.channel);
             try writeLenPrefixed(w, evt.message);
         },
@@ -636,11 +636,11 @@ pub fn writeCommand(writer: anytype, cmd: Command) !void {
     var w = writer;
     switch (cmd) {
         .get => |key| {
-            try writeHeader(w, @intFromEnum(CommandId.get), @intCast(4 + key.len));
+            try writeHeader(w, @backingInt(CommandId.get), @intCast(4 + key.len));
             try writeLenPrefixed(w, key);
         },
         .delete => |key| {
-            try writeHeader(w, @intFromEnum(CommandId.delete), @intCast(4 + key.len));
+            try writeHeader(w, @backingInt(CommandId.delete), @intCast(4 + key.len));
             try writeLenPrefixed(w, key);
         },
         .subscribe => |params| {
@@ -648,25 +648,25 @@ pub fn writeCommand(writer: anytype, cmd: Command) !void {
             if (params.filter) |filter| payload_len += 4 + filter.len;
             if (payload_len > MAX_PAYLOAD_LENGTH) return error.PayloadTooLarge;
 
-            try writeHeader(w, @intFromEnum(CommandId.subscribe), @intCast(payload_len));
+            try writeHeader(w, @backingInt(CommandId.subscribe), @intCast(payload_len));
             try writeLenPrefixed(w, params.channel);
             if (params.filter) |filter| try writeLenPrefixed(w, filter);
         },
         .unsubscribe => |channel| {
-            try writeHeader(w, @intFromEnum(CommandId.unsubscribe), @intCast(4 + channel.len));
+            try writeHeader(w, @backingInt(CommandId.unsubscribe), @intCast(4 + channel.len));
             try writeLenPrefixed(w, channel);
         },
         .status => {
-            try writeHeader(w, @intFromEnum(CommandId.status), 0);
+            try writeHeader(w, @backingInt(CommandId.status), 0);
         },
         .cluster_status => {
-            try writeHeader(w, @intFromEnum(CommandId.cluster_status), 0);
+            try writeHeader(w, @backingInt(CommandId.cluster_status), 0);
         },
         .cluster_peers => {
-            try writeHeader(w, @intFromEnum(CommandId.cluster_peers), 0);
+            try writeHeader(w, @backingInt(CommandId.cluster_peers), 0);
         },
         .save => {
-            try writeHeader(w, @intFromEnum(CommandId.save), 0);
+            try writeHeader(w, @backingInt(CommandId.save), 0);
         },
         .set => |params| {
             var payload_len: usize = 1;
@@ -674,7 +674,7 @@ pub fn writeCommand(writer: anytype, cmd: Command) !void {
             payload_len += 4 + params.value.len;
             if (payload_len > MAX_PAYLOAD_LENGTH) return error.PayloadTooLarge;
 
-            try writeHeader(w, @intFromEnum(CommandId.set), @intCast(payload_len));
+            try writeHeader(w, @backingInt(CommandId.set), @intCast(payload_len));
             const flags: u8 = if (params.worm) 0x01 else 0x00;
             try w.writeAll(&[_]u8{flags});
             try writeLenPrefixed(w, params.key);
@@ -686,7 +686,7 @@ pub fn writeCommand(writer: anytype, cmd: Command) !void {
             payload_len += 4 + params.message.len;
             if (payload_len > MAX_PAYLOAD_LENGTH) return error.PayloadTooLarge;
 
-            try writeHeader(w, @intFromEnum(CommandId.publish), @intCast(payload_len));
+            try writeHeader(w, @backingInt(CommandId.publish), @intCast(payload_len));
             try writeLenPrefixed(w, params.channel);
             try writeLenPrefixed(w, params.message);
         },
@@ -699,7 +699,7 @@ pub fn writeCommand(writer: anytype, cmd: Command) !void {
             }
             if (payload_len > MAX_PAYLOAD_LENGTH) return error.PayloadTooLarge;
 
-            try writeHeader(w, @intFromEnum(CommandId.exec), @intCast(payload_len));
+            try writeHeader(w, @backingInt(CommandId.exec), @intCast(payload_len));
             try writeLenPrefixed(w, params.procedure);
             var count_buf: [4]u8 = undefined;
             std.mem.writeInt(u32, count_buf[0..4], @intCast(params.args.len), .big);
@@ -709,7 +709,7 @@ pub fn writeCommand(writer: anytype, cmd: Command) !void {
             }
         },
         .auth => |token| {
-            try writeHeader(w, @intFromEnum(CommandId.auth), @intCast(4 + token.len));
+            try writeHeader(w, @backingInt(CommandId.auth), @intCast(4 + token.len));
             try writeLenPrefixed(w, token);
         },
         .vinsert => |params| {
@@ -723,7 +723,7 @@ pub fn writeCommand(writer: anytype, cmd: Command) !void {
             payload_len += 8;
             if (payload_len > MAX_PAYLOAD_LENGTH) return error.PayloadTooLarge;
 
-            try writeHeader(w, @intFromEnum(CommandId.vinsert), @intCast(payload_len));
+            try writeHeader(w, @backingInt(CommandId.vinsert), @intCast(payload_len));
             try writeLenPrefixed(w, params.key);
             try writeLenPrefixed(w, params.vector);
             var flags: u8 = 0;
@@ -742,7 +742,7 @@ pub fn writeCommand(writer: anytype, cmd: Command) !void {
             payload_len += 4 + params.namespace.len;
             if (payload_len > MAX_PAYLOAD_LENGTH) return error.PayloadTooLarge;
 
-            try writeHeader(w, @intFromEnum(CommandId.vdelete), @intCast(payload_len));
+            try writeHeader(w, @backingInt(CommandId.vdelete), @intCast(payload_len));
             try writeLenPrefixed(w, params.key);
             try writeLenPrefixed(w, params.namespace);
         },
@@ -759,7 +759,7 @@ pub fn writeCommand(writer: anytype, cmd: Command) !void {
             }
             if (payload_len > MAX_PAYLOAD_LENGTH) return error.PayloadTooLarge;
 
-            try writeHeader(w, @intFromEnum(CommandId.vbulkinsert), @intCast(payload_len));
+            try writeHeader(w, @backingInt(CommandId.vbulkinsert), @intCast(payload_len));
             try writeLenPrefixed(w, params.namespace);
             try writeLenPrefixed(w, params.metric);
             var flags: u8 = 0;
@@ -787,7 +787,7 @@ pub fn writeCommand(writer: anytype, cmd: Command) !void {
             payload_len += 4 + params.rotation.len;
             if (payload_len > MAX_PAYLOAD_LENGTH) return error.PayloadTooLarge;
 
-            try writeHeader(w, @intFromEnum(CommandId.vrabitq_install), @intCast(payload_len));
+            try writeHeader(w, @backingInt(CommandId.vrabitq_install), @intCast(payload_len));
             try writeLenPrefixed(w, params.namespace);
             var dim_buf: [4]u8 = undefined;
             std.mem.writeInt(u32, dim_buf[0..4], params.dim, .big);
@@ -871,7 +871,7 @@ test "wire rejects oversized declared payload" {
     const testing = std.testing;
 
     var frame: [5]u8 = undefined;
-    frame[0] = @intFromEnum(CommandId.get);
+    frame[0] = @backingInt(CommandId.get);
     std.mem.writeInt(u32, frame[1..5], MAX_PAYLOAD_LENGTH + 1, .big);
 
     var reader = TestSliceReader{ .buffer = &frame };
@@ -953,7 +953,7 @@ test "wire rejects impossible VBULKINSERT count before allocation" {
     // Payload: empty namespace, empty metric, flags=0, count=0xffff_ffff, and no item records.
     // The parser must reject based on remaining bytes before attempting to allocate count items.
     var frame: [18]u8 = undefined;
-    frame[0] = @intFromEnum(CommandId.vbulkinsert);
+    frame[0] = @backingInt(CommandId.vbulkinsert);
     std.mem.writeInt(u32, frame[1..5], 13, .big);
     var pos: usize = 5;
     std.mem.writeInt(u32, frame[pos..][0..4], 0, .big);

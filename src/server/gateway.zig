@@ -1174,7 +1174,7 @@ test "gateway allocator-backed response encoder handles payloads over 64 KiB" {
     defer testing.allocator.free(encoded);
 
     try testing.expectEqual(@as(usize, payload.len + 5), encoded.len);
-    try testing.expectEqual(@as(u8, @intFromEnum(wire.ResponseCode.value)), encoded[0]);
+    try testing.expectEqual(@as(u8, @backingInt(wire.ResponseCode.value)), encoded[0]);
     try testing.expectEqual(@as(u32, @intCast(payload.len)), std.mem.readInt(u32, encoded[1..5], .big));
     try testing.expectEqualSlices(u8, payload, encoded[5..]);
 }

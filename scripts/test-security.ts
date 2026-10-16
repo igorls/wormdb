@@ -291,7 +291,12 @@ test("explicit cluster-open acknowledgment preserves legacy replication", () => 
     p.socket.write("WR");
     await delay(800);
     assert.ok(!p.closed, "accepted legacy replication must remain idle-capable");
-    assert.equal((await p.request(set())).code, 0);
+    // Replicated writes are one-way (the sender never reads replies), so SET gets no response.
+    // A request/response replication RPC behind it proves the stream is live and the SET applied.
+    p.socket.write(set());
+    const root = await p.request(frame(9, Buffer.concat([field("proof_prefix_root"), u32(1), field("tenant:")])));
+    assert.equal(root.code, 1);
+    assert.match(root.body.toString(), /"entry_count":1[,}]/);
   }
   finally { p.close(); }
 }, "none", ["--cluster-open"]));

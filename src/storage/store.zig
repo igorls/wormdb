@@ -180,6 +180,36 @@ pub const Store = struct {
     /// cover live entries only.
     ssts_buf: [MAX_SSTS]*const Sst = undefined,
     sst_count: usize = 0,
+    /// Per-Store sequence hint cache for `proof/append_log.zig` tail lookups.
+    /// Scoped to the `Store` instance (rather than a process-global table keyed
+    /// by `@intFromPtr(store)`) so address reuse across open/close or FFI
+    /// lifetimes never inherits stale sequence hints.
+    seq_hints: [SEQ_HINT_SLOTS]SeqHintSlot = @splat(.{}),
+
+    pub const SEQ_HINT_SLOTS: usize = 64;
+    pub const SeqHintSlot = struct {
+        mutex: core.compat.Mutex = .{},
+        log_hash: [32]u8 = @splat(0),
+        seq: u64 = 0,
+    };
+
+    pub fn getAppendLogSeqHint(self: *Store, log_hash: [32]u8) u64 {
+        const slot = &self.seq_hints[log_hash[0] & (SEQ_HINT_SLOTS - 1)];
+        slot.mutex.lock();
+        defer slot.mutex.unlock();
+        if (std.mem.eql(u8, slot.log_hash[0..], log_hash[0..])) {
+            return slot.seq;
+        }
+        return 0;
+    }
+
+    pub fn setAppendLogSeqHint(self: *Store, log_hash: [32]u8, seq: u64) void {
+        const slot = &self.seq_hints[log_hash[0] & (SEQ_HINT_SLOTS - 1)];
+        slot.mutex.lock();
+        defer slot.mutex.unlock();
+        slot.log_hash = log_hash;
+        slot.seq = seq;
+    }
 
     /// Attach the per-namespace HNSW registry to this store so snapshots
     /// persist and restore graph state alongside KV data. Call after both
@@ -343,6 +373,7 @@ pub const Store = struct {
             shard.sorted.deinit(self.allocator);
         }
         self.snapshot_arena.deinit();
+        self.seq_hints = @splat(.{});
     }
 
     pub fn destroyEntry(self: *Store, entry: *Entry) void {
@@ -874,6 +905,96 @@ pub const Store = struct {
         return self.scanPrefixCut(prefix, limit, alloc, .first);
     }
 
+    fn scanHeapWorse(cut: ScanCut, a: ScanResult, b: ScanResult) bool {
+        // Returns true if `a` is closer to eviction than `b` (so `a` sits higher in the heap):
+        // - For `.first` (keep smallest): max-heap root is the LARGEST key (`a.key > b.key`).
+        // - For `.last` (keep largest): min-heap root is the SMALLEST key (`a.key < b.key`).
+        return switch (cut) {
+            .first => std.mem.order(u8, a.key, b.key) == .gt,
+            .last => std.mem.order(u8, a.key, b.key) == .lt,
+        };
+    }
+
+    fn scanHeapSiftUp(items: []ScanResult, cut: ScanCut, start_idx: usize) void {
+        var idx = start_idx;
+        while (idx > 0) {
+            const parent = (idx - 1) / 2;
+            if (scanHeapWorse(cut, items[idx], items[parent])) {
+                std.mem.swap(ScanResult, &items[idx], &items[parent]);
+                idx = parent;
+            } else break;
+        }
+    }
+
+    fn scanHeapSiftDown(items: []ScanResult, cut: ScanCut, start_idx: usize) void {
+        var idx = start_idx;
+        const len = items.len;
+        while (true) {
+            const left = 2 * idx + 1;
+            if (left >= len) break;
+            var best = left;
+            const right = left + 1;
+            if (right < len and scanHeapWorse(cut, items[right], items[left])) {
+                best = right;
+            }
+            if (scanHeapWorse(cut, items[best], items[idx])) {
+                std.mem.swap(ScanResult, &items[idx], &items[best]);
+                idx = best;
+            } else break;
+        }
+    }
+
+    fn scanHeapOffer(
+        results: *std.ArrayListUnmanaged(ScanResult),
+        alloc: std.mem.Allocator,
+        limit: usize,
+        cut: ScanCut,
+        key: []const u8,
+        value: []const u8,
+        timestamp: u64,
+        is_worm: bool,
+    ) !bool {
+        if (limit > 0 and results.items.len == limit) {
+            // Check against the eviction root before duping any memory:
+            const better = switch (cut) {
+                .first => std.mem.order(u8, key, results.items[0].key) == .lt,
+                .last => std.mem.order(u8, key, results.items[0].key) == .gt,
+            };
+            if (!better) return false;
+
+            const key_copy = try alloc.dupe(u8, key);
+            errdefer alloc.free(key_copy);
+            const val_copy = try alloc.dupe(u8, value);
+
+            alloc.free(results.items[0].key);
+            alloc.free(results.items[0].value);
+            results.items[0] = .{
+                .key = key_copy,
+                .value = val_copy,
+                .timestamp = timestamp,
+                .is_worm = is_worm,
+            };
+            scanHeapSiftDown(results.items, cut, 0);
+            return true;
+        }
+
+        const key_copy = try alloc.dupe(u8, key);
+        errdefer alloc.free(key_copy);
+        const val_copy = try alloc.dupe(u8, value);
+        errdefer alloc.free(val_copy);
+
+        try results.append(alloc, .{
+            .key = key_copy,
+            .value = val_copy,
+            .timestamp = timestamp,
+            .is_worm = is_worm,
+        });
+        if (limit > 0) {
+            scanHeapSiftUp(results.items, cut, results.items.len - 1);
+        }
+        return true;
+    }
+
     fn scanPrefixCut(
         self: *Store,
         prefix: []const u8,
@@ -889,36 +1010,40 @@ pub const Store = struct {
             }
             results.deinit(alloc);
         }
+        if (limit > 0) {
+            try results.ensureTotalCapacity(alloc, limit);
+        }
 
-        // Collect each shard's match range. With a limit, only a shard's
-        // first/last `limit` matches (per the cut) can survive the global cut
-        // below, so the rest are never copied.
+        // Collect each shard's match range. With a bounded heap of size `limit`
+        // and sorted shard ranges, we stop iterating a shard as soon as the
+        // first candidate fails to beat the heap's eviction root — zero extra
+        // allocations or copies for dominated keys.
         for (&self.shards) |*shard| {
             shard.mutex.lock();
             defer shard.mutex.unlock();
 
             const range = prefixRange(shard.sorted.items, prefix);
-            var start = range.lo;
-            var end = range.hi;
-            if (limit > 0 and range.hi - range.lo > limit) {
-                switch (cut) {
-                    .first => end = range.lo + limit,
-                    .last => start = range.hi - limit,
-                }
-            }
-            for (shard.sorted.items[start..end]) |e| {
-                // Copy key and value into the arena so they survive after unlock
-                const key_copy = try alloc.dupe(u8, e.key);
-                errdefer alloc.free(key_copy);
-                const val_copy = try alloc.dupe(u8, e.value);
-                errdefer alloc.free(val_copy);
+            if (range.lo == range.hi) continue;
 
-                try results.append(alloc, .{
-                    .key = key_copy,
-                    .value = val_copy,
-                    .timestamp = e.timestamp,
-                    .is_worm = e.flags.is_worm,
-                });
+            if (limit > 0 and cut == .last) {
+                const start = if (range.hi - range.lo > limit) range.hi - limit else range.lo;
+                var idx = range.hi;
+                while (idx > start) {
+                    idx -= 1;
+                    const e = shard.sorted.items[idx];
+                    if (!try scanHeapOffer(&results, alloc, limit, cut, e.key, e.value, e.timestamp, e.flags.is_worm)) {
+                        // Descending traversal: all earlier keys in this shard are even smaller.
+                        break;
+                    }
+                }
+            } else {
+                const end = if (limit > 0 and range.hi - range.lo > limit) range.lo + limit else range.hi;
+                for (shard.sorted.items[range.lo..end]) |e| {
+                    if (!try scanHeapOffer(&results, alloc, limit, cut, e.key, e.value, e.timestamp, e.flags.is_worm)) {
+                        // Ascending traversal: all subsequent keys in this shard are even larger.
+                        break;
+                    }
+                }
             }
         }
 
@@ -929,63 +1054,38 @@ pub const Store = struct {
         const live_may_shadow = self.sst_count > 0 and self.livePrefixNonEmpty(prefix);
         for (self.ssts_buf[0..self.sst_count]) |sst| {
             const range = sst.prefixRange(prefix);
-            var start = range.lo;
-            var end = range.hi;
-            if (limit > 0 and range.hi - range.lo > limit) {
-                switch (cut) {
-                    .first => end = range.lo + limit,
-                    .last => start = range.hi - limit,
+            if (range.lo == range.hi) continue;
+
+            if (limit > 0 and cut == .last) {
+                const start = if (range.hi - range.lo > limit) range.hi - limit else range.lo;
+                var idx = range.hi;
+                while (idx > start) {
+                    idx -= 1;
+                    const hit = sst.hitAt(idx);
+                    if (live_may_shadow and self.containsLive(hit.key)) continue;
+                    if (!try scanHeapOffer(&results, alloc, limit, cut, hit.key, hit.value, hit.timestamp, hit.is_worm)) {
+                        break;
+                    }
                 }
-            }
-            var i = start;
-            while (i < end) : (i += 1) {
-                const hit = sst.hitAt(i);
-                if (live_may_shadow and self.containsLive(hit.key)) continue;
-
-                const key_copy = try alloc.dupe(u8, hit.key);
-                errdefer alloc.free(key_copy);
-                const val_copy = try alloc.dupe(u8, hit.value);
-                errdefer alloc.free(val_copy);
-
-                try results.append(alloc, .{
-                    .key = key_copy,
-                    .value = val_copy,
-                    .timestamp = hit.timestamp,
-                    .is_worm = hit.is_worm,
-                });
+            } else {
+                const end = if (limit > 0 and range.hi - range.lo > limit) range.lo + limit else range.hi;
+                var i = range.lo;
+                while (i < end) : (i += 1) {
+                    const hit = sst.hitAt(i);
+                    if (live_may_shadow and self.containsLive(hit.key)) continue;
+                    if (!try scanHeapOffer(&results, alloc, limit, cut, hit.key, hit.value, hit.timestamp, hit.is_worm)) {
+                        break;
+                    }
+                }
             }
         }
 
-        // Sort by key ascending (lexicographic = chronological for timestamp-keyed data)
+        // Sort surviving items by key ascending (lexicographic = chronological for timestamp-keyed data)
         std.sort.heap(ScanResult, results.items, {}, struct {
             fn lessThan(_: void, a: ScanResult, b: ScanResult) bool {
                 return std.mem.lessThan(u8, a.key, b.key);
             }
         }.lessThan);
-
-        // Apply the limit on the requested end of the ascending match set.
-        if (limit > 0 and results.items.len > limit) {
-            switch (cut) {
-                .first => {
-                    for (results.items[limit..]) |r| {
-                        alloc.free(r.key);
-                        alloc.free(r.value);
-                    }
-                    results.shrinkRetainingCapacity(limit);
-                },
-                .last => {
-                    // Free the excess oldest entries
-                    const excess = results.items.len - limit;
-                    for (results.items[0..excess]) |r| {
-                        alloc.free(r.key);
-                        alloc.free(r.value);
-                    }
-                    // Shift the remaining items
-                    std.mem.copyForwards(ScanResult, results.items[0..limit], results.items[excess..]);
-                    results.shrinkRetainingCapacity(limit);
-                },
-            }
-        }
 
         return try results.toOwnedSlice(alloc);
     }
@@ -1375,11 +1475,9 @@ pub const Store = struct {
         self.snapshot_mutex.lock();
         defer self.snapshot_mutex.unlock();
 
-        // Phase 1: under all shard locks, deep-copy live KV (+ optional HNSW
-        // trailer bytes) into owned buffers. Phase 2 (disk I/O) does NOT hold
-        // shard locks — that froze STATUS/EXECs for the whole snapshot (#91).
-        // Callers that truncate the WAL must hold wal_enqueue_mutex across
-        // this function + truncate so durable writers cannot interleave.
+        // Phase 1: under all shard locks, deep-copy each shard's already-sorted
+        // entries (+ optional HNSW trailer bytes) into a single bump arena.
+        // Phase 2 (256-way merge + disk I/O) does NOT hold shard locks (#91).
         const SnapRec = struct {
             key: []u8,
             value: []u8,
@@ -1387,14 +1485,12 @@ pub const Store = struct {
             timestamp: u64,
         };
 
-        var records: std.ArrayListUnmanaged(SnapRec) = .empty;
-        defer {
-            for (records.items) |rec| {
-                self.allocator.free(rec.key);
-                self.allocator.free(rec.value);
-            }
-            records.deinit(self.allocator);
-        }
+        var snap_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer snap_arena.deinit();
+        const snap_alloc = snap_arena.allocator();
+
+        var shard_slices: [SHARD_COUNT][]SnapRec = undefined;
+        var total_records: usize = 0;
 
         var hnsw_trailer: std.ArrayListUnmanaged(u8) = .empty;
         defer hnsw_trailer.deinit(self.allocator);
@@ -1403,26 +1499,21 @@ pub const Store = struct {
             for (&self.shards) |*shard| shard.mutex.lock();
             defer for (&self.shards) |*shard| shard.mutex.unlock();
 
-            var data_count: usize = 0;
-            for (&self.shards) |*shard| data_count += shard.data.count();
-            try records.ensureTotalCapacity(self.allocator, data_count);
-
-            for (&self.shards) |*shard| {
-                var iter = shard.data.iterator();
-                while (iter.next()) |item| {
-                    const entry = item.value_ptr.*;
-                    const k = try self.allocator.dupe(u8, entry.key);
-                    errdefer self.allocator.free(k);
-                    const v = try self.allocator.dupe(u8, entry.value);
+            for (&self.shards, 0..) |*shard, si| {
+                const items = shard.sorted.items;
+                total_records += items.len;
+                const slice = try snap_alloc.alloc(SnapRec, items.len);
+                for (items, 0..) |entry, i| {
                     var flags = entry.flags;
                     flags.arena_owned = false;
-                    records.appendAssumeCapacity(.{
-                        .key = k,
-                        .value = v,
+                    slice[i] = .{
+                        .key = try snap_alloc.dupe(u8, entry.key),
+                        .value = try snap_alloc.dupe(u8, entry.value),
                         .flags = flags,
                         .timestamp = entry.timestamp,
-                    });
+                    };
                 }
+                shard_slices[si] = slice;
             }
 
             // Capture HNSW while shards are still locked so the trailer matches
@@ -1444,12 +1535,6 @@ pub const Store = struct {
                 }
             }
         }
-
-        std.sort.heap(SnapRec, records.items, {}, struct {
-            fn lessThan(_: void, lhs: SnapRec, rhs: SnapRec) bool {
-                return std.mem.lessThan(u8, lhs.key, rhs.key);
-            }
-        }.lessThan);
 
         const temp_snapshot_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{self.config.snapshot_path});
         defer self.allocator.free(temp_snapshot_path);
@@ -1474,21 +1559,92 @@ pub const Store = struct {
         try writer.writeAll(version_buf[0..4]);
 
         var count_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, count_buf[0..8], @intCast(records.items.len), .little);
+        std.mem.writeInt(u64, count_buf[0..8], @intCast(total_records), .little);
         try writer.writeAll(count_buf[0..8]);
 
-        for (records.items) |rec| {
-            // Fixed entry header (matches the load path's single 17-byte read):
-            // key_len u32 | value_len u32 | flags u8 | timestamp u64.
+        // 256-way min-heap merge across already-sorted shard slices: O(N log 256)
+        const MergeCursor = struct {
+            shard_idx: u16,
+            pos: u32,
+            rec: SnapRec,
+        };
+        var heap: [SHARD_COUNT]MergeCursor = undefined;
+        var heap_len: usize = 0;
+
+        const siftUp = struct {
+            fn call(h: []MergeCursor, start: usize) void {
+                var idx = start;
+                while (idx > 0) {
+                    const parent = (idx - 1) / 2;
+                    if (std.mem.lessThan(u8, h[idx].rec.key, h[parent].rec.key)) {
+                        std.mem.swap(MergeCursor, &h[idx], &h[parent]);
+                        idx = parent;
+                    } else break;
+                }
+            }
+        }.call;
+
+        const siftDown = struct {
+            fn call(h: []MergeCursor, start: usize) void {
+                var idx = start;
+                const len = h.len;
+                while (true) {
+                    const left = 2 * idx + 1;
+                    if (left >= len) break;
+                    var smallest = left;
+                    const right = left + 1;
+                    if (right < len and std.mem.lessThan(u8, h[right].rec.key, h[left].rec.key)) {
+                        smallest = right;
+                    }
+                    if (std.mem.lessThan(u8, h[smallest].rec.key, h[idx].rec.key)) {
+                        std.mem.swap(MergeCursor, &h[idx], &h[smallest]);
+                        idx = smallest;
+                    } else break;
+                }
+            }
+        }.call;
+
+        for (shard_slices, 0..) |slice, si| {
+            if (slice.len > 0) {
+                heap[heap_len] = .{
+                    .shard_idx = @intCast(si),
+                    .pos = 0,
+                    .rec = slice[0],
+                };
+                siftUp(heap[0 .. heap_len + 1], heap_len);
+                heap_len += 1;
+            }
+        }
+
+        while (heap_len > 0) {
+            const top = heap[0];
+            const rec = top.rec;
+
             var header_buf: [17]u8 = undefined;
             std.mem.writeInt(u32, header_buf[0..4], @intCast(rec.key.len), .little);
             std.mem.writeInt(u32, header_buf[4..8], @intCast(rec.value.len), .little);
             header_buf[8] = @bitCast(rec.flags);
             std.mem.writeInt(u64, header_buf[9..17], rec.timestamp, .little);
             try writer.writeAll(header_buf[0..]);
-
             try writer.writeAll(rec.key);
             try writer.writeAll(rec.value);
+
+            const next_pos = top.pos + 1;
+            const s_slice = shard_slices[top.shard_idx];
+            if (next_pos < s_slice.len) {
+                heap[0] = .{
+                    .shard_idx = top.shard_idx,
+                    .pos = next_pos,
+                    .rec = s_slice[next_pos],
+                };
+                siftDown(heap[0..heap_len], 0);
+            } else {
+                heap_len -= 1;
+                if (heap_len > 0) {
+                    heap[0] = heap[heap_len];
+                    siftDown(heap[0..heap_len], 0);
+                }
+            }
         }
 
         if (hnsw_trailer.items.len > 0) {

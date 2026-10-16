@@ -34,25 +34,42 @@ pub fn cosine(a: []align(1) const f32, b: []align(1) const f32) f32 {
     const len = @min(a.len, b.len);
     if (len == 0) return 0.0;
 
-    var dot_acc: F32xN = ZERO;
-    var norm_a_acc: F32xN = ZERO;
-    var norm_b_acc: F32xN = ZERO;
+    var dot0: F32xN = ZERO;
+    var dot1: F32xN = ZERO;
+    var na0: F32xN = ZERO;
+    var na1: F32xN = ZERO;
+    var nb0: F32xN = ZERO;
+    var nb1: F32xN = ZERO;
 
-    // Vectorized main loop
-    const vec_len = len - (len % LANES);
     var i: usize = 0;
+    const step2 = LANES * 2;
+    const vec2_len = len - (len % step2);
+    while (i < vec2_len) : (i += step2) {
+        const va0: F32xN = a[i..][0..LANES].*;
+        const vb0: F32xN = b[i..][0..LANES].*;
+        const va1: F32xN = a[i + LANES ..][0..LANES].*;
+        const vb1: F32xN = b[i + LANES ..][0..LANES].*;
+        dot0 = @mulAdd(F32xN, va0, vb0, dot0);
+        dot1 = @mulAdd(F32xN, va1, vb1, dot1);
+        na0 = @mulAdd(F32xN, va0, va0, na0);
+        na1 = @mulAdd(F32xN, va1, va1, na1);
+        nb0 = @mulAdd(F32xN, vb0, vb0, nb0);
+        nb1 = @mulAdd(F32xN, vb1, vb1, nb1);
+    }
+
+    const vec_len = len - (len % LANES);
     while (i < vec_len) : (i += LANES) {
         const va: F32xN = a[i..][0..LANES].*;
         const vb: F32xN = b[i..][0..LANES].*;
-        dot_acc = @mulAdd(F32xN, va, vb, dot_acc);
-        norm_a_acc = @mulAdd(F32xN, va, va, norm_a_acc);
-        norm_b_acc = @mulAdd(F32xN, vb, vb, norm_b_acc);
+        dot0 = @mulAdd(F32xN, va, vb, dot0);
+        na0 = @mulAdd(F32xN, va, va, na0);
+        nb0 = @mulAdd(F32xN, vb, vb, nb0);
     }
 
     // Horizontal reduce
-    var dot_sum = @reduce(.Add, dot_acc);
-    var norm_a_sum = @reduce(.Add, norm_a_acc);
-    var norm_b_sum = @reduce(.Add, norm_b_acc);
+    var dot_sum = @reduce(.Add, dot0 + dot1);
+    var norm_a_sum = @reduce(.Add, na0 + na1);
+    var norm_b_sum = @reduce(.Add, nb0 + nb1);
 
     // Scalar tail
     while (i < len) : (i += 1) {
@@ -76,17 +93,37 @@ pub fn dot(a: []align(1) const f32, b: []align(1) const f32) f32 {
     const len = @min(a.len, b.len);
     if (len == 0) return 0.0;
 
-    var acc: F32xN = ZERO;
+    var acc0: F32xN = ZERO;
+    var acc1: F32xN = ZERO;
+    var acc2: F32xN = ZERO;
+    var acc3: F32xN = ZERO;
+
+    var i: usize = 0;
+    const step4 = LANES * 4;
+    const vec4_len = len - (len % step4);
+    while (i < vec4_len) : (i += step4) {
+        const va0: F32xN = a[i..][0..LANES].*;
+        const vb0: F32xN = b[i..][0..LANES].*;
+        const va1: F32xN = a[i + LANES ..][0..LANES].*;
+        const vb1: F32xN = b[i + LANES ..][0..LANES].*;
+        const va2: F32xN = a[i + LANES * 2 ..][0..LANES].*;
+        const vb2: F32xN = b[i + LANES * 2 ..][0..LANES].*;
+        const va3: F32xN = a[i + LANES * 3 ..][0..LANES].*;
+        const vb3: F32xN = b[i + LANES * 3 ..][0..LANES].*;
+        acc0 = @mulAdd(F32xN, va0, vb0, acc0);
+        acc1 = @mulAdd(F32xN, va1, vb1, acc1);
+        acc2 = @mulAdd(F32xN, va2, vb2, acc2);
+        acc3 = @mulAdd(F32xN, va3, vb3, acc3);
+    }
 
     const vec_len = len - (len % LANES);
-    var i: usize = 0;
     while (i < vec_len) : (i += LANES) {
         const va: F32xN = a[i..][0..LANES].*;
         const vb: F32xN = b[i..][0..LANES].*;
-        acc = @mulAdd(F32xN, va, vb, acc);
+        acc0 = @mulAdd(F32xN, va, vb, acc0);
     }
 
-    var sum = @reduce(.Add, acc);
+    var sum = @reduce(.Add, (acc0 + acc1) + (acc2 + acc3));
 
     while (i < len) : (i += 1) {
         sum += a[i] * b[i];
@@ -105,18 +142,32 @@ pub fn l2Squared(a: []align(1) const f32, b: []align(1) const f32) f32 {
     const len = @min(a.len, b.len);
     if (len == 0) return 0.0;
 
-    var acc: F32xN = ZERO;
+    var acc0: F32xN = ZERO;
+    var acc1: F32xN = ZERO;
+    var acc2: F32xN = ZERO;
+    var acc3: F32xN = ZERO;
 
-    const vec_len = len - (len % LANES);
     var i: usize = 0;
-    while (i < vec_len) : (i += LANES) {
-        const va: F32xN = a[i..][0..LANES].*;
-        const vb: F32xN = b[i..][0..LANES].*;
-        const diff = va - vb;
-        acc = @mulAdd(F32xN, diff, diff, acc);
+    const step4 = LANES * 4;
+    const vec4_len = len - (len % step4);
+    while (i < vec4_len) : (i += step4) {
+        const d0 = @as(F32xN, a[i..][0..LANES].*) - @as(F32xN, b[i..][0..LANES].*);
+        const d1 = @as(F32xN, a[i + LANES ..][0..LANES].*) - @as(F32xN, b[i + LANES ..][0..LANES].*);
+        const d2 = @as(F32xN, a[i + LANES * 2 ..][0..LANES].*) - @as(F32xN, b[i + LANES * 2 ..][0..LANES].*);
+        const d3 = @as(F32xN, a[i + LANES * 3 ..][0..LANES].*) - @as(F32xN, b[i + LANES * 3 ..][0..LANES].*);
+        acc0 = @mulAdd(F32xN, d0, d0, acc0);
+        acc1 = @mulAdd(F32xN, d1, d1, acc1);
+        acc2 = @mulAdd(F32xN, d2, d2, acc2);
+        acc3 = @mulAdd(F32xN, d3, d3, acc3);
     }
 
-    var sum = @reduce(.Add, acc);
+    const vec_len = len - (len % LANES);
+    while (i < vec_len) : (i += LANES) {
+        const diff = @as(F32xN, a[i..][0..LANES].*) - @as(F32xN, b[i..][0..LANES].*);
+        acc0 = @mulAdd(F32xN, diff, diff, acc0);
+    }
+
+    var sum = @reduce(.Add, (acc0 + acc1) + (acc2 + acc3));
 
     while (i < len) : (i += 1) {
         const d = a[i] - b[i];
@@ -186,8 +237,16 @@ pub fn hammingSimilarity(a: []const u8, b: []const u8) f32 {
 pub fn binaryQuantize(vec: []align(1) const f32, out: []u8) void {
     const byte_count = (vec.len + 7) / 8;
     const actual = @min(byte_count, out.len);
+    const full_bytes = @min(vec.len / 8, actual);
 
-    for (0..actual) |byte_idx| {
+    var byte_idx: usize = 0;
+    while (byte_idx < full_bytes) : (byte_idx += 1) {
+        const chunk: F32xN = vec[byte_idx * 8 ..][0..8].*;
+        const mask: u8 = @bitCast(chunk >= ZERO);
+        out[byte_idx] = @bitReverse(mask);
+    }
+
+    while (byte_idx < actual) : (byte_idx += 1) {
         var byte: u8 = 0;
         const base = byte_idx * 8;
         inline for (0..8) |bit| {
@@ -216,8 +275,17 @@ pub fn binaryQuantizeCentered(
     std.debug.assert(centroid.len == vec.len);
     const byte_count = (vec.len + 7) / 8;
     const actual = @min(byte_count, out.len);
+    const full_bytes = @min(vec.len / 8, actual);
 
-    for (0..actual) |byte_idx| {
+    var byte_idx: usize = 0;
+    while (byte_idx < full_bytes) : (byte_idx += 1) {
+        const v_chunk: F32xN = vec[byte_idx * 8 ..][0..8].*;
+        const c_chunk: F32xN = centroid[byte_idx * 8 ..][0..8].*;
+        const mask: u8 = @bitCast((v_chunk - c_chunk) >= ZERO);
+        out[byte_idx] = @bitReverse(mask);
+    }
+
+    while (byte_idx < actual) : (byte_idx += 1) {
         var byte: u8 = 0;
         const base = byte_idx * 8;
         inline for (0..8) |bit| {

@@ -53,6 +53,7 @@ const ConnState = struct {
     recv_buf: [RECV_BUF_SIZE]u8 = undefined,
     recv_len: usize = 0,
     send_buf: std.ArrayListUnmanaged(u8) = .empty,
+    send_pos: usize = 0,
     active: bool = false,
     /// Set to true once the full WormWire handshake (2 bytes) is validated.
     handshake_done: bool = false,
@@ -61,8 +62,26 @@ const ConnState = struct {
         self.fd = -1;
         self.recv_len = 0;
         self.send_buf.clearRetainingCapacity();
+        self.send_pos = 0;
         self.active = false;
         self.handshake_done = false;
+    }
+
+    fn pendingSendSlice(self: *const ConnState) []const u8 {
+        return self.send_buf.items[self.send_pos..];
+    }
+
+    /// Advance `send_pos` after a send CQE completes with `sent` bytes.
+    /// Returns `true` when the entire `send_buf` has been sent (and resets
+    /// `send_buf` and `send_pos`), or `false` when bytes remain to be sent.
+    fn advanceSend(self: *ConnState, sent: usize) bool {
+        self.send_pos = @min(self.send_pos + sent, self.send_buf.items.len);
+        if (self.send_pos < self.send_buf.items.len) {
+            return false;
+        }
+        self.send_buf.clearRetainingCapacity();
+        self.send_pos = 0;
+        return true;
     }
 };
 
@@ -222,7 +241,7 @@ pub const UringServer = struct {
         _ = try self.ring.send(
             encodeUserData(slot, .send),
             conn.fd,
-            conn.send_buf.items,
+            conn.pendingSendSlice(),
             0,
         );
     }
@@ -458,13 +477,26 @@ pub const UringServer = struct {
                     },
                     .send => {
                         const conn = &self.conns[slot];
-                        conn.send_buf.clearRetainingCapacity();
-
-                        if (res < 0) {
-                            // Send error — close
+                        if (res <= 0) {
+                            // Send error or zero-byte write — close
+                            conn.send_buf.clearRetainingCapacity();
+                            conn.send_pos = 0;
                             self.queueClose(slot) catch {
                                 core.compat.close(conn.fd);
                                 self.freeSlot(slot);
+                            };
+                            continue;
+                        }
+
+                        if (!conn.advanceSend(@intCast(res))) {
+                            // Partial send — resubmit remainder
+                            self.queueSend(slot) catch {
+                                conn.send_buf.clearRetainingCapacity();
+                                conn.send_pos = 0;
+                                self.queueClose(slot) catch {
+                                    core.compat.close(conn.fd);
+                                    self.freeSlot(slot);
+                                };
                             };
                             continue;
                         }
@@ -495,4 +527,28 @@ fn responseSucceeded(response: Response) bool {
         .err => false,
         else => true,
     };
+}
+
+test "ConnState advanceSend tracks partial sends and resets when complete" {
+    const testing = std.testing;
+    var conn: ConnState = .{};
+    defer conn.send_buf.deinit(testing.allocator);
+
+    try conn.send_buf.appendSlice(testing.allocator, "hello world!");
+    try testing.expectEqualStrings("hello world!", conn.pendingSendSlice());
+
+    // First partial send: 5 bytes ("hello")
+    try testing.expect(!conn.advanceSend(5));
+    try testing.expectEqual(@as(usize, 5), conn.send_pos);
+    try testing.expectEqualStrings(" world!", conn.pendingSendSlice());
+
+    // Second partial send: 4 bytes (" wor")
+    try testing.expect(!conn.advanceSend(4));
+    try testing.expectEqual(@as(usize, 9), conn.send_pos);
+    try testing.expectEqualStrings("ld!", conn.pendingSendSlice());
+
+    // Final send: remaining 3 bytes ("ld!")
+    try testing.expect(conn.advanceSend(3));
+    try testing.expectEqual(@as(usize, 0), conn.send_pos);
+    try testing.expectEqual(@as(usize, 0), conn.send_buf.items.len);
 }

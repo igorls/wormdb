@@ -388,6 +388,7 @@ pub fn build(b: *std.Build) void {
         .{ "chacha_backend_bench", "bench/chacha_backend_bench.zig", false },
         .{ "engine_bench", "bench/engine_bench.zig", true },
         .{ "vsearch_and_wal_mt_bench", "bench/vsearch_and_wal_mt_bench.zig", true },
+        .{ "wire_load_bench", "bench/wire_load_bench.zig", true },
     }) |entry| {
         const bench_mod = b.createModule(.{
             .root_source_file = b.path(entry[1]),

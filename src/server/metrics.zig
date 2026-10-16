@@ -4,23 +4,23 @@ const std = @import("std");
 const core = @import("../core/mod.zig");
 
 pub const ServerMetrics = struct {
-    started_ms: std.atomic.Value(u64),
+    started_ms: std.atomic.Value(u64) align(64),
 
-    tcp_connections_active: std.atomic.Value(u64),
-    tcp_commands_in_flight: std.atomic.Value(u64),
-    tcp_commands_completed: std.atomic.Value(u64),
-    tcp_commands_succeeded: std.atomic.Value(u64),
-    tcp_last_successful_command_completed_ms: std.atomic.Value(u64),
-    tcp_connection_queue_depth: std.atomic.Value(u64),
+    tcp_connections_active: std.atomic.Value(u64) align(64),
+    tcp_commands_in_flight: std.atomic.Value(u64) align(64),
+    tcp_commands_completed: std.atomic.Value(u64) align(64),
+    tcp_commands_succeeded: std.atomic.Value(u64) align(64),
+    tcp_last_successful_command_completed_ms: std.atomic.Value(u64) align(64),
+    tcp_connection_queue_depth: std.atomic.Value(u64) align(64),
 
-    gateway_connections_active: std.atomic.Value(u64),
-    gateway_websocket_connections_active: std.atomic.Value(u64),
-    gateway_threads_active: std.atomic.Value(u64),
-    gateway_commands_in_flight: std.atomic.Value(u64),
-    gateway_commands_completed: std.atomic.Value(u64),
-    gateway_commands_succeeded: std.atomic.Value(u64),
-    gateway_last_successful_command_completed_ms: std.atomic.Value(u64),
-    gateway_per_ip_rejections: std.atomic.Value(u64),
+    gateway_connections_active: std.atomic.Value(u64) align(64),
+    gateway_websocket_connections_active: std.atomic.Value(u64) align(64),
+    gateway_threads_active: std.atomic.Value(u64) align(64),
+    gateway_commands_in_flight: std.atomic.Value(u64) align(64),
+    gateway_commands_completed: std.atomic.Value(u64) align(64),
+    gateway_commands_succeeded: std.atomic.Value(u64) align(64),
+    gateway_last_successful_command_completed_ms: std.atomic.Value(u64) align(64),
+    gateway_per_ip_rejections: std.atomic.Value(u64) align(64),
 
     pub const Snapshot = struct {
         started_ms: u64,

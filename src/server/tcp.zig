@@ -441,9 +441,34 @@ pub const Server = struct {
     fn handleBinaryConnection(self: *Server, stream: *core.compat.net.Stream, conn_ctx: *ConnectionContext) void {
         const ReadAdapter = struct {
             stream: *core.compat.net.Stream,
+            buf: [16384]u8 = undefined,
+            pos: usize = 0,
+            end: usize = 0,
 
             pub fn read(adapter: *@This(), dest: []u8) !usize {
-                return adapter.stream.read(dest);
+                if (adapter.pos < adapter.end) {
+                    const avail = adapter.end - adapter.pos;
+                    const n = @min(avail, dest.len);
+                    @memcpy(dest[0..n], adapter.buf[adapter.pos .. adapter.pos + n]);
+                    adapter.pos += n;
+                    if (adapter.pos == adapter.end) {
+                        adapter.pos = 0;
+                        adapter.end = 0;
+                    }
+                    return n;
+                }
+                if (dest.len >= adapter.buf.len) {
+                    return adapter.stream.read(dest);
+                }
+                const n_read = try adapter.stream.read(&adapter.buf);
+                if (n_read == 0) return 0;
+                const n = @min(n_read, dest.len);
+                @memcpy(dest[0..n], adapter.buf[0..n]);
+                if (n < n_read) {
+                    adapter.pos = n;
+                    adapter.end = n_read;
+                }
+                return n;
             }
         };
 
@@ -493,7 +518,8 @@ pub const Server = struct {
             const arena_alloc = cmd_arena.allocator();
 
             self.expireAuthState(conn_ctx);
-            const may_idle = conn_ctx.subscriptions.count() > 0 and
+            const may_idle = (reader.pos == reader.end) and
+                conn_ctx.subscriptions.count() > 0 and
                 (!self.config.auth_enforce or conn_ctx.auth_state != null);
             stream.beginRead(self.config.timeout_ms, may_idle);
             const cmd = wire.readFrameZeroCopy(&reader, arena_alloc) catch |err| {

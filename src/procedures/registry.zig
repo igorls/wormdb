@@ -122,11 +122,18 @@ pub const builtin_names = blk: {
     break :blk acc;
 };
 
-/// Look up a procedure by name. O(n) scan — n is tiny at comptime-known size.
-pub fn lookup(name: []const u8) ?ProcedureFn {
-    for (&PROCEDURES) |*entry| {
-        if (std.mem.eql(u8, entry.name, name)) return entry.func;
+const PROCEDURE_MAP = std.StaticStringMap(ProcedureFn).initComptime(blk: {
+    const KV = struct { []const u8, ProcedureFn };
+    var kvs: [PROCEDURES.len]KV = undefined;
+    for (PROCEDURES, 0..) |e, i| {
+        kvs[i] = .{ e.name, e.func };
     }
+    break :blk kvs;
+});
+
+/// Look up a procedure by name. O(1) length-bucketed comptime lookup for built-ins.
+pub fn lookup(name: []const u8) ?ProcedureFn {
+    if (PROCEDURE_MAP.get(name)) |func| return func;
     // External domain procedures (registered at startup from package manifests).
     for (domain_procedures) |entry| {
         if (std.mem.eql(u8, entry.name, name)) return entry.func;

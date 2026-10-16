@@ -820,8 +820,15 @@ pub const Gateway = struct {
 
         // Unmask if needed (browser clients always mask)
         if (masked) {
-            for (buf, 0..) |*byte, j| {
-                byte.* ^= mask_key[j % 4];
+            const mask_u32: u32 = @bitCast(mask_key);
+            const mask_vec: @Vector(16, u8) = @bitCast(@as(@Vector(4, u32), @splat(mask_u32)));
+            var j: usize = 0;
+            while (j + 16 <= buf.len) : (j += 16) {
+                const chunk: @Vector(16, u8) = buf[j..][0..16].*;
+                buf[j..][0..16].* = chunk ^ mask_vec;
+            }
+            while (j < buf.len) : (j += 1) {
+                buf[j] ^= mask_key[j % 4];
             }
         }
 

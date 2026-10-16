@@ -350,7 +350,7 @@ pub fn buildFromSnapshot(
 
     // ── Header ──
     {
-        var header: [HEADER_SIZE]u8 = [_]u8{0} ** HEADER_SIZE;
+        var header: [HEADER_SIZE]u8 = @splat(0);
         @memcpy(header[0..8], MAGIC);
         std.mem.writeInt(u32, header[8..12], VERSION, .little);
         std.mem.writeInt(u64, header[16..24], total, .little);

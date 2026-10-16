@@ -407,8 +407,8 @@ pub const Hnsw = struct {
         entry_ids: []const u32,
         ef: usize,
         lc: u8,
-        visited: *std.DynamicBitSetUnmanaged,
-        skip: ?*const std.DynamicBitSetUnmanaged,
+        visited: *std.bit_set.Dynamic,
+        skip: ?*const std.bit_set.Dynamic,
     ) !MaxPQ {
         // Reset visited (caller guarantees it's sized for current nodes.len).
         visited.unsetAll();
@@ -486,7 +486,7 @@ pub const Hnsw = struct {
         return w;
     }
 
-    inline fn isSkipped(skip: ?*const std.DynamicBitSetUnmanaged, id: u32) bool {
+    inline fn isSkipped(skip: ?*const std.bit_set.Dynamic, id: u32) bool {
         const s = skip orelse return false;
         if (id >= s.bit_length) return false;
         return s.isSet(id);
@@ -574,7 +574,7 @@ pub const Hnsw = struct {
         }
 
         // Scratch bit-set for search_layer; sized once to cover new node too.
-        var visited = try std.DynamicBitSetUnmanaged.initEmpty(self.allocator, self.nodes.items.len);
+        var visited = try std.bit_set.Dynamic.initEmpty(self.allocator, self.nodes.items.len);
         defer visited.deinit(self.allocator);
 
         const query_vec: []align(1) const f32 = @ptrCast(node.vector);
@@ -747,14 +747,14 @@ pub const Hnsw = struct {
         k: usize,
         ef: usize,
         out: []SearchResult,
-        skip: ?*const std.DynamicBitSetUnmanaged,
+        skip: ?*const std.bit_set.Dynamic,
     ) !usize {
         if (self.entry_point == null) return 0;
         if (k == 0) return 0;
         if (self.dim != 0 and query.len != self.dim) return error.DimensionMismatch;
         const effective_ef = @max(ef, k);
 
-        var visited = try std.DynamicBitSetUnmanaged.initEmpty(self.allocator, self.nodes.items.len);
+        var visited = try std.bit_set.Dynamic.initEmpty(self.allocator, self.nodes.items.len);
         defer visited.deinit(self.allocator);
 
         // ── Greedy descend from top level with ef=1 ──
@@ -910,7 +910,7 @@ test "hnsw: distinct levels are sampled" {
     var h = Hnsw.init(testing.allocator, .{ .m = 16 });
     defer h.deinit();
 
-    var seen_levels = [_]bool{false} ** 32;
+    var seen_levels: [32]bool = @splat(false);
     for (0..500) |_| {
         const lv = h.sampleLevel();
         seen_levels[lv] = true;

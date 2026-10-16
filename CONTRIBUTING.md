@@ -8,7 +8,7 @@ for private vulnerability reports; do not post exploit details in public issues.
 
 ## Development setup
 
-Use Zig **0.16.0**, Git, and Bun for the TypeScript clients and documentation.
+Use Zig **0.17.0**, Git, and Bun for the TypeScript clients and documentation.
 
 ```sh
 git clone https://github.com/igorls/wormdb.git

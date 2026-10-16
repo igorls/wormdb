@@ -22,7 +22,7 @@ pub const ACCUMULATOR_STATE_PREFIX: []const u8 = "proof:append-log-mmr-state:v1:
 pub const ACCUMULATOR_STATE_SUFFIX: []const u8 = ":state:";
 pub const ACCUMULATOR_STATE_MAGIC: []const u8 = "WDBMMRS1";
 pub const ACCUMULATOR_STATE_VERSION: u16 = 1;
-pub const ZERO_HASH: Hash = [_]u8{0} ** HASH_LEN;
+pub const ZERO_HASH: Hash = @splat(0);
 
 const LOG_ID_MAX: usize = std.math.maxInt(u32);
 const PAYLOAD_MAX: usize = std.math.maxInt(u32);
@@ -93,6 +93,39 @@ pub const AccumulatorState = struct {
     }
 };
 
+const EVENT_PREFIX_LEN: usize = STORAGE_PREFIX.len + (HASH_LEN * 2) + EVENT_SUFFIX.len;
+const EVENT_KEY_LEN: usize = EVENT_PREFIX_LEN + 8;
+const STATE_PREFIX_LEN: usize = ACCUMULATOR_STATE_PREFIX.len + (HASH_LEN * 2) + ACCUMULATOR_STATE_SUFFIX.len;
+const STATE_KEY_LEN: usize = STATE_PREFIX_LEN + 8;
+
+fn formatEventKeyFromHex(out: *[EVENT_KEY_LEN]u8, log_hex: *const [HASH_LEN * 2]u8, seq: u64) []const u8 {
+    var pos: usize = 0;
+    @memcpy(out[pos..][0..STORAGE_PREFIX.len], STORAGE_PREFIX);
+    pos += STORAGE_PREFIX.len;
+    @memcpy(out[pos..][0 .. HASH_LEN * 2], log_hex);
+    pos += HASH_LEN * 2;
+    @memcpy(out[pos..][0..EVENT_SUFFIX.len], EVENT_SUFFIX);
+    pos += EVENT_SUFFIX.len;
+    std.mem.writeInt(u64, out[pos..][0..8], seq, .big);
+    return out[0..];
+}
+
+fn formatStatePrefixFromHex(out: *[STATE_PREFIX_LEN]u8, log_hex: *const [HASH_LEN * 2]u8) []const u8 {
+    var pos: usize = 0;
+    @memcpy(out[pos..][0..ACCUMULATOR_STATE_PREFIX.len], ACCUMULATOR_STATE_PREFIX);
+    pos += ACCUMULATOR_STATE_PREFIX.len;
+    @memcpy(out[pos..][0 .. HASH_LEN * 2], log_hex);
+    pos += HASH_LEN * 2;
+    @memcpy(out[pos..][0..ACCUMULATOR_STATE_SUFFIX.len], ACCUMULATOR_STATE_SUFFIX);
+    return out[0..];
+}
+
+fn formatStateKeyFromHex(out: *[STATE_KEY_LEN]u8, log_hex: *const [HASH_LEN * 2]u8, seq: u64) []const u8 {
+    _ = formatStatePrefixFromHex(out[0..STATE_PREFIX_LEN], log_hex);
+    std.mem.writeInt(u64, out[STATE_PREFIX_LEN..][0..8], seq, .big);
+    return out[0..];
+}
+
 /// Append a payload to a named WORM log.
 ///
 /// This helper loads the latest durable MMR state to find the tail, falling
@@ -108,14 +141,18 @@ pub fn append(
     attachment_hashes: []const Hash,
     options: AppendOptions,
 ) !AppendResult {
-    var tail = try loadOrRebuildAccumulatorState(allocator, store, log_id);
+    const log_hash = hashBytes(log_id);
+    var log_hex: [HASH_LEN * 2]u8 = undefined;
+    _ = hashToHex(log_hash, &log_hex);
+
+    var tail = try loadOrRebuildAccumulatorStateWithHex(allocator, store, log_id, log_hash, &log_hex);
     defer tail.deinit(allocator);
     if (tail.last_seq == std.math.maxInt(u64)) return error.SequenceOverflow;
 
     const seq = tail.last_seq + 1;
     const ingest_time_ms: u64 = options.ingest_time_ms orelse @intCast(compat.nowMs());
 
-    const envelope = try encodeEnvelope(allocator, .{
+    const encoded = try encodeEnvelopeWithHashes(allocator, .{
         .log_id = log_id,
         .seq = seq,
         .prev_event_hash = tail.head_hash,
@@ -123,13 +160,12 @@ pub fn append(
         .payload = payload,
         .attachment_hashes = attachment_hashes,
     });
+    const envelope = encoded.envelope;
     errdefer allocator.free(envelope);
 
-    const view = try decodeEnvelope(envelope);
-    try verifyEnvelope(log_id, view);
-
-    const key = try eventKey(allocator, log_id, seq);
+    const key = try allocator.alloc(u8, EVENT_KEY_LEN);
     errdefer allocator.free(key);
+    _ = formatEventKeyFromHex(key[0..EVENT_KEY_LEN], &log_hex, seq);
 
     store.setWithTimestamp(key, envelope, true, ingest_time_ms) catch |err| switch (err) {
         error.WormViolation => return error.SequenceReuse,
@@ -137,9 +173,9 @@ pub fn append(
     };
 
     const record_hash = hashBytes(envelope);
-    var next_state = try advanceAccumulatorState(allocator, tail, record_hash, view.event_hash, ingest_time_ms);
+    var next_state = try advanceAccumulatorState(allocator, tail, record_hash, encoded.event_hash, ingest_time_ms);
     defer next_state.deinit(allocator);
-    persistAccumulatorState(allocator, store, log_id, next_state) catch |err| {
+    persistAccumulatorStateWithHex(allocator, store, log_id, log_hash, &log_hex, next_state) catch |err| {
         std.log.warn("append-log MMR state persist failed for '{s}' seq={d}: {s}", .{
             log_id,
             next_state.last_seq,
@@ -151,9 +187,9 @@ pub fn append(
         .key = key,
         .envelope = envelope,
         .seq = seq,
-        .prev_event_hash = view.prev_event_hash,
-        .payload_hash = view.payload_hash,
-        .event_hash = view.event_hash,
+        .prev_event_hash = tail.head_hash,
+        .payload_hash = encoded.payload_hash,
+        .event_hash = encoded.event_hash,
         .accumulator_root = next_state.accumulator_root,
         .accumulator_leaf_count = next_state.last_seq,
         .ingest_time_ms = ingest_time_ms,
@@ -195,7 +231,13 @@ pub fn verifyEnvelopes(log_id: []const u8, envelopes: []const []const u8) !Verif
     return verifier.report();
 }
 
-pub fn encodeEnvelope(allocator: std.mem.Allocator, input: EventInput) ![]u8 {
+const EncodedEnvelope = struct {
+    envelope: []u8,
+    payload_hash: Hash,
+    event_hash: Hash,
+};
+
+fn encodeEnvelopeWithHashes(allocator: std.mem.Allocator, input: EventInput) !EncodedEnvelope {
     if (input.log_id.len > LOG_ID_MAX) return error.EnvelopeTooLarge;
     if (input.payload.len > PAYLOAD_MAX) return error.EnvelopeTooLarge;
     if (input.attachment_hashes.len > ATTACHMENT_MAX) return error.EnvelopeTooLarge;
@@ -242,7 +284,15 @@ pub fn encodeEnvelope(allocator: std.mem.Allocator, input: EventInput) ![]u8 {
     writeHash(buf, &pos, event_hash);
     std.debug.assert(pos == total_len);
 
-    return buf;
+    return .{
+        .envelope = buf,
+        .payload_hash = payload_hash,
+        .event_hash = event_hash,
+    };
+}
+
+pub fn encodeEnvelope(allocator: std.mem.Allocator, input: EventInput) ![]u8 {
+    return (try encodeEnvelopeWithHashes(allocator, input)).envelope;
 }
 
 pub fn decodeEnvelope(bytes: []const u8) !EventView {
@@ -319,12 +369,11 @@ pub fn accumulatorStateKeyPrefix(allocator: std.mem.Allocator, log_id: []const u
 }
 
 pub fn accumulatorStateKey(allocator: std.mem.Allocator, log_id: []const u8, seq: u64) ![]u8 {
-    const prefix = try accumulatorStateKeyPrefix(allocator, log_id);
-    defer allocator.free(prefix);
-
-    var key = try allocator.alloc(u8, prefix.len + 8);
-    @memcpy(key[0..prefix.len], prefix);
-    std.mem.writeInt(u64, key[prefix.len..][0..8], seq, .big);
+    const log_hash = hashBytes(log_id);
+    var hex: [HASH_LEN * 2]u8 = undefined;
+    _ = hashToHex(log_hash, &hex);
+    const key = try allocator.alloc(u8, STATE_KEY_LEN);
+    _ = formatStateKeyFromHex(key[0..STATE_KEY_LEN], &hex, seq);
     return key;
 }
 
@@ -335,25 +384,30 @@ pub fn seqFromAccumulatorStateKey(prefix: []const u8, key: []const u8) !u64 {
 }
 
 fn appendLeafToPeaks(allocator: std.mem.Allocator, peaks_in: []const mmr.Peak, leaf_index: u64, leaf: []const u8) ![]mmr.Peak {
-    var peaks: std.ArrayListUnmanaged(mmr.Peak) = .empty;
-    errdefer peaks.deinit(allocator);
-    try peaks.appendSlice(allocator, peaks_in);
+    var peaks = try allocator.alloc(mmr.Peak, peaks_in.len + 1);
+    errdefer allocator.free(peaks);
+    @memcpy(peaks[0..peaks_in.len], peaks_in);
+    var len: usize = peaks_in.len;
 
     var carry = mmr.Peak{
         .height = 0,
         .hash = mmr.hashLeaf(leaf_index, leaf),
     };
-    while (peaks.items.len > 0) {
-        const left = peaks.items[peaks.items.len - 1];
+    while (len > 0) {
+        const left = peaks[len - 1];
         if (left.height != carry.height) break;
-        _ = peaks.pop();
+        len -= 1;
         carry = .{
             .height = left.height + 1,
             .hash = mmr.hashParent(left.height + 1, left.hash, carry.hash),
         };
     }
-    try peaks.append(allocator, carry);
-    return peaks.toOwnedSlice(allocator);
+    peaks[len] = carry;
+    len += 1;
+    if (len == peaks.len) return peaks;
+    const exact = try allocator.dupe(mmr.Peak, peaks[0..len]);
+    allocator.free(peaks);
+    return exact;
 }
 
 fn advanceAccumulatorState(
@@ -377,22 +431,62 @@ fn advanceAccumulatorState(
     };
 }
 
-fn loadOrRebuildAccumulatorState(allocator: std.mem.Allocator, store: *Store, log_id: []const u8) !AccumulatorState {
-    const maybe_state = loadLatestAccumulatorState(allocator, store, log_id) catch |err| blk: {
+fn loadOrRebuildAccumulatorStateWithHex(
+    allocator: std.mem.Allocator,
+    store: *Store,
+    log_id: []const u8,
+    log_hash: Hash,
+    log_hex: *const [HASH_LEN * 2]u8,
+) !AccumulatorState {
+    const maybe_state = loadLatestAccumulatorStateWithHex(allocator, store, log_id, log_hash, log_hex) catch |err| blk: {
         std.log.warn("append-log MMR state load failed for '{s}', rebuilding: {s}", .{ log_id, @errorName(err) });
         break :blk null;
     };
     if (maybe_state) |state| {
-        if (try accumulatorStateUsable(allocator, store, log_id, state)) return state;
+        if (try accumulatorStateUsableWithHex(allocator, store, log_id, log_hex, state)) return state;
         var stale = state;
         stale.deinit(allocator);
     }
-    return rebuildAccumulatorState(allocator, store, log_id);
+    const rebuilt = try rebuildAccumulatorState(allocator, store, log_id);
+    store.setAppendLogSeqHint(log_hash, rebuilt.last_seq);
+    return rebuilt;
 }
 
 fn loadLatestAccumulatorState(allocator: std.mem.Allocator, store: *Store, log_id: []const u8) !?AccumulatorState {
-    const prefix = try accumulatorStateKeyPrefix(allocator, log_id);
-    defer allocator.free(prefix);
+    const log_hash = hashBytes(log_id);
+    var log_hex: [HASH_LEN * 2]u8 = undefined;
+    _ = hashToHex(log_hash, &log_hex);
+    return loadLatestAccumulatorStateWithHex(allocator, store, log_id, log_hash, &log_hex);
+}
+
+fn loadLatestAccumulatorStateWithHex(
+    allocator: std.mem.Allocator,
+    store: *Store,
+    log_id: []const u8,
+    log_hash: Hash,
+    log_hex: *const [HASH_LEN * 2]u8,
+) !?AccumulatorState {
+    // O(1) fast path: check the cached latest sequence number on `store` for
+    // `log_id` via a single-shard hash lookup before scanning all 256 shards.
+    const hinted_seq = store.getAppendLogSeqHint(log_hash);
+    if (hinted_seq > 0) fast: {
+        if (hinted_seq < std.math.maxInt(u64)) {
+            var next_state_key_buf: [STATE_KEY_LEN]u8 = undefined;
+            const next_state_key = formatStateKeyFromHex(&next_state_key_buf, log_hex, hinted_seq + 1);
+            if (store.exists(next_state_key)) break :fast;
+        }
+        var state_key_buf: [STATE_KEY_LEN]u8 = undefined;
+        const state_key = formatStateKeyFromHex(&state_key_buf, log_hex, hinted_seq);
+        const entry = store.get(state_key) orelse break :fast;
+        if (!entry.flags.is_worm) return error.NonWormAccumulatorState;
+        var state = try decodeAccumulatorState(allocator, log_id, entry.value);
+        errdefer state.deinit(allocator);
+        if (state.last_seq != hinted_seq) return error.AccumulatorStateKeyMismatch;
+        return state;
+    }
+
+    var prefix_buf: [STATE_PREFIX_LEN]u8 = undefined;
+    const prefix = formatStatePrefixFromHex(&prefix_buf, log_hex);
 
     const results = try store.scanPrefix(prefix, 1, allocator);
     defer {
@@ -409,22 +503,27 @@ fn loadLatestAccumulatorState(allocator: std.mem.Allocator, store: *Store, log_i
     var state = try decodeAccumulatorState(allocator, log_id, results[0].value);
     errdefer state.deinit(allocator);
     if (state.last_seq != key_seq) return error.AccumulatorStateKeyMismatch;
+    store.setAppendLogSeqHint(log_hash, state.last_seq);
     return state;
 }
 
-fn accumulatorStateUsable(
+fn accumulatorStateUsableWithHex(
     allocator: std.mem.Allocator,
     store: *Store,
     log_id: []const u8,
+    log_hex: *const [HASH_LEN * 2]u8,
     state: AccumulatorState,
 ) !bool {
+    _ = allocator;
+    _ = log_id;
     if (!mmr.peaksAreCanonical(state.last_seq, state.peaks)) return false;
     if (!hashEql(mmr.rootFromPeaks(state.last_seq, state.peaks), state.accumulator_root)) return false;
 
     if (state.last_seq > 0) {
-        const last_event = try loadEventValue(allocator, store, log_id, state.last_seq) orelse return false;
-        defer allocator.free(last_event);
-        const view = decodeEnvelope(last_event) catch return false;
+        var event_key_buf: [EVENT_KEY_LEN]u8 = undefined;
+        const last_key = formatEventKeyFromHex(&event_key_buf, log_hex, state.last_seq);
+        const entry = store.get(last_key) orelse return false;
+        const view = decodeEnvelope(entry.value) catch return false;
         if (view.seq != state.last_seq) return false;
         if (!hashEql(view.event_hash, state.head_hash)) return false;
         if (view.ingest_time_ms != state.last_ingest_time_ms) return false;
@@ -432,18 +531,10 @@ fn accumulatorStateUsable(
         return false;
     }
 
-    const next = try loadEventValue(allocator, store, log_id, state.last_seq + 1);
-    if (next) |bytes| {
-        allocator.free(bytes);
-        return false;
-    }
+    var next_key_buf: [EVENT_KEY_LEN]u8 = undefined;
+    const next_key = formatEventKeyFromHex(&next_key_buf, log_hex, state.last_seq + 1);
+    if (store.exists(next_key)) return false;
     return true;
-}
-
-fn loadEventValue(allocator: std.mem.Allocator, store: *Store, log_id: []const u8, seq: u64) !?[]const u8 {
-    const key = try eventKey(allocator, log_id, seq);
-    defer allocator.free(key);
-    return try store.getValueDupe(key, allocator);
 }
 
 fn rebuildAccumulatorState(allocator: std.mem.Allocator, store: *Store, log_id: []const u8) !AccumulatorState {
@@ -493,40 +584,46 @@ fn rebuildAccumulatorState(allocator: std.mem.Allocator, store: *Store, log_id: 
     };
 }
 
-fn persistAccumulatorState(
+fn persistAccumulatorStateWithHex(
     allocator: std.mem.Allocator,
     store: *Store,
     log_id: []const u8,
+    log_hash: Hash,
+    log_hex: *const [HASH_LEN * 2]u8,
     state: AccumulatorState,
 ) !void {
-    const key = try accumulatorStateKey(allocator, log_id, state.last_seq);
-    defer allocator.free(key);
+    var key_buf: [STATE_KEY_LEN]u8 = undefined;
+    const key = formatStateKeyFromHex(&key_buf, log_hex, state.last_seq);
     const value = try encodeAccumulatorState(allocator, log_id, state);
     defer allocator.free(value);
     try store.setWithTimestamp(key, value, true, state.last_ingest_time_ms);
+    store.setAppendLogSeqHint(log_hash, state.last_seq);
 }
 
 fn encodeAccumulatorState(allocator: std.mem.Allocator, log_id: []const u8, state: AccumulatorState) ![]u8 {
     if (log_id.len > std.math.maxInt(u32)) return error.AccumulatorStateTooLarge;
     if (state.peaks.len > mmr.PROOF_MAX_PEAKS) return error.AccumulatorStateTooLarge;
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
+    const total_len = ACCUMULATOR_STATE_MAGIC.len + 2 + 4 + log_id.len + 8 + 8 + HASH_LEN + HASH_LEN + 4 + state.peaks.len * (1 + HASH_LEN);
+    const buf = try allocator.alloc(u8, total_len);
+    var pos: usize = 0;
 
-    try appendBytes(&out, allocator, ACCUMULATOR_STATE_MAGIC);
-    try appendU16(&out, allocator, ACCUMULATOR_STATE_VERSION);
-    try appendU32(&out, allocator, @intCast(log_id.len));
-    try appendBytes(&out, allocator, log_id);
-    try appendU64(&out, allocator, state.last_seq);
-    try appendU64(&out, allocator, state.last_ingest_time_ms);
-    try appendBytes(&out, allocator, state.head_hash[0..]);
-    try appendBytes(&out, allocator, state.accumulator_root[0..]);
-    try appendU32(&out, allocator, @intCast(state.peaks.len));
+    writeBytes(buf, &pos, ACCUMULATOR_STATE_MAGIC);
+    writeU16(buf, &pos, ACCUMULATOR_STATE_VERSION);
+    writeU32(buf, &pos, @intCast(log_id.len));
+    writeBytes(buf, &pos, log_id);
+    writeU64(buf, &pos, state.last_seq);
+    writeU64(buf, &pos, state.last_ingest_time_ms);
+    writeHash(buf, &pos, state.head_hash);
+    writeHash(buf, &pos, state.accumulator_root);
+    writeU32(buf, &pos, @intCast(state.peaks.len));
     for (state.peaks) |peak| {
-        try appendU8(&out, allocator, peak.height);
-        try appendBytes(&out, allocator, peak.hash[0..]);
+        buf[pos] = peak.height;
+        pos += 1;
+        writeHash(buf, &pos, peak.hash);
     }
-    return out.toOwnedSlice(allocator);
+    std.debug.assert(pos == total_len);
+    return buf;
 }
 
 fn decodeAccumulatorState(allocator: std.mem.Allocator, expected_log_id: []const u8, bytes: []const u8) !AccumulatorState {
@@ -927,4 +1024,35 @@ test "verifyStore rejects receipt timestamp mismatch" {
 
     try store.setWithTimestamp(key, envelope, true, 101);
     try testing.expectError(error.ReceiptTimestampMismatch, verifyStore(testing.allocator, &store, "site-a"));
+}
+
+test "seq hint cache is scoped to Store instance and reset across address reuse" {
+    const testing = std.testing;
+    const store_slot = try testing.allocator.create(Store);
+    defer testing.allocator.destroy(store_slot);
+
+    const log_hash = hashBytes("site-reuse");
+
+    store_slot.* = try Store.init(testing.allocator, Config{ .persistence = .none });
+    {
+        defer store_slot.deinit();
+        var e1 = try append(testing.allocator, store_slot, "site-reuse", "one", &.{}, .{ .ingest_time_ms = 100 });
+        defer e1.deinit(testing.allocator);
+        var e2 = try append(testing.allocator, store_slot, "site-reuse", "two", &.{}, .{ .ingest_time_ms = 101 });
+        defer e2.deinit(testing.allocator);
+        var e3 = try append(testing.allocator, store_slot, "site-reuse", "three", &.{}, .{ .ingest_time_ms = 102 });
+        defer e3.deinit(testing.allocator);
+        try testing.expectEqual(@as(u64, 3), store_slot.getAppendLogSeqHint(log_hash));
+    }
+
+    // Re-initialize a new Store at the exact same address (`store_slot`):
+    // its sequence hint cache must start clean (0), never inheriting seq=3.
+    store_slot.* = try Store.init(testing.allocator, Config{ .persistence = .none });
+    defer store_slot.deinit();
+
+    try testing.expectEqual(@as(u64, 0), store_slot.getAppendLogSeqHint(log_hash));
+    var fresh = try append(testing.allocator, store_slot, "site-reuse", "fresh-one", &.{}, .{ .ingest_time_ms = 200 });
+    defer fresh.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, 1), fresh.seq);
+    try testing.expectEqual(@as(u64, 1), store_slot.getAppendLogSeqHint(log_hash));
 }

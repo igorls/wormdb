@@ -27,10 +27,8 @@ const Command = core.types.Command;
 const Response = core.types.Response;
 const Cluster = cluster_mod.Cluster;
 
-// libwtf C bindings
-const wtf = @cImport({
-    @cInclude("wtf.h");
-});
+// libwtf C bindings (translated in build.zig when -Dquic=true)
+const wtf = @import("wtf_c");
 
 /// Per-session state — allocated on CONNECTED, freed on DISCONNECTED.
 const SessionContext = struct {

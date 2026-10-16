@@ -385,7 +385,7 @@ pub const Server = struct {
         stream.write_timeout_ms = 2_000;
         var conn_ctx = ConnectionContext.init(self.allocator, self.event_bus, &stream);
         conn_ctx.auth_enforce = self.config.auth_enforce;
-        defer conn.stream.close();
+        defer stream.close();
         defer conn_ctx.deinit();
 
         var handshake: [2]u8 = undefined;
@@ -441,9 +441,34 @@ pub const Server = struct {
     fn handleBinaryConnection(self: *Server, stream: *core.compat.net.Stream, conn_ctx: *ConnectionContext) void {
         const ReadAdapter = struct {
             stream: *core.compat.net.Stream,
+            buf: [16384]u8 = undefined,
+            pos: usize = 0,
+            end: usize = 0,
 
             pub fn read(adapter: *@This(), dest: []u8) !usize {
-                return adapter.stream.read(dest);
+                if (adapter.pos < adapter.end) {
+                    const avail = adapter.end - adapter.pos;
+                    const n = @min(avail, dest.len);
+                    @memcpy(dest[0..n], adapter.buf[adapter.pos .. adapter.pos + n]);
+                    adapter.pos += n;
+                    if (adapter.pos == adapter.end) {
+                        adapter.pos = 0;
+                        adapter.end = 0;
+                    }
+                    return n;
+                }
+                if (dest.len >= adapter.buf.len) {
+                    return adapter.stream.read(dest);
+                }
+                const n_read = try adapter.stream.read(&adapter.buf);
+                if (n_read == 0) return 0;
+                const n = @min(n_read, dest.len);
+                @memcpy(dest[0..n], adapter.buf[0..n]);
+                if (n < n_read) {
+                    adapter.pos = n;
+                    adapter.end = n_read;
+                }
+                return n;
             }
         };
 
@@ -493,7 +518,8 @@ pub const Server = struct {
             const arena_alloc = cmd_arena.allocator();
 
             self.expireAuthState(conn_ctx);
-            const may_idle = conn_ctx.subscriptions.count() > 0 and
+            const may_idle = (reader.pos == reader.end) and
+                conn_ctx.subscriptions.count() > 0 and
                 (!self.config.auth_enforce or conn_ctx.auth_state != null);
             stream.beginRead(self.config.timeout_ms, may_idle);
             const cmd = wire.readFrameZeroCopy(&reader, arena_alloc) catch |err| {
@@ -594,12 +620,14 @@ pub const Server = struct {
     /// Emits local PUB/SUB events for replicated writes so local subscribers
     /// (e.g. WebSocket-connected clients) get real-time notifications.
     ///
-    /// `peer_org` is the org pubkey proven by the W2 handshake (null on a
-    /// legacy "WR" connection, which only exists while enforcement is off).
-    /// When org trust is enforced, every mutating frame's key must fall in a
-    /// prefix granted to `peer_org`; violations get an err response and the
-    /// frame is skipped (connection stays up — one bad key must not sever an
-    /// otherwise healthy replication stream).
+    /// Persistent `PeerConnection` streams are one-way: `PeerConnection.sendCommand`
+    /// never reads from the socket, so mutating commands (`set`, `delete`, `vinsert`,
+    /// `vdelete`, `vbulkinsert`, `vrabitq_install`, and `EXEC append_log_witness`)
+    /// must not write `.ok` or `.err` frames back on the wire (otherwise unread
+    /// responses fill the TCP send/receive buffers and drop the replication link on
+    /// the 2 s send timeout). Only one-shot request/response replication RPCs
+    /// (`EXEC proof_prefix_root`, `EXEC vsearch_local_raw`) write a response frame
+    /// because their callers explicitly drain it with `wire.readResponseAlloc`.
     fn handleReplicationConnection(self: *Server, stream: *core.compat.net.Stream, peer_org: ?[32]u8) void {
         const ReadAdapter = struct {
             stream: *core.compat.net.Stream,
@@ -623,7 +651,7 @@ pub const Server = struct {
             switch (cmd) {
                 .set => |params| {
                     if (!self.replicationKeyAuthorized(peer_org, params.key)) {
-                        wire.writeResponse(stream, .{ .err = "unauthorized: namespace" }) catch return;
+                        std.log.warn("replication: SET unauthorized for key '{s}'", .{params.key});
                         continue;
                     }
                     self.store.set(params.key, params.value, params.worm) catch {};
@@ -670,12 +698,10 @@ pub const Server = struct {
                             }
                         }
                     }
-
-                    wire.writeResponse(stream, .ok) catch return;
                 },
                 .delete => |key| {
                     if (!self.replicationKeyAuthorized(peer_org, key)) {
-                        wire.writeResponse(stream, .{ .err = "unauthorized: namespace" }) catch return;
+                        std.log.warn("replication: DEL unauthorized for key '{s}'", .{key});
                         continue;
                     }
                     self.store.delete(key) catch {};
@@ -695,16 +721,14 @@ pub const Server = struct {
                             self.event_bus.publish("notes", msg) catch {};
                         }
                     }
-
-                    wire.writeResponse(stream, .ok) catch return;
                 },
                 .vinsert => |params| {
                     if (!self.replicationKeyAuthorized(peer_org, params.key)) {
-                        wire.writeResponse(stream, .{ .err = "unauthorized: namespace" }) catch return;
+                        std.log.warn("replication: VINSERT unauthorized for key '{s}'", .{params.key});
                         continue;
                     }
                     const metric_enum = Metric.fromStr(params.metric) orelse {
-                        wire.writeResponse(stream, .{ .err = "vinsert: unknown metric" }) catch return;
+                        std.log.warn("replication: VINSERT unknown metric '{s}'", .{params.metric});
                         continue;
                     };
                     vector_ops.applyVinsert(
@@ -726,11 +750,10 @@ pub const Server = struct {
                     ) catch |e| {
                         std.log.warn("replication: applyVinsert failed: {s}", .{@errorName(e)});
                     };
-                    wire.writeResponse(stream, .ok) catch return;
                 },
                 .vdelete => |params| {
                     if (!self.replicationKeyAuthorized(peer_org, params.key)) {
-                        wire.writeResponse(stream, .{ .err = "unauthorized: namespace" }) catch return;
+                        std.log.warn("replication: VDELETE unauthorized for key '{s}'", .{params.key});
                         continue;
                     }
                     vector_ops.applyVdelete(
@@ -745,7 +768,6 @@ pub const Server = struct {
                     ) catch |e| {
                         std.log.warn("replication: applyVdelete failed: {s}", .{@errorName(e)});
                     };
-                    wire.writeResponse(stream, .ok) catch return;
                 },
                 .vbulkinsert => |params| {
                     // Every item key must be authorized — reject the whole frame
@@ -757,11 +779,11 @@ pub const Server = struct {
                         break :blk true;
                     };
                     if (!bulk_authorized) {
-                        wire.writeResponse(stream, .{ .err = "unauthorized: namespace" }) catch return;
+                        std.log.warn("replication: VBULKINSERT unauthorized for namespace '{s}'", .{params.namespace});
                         continue;
                     }
                     const metric_enum = Metric.fromStr(params.metric) orelse {
-                        wire.writeResponse(stream, .{ .err = "vbulkinsert: unknown metric" }) catch return;
+                        std.log.warn("replication: VBULKINSERT unknown metric '{s}'", .{params.metric});
                         continue;
                     };
                     vector_ops.applyVbulkinsert(
@@ -779,9 +801,29 @@ pub const Server = struct {
                     ) catch |e| {
                         std.log.warn("replication: applyVbulkinsert failed: {s}", .{@errorName(e)});
                     };
-                    wire.writeResponse(stream, .ok) catch return;
+                },
+                .vrabitq_install => |params| {
+                    if (!self.replicationKeyAuthorized(peer_org, params.namespace)) {
+                        std.log.warn("replication: VRABITQ_INSTALL unauthorized for namespace '{s}'", .{params.namespace});
+                        continue;
+                    }
+                    const inferred_metric: Metric = if (self.config.vector_registry) |reg|
+                        if (reg.get(params.namespace)) |idx| idx.metric else Metric.l2
+                    else
+                        Metric.l2;
+                    vector_ops.applyVrabitqInstall(self.config.vector_registry, .{
+                        .namespace = params.namespace,
+                        .dim = params.dim,
+                        .seed = params.seed,
+                        .centroid_bytes = params.centroid,
+                        .rotation_bytes = params.rotation,
+                        .metric = inferred_metric,
+                    }) catch |e| {
+                        std.log.warn("replication: applyVrabitqInstall failed: {s}", .{@errorName(e)});
+                    };
                 },
                 .exec => |params| {
+                    const one_way = isOneWayReplicationProcedure(params.procedure);
                     if (!isAllowedReplicationProcedure(params.procedure)) {
                         wire.writeResponse(stream, .{ .err = "unsupported replication command" }) catch return;
                         continue;
@@ -791,7 +833,9 @@ pub const Server = struct {
                     // org-authenticated connection (proven by the W2 handshake).
                     if (self.config.org_trust) |trust| {
                         if (trust.enforce and peer_org == null) {
-                            wire.writeResponse(stream, .{ .err = "unauthorized: org handshake required" }) catch return;
+                            if (!one_way) {
+                                wire.writeResponse(stream, .{ .err = "unauthorized: org handshake required" }) catch return;
+                            }
                             continue;
                         }
                     }
@@ -808,13 +852,17 @@ pub const Server = struct {
                         .vector_registry = self.config.vector_registry,
                     }, cmd) catch |e| {
                         std.log.warn("replication: EXEC {s} failed: {s}", .{ params.procedure, @errorName(e) });
-                        wire.writeResponse(stream, .{ .err = "replication EXEC failed" }) catch return;
+                        if (!one_way) {
+                            wire.writeResponse(stream, .{ .err = "replication EXEC failed" }) catch return;
+                        }
                         continue;
                     };
-                    wire.writeResponse(stream, response) catch return;
+                    if (!one_way) {
+                        wire.writeResponse(stream, response) catch return;
+                    }
                 },
                 else => {
-                    wire.writeResponse(stream, .{ .err = "unsupported replication command" }) catch return;
+                    std.log.warn("replication: unsupported command dropped", .{});
                 },
             }
         }
@@ -828,6 +876,13 @@ pub const Server = struct {
         return std.mem.eql(u8, name, "append_log_witness") or
             std.mem.eql(u8, name, "proof_prefix_root") or
             std.mem.eql(u8, name, "vsearch_local_raw");
+    }
+
+    /// True when a replication EXEC is sent fire-and-forget on `PeerConnection`
+    /// (where the sender never reads a response) rather than on a one-shot RPC
+    /// connection that drains the response via `wire.readResponseAlloc`.
+    fn isOneWayReplicationProcedure(name: []const u8) bool {
+        return std.mem.eql(u8, name, "append_log_witness");
     }
 
     /// Read exactly `buf.len` bytes from a raw stream (pre-framing handshake I/O).
@@ -1551,4 +1606,173 @@ test "TCP framing rejects oversized line and recovers for next valid command" {
 
     const ok_entry = store.get("ok") orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("value", ok_entry.value);
+}
+
+test "handleReplicationConnection does not emit unread acks on one-way replication commands" {
+    const testing = std.testing;
+    var store = try Store.init(testing.allocator, .{ .persistence = .none });
+    defer store.deinit();
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    var server = Server.init(testing.allocator, &store, &bus, .{});
+
+    const listen_addr = try core.compat.net.Address.parseIp("127.0.0.1", 0);
+    var listener = try listen_addr.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    const bound_port = listener.inner.socket.address.getPort();
+
+    const AcceptCtx = struct {
+        listener: *core.compat.net.ServerCompat,
+        server: *Server,
+
+        fn run(ctx: @This()) void {
+            var conn = ctx.listener.accept() catch return;
+            defer conn.stream.close();
+            ctx.server.handleReplicationConnection(&conn.stream, null);
+        }
+    };
+
+    const thread = try std.Thread.spawn(.{}, AcceptCtx.run, .{AcceptCtx{
+        .listener = &listener,
+        .server = &server,
+    }});
+    defer thread.join();
+
+    const connect_addr = core.compat.net.Address.initIp4(.{ 127, 0, 0, 1 }, bound_port);
+    var client = try core.compat.net.tcpConnectToAddress(connect_addr);
+    defer client.close();
+
+    var key_buf: [32]u8 = undefined;
+    var val_buf: [1024]u8 = undefined;
+    @memset(&val_buf, 'r');
+
+    // Stream 500 one-way SET frames + 1 DEL frame without reading any response.
+    for (0..500) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "repl:key:{d}", .{i});
+        try wire.writeCommand(&client, .{ .set = .{
+            .key = key,
+            .value = &val_buf,
+            .worm = false,
+        } });
+    }
+    try wire.writeCommand(&client, .{ .delete = "repl:key:0" });
+
+    // Follow immediately with a request-response replication RPC (proof_prefix_root).
+    // If one-way commands emitted .ok frames, reading the next frame here would read .ok
+    // instead of the proof_prefix_root JSON value payload.
+    var rpc_args = [_][]const u8{ "repl:key:", "limit=0" };
+    try wire.writeCommand(&client, .{ .exec = .{
+        .procedure = "proof_prefix_root",
+        .args = rpc_args[0..],
+    } });
+
+    const ReadAdapter = struct {
+        stream: *core.compat.net.Stream,
+        pub fn read(adapter: *@This(), dest: []u8) !usize {
+            return adapter.stream.read(dest);
+        }
+    };
+    var reader = ReadAdapter{ .stream = &client };
+    const resp = try wire.readResponseAlloc(&reader, testing.allocator);
+    defer protocol.deinitResponse(testing.allocator, resp);
+
+    try testing.expect(resp == .value);
+    try testing.expect(resp.value != null);
+    try testing.expect(std.mem.indexOf(u8, resp.value.?, "\"entry_count\":499") != null);
+    try testing.expect(store.get("repl:key:0") == null);
+    try testing.expect(store.get("repl:key:499") != null);
+}
+
+test "handleReplicationConnection applies vrabitq_install without emitting unread ack" {
+    const testing = std.testing;
+    const NamespaceRegistry = @import("../vector/index.zig").NamespaceRegistry;
+
+    var store = try Store.init(testing.allocator, .{ .persistence = .none });
+    defer store.deinit();
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    var reg = NamespaceRegistry.init(testing.allocator, .{});
+    defer reg.deinit();
+    _ = try reg.getOrCreate("vec:rbq:", .cosine);
+
+    var server = Server.init(testing.allocator, &store, &bus, .{
+        .vector_registry = &reg,
+    });
+
+    const listen_addr = try core.compat.net.Address.parseIp("127.0.0.1", 0);
+    var listener = try listen_addr.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    const bound_port = listener.inner.socket.address.getPort();
+
+    const AcceptCtx = struct {
+        listener: *core.compat.net.ServerCompat,
+        server: *Server,
+
+        fn run(ctx: @This()) void {
+            var conn = ctx.listener.accept() catch return;
+            defer conn.stream.close();
+            ctx.server.handleReplicationConnection(&conn.stream, null);
+        }
+    };
+
+    const thread = try std.Thread.spawn(.{}, AcceptCtx.run, .{AcceptCtx{
+        .listener = &listener,
+        .server = &server,
+    }});
+    defer thread.join();
+
+    const connect_addr = core.compat.net.Address.initIp4(.{ 127, 0, 0, 1 }, bound_port);
+    var client = try core.compat.net.tcpConnectToAddress(connect_addr);
+    defer client.close();
+
+    const centroid_floats = [_]f32{ 0.25, -0.5, 0.75, 1.0 };
+    const rotation_floats = [_]f32{
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+    };
+
+    try wire.writeCommand(&client, .{ .vrabitq_install = .{
+        .namespace = "vec:rbq:",
+        .dim = 4,
+        .seed = 0xCAFE_1234,
+        .centroid = std.mem.sliceAsBytes(&centroid_floats),
+        .rotation = std.mem.sliceAsBytes(&rotation_floats),
+    } });
+
+    // Follow with a request-response RPC to prove vrabitq_install has been
+    // processed and emitted no unread .ok frame ahead of the RPC response.
+    var rpc_args = [_][]const u8{ "vec:rbq:", "limit=0" };
+    try wire.writeCommand(&client, .{ .exec = .{
+        .procedure = "proof_prefix_root",
+        .args = rpc_args[0..],
+    } });
+
+    const ReadAdapter = struct {
+        stream: *core.compat.net.Stream,
+        pub fn read(adapter: *@This(), dest: []u8) !usize {
+            return adapter.stream.read(dest);
+        }
+    };
+    var reader = ReadAdapter{ .stream = &client };
+    const resp = try wire.readResponseAlloc(&reader, testing.allocator);
+    defer protocol.deinitResponse(testing.allocator, resp);
+    try testing.expect(resp == .value);
+
+    const idx = reg.get("vec:rbq:") orelse return error.TestUnexpectedResult;
+    idx.lock.lockShared();
+    defer idx.lock.unlockShared();
+    const params = idx.getRabitqParams() orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 4), params.dim);
+    try testing.expectEqual(@as(u64, 0xCAFE_1234), params.seed);
+    try testing.expectApproxEqAbs(@as(f32, 0.25), params.centroid[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), params.centroid[3], 1e-6);
+    try testing.expectEqual(Metric.cosine, idx.metric);
 }

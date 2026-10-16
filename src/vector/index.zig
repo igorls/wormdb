@@ -140,7 +140,7 @@ pub const NamespaceIndex = struct {
     /// Tombstone bitset: bit i set ⇔ node i is logically deleted.
     /// Length tracks hnsw.len() — grown on every insertLocked. Search
     /// traversal skips tombstoned neighbors entirely.
-    tombstones: std.DynamicBitSetUnmanaged,
+    tombstones: std.bit_set.Dynamic,
     /// Running count of set bits in `tombstones`, kept in sync as a cache
     /// so `vstats` can report deletion density without re-scanning.
     tombstone_count: usize,
@@ -397,6 +397,21 @@ pub const NamespaceIndex = struct {
             if (vector.len != d) return RegistryError.DimensionMismatch;
         }
 
+        if (self.key_to_node.get(key)) |old_id| {
+            if (!self.tombstones.isSet(old_id)) {
+                if (timestamp < self.timestamps.items[old_id]) {
+                    return old_id;
+                }
+                const old_vec = self.hnsw.nodes.items[old_id].vector;
+                if (old_vec.len == vector.len and std.mem.eql(u8, std.mem.sliceAsBytes(old_vec), std.mem.sliceAsBytes(vector))) {
+                    self.timestamps.items[old_id] = timestamp;
+                    return old_id;
+                }
+                self.tombstones.set(old_id);
+                self.tombstone_count += 1;
+            }
+        }
+
         const key_copy = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(key_copy);
 
@@ -422,6 +437,47 @@ pub const NamespaceIndex = struct {
         try self.key_to_node.put(self.allocator, key_copy, node_id);
 
         return node_id;
+    }
+
+    /// Encode `vec_f32` into its BQ companion format (RaBitQ 24B/128-dim when
+    /// `self.rabitq_params` is installed and matches `vec_f32.len`, otherwise
+    /// 1-bit sign quantization). Caller must hold `self.lock` (shared or exclusive).
+    pub fn encodeBqLocked(
+        self: *const NamespaceIndex,
+        allocator: std.mem.Allocator,
+        vec_f32: []align(1) const f32,
+    ) ![]u8 {
+        const distance = @import("distance.zig");
+        if (self.rabitq_params) |p| {
+            if (p.dim == vec_f32.len) {
+                const out = try allocator.alloc(u8, rabitq_mod.encodedSize(vec_f32.len));
+                errdefer allocator.free(out);
+
+                const residual = try allocator.alloc(f32, vec_f32.len);
+                defer allocator.free(residual);
+                const rotated = try allocator.alloc(f32, vec_f32.len);
+                defer allocator.free(rotated);
+
+                const encode_input: []align(1) const f32 = if (self.metric == .cosine) blk: {
+                    const norm_buf = allocator.alloc(f32, vec_f32.len) catch break :blk vec_f32;
+                    if (!rabitq_mod.normalizeInto(vec_f32, norm_buf)) {
+                        allocator.free(norm_buf);
+                        break :blk vec_f32;
+                    }
+                    break :blk @ptrCast(norm_buf);
+                } else vec_f32;
+                defer if (encode_input.ptr != vec_f32.ptr) allocator.free(@constCast(encode_input));
+
+                const code_slice = out[0..rabitq_mod.codeBytes(vec_f32.len)];
+                const enc = rabitq_mod.encode(encode_input, p, residual, rotated, code_slice);
+                rabitq_mod.serialize(enc, out);
+                return out;
+            }
+        }
+        const out = try allocator.alloc(u8, distance.binaryQuantizedSize(vec_f32.len));
+        errdefer allocator.free(out);
+        distance.binaryQuantize(vec_f32, out);
+        return out;
     }
 
     /// Mark the node corresponding to `key` as tombstoned. Returns:
@@ -477,7 +533,7 @@ pub const NamespaceIndex = struct {
         hnsw_scratch: []hnsw_mod.SearchResult,
     ) !usize {
         if (hnsw_scratch.len < k) return error.ScratchTooSmall;
-        const filter: ?*const std.DynamicBitSetUnmanaged =
+        const filter: ?*const std.bit_set.Dynamic =
             if (self.tombstone_count > 0) &self.tombstones else null;
         const n = try self.hnsw.search(query, k, ef, hnsw_scratch[0..k], filter);
         for (0..n) |i| {
@@ -685,10 +741,10 @@ pub const NamespaceIndex = struct {
         // narrowing has to be explicit; the value is bounded by the vector count, far under 2^32.
         const tombstone_count: usize = @intCast(std.mem.readInt(u64, tc_buf[0..8], .little));
 
-        var tombstones: std.DynamicBitSetUnmanaged = if (node_count == 0)
+        var tombstones: std.bit_set.Dynamic = if (node_count == 0)
             .{}
         else
-            try std.DynamicBitSetUnmanaged.initEmpty(allocator, node_count);
+            try std.bit_set.Dynamic.initEmpty(allocator, node_count);
         errdefer tombstones.deinit(allocator);
 
         const tomb_bytes = (node_count + 7) / 8;
@@ -834,6 +890,18 @@ pub const NamespaceRegistry = struct {
     lock: RwLock,
     /// Default params applied to newly-created namespaces.
     default_params: HnswParams,
+    /// Lock-free count of active namespaces so non-vector KV workloads skip
+    /// `syncRawSet` / `syncRawDelete` without acquiring `lock`.
+    active_namespaces: std.atomic.Value(usize) = .init(0),
+    /// Lock-free first-byte refcount table of registered namespaces, indexed by
+    /// `namespace[0]`. Rejects non-matching keys before taking `lock`.
+    first_byte_counts: [256]std.atomic.Value(u32) align(64) = initFirstByteCounts(),
+
+    fn initFirstByteCounts() [256]std.atomic.Value(u32) {
+        var table: [256]std.atomic.Value(u32) = undefined;
+        for (&table) |*slot| slot.* = .init(0);
+        return table;
+    }
 
     pub fn init(allocator: std.mem.Allocator, default_params: HnswParams) NamespaceRegistry {
         return .{
@@ -841,6 +909,8 @@ pub const NamespaceRegistry = struct {
             .map = .empty,
             .lock = .{},
             .default_params = default_params,
+            .active_namespaces = .init(0),
+            .first_byte_counts = initFirstByteCounts(),
         };
     }
 
@@ -854,6 +924,8 @@ pub const NamespaceRegistry = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.map.deinit(self.allocator);
+        for (&self.first_byte_counts) |*slot| slot.store(0, .monotonic);
+        self.active_namespaces.store(0, .monotonic);
     }
 
     /// Look up an existing index. Returns null if the namespace has no
@@ -901,6 +973,10 @@ pub const NamespaceRegistry = struct {
         idx.* = NamespaceIndex.init(self.allocator, self.default_params, m);
 
         try self.map.put(self.allocator, ns_copy, idx);
+        if (ns_copy.len > 0) {
+            _ = self.first_byte_counts[ns_copy[0]].fetchAdd(1, .release);
+        }
+        _ = self.active_namespaces.fetchAdd(1, .release);
         return idx;
     }
 
@@ -910,10 +986,151 @@ pub const NamespaceRegistry = struct {
         self.lock.lock();
         defer self.lock.unlock();
         if (self.map.fetchRemove(namespace)) |kv| {
+            if (kv.key.len > 0) {
+                _ = self.first_byte_counts[kv.key[0]].fetchSub(1, .release);
+            }
+            _ = self.active_namespaces.fetchSub(1, .release);
             self.allocator.free(kv.key);
             kv.value.deinit();
             self.allocator.destroy(kv.value);
         }
+    }
+
+    inline fn mayMatchRegisteredNamespace(self: *const NamespaceRegistry, key: []const u8) bool {
+        if (key.len == 0) return false;
+        if (self.first_byte_counts[key[0]].load(.acquire) == 0) return false;
+        if (self.active_namespaces.load(.acquire) == 0) return false;
+        if (std.mem.startsWith(u8, key, "bq:") or std.mem.startsWith(u8, key, "__meta:")) return false;
+        return true;
+    }
+
+    pub const RawSetBqAction = union(enum) {
+        none,
+        upsert: []u8,
+        delete,
+    };
+
+    /// Synchronize a plain `DEL` against any registered vector namespace whose
+    /// prefix matches `key`. Returns true if `key` matched any registered
+    /// namespace prefix (so the caller can also remove any `"bq:" ++ key`
+    /// companion). Must be called with NO shard locks held.
+    pub fn syncRawDelete(self: *NamespaceRegistry, key: []const u8) bool {
+        if (!self.mayMatchRegisteredNamespace(key)) return false;
+
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
+        var matched_ns = false;
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.startsWith(u8, key, entry.key_ptr.*)) {
+                matched_ns = true;
+                const idx = entry.value_ptr.*;
+                idx.lock.lock();
+                defer idx.lock.unlock();
+                _ = idx.markTombstoneLocked(key);
+            }
+        }
+        return matched_ns;
+    }
+
+    /// Synchronize a raw `SET` against registered vector namespaces without
+    /// returning a BQ companion buffer.
+    pub fn syncRawSet(self: *NamespaceRegistry, key: []const u8, value: []const u8, timestamp: u64) void {
+        _ = self.syncRawSetInternal(key, value, timestamp, false);
+    }
+
+    /// Synchronize a raw `SET` against registered vector namespaces and return
+    /// the companion `bq:<key>` mutation to apply in `Store` after releasing
+    /// registry/index locks. Must be called with NO shard locks held.
+    pub fn syncRawSetWithBq(self: *NamespaceRegistry, key: []const u8, value: []const u8, timestamp: u64) RawSetBqAction {
+        return self.syncRawSetInternal(key, value, timestamp, true);
+    }
+
+    fn syncRawSetInternal(
+        self: *NamespaceRegistry,
+        key: []const u8,
+        value: []const u8,
+        timestamp: u64,
+        want_bq: bool,
+    ) RawSetBqAction {
+        if (!self.mayMatchRegisteredNamespace(key)) return .none;
+        const distance = @import("distance.zig");
+
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
+        var best_ns_len: usize = 0;
+        var best_idx: ?*NamespaceIndex = null;
+        var refreshed_existing = false;
+        var encoded_ns_len: usize = 0;
+        var action: RawSetBqAction = .none;
+
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            const ns = entry.key_ptr.*;
+            if (!std.mem.startsWith(u8, key, ns)) continue;
+            const idx = entry.value_ptr.*;
+            idx.lock.lock();
+            defer idx.lock.unlock();
+            if (idx.nodeIdFor(key)) |old_id| {
+                refreshed_existing = true;
+                if (!idx.tombstones.isSet(old_id) and timestamp < idx.timestamps.items[old_id]) {
+                    continue;
+                }
+                if (distance.bytesToF32(value)) |vec| {
+                    if (idx.dim == null or vec.len == idx.dim.?) {
+                        if (idx.insertLocked(key, vec, timestamp)) |_| {
+                            if (want_bq and ns.len >= encoded_ns_len) {
+                                if (idx.encodeBqLocked(self.allocator, vec) catch null) |bq| {
+                                    if (action == .upsert) self.allocator.free(action.upsert);
+                                    action = .{ .upsert = bq };
+                                    encoded_ns_len = ns.len;
+                                }
+                            }
+                        } else |_| {
+                            _ = idx.markTombstoneLocked(key);
+                            if (action == .none) action = .delete;
+                        }
+                    } else {
+                        _ = idx.markTombstoneLocked(key);
+                        if (action == .none) action = .delete;
+                    }
+                } else {
+                    _ = idx.markTombstoneLocked(key);
+                    if (action == .none) action = .delete;
+                }
+            } else if (ns.len > best_ns_len) {
+                best_ns_len = ns.len;
+                best_idx = idx;
+            }
+        }
+
+        if (!refreshed_existing) {
+            if (best_idx) |idx| {
+                idx.lock.lock();
+                defer idx.lock.unlock();
+                if (idx.dim) |d| {
+                    if (distance.bytesToF32(value)) |vec| {
+                        if (vec.len == d) {
+                            if (idx.insertLocked(key, vec, timestamp)) |_| {
+                                if (want_bq) {
+                                    if (idx.encodeBqLocked(self.allocator, vec) catch null) |bq| {
+                                        action = .{ .upsert = bq };
+                                    }
+                                }
+                            } else |_| {}
+                        } else if (want_bq) {
+                            action = .delete;
+                        }
+                    } else if (want_bq) {
+                        action = .delete;
+                    }
+                }
+            }
+        }
+
+        return action;
     }
 
     // ╔═══════════════════════════════════════════════════╗
@@ -1012,6 +1229,10 @@ pub const NamespaceRegistry = struct {
             errdefer idx_ptr.deinit();
 
             try self.map.put(self.allocator, ns_copy, idx_ptr);
+            if (ns_copy.len > 0) {
+                _ = self.first_byte_counts[ns_copy[0]].fetchAdd(1, .release);
+            }
+            _ = self.active_namespaces.fetchAdd(1, .release);
         }
     }
 };
@@ -1029,6 +1250,13 @@ test "registry: getOrCreate is idempotent" {
     const a = try reg.getOrCreate("vec:", .cosine);
     const b = try reg.getOrCreate("vec:", .cosine);
     try testing.expectEqual(a, b);
+    try testing.expectEqual(@as(u32, 1), reg.first_byte_counts['v'].load(.acquire));
+    try testing.expect(!reg.mayMatchRegisteredNamespace("kv:1"));
+    try testing.expect(reg.mayMatchRegisteredNamespace("vec:1"));
+
+    reg.remove("vec:");
+    try testing.expectEqual(@as(u32, 0), reg.first_byte_counts['v'].load(.acquire));
+    try testing.expect(!reg.mayMatchRegisteredNamespace("vec:1"));
 }
 
 test "registry: distinct namespaces get distinct indexes" {
@@ -1281,7 +1509,6 @@ test "namespace index: clearLocked resets dim for rebuild under new dim" {
     try testing.expectEqual(@as(?usize, 3), idx.dim);
 }
 
-
 // ╔═══════════════════════════════════════════════════╗
 // ║  Registry serialization tests                      ║
 // ╚═══════════════════════════════════════════════════╝
@@ -1469,4 +1696,21 @@ test "registry: writeTo/readFrom preserves installed RabitqParams" {
     for (rp.rotation, expected_rotation) |got, want| {
         try testing.expectApproxEqAbs(want, got, 1e-7);
     }
+}
+
+test "insertLocked ignores writes older than the stored timestamp" {
+    var idx = NamespaceIndex.init(testing.allocator, .{ .m = 4, .ef_construction = 20 }, .cosine);
+    defer idx.deinit();
+
+    const v_newer = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+    const v_older = [_]f32{ 0.0, 1.0, 0.0, 0.0 };
+
+    const id_newer = try idx.insertLocked("vec:k1", &v_newer, 200);
+    const id_older = try idx.insertLocked("vec:k1", &v_older, 100);
+
+    try testing.expectEqual(id_newer, id_older);
+    try testing.expectEqual(@as(usize, 1), idx.liveCount());
+    try testing.expectEqual(@as(usize, 0), idx.tombstone_count);
+    try testing.expectEqual(@as(u64, 200), idx.timestamps.items[id_newer]);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), idx.hnsw.nodes.items[id_newer].vector[0], 1e-6);
 }

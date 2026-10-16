@@ -1847,7 +1847,7 @@ test "validateNs accepts safe tokens" {
 
 test "validateNs rejects empty, too-long, colons, and control chars" {
     try testing.expect(!validateNs(""));
-    const too_long = "a" ** (MAX_NS_LEN + 1);
+    const too_long: []const u8 = &@as([MAX_NS_LEN + 1]u8, @splat('a'));
     try testing.expect(!validateNs(too_long));
     try testing.expect(!validateNs("has:colon"));
     try testing.expect(!validateNs("has space"));

@@ -2,11 +2,11 @@
 
 This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
-WormDB is a distributed key-value store written in **Zig 0.16**, with a WORM (write-once-read-many) mode, pub/sub event streaming, encrypted clustering, and a co-located vector-search engine. The server is a single static binary; the Bun/TypeScript code under `apps/` is reference clients and tooling, not part of the server.
+WormDB is a distributed key-value store written in **Zig 0.17**, with a WORM (write-once-read-many) mode, pub/sub event streaming, encrypted clustering, and a co-located vector-search engine. The server is a single static binary; the Bun/TypeScript code under `apps/` is reference clients and tooling, not part of the server.
 
 ## Build, Test, Run
 
-**Linux** is the primary target and the only platform with clustering and the io_uring/epoll backends. **Windows** is supported for single-node use (threadpool backend; no clustering) — see [docs/WINDOWS.md](docs/WINDOWS.md). Requires **Zig 0.16+** and **libsodium**. `deps/lib/libsodium.so` is linked on Linux; `deps/lib/windows-x86_64/libsodium.a` (static MinGW) on Windows. [build.zig](build.zig)'s `linkSodium` branches on target OS.
+**Linux** is the primary target and the only platform with clustering and the io_uring/epoll backends. **Windows** is supported for single-node use (threadpool backend; no clustering) — see [docs/WINDOWS.md](docs/WINDOWS.md). Requires **Zig 0.17+** and **libsodium**. `deps/lib/libsodium.so` is linked on Linux; `deps/lib/windows-x86_64/libsodium.a` (static MinGW) on Windows. [build.zig](build.zig)'s `linkSodium` branches on target OS.
 
 Platform-specific code is centralized: OS branching lives in [src/core/compat.zig](src/core/compat.zig) (time, socket I/O, `setNoDelay`), with Linux-only backends gated in [src/server/mod.zig](src/server/mod.zig) and cluster/WireGuard calls comptime-gated in [src/cluster/node.zig](src/cluster/node.zig). Prefer adding to `compat.zig` over reaching into `std` directly.
 
@@ -38,7 +38,7 @@ There is no single-test-by-name runner for Zig here; isolate by passing one file
 
 Module map (each is a directory with `mod.zig`):
 
-- **core** — `types.zig` (Entry/Command/Response/CommandId), `config.zig` (JSON config + CLI override schema), `compat.zig` (Zig-0.16 std shims: Io, Mutex, net, time, randomBytes).
+- **core** — `types.zig` (Entry/Command/Response/CommandId), `config.zig` (JSON config + CLI override schema), `compat.zig` (Zig-0.17 std shims: Io, Mutex, net, time, randomBytes).
 - **storage** — `store.zig` is a **256-shard** `StringHashMap`, sharded by `FNV1a(key) & 255`; each shard has its own mutex. `wal.zig` is an append-only WAL with per-record CRC32. Snapshots use magic `WDBSNAP1`; **v2** appends an HNSW trailer (`WDBHNSW2`) so vector graphs persist alongside KV.
 - **protocol** — `wire.zig` is the WormWire binary codec. Client connections open with magic `0x57 0x57` ("WW"); replication connections use `0x57 0x52` ("WR"). Frames are `[1B id/code][4B big-endian len][payload]`, 16 MiB max. Raw `nc`/`telnet` is rejected.
 - **server** — `executor.zig` is the transport-agnostic command dispatcher (used by all backends). Three interchangeable backends, chosen by `--backend`: `tcp.zig` (threadpool, default, thread-per-connection), `uring.zig` (io_uring), `epoll.zig`. `gateway.zig` is a WebSocket bridge for browsers; `quic_gateway.zig` is compile-time gated behind `-Dquic`. `auth.zig` validates Ed25519 SCT tokens (per-gateway enforcement).
@@ -74,7 +74,7 @@ The `Ctx` API ([src/procedures/context.zig](src/procedures/context.zig)) handles
 
 ## Conventions
 
-- **Zig 0.16 is young and the std API churns.** This code uses 0.16-isms (`std.process.Init` "Juicy Main", the new `std.Io` interface, `Module`-based linking in `build.zig`). `src/core/compat.zig` centralizes std shims — prefer it over reaching into `std` directly for IO/time/random/net/mutex so a single API break is patched in one place.
+- **Zig 0.17 is young and the std API churns.** This code uses 0.17-isms (`std.process.Init` "Juicy Main", the new `std.Io` interface, `Module`-based linking in `build.zig`). `src/core/compat.zig` centralizes std shims — prefer it over reaching into `std` directly for IO/time/random/net/mutex so a single API break is patched in one place.
 - Big-endian for all multi-byte wire integers. Payloads cap at 16 MiB.
 - Default client port **6389** (deliberately not Redis 6379); gossip **51821** (UDP); WireGuard **51830**.
 - Config is JSON (`./wormdb.json` by default, `--config` to override); CLI flags override file values. See `printHelp` in main.zig for the full flag list and `core/config.zig` for the schema.

@@ -286,7 +286,7 @@ pub fn encodeCanonical(allocator: std.mem.Allocator, bundle: ProofBundle) ![]u8 
     try appendRaw(&out, allocator, BUNDLE_MAGIC);
     try appendU16(&out, allocator, BUNDLE_CODEC_VERSION);
     try appendU8(&out, allocator, bundle.version);
-    try appendU8(&out, allocator, @intFromEnum(bundle.kind));
+    try appendU8(&out, allocator, @backingInt(bundle.kind));
     try appendLenBytes(&out, allocator, bundle.log_id);
     try appendLenBytes(&out, allocator, bundle.extension_bytes);
 
@@ -574,7 +574,7 @@ fn encodeCheckpoint(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocat
     try appendLenBytes(out, allocator, cp.log_id);
     try appendU64(out, allocator, cp.from_seq);
     try appendU64(out, allocator, cp.to_seq);
-    try appendU8(out, allocator, @intFromEnum(cp.accumulator_kind));
+    try appendU8(out, allocator, @backingInt(cp.accumulator_kind));
     try appendHash(out, allocator, cp.accumulator_root);
     if (cp.previous_checkpoint_hash) |previous| {
         try appendU8(out, allocator, 1);
@@ -583,7 +583,7 @@ fn encodeCheckpoint(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocat
         try appendU8(out, allocator, 0);
     }
     try appendLenBytes(out, allocator, cp.creator_identity);
-    try appendU8(out, allocator, @intFromEnum(cp.signature_scheme));
+    try appendU8(out, allocator, @backingInt(cp.signature_scheme));
     try appendRaw(out, allocator, cp.signature[0..]);
     try appendU64(out, allocator, cp.created_at_ms);
     try appendU64(out, allocator, cp.ingested_at_ms);
@@ -592,24 +592,24 @@ fn encodeCheckpoint(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocat
 
 fn decodeBundleKind(raw: u8) !BundleKind {
     return switch (raw) {
-        @intFromEnum(BundleKind.single_event) => .single_event,
-        @intFromEnum(BundleKind.range) => .range,
+        @backingInt(BundleKind.single_event) => .single_event,
+        @backingInt(BundleKind.range) => .range,
         else => error.InvalidProofBundleBytes,
     };
 }
 
 fn decodeAccumulatorKind(raw: u8) !checkpoint.AccumulatorKind {
     return switch (raw) {
-        @intFromEnum(checkpoint.AccumulatorKind.opaque_root) => .opaque_root,
-        @intFromEnum(checkpoint.AccumulatorKind.merkle_sha256_v1) => .merkle_sha256_v1,
-        @intFromEnum(checkpoint.AccumulatorKind.mmr_sha256_v1) => .mmr_sha256_v1,
+        @backingInt(checkpoint.AccumulatorKind.opaque_root) => .opaque_root,
+        @backingInt(checkpoint.AccumulatorKind.merkle_sha256_v1) => .merkle_sha256_v1,
+        @backingInt(checkpoint.AccumulatorKind.mmr_sha256_v1) => .mmr_sha256_v1,
         else => error.InvalidProofBundleBytes,
     };
 }
 
 fn decodeSignatureScheme(raw: u8) !checkpoint.SignatureScheme {
     return switch (raw) {
-        @intFromEnum(checkpoint.SignatureScheme.ed25519) => .ed25519,
+        @backingInt(checkpoint.SignatureScheme.ed25519) => .ed25519,
         else => error.InvalidProofBundleBytes,
     };
 }

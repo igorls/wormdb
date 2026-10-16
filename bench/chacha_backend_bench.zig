@@ -76,6 +76,7 @@ const Sodium = struct {
     name: []const u8,
 
     fn load() ?Sodium {
+        if (@import("builtin").os.tag == .windows) return null;
         // Try the common runtime names across platforms; dlopen walks the
         // loader search path (honours LD_LIBRARY_PATH / DYLD_LIBRARY_PATH).
         const candidates = [_][:0]const u8{
@@ -192,8 +193,8 @@ pub fn main() !void {
     try p("{s:->8}  {s:->4}  {s:->12}  {s:->12}  {s:->9}\n", .{ "", "", "", "", "" });
 
     const gpa = std.heap.page_allocator;
-    const key: [32]u8 = .{0x42} ** 32;
-    const nonce: [12]u8 = .{0x11} ** 12;
+    const key: [32]u8 = @splat(0x42);
+    const nonce: [12]u8 = @splat(0x11);
 
     for (SIZES) |size| {
         const pt = try gpa.alloc(u8, size);

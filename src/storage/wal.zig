@@ -12,29 +12,8 @@ const EntryFlags = core.types.EntryFlags;
 const Timestamp = core.types.Timestamp;
 const compat = core.compat;
 
-// CRC32 Castagnoli with comptime-generated lookup table (4-8x faster than bit-by-bit)
-const CRC32_TABLE: [256]u32 = blk: {
-    @setEvalBranchQuota(100_000);
-    const polynomial: u32 = 0x82F63B78;
-    var table: [256]u32 = undefined;
-    var i: usize = 0;
-    while (i < 256) : (i += 1) {
-        var crc: u32 = @intCast(i);
-        var j: usize = 0;
-        while (j < 8) : (j += 1) {
-            crc = if (crc & 1 != 0) (crc >> 1) ^ polynomial else crc >> 1;
-        }
-        table[i] = crc;
-    }
-    break :blk table;
-};
-
 fn crc32(data: []const u8) u32 {
-    var crc: u32 = 0xFFFFFFFF;
-    for (data) |byte| {
-        crc = (crc >> 8) ^ CRC32_TABLE[@as(u8, @truncate(crc)) ^ byte];
-    }
-    return crc ^ 0xFFFFFFFF;
+    return std.hash.crc.@"CRC-32/ISCSI".hash(data);
 }
 
 pub const Wal = struct {
@@ -43,14 +22,21 @@ pub const Wal = struct {
     path: []const u8,
     sync_writes: bool,
     write_count: usize,
+    wal_bytes: std.atomic.Value(usize),
     queue: []?[]u8,
-    queue_head: std.atomic.Value(usize),
-    queue_tail: std.atomic.Value(usize),
+    queue_head: std.atomic.Value(usize) align(64),
+    queue_tail: std.atomic.Value(usize) align(64),
+    /// Leaf mutex serializing multi-producer ring-buffer slot reservation.
+    /// Lock order: Store.wal_enqueue_mutex -> Store.snapshot_mutex -> Shard.mutex -> Wal.queue_mutex.
+    queue_mutex: compat.Mutex = .{},
     writer_thread: ?std.Thread,
     writer_running: std.atomic.Value(bool),
     writer_started: bool,
     sync_requested: std.atomic.Value(bool),
-    wake_futex: std.atomic.Value(u32),
+    wake_futex: std.atomic.Value(u32) align(64),
+    consumer_parked: std.atomic.Value(bool),
+    producer_futex: std.atomic.Value(u32) align(64),
+    producer_parked: std.atomic.Value(bool),
     /// Direct synchronous I/O failures have an uncertain commit outcome. Do
     /// not acknowledge later writes against a live view that may differ from
     /// replay. Store serializes these fields with wal_enqueue_mutex.
@@ -80,7 +66,7 @@ pub const Wal = struct {
 
         const queue = try allocator.alloc(?[]u8, WAL_QUEUE_CAP);
         errdefer allocator.free(queue);
-        for (queue) |*slot| slot.* = null;
+        @memset(queue, null);
 
         return .{
             .allocator = allocator,
@@ -88,14 +74,19 @@ pub const Wal = struct {
             .path = path,
             .sync_writes = sync_writes,
             .write_count = 0,
+            .wal_bytes = std.atomic.Value(usize).init(@intCast(s.size)),
             .queue = queue,
             .queue_head = std.atomic.Value(usize).init(0),
             .queue_tail = std.atomic.Value(usize).init(0),
+            .queue_mutex = .{},
             .writer_thread = null,
             .writer_running = std.atomic.Value(bool).init(false),
             .writer_started = false,
             .sync_requested = std.atomic.Value(bool).init(false),
             .wake_futex = std.atomic.Value(u32).init(0),
+            .consumer_parked = std.atomic.Value(bool).init(false),
+            .producer_futex = std.atomic.Value(u32).init(0),
+            .producer_parked = std.atomic.Value(bool).init(false),
         };
     }
 
@@ -105,7 +96,7 @@ pub const Wal = struct {
     /// threaded build would assert nothing anywhere. The test checks this predicate directly.
     pub const use_background_writer = !build_options.single_threaded;
 
-    /// Start background WAL writer for lock-free producer submission.
+    /// Start background WAL writer for producer submission.
     /// Producer path becomes enqueue-only; this removes file I/O from request critical path.
     pub fn startBackground(self: *Wal) !void {
         if (!self.sync_writes or self.writer_started) return;
@@ -116,48 +107,19 @@ pub const Wal = struct {
         // fails so later writes are fenced (a46f517). A queued single-threaded drain would
         // batch and swallow those failures instead, so the queue is not used at all here.
         if (!use_background_writer) return;
-        self.writer_running.store(true, .release);
+        self.writer_running.store(true, .seq_cst);
         self.writer_thread = try std.Thread.spawn(.{}, writerLoop, .{self});
         self.writer_started = true;
-    }
-
-    /// Flush everything currently queued, in one batch and one fsync. Only the background
-    /// `writerLoop` uses this: a single-threaded build never starts the writer, so its producer
-    /// takes `writeDirect` and gets an immediate fsync plus the `sync_failed` fence instead of a
-    /// batch that would swallow those failures. Kept as one function so the batching exists in
-    /// exactly one place.
-    pub fn drainOnce(self: *Wal) void {
-        var batch: [64][]u8 = undefined;
-        var batch_count: usize = 0;
-        while (batch_count < 64) {
-            if (self.tryDequeueRecord()) |record| {
-                batch[batch_count] = record;
-                batch_count += 1;
-            } else break;
-        }
-
-        if (batch_count > 0) {
-            for (batch[0..batch_count]) |record| {
-                compat.File.writeAll(self.file, record) catch {};
-                self.allocator.free(record);
-                self.write_count += 1;
-            }
-            // Single fsync for entire batch — key performance win
-            if (self.sync_writes) {
-                compat.File.sync(self.file) catch {};
-            }
-        }
-
-        if (self.sync_requested.swap(false, .acq_rel)) {
-            compat.File.sync(self.file) catch {};
-        }
     }
 
     pub fn deinit(self: *Wal) void {
         // Guarded so the join is not analysed on a single-threaded target: std.Thread.join's
         // wasm path contains the atomic-wait asm, and no thread exists here to join.
         if (self.writer_started and !build_options.single_threaded) {
-            self.writer_running.store(false, .release);
+            self.writer_running.store(false, .seq_cst);
+            self.consumer_parked.store(false, .seq_cst);
+            _ = self.wake_futex.fetchAdd(1, .release);
+            compat.Futex.wake(&self.wake_futex, 1);
             if (self.writer_thread) |t| t.join();
             self.writer_thread = null;
             self.writer_started = false;
@@ -176,10 +138,32 @@ pub const Wal = struct {
     pub fn sync(self: *Wal) !void {
         if (self.sync_failed) return error.WalNeedsRecovery;
         if (self.writer_started) {
-            self.sync_requested.store(true, .release);
+            self.sync_requested.store(true, .seq_cst);
+            if (self.consumer_parked.load(.seq_cst)) {
+                self.consumer_parked.store(false, .release);
+                _ = self.wake_futex.fetchAdd(1, .release);
+                compat.Futex.wake(&self.wake_futex, 1);
+            }
             return;
         }
         try compat.File.sync(self.file);
+    }
+
+    /// Commit a pre-serialized WAL record buffer. Takes ownership of `record` on success;
+    /// on error, caller still owns `record` and must free it.
+    pub fn commitSerializedRecord(self: *Wal, record: []u8) !void {
+        const rec_len = record.len;
+        if (self.writer_started) {
+            self.enqueueRecordBlocking(record);
+            _ = self.wal_bytes.fetchAdd(rec_len, .monotonic);
+        } else {
+            try self.writeDirect(record);
+            self.allocator.free(record);
+        }
+    }
+
+    pub fn freeRecord(self: *Wal, record: []u8) void {
+        self.allocator.free(record);
     }
 
     /// Append a SET record to the WAL.
@@ -205,25 +189,14 @@ pub const Wal = struct {
             .flags = flags,
         };
 
-        if (self.writer_started) {
-            self.enqueueRecordBlocking(record);
-        } else {
-            try self.writeDirect(record);
-            self.allocator.free(record);
-        }
+        try self.commitSerializedRecord(record);
         return entry;
     }
 
     pub fn appendDelete(self: *Wal, key: []const u8) !void {
         const record = try self.serializeDeleteRecord(key);
-
-        if (self.writer_started) {
-            self.enqueueRecordBlocking(record);
-        } else {
-            errdefer self.allocator.free(record);
-            try self.writeDirect(record);
-            self.allocator.free(record);
-        }
+        errdefer self.allocator.free(record);
+        try self.commitSerializedRecord(record);
     }
 
     pub fn appendVinsert(
@@ -235,26 +208,14 @@ pub const Wal = struct {
         timestamp: Timestamp,
     ) !void {
         const record = try self.serializeVinsertRecord(key, namespace, metric, flags, timestamp);
-
-        if (self.writer_started) {
-            self.enqueueRecordBlocking(record);
-        } else {
-            errdefer self.allocator.free(record);
-            try self.writeDirect(record);
-            self.allocator.free(record);
-        }
+        errdefer self.allocator.free(record);
+        try self.commitSerializedRecord(record);
     }
 
     pub fn appendVdelete(self: *Wal, key: []const u8, namespace: []const u8) !void {
         const record = try self.serializeVdeleteRecord(key, namespace);
-
-        if (self.writer_started) {
-            self.enqueueRecordBlocking(record);
-        } else {
-            errdefer self.allocator.free(record);
-            try self.writeDirect(record);
-            self.allocator.free(record);
-        }
+        errdefer self.allocator.free(record);
+        try self.commitSerializedRecord(record);
     }
 
     fn writeDirect(self: *Wal, record: []const u8) !void {
@@ -270,9 +231,10 @@ pub const Wal = struct {
             try compat.File.sync(self.file);
         }
         self.write_count += 1;
+        _ = self.wal_bytes.fetchAdd(record.len, .monotonic);
     }
 
-    fn serializeSetRecord(self: *Wal, key: []const u8, value: []const u8, flags: EntryFlags, timestamp: Timestamp) ![]u8 {
+    pub fn serializeSetRecord(self: *Wal, key: []const u8, value: []const u8, flags: EntryFlags, timestamp: Timestamp) ![]u8 {
         const payload_len = SET_PAYLOAD_OVERHEAD + key.len + value.len;
         const total_len = @sizeOf(RecordHeader) + payload_len;
         const buf = try self.allocator.alloc(u8, total_len);
@@ -293,14 +255,14 @@ pub const Wal = struct {
         const payload_slice = buf[@sizeOf(RecordHeader)..total_len];
         const header = RecordHeader{
             .crc = crc32(payload_slice),
-            .record_type = @intFromEnum(WalRecordType.set),
+            .record_type = @backingInt(WalRecordType.set),
             .length = @intCast(payload_len),
         };
         @memcpy(buf[0..@sizeOf(RecordHeader)], std.mem.asBytes(&header));
         return buf;
     }
 
-    fn serializeDeleteRecord(self: *Wal, key: []const u8) ![]u8 {
+    pub fn serializeDeleteRecord(self: *Wal, key: []const u8) ![]u8 {
         const payload_len = DEL_PAYLOAD_OVERHEAD + key.len;
         const total_len = @sizeOf(RecordHeader) + payload_len;
         const buf = try self.allocator.alloc(u8, total_len);
@@ -313,14 +275,14 @@ pub const Wal = struct {
         const payload_slice = buf[@sizeOf(RecordHeader)..total_len];
         const header = RecordHeader{
             .crc = crc32(payload_slice),
-            .record_type = @intFromEnum(WalRecordType.delete),
+            .record_type = @backingInt(WalRecordType.delete),
             .length = @intCast(payload_len),
         };
         @memcpy(buf[0..@sizeOf(RecordHeader)], std.mem.asBytes(&header));
         return buf;
     }
 
-    fn serializeVinsertRecord(
+    pub fn serializeVinsertRecord(
         self: *Wal,
         key: []const u8,
         namespace: []const u8,
@@ -352,14 +314,14 @@ pub const Wal = struct {
         const payload_slice = buf[@sizeOf(RecordHeader)..total_len];
         const header = RecordHeader{
             .crc = crc32(payload_slice),
-            .record_type = @intFromEnum(WalRecordType.vinsert),
+            .record_type = @backingInt(WalRecordType.vinsert),
             .length = @intCast(payload_len),
         };
         @memcpy(buf[0..@sizeOf(RecordHeader)], std.mem.asBytes(&header));
         return buf;
     }
 
-    fn serializeVdeleteRecord(self: *Wal, key: []const u8, namespace: []const u8) ![]u8 {
+    pub fn serializeVdeleteRecord(self: *Wal, key: []const u8, namespace: []const u8) ![]u8 {
         const payload_len = VDELETE_PAYLOAD_OVERHEAD + key.len + namespace.len;
         const total_len = @sizeOf(RecordHeader) + payload_len;
         const buf = try self.allocator.alloc(u8, total_len);
@@ -376,63 +338,123 @@ pub const Wal = struct {
         const payload_slice = buf[@sizeOf(RecordHeader)..total_len];
         const header = RecordHeader{
             .crc = crc32(payload_slice),
-            .record_type = @intFromEnum(WalRecordType.vdelete),
+            .record_type = @backingInt(WalRecordType.vdelete),
             .length = @intCast(payload_len),
         };
         @memcpy(buf[0..@sizeOf(RecordHeader)], std.mem.asBytes(&header));
         return buf;
     }
 
-    /// Single-producer enqueue (producer currently runs under Store global write lock).
+    /// Producer enqueue protected by leaf `queue_mutex` (always innermost in lock order).
     fn enqueueRecordBlocking(self: *Wal, record: []u8) void {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+
         while (!self.tryEnqueueRecord(record)) {
+            self.producer_parked.store(true, .seq_cst);
+            if (self.tryEnqueueRecord(record)) {
+                self.producer_parked.store(false, .release);
+                break;
+            }
             // Wait on futex instead of spinning — wake when consumer drains
-            compat.Futex.timedWait(&self.wake_futex, self.wake_futex.load(.acquire), 50_000);
+            compat.Futex.timedWait(&self.producer_futex, self.producer_futex.load(.acquire), 50_000);
         }
-        // Wake writer thread immediately
-        _ = self.wake_futex.fetchAdd(1, .release);
-        compat.Futex.wake(&self.wake_futex, 1);
+        // Dekker pair with consumer_parked: tryEnqueueRecord published queue_tail
+        // with .seq_cst before this .seq_cst load, preventing lost wake-ups.
+        if (self.consumer_parked.load(.seq_cst)) {
+            self.consumer_parked.store(false, .release);
+            _ = self.wake_futex.fetchAdd(1, .release);
+            compat.Futex.wake(&self.wake_futex, 1);
+        }
     }
 
     fn tryEnqueueRecord(self: *Wal, record: []u8) bool {
-        const head = self.queue_head.load(.acquire);
-        const tail = self.queue_tail.load(.acquire);
+        const head = self.queue_head.load(.seq_cst);
+        const tail = self.queue_tail.load(.monotonic);
         if (tail - head >= self.queue.len) return false;
 
         const idx = tail & WAL_QUEUE_MASK;
         self.queue[idx] = record;
-        self.queue_tail.store(tail + 1, .release);
+        // .seq_cst store forms a Dekker pair with consumer_parked.load(.seq_cst)
+        // in enqueueRecordBlocking and consumer_parked.store(true, .seq_cst) ->
+        // hasPendingRecords() in writerLoop.
+        self.queue_tail.store(tail + 1, .seq_cst);
         return true;
     }
 
     fn tryDequeueRecord(self: *Wal) ?[]u8 {
-        const head = self.queue_head.load(.acquire);
+        const head = self.queue_head.load(.monotonic);
         const tail = self.queue_tail.load(.acquire);
         if (head == tail) return null;
 
         const idx = head & WAL_QUEUE_MASK;
         const record = self.queue[idx] orelse return null;
         self.queue[idx] = null;
-        self.queue_head.store(head + 1, .release);
+        self.queue_head.store(head + 1, .seq_cst);
         return record;
     }
 
     fn hasPendingRecords(self: *Wal) bool {
-        return self.queue_head.load(.acquire) != self.queue_tail.load(.acquire);
+        return self.queue_head.load(.seq_cst) != self.queue_tail.load(.seq_cst);
     }
 
     fn writerLoop(self: *Wal) void {
+        var write_buf: [65536]u8 = undefined;
         while (self.writer_running.load(.acquire) or self.hasPendingRecords()) {
-            if (self.hasPendingRecords() or self.sync_requested.load(.acquire)) {
-                self.drainOnce();
-                // Wake a producer that was blocked on a full queue.
-                _ = self.wake_futex.fetchAdd(1, .release);
-                compat.Futex.wake(&self.wake_futex, 1);
+            // Drain phase: coalesce pending records into a single 64 KiB write buffer
+            var batch_count: usize = 0;
+            var write_pos: usize = 0;
+            while (batch_count < 256) {
+                if (self.tryDequeueRecord()) |record| {
+                    if (record.len > write_buf.len) {
+                        if (write_pos > 0) {
+                            compat.File.writeAll(self.file, write_buf[0..write_pos]) catch {};
+                            write_pos = 0;
+                        }
+                        compat.File.writeAll(self.file, record) catch {};
+                    } else {
+                        if (write_pos + record.len > write_buf.len) {
+                            compat.File.writeAll(self.file, write_buf[0..write_pos]) catch {};
+                            write_pos = 0;
+                        }
+                        @memcpy(write_buf[write_pos..][0..record.len], record);
+                        write_pos += record.len;
+                    }
+                    self.allocator.free(record);
+                    self.write_count += 1;
+                    batch_count += 1;
+                } else break;
+            }
+
+            if (batch_count > 0) {
+                if (write_pos > 0) {
+                    compat.File.writeAll(self.file, write_buf[0..write_pos]) catch {};
+                }
+                // Single fsync for entire batch — key performance win
+                if (self.sync_writes) {
+                    compat.File.sync(self.file) catch {};
+                }
+                // Wake producer ONLY if it was blocked on a full queue
+                if (self.producer_parked.swap(false, .seq_cst)) {
+                    _ = self.producer_futex.fetchAdd(1, .release);
+                    compat.Futex.wake(&self.producer_futex, 1);
+                }
                 continue;
             }
 
-            // Wait for producer to enqueue — instant wake, zero CPU waste
-            compat.Futex.timedWait(&self.wake_futex, self.wake_futex.load(.acquire), 1_000_000);
+            if (self.sync_requested.swap(false, .acq_rel)) {
+                compat.File.sync(self.file) catch {};
+                continue;
+            }
+
+            // Park consumer and wait for producer to enqueue — Dekker handshake
+            // with producer's queue_tail.store(.seq_cst) + consumer_parked.load(.seq_cst).
+            const futex_val = self.wake_futex.load(.acquire);
+            self.consumer_parked.store(true, .seq_cst);
+            if (!self.hasPendingRecords() and !self.sync_requested.load(.seq_cst) and self.writer_running.load(.seq_cst)) {
+                compat.Futex.timedWait(&self.wake_futex, futex_val, 1_000_000);
+            }
+            self.consumer_parked.store(false, .release);
         }
 
         // Final durability point on shutdown.
@@ -445,14 +467,14 @@ pub const Wal = struct {
     }
 
     pub fn size(self: *Wal) !usize {
-        const s = try compat.File.stat(self.file);
-        return @intCast(s.size);
+        return self.wal_bytes.load(.monotonic);
     }
 
     /// Truncate the WAL to zero bytes and reset write cursor to the beginning.
     pub fn truncate(self: *Wal) !void {
         try compat.File.setLength(self.file, 0);
         try compat.File.seekTo(self.file, 0);
+        self.wal_bytes.store(0, .monotonic);
         if (self.sync_writes) {
             try compat.File.sync(self.file);
         }
@@ -497,13 +519,37 @@ pub const WalRecord = union(enum) {
 pub const WalIterator = struct {
     file: std.Io.File,
     allocator: std.mem.Allocator,
+    read_buf: [65536]u8 = undefined,
+    buf_pos: usize = 0,
+    buf_end: usize = 0,
     done: bool = false,
+
+    fn readBuffered(self: *WalIterator, dest: []u8) !usize {
+        var total: usize = 0;
+        while (total < dest.len) {
+            const avail = self.buf_end - self.buf_pos;
+            if (avail == 0) {
+                if (dest.len - total >= self.read_buf.len) {
+                    return total + try compat.File.readAll(self.file, dest[total..]);
+                }
+                self.buf_pos = 0;
+                self.buf_end = try compat.File.readAll(self.file, &self.read_buf);
+                if (self.buf_end == 0) break;
+                continue;
+            }
+            const n = @min(avail, dest.len - total);
+            @memcpy(dest[total..][0..n], self.read_buf[self.buf_pos..][0..n]);
+            self.buf_pos += n;
+            total += n;
+        }
+        return total;
+    }
 
     pub fn next(self: *WalIterator) !?WalRecord {
         if (self.done) return null;
 
         var header: Wal.RecordHeader = undefined;
-        const header_bytes_read = compat.File.readAll(self.file, std.mem.asBytes(&header)) catch {
+        const header_bytes_read = self.readBuffered(std.mem.asBytes(&header)) catch {
             self.done = true;
             return null;
         };
@@ -516,18 +562,35 @@ pub const WalIterator = struct {
         const payload_len: usize = @intCast(header.length);
         if (payload_len == 0 or payload_len > 1024 * 1024 * 100) return error.Corruption;
 
+        // Zero-copy fast path when payload is already contiguous in read_buf
+        if (self.buf_end - self.buf_pos >= payload_len) {
+            const payload = self.read_buf[self.buf_pos .. self.buf_pos + payload_len];
+            self.buf_pos += payload_len;
+            if (crc32(payload) != header.crc) return error.Corruption;
+            const record_type: WalRecordType = @fromBackingInt(@intCast(header.record_type));
+            return switch (record_type) {
+                .set => try self.parseSet(payload),
+                .delete => try self.parseDelete(payload),
+                .vinsert => try self.parseVinsert(payload),
+                .vdelete => try self.parseVdelete(payload),
+            };
+        }
+
         const payload = try self.allocator.alloc(u8, payload_len);
         defer self.allocator.free(payload);
 
-        const payload_read = compat.File.readAll(self.file, payload) catch {
+        const payload_read = self.readBuffered(payload) catch {
             self.done = true;
             return null;
         };
-        _ = payload_read;
+        if (payload_read < payload_len) {
+            self.done = true;
+            return null;
+        }
 
         if (crc32(payload) != header.crc) return error.Corruption;
 
-        const record_type: WalRecordType = @enumFromInt(header.record_type);
+        const record_type: WalRecordType = @fromBackingInt(@intCast(header.record_type));
         return switch (record_type) {
             .set => try self.parseSet(payload),
             .delete => try self.parseDelete(payload),
@@ -632,10 +695,8 @@ pub const WalIterator = struct {
     }
 };
 
-test "WAL append and replay" {
-    const testing = std.testing;
-    // TODO: Zig 0.16 test tmpDir API may have changed — re-enable after verifying
-    _ = testing;
+test "WAL CRC32C check value matches Castagnoli standard 0xE3069283" {
+    try std.testing.expectEqual(@as(u32, 0xE3069283), crc32("123456789"));
 }
 
 /// The single-threaded path must keep the durability semantics the threaded path has:

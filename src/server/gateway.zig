@@ -820,8 +820,15 @@ pub const Gateway = struct {
 
         // Unmask if needed (browser clients always mask)
         if (masked) {
-            for (buf, 0..) |*byte, j| {
-                byte.* ^= mask_key[j % 4];
+            const mask_u32: u32 = @bitCast(mask_key);
+            const mask_vec: @Vector(16, u8) = @bitCast(@as(@Vector(4, u32), @splat(mask_u32)));
+            var j: usize = 0;
+            while (j + 16 <= buf.len) : (j += 16) {
+                const chunk: @Vector(16, u8) = buf[j..][0..16].*;
+                buf[j..][0..16].* = chunk ^ mask_vec;
+            }
+            while (j < buf.len) : (j += 1) {
+                buf[j] ^= mask_key[j % 4];
             }
         }
 
@@ -871,8 +878,10 @@ pub const Gateway = struct {
     }
 
     fn sendWireResponseFrame(stream: *core.compat.net.Stream, allocator: std.mem.Allocator, response: Response) !void {
-        var resp_buf: [65536]u8 = undefined;
-        var fbw = wire.FixedBufWriter.init(&resp_buf);
+        // Reserve 10 bytes at the front for the WebSocket frame header so we can
+        // emit the WS header + WormWire response in a single writeAll syscall.
+        var frame_buf: [10 + 65536]u8 = undefined;
+        var fbw = wire.FixedBufWriter.init(frame_buf[10..]);
         wire.writeResponse(&fbw, response) catch |err| {
             if (err != error.NoSpaceLeft) return err;
             const encoded = try encodeWireResponseAlloc(allocator, response);
@@ -880,7 +889,22 @@ pub const Gateway = struct {
             try sendWsFrame(stream, 0x02, encoded);
             return;
         };
-        try sendWsFrame(stream, 0x02, fbw.getWritten());
+        const payload = fbw.getWritten();
+        if (payload.len < 126) {
+            frame_buf[8] = 0x82; // FIN + binary opcode (0x02)
+            frame_buf[9] = @intCast(payload.len);
+            try stream.writeAll(frame_buf[8 .. 10 + payload.len]);
+        } else if (payload.len <= 65535) {
+            frame_buf[6] = 0x82;
+            frame_buf[7] = 126;
+            std.mem.writeInt(u16, frame_buf[8..10], @intCast(payload.len), .big);
+            try stream.writeAll(frame_buf[6 .. 10 + payload.len]);
+        } else {
+            frame_buf[0] = 0x82;
+            frame_buf[1] = 127;
+            std.mem.writeInt(u64, frame_buf[2..10], @intCast(payload.len), .big);
+            try stream.writeAll(frame_buf[0 .. 10 + payload.len]);
+        }
     }
 
     fn sendWsCloseWithCode(stream: *core.compat.net.Stream, code: u16) !void {
@@ -1174,7 +1198,67 @@ test "gateway allocator-backed response encoder handles payloads over 64 KiB" {
     defer testing.allocator.free(encoded);
 
     try testing.expectEqual(@as(usize, payload.len + 5), encoded.len);
-    try testing.expectEqual(@as(u8, @intFromEnum(wire.ResponseCode.value)), encoded[0]);
+    try testing.expectEqual(@as(u8, @backingInt(wire.ResponseCode.value)), encoded[0]);
     try testing.expectEqual(@as(u32, @intCast(payload.len)), std.mem.readInt(u32, encoded[1..5], .big));
     try testing.expectEqualSlices(u8, payload, encoded[5..]);
+}
+
+test "sendWireResponseFrame handles 65,536-byte payload without u16 header overflow" {
+    const testing = std.testing;
+
+    const listen_addr = try core.compat.net.Address.parseIp("127.0.0.1", 0);
+    var listener = try listen_addr.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    const bound_port = listener.inner.socket.address.getPort();
+
+    const SenderCtx = struct {
+        listener: *core.compat.net.ServerCompat,
+        alloc: std.mem.Allocator,
+
+        fn run(ctx: @This()) void {
+            var conn = ctx.listener.accept() catch return;
+            defer conn.stream.close();
+
+            // 1. Value of 65,531 bytes -> encoded WormWire response is 5 + 65,531 = 65,536 bytes,
+            // which fits in frame_buf[10..] (65,536 bytes) and exercises the >65,535 64-bit WS length branch.
+            const exact_frame_val = ctx.alloc.alloc(u8, 65536 - 5) catch return;
+            defer ctx.alloc.free(exact_frame_val);
+            @memset(exact_frame_val, 'a');
+            Gateway.sendWireResponseFrame(&conn.stream, ctx.alloc, .{ .value = exact_frame_val }) catch return;
+
+            // 2. Value of 65,536 bytes -> encoded WormWire response is 65,541 bytes,
+            // which exceeds frame_buf[10..] and exercises the allocator fallback + sendWsFrame.
+            const exact_val_64k = ctx.alloc.alloc(u8, 65536) catch return;
+            defer ctx.alloc.free(exact_val_64k);
+            @memset(exact_val_64k, 'b');
+            Gateway.sendWireResponseFrame(&conn.stream, ctx.alloc, .{ .value = exact_val_64k }) catch return;
+        }
+    };
+
+    const thread = try std.Thread.spawn(.{}, SenderCtx.run, .{SenderCtx{
+        .listener = &listener,
+        .alloc = testing.allocator,
+    }});
+    defer thread.join();
+
+    const connect_addr = core.compat.net.Address.initIp4(.{ 127, 0, 0, 1 }, bound_port);
+    var client = try core.compat.net.tcpConnectToAddress(connect_addr);
+    defer client.close();
+
+    // Verify frame 1 (encoded WormWire payload == 65,536 bytes)
+    const ws_frame1 = Gateway.readWsFrame(&client, testing.allocator) orelse return error.TestUnexpectedResult;
+    defer if (ws_frame1.allocated) testing.allocator.free(ws_frame1.payload);
+    try testing.expectEqual(@as(u4, 0x02), ws_frame1.opcode);
+    try testing.expectEqual(@as(usize, 65536), ws_frame1.payload.len);
+    try testing.expectEqual(@as(u8, @backingInt(wire.ResponseCode.value)), ws_frame1.payload[0]);
+    try testing.expectEqual(@as(u32, 65531), std.mem.readInt(u32, ws_frame1.payload[1..5], .big));
+
+    // Verify frame 2 (value payload == 65,536 bytes, encoded WormWire payload == 65,541 bytes)
+    const ws_frame2 = Gateway.readWsFrame(&client, testing.allocator) orelse return error.TestUnexpectedResult;
+    defer if (ws_frame2.allocated) testing.allocator.free(ws_frame2.payload);
+    try testing.expectEqual(@as(u4, 0x02), ws_frame2.opcode);
+    try testing.expectEqual(@as(usize, 65536 + 5), ws_frame2.payload.len);
+    try testing.expectEqual(@as(u8, @backingInt(wire.ResponseCode.value)), ws_frame2.payload[0]);
+    try testing.expectEqual(@as(u32, 65536), std.mem.readInt(u32, ws_frame2.payload[1..5], .big));
 }

@@ -18,8 +18,8 @@ pub const Hash = [HASH_LEN]u8;
 pub const PublicKey = [PUBLIC_KEY_LEN]u8;
 pub const Signature = [SIGNATURE_LEN]u8;
 
-pub const ZERO_HASH: Hash = [_]u8{0} ** HASH_LEN;
-pub const ZERO_SIGNATURE: Signature = [_]u8{0} ** SIGNATURE_LEN;
+pub const ZERO_HASH: Hash = @splat(0);
+pub const ZERO_SIGNATURE: Signature = @splat(0);
 
 const CHECKPOINT_SIGNING_DOMAIN = "wormdb.checkpoint.sign.v1";
 const CHECKPOINT_RECORD_DOMAIN = "wormdb.checkpoint.record.v1";
@@ -90,7 +90,7 @@ pub const CheckpointRecord = struct {
         try appendLenBytes(&out, allocator, self.log_id);
         try appendU64(&out, allocator, self.from_seq);
         try appendU64(&out, allocator, self.to_seq);
-        try appendU8(&out, allocator, @intFromEnum(self.accumulator_kind));
+        try appendU8(&out, allocator, @backingInt(self.accumulator_kind));
         try appendFixed(&out, allocator, self.accumulator_root[0..]);
         if (self.previous_checkpoint_hash) |prev| {
             try appendU8(&out, allocator, 1);
@@ -99,7 +99,7 @@ pub const CheckpointRecord = struct {
             try appendU8(&out, allocator, 0);
         }
         try appendLenBytes(&out, allocator, self.creator_identity);
-        try appendU8(&out, allocator, @intFromEnum(self.signature_scheme));
+        try appendU8(&out, allocator, @backingInt(self.signature_scheme));
         try appendU64(&out, allocator, self.created_at_ms);
         try appendU64(&out, allocator, self.ingested_at_ms);
         try appendLenBytes(&out, allocator, self.extension_bytes);

@@ -10,16 +10,17 @@
 //! roughly an order of magnitude faster than brute-force while maintaining
 //! >95% recall on natural embedding distributions.
 //!
-//! EXEC vsearch <query_key> <top_k> [<namespace>] [<metric>] [<decay>] [<mode>] [<decay_tau_hours>]
+//! EXEC vsearch <query_key> <top_k> [<namespace>] [<metric>] [<decay>] [<mode>] [<decay_tau_hours>] [<ef>]
 //!
 //! - query_key:  key holding the query vector (raw f32 bytes)
 //! - top_k:      max results to return (1–100)
 //! - namespace:  key prefix to search (default: "vec:")
 //! - metric:     "cosine" (default), "dot", "l2"
 //! - decay:      temporal decay factor (0.0 = no decay)
-//! - mode:       "auto" (default — BQ prefilter if hashes exist, else
-//!               brute-force) or "exact" (always brute-force)
+//! - mode:       "auto" (default — HNSW if index exists, else BQ prefilter,
+//!               else brute-force) or "exact" (always brute-force)
 //! - decay_tau_hours: temporal decay time constant (default: 168)
+//! - ef:         optional HNSW search beam width (default: 128; accepts "<N>" or "ef=<N>")
 //!
 //! Returns JSON array sorted by descending score:
 //!   [{"k":"vec:ns:id","s":0.95,"ts":1709...}, ...]
@@ -43,10 +44,8 @@ pub const MAX_TOP_K: usize = 100;
 pub const DEFAULT_NAMESPACE: []const u8 = "vec:";
 const BQ_PREFIX: []const u8 = "bq:";
 const STAGE1_OVERSAMPLE: usize = 20;
-/// HNSW ef (beam width) factor relative to M (= top_k × STAGE1_OVERSAMPLE).
-/// HNSW recall tracks ef closely; we reuse the same oversample budget so
-/// the stage-1→stage-2 shape stays consistent across dispatch paths.
-const HNSW_EF_SEARCH_FACTOR: usize = 1;
+/// Default HNSW search beam width (`ef`) when no explicit `ef` argument is passed.
+pub const DEFAULT_HNSW_EF: usize = 128;
 pub const DEFAULT_DECAY_TAU_HOURS: f32 = 168.0; // ~1 week time constant
 
 pub const Mode = enum {
@@ -97,6 +96,7 @@ pub const SearchParams = struct {
     decay: f32,
     mode: Mode,
     decay_tau_hours: f32,
+    ef: ?usize = null,
 };
 
 // ╔═══════════════════════════════════════════════════╗
@@ -107,6 +107,13 @@ pub fn parseDecayTauHours(raw: []const u8) ?f32 {
     const tau = std.fmt.parseFloat(f32, raw) catch return null;
     if (!std.math.isFinite(tau) or tau <= 0.0) return null;
     return tau;
+}
+
+pub fn parseEfArg(raw: []const u8) ?usize {
+    const trimmed = if (std.mem.startsWith(u8, raw, "ef=")) raw["ef=".len..] else raw;
+    const val = std.fmt.parseInt(usize, trimmed, 10) catch return null;
+    if (val == 0) return null;
+    return val;
 }
 
 inline fn applyDecay(raw_sim: f32, timestamp: u64, decay: f32, now_ms: u64, decay_tau_hours: f32) f32 {
@@ -318,14 +325,15 @@ fn onExactMatch(
 
 const IndexModule = @import("../vector/index.zig");
 
-/// Stage 1 via HNSW + stage 2 exact refine. Returns true if the heap was
-/// populated from HNSW; false if the index is empty (caller falls back to
-/// BQ or brute-force).
+/// Stage 1 via HNSW. Returns true if the heap was populated from HNSW;
+/// false if the index is empty (caller falls back to BQ or brute-force).
 ///
-/// Holds `ns_idx.lock` in shared mode only while reading the stage-1
-/// candidate set and duping keys — then releases before `ctx.getCopy`
-/// calls, which lock shards. Short critical section, no lock interleaving
-/// with store shards.
+/// Since `ns_idx.metric == metric` is verified by the caller, `Hnsw.search`
+/// already computes the exact distance `r.dist` against the full-precision
+/// vectors stored in `node.vector`. We convert `r.dist` directly back to
+/// similarity (`cosine: 1 - d`, `dot: -d`, `l2: 1 / (1 + d)`) under a single
+/// shared lock acquisition, copy candidate keys, release `ns_idx.lock`, and
+/// verify existence in the KV store without holding the index lock.
 fn runHnswDispatch(
     ctx: *Ctx,
     query_key: []const u8,
@@ -335,54 +343,58 @@ fn runHnswDispatch(
     metric: Metric,
     decay: f32,
     decay_tau_hours: f32,
+    ef_override: ?usize,
     now_ms: u64,
     heap: *TopKCandidate,
 ) !bool {
-    const stage1_size = top_k * STAGE1_OVERSAMPLE;
+    // When temporal decay is disabled, similarity is strictly monotonic in
+    // `r.dist`, so we only need `top_k + 8` results (extra headroom in case
+    // `query_key` is in the index or an unattached store deleted keys). When
+    // decay > 0, oversample so recency re-ranking can promote slightly further
+    // but newer vectors.
+    const k_req = if (decay > 0.0) top_k * STAGE1_OVERSAMPLE else top_k + 8;
+    const ef = if (ef_override) |custom_ef|
+        @max(k_req, custom_ef)
+    else
+        @max(k_req, @max(top_k * 2, DEFAULT_HNSW_EF));
 
-    // Scratch buffers for the HNSW call.
-    const raw_buf = try ctx.allocator.alloc(IndexModule.IndexSearchResult, stage1_size);
-    const hnsw_scratch = try ctx.allocator.alloc(hnsw_mod.SearchResult, stage1_size);
-    const ef = stage1_size * HNSW_EF_SEARCH_FACTOR;
+    const raw_buf = try ctx.allocator.alloc(IndexModule.IndexSearchResult, k_req);
+    const hnsw_scratch = try ctx.allocator.alloc(hnsw_mod.SearchResult, k_req);
+    const cands = try ctx.allocator.alloc(Candidate, k_req);
 
-    const n_stage1 = blk: {
-        ns_idx.lock.lockShared();
-        defer ns_idx.lock.unlockShared();
-        if (ns_idx.len() == 0) break :blk @as(usize, 0);
-        break :blk try ns_idx.searchLocked(query_vec, stage1_size, ef, raw_buf, hnsw_scratch);
-    };
-
-    if (n_stage1 == 0) return false;
-
-    // Dupe keys out of the index before touching the store — the borrowed
-    // key slices are only valid under the read-lock, and we released it.
-    const stage1_keys = try ctx.allocator.alloc([]u8, n_stage1);
-    const stage1_ts = try ctx.allocator.alloc(u64, n_stage1);
+    var n_cands: usize = 0;
     {
         ns_idx.lock.lockShared();
         defer ns_idx.lock.unlockShared();
-        // n_stage1 <= ns_idx.len() at entry; the only mutation that can have
-        // happened in the gap is an insert, which only appends — existing
-        // indices remain valid.
-        for (raw_buf[0..n_stage1], 0..) |r, i| {
-            stage1_keys[i] = try ctx.allocator.dupe(u8, r.key);
-            stage1_ts[i] = r.timestamp;
+
+        if (ns_idx.len() == 0) return false;
+        const n_found = try ns_idx.searchLocked(query_vec, k_req, ef, raw_buf, hnsw_scratch);
+        if (n_found == 0) return false;
+
+        for (raw_buf[0..n_found]) |r| {
+            if (std.mem.eql(u8, r.key, query_key)) continue;
+
+            const raw_sim: f32 = switch (metric) {
+                .cosine => 1.0 - r.dist,
+                .dot => -r.dist,
+                .l2 => 1.0 / (1.0 + r.dist),
+            };
+            const score = applyDecay(raw_sim, r.timestamp, decay, now_ms, decay_tau_hours);
+            cands[n_cands] = .{
+                .key = try ctx.allocator.dupe(u8, r.key),
+                .score = score,
+                .timestamp = r.timestamp,
+            };
+            n_cands += 1;
         }
     }
 
-    // Stage 2: exact refine (no index lock held).
-    for (0..n_stage1) |i| {
-        // The query's own stored entry is never a result — mirrors the
-        // BQ/RaBitQ/brute-force scan paths and the runSearch contract.
-        if (std.mem.eql(u8, stage1_keys[i], query_key)) continue;
-        const vec_bytes = (try ctx.getCopy(stage1_keys[i])) orelse continue;
-        const vec = distance.bytesToF32(vec_bytes) orelse continue;
-        if (vec.len != query_vec.len) continue;
-
-        const raw_sim = computeExactSim(metric, query_vec, vec);
-        const score = applyDecay(raw_sim, stage1_ts[i], decay, now_ms, decay_tau_hours);
-
-        heap.push(.{ .key = stage1_keys[i], .score = score, .timestamp = stage1_ts[i] });
+    // Index lock is released; verify key existence in the KV store (never take
+    // shard locks while holding `ns_idx.lock`).
+    for (cands[0..n_cands]) |cand| {
+        if (cand.score <= heap.thresholdScore()) continue;
+        if (!ctx.store.exists(cand.key) and ctx.store.sstHit(cand.key) == null) continue;
+        heap.push(cand);
     }
 
     return true;
@@ -417,25 +429,29 @@ fn emitJson(ctx: *Ctx, results: []const Candidate) !Ctx.Result {
 }
 
 pub fn appendJsonEscaped(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, s: []const u8) !void {
-    for (s) |c| {
-        switch (c) {
-            '"' => try list.appendSlice(alloc, "\\\""),
-            '\\' => try list.appendSlice(alloc, "\\\\"),
-            '\n' => try list.appendSlice(alloc, "\\n"),
-            '\r' => try list.appendSlice(alloc, "\\r"),
-            '\t' => try list.appendSlice(alloc, "\\t"),
-            else => {
-                if (c < 0x20) {
-                    try list.appendSlice(alloc, "\\u00");
-                    const hex = "0123456789abcdef";
-                    try list.append(alloc, hex[c >> 4]);
-                    try list.append(alloc, hex[c & 0x0f]);
-                } else {
-                    try list.append(alloc, c);
-                }
-            },
+    var start: usize = 0;
+    for (s, 0..) |c, i| {
+        const esc: ?[]const u8 = switch (c) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            else => if (c < 0x20) "" else null,
+        };
+        if (esc) |seq| {
+            if (i > start) try list.appendSlice(alloc, s[start..i]);
+            if (seq.len > 0) {
+                try list.appendSlice(alloc, seq);
+            } else {
+                const hex = "0123456789abcdef";
+                const u_esc = [6]u8{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 0x0f] };
+                try list.appendSlice(alloc, &u_esc);
+            }
+            start = i + 1;
         }
     }
+    if (start < s.len) try list.appendSlice(alloc, s[start..]);
 }
 
 // ╔═══════════════════════════════════════════════════╗
@@ -445,7 +461,7 @@ pub fn appendJsonEscaped(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Alloc
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     // ── Parse args ───────────────────────────────────────────────
     const query_key = ctx.arg(0) orelse
-        return ctx.err("vsearch requires at least 2 args: <query_key> <top_k> [namespace] [metric] [decay] [mode] [decay_tau_hours]");
+        return ctx.err("vsearch requires at least 2 args: <query_key> <top_k> [namespace] [metric] [decay] [mode] [decay_tau_hours] [ef]");
 
     const top_k_raw = ctx.argInt(usize, 1) orelse
         return ctx.err("vsearch: top_k must be a positive integer");
@@ -469,6 +485,11 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     else
         DEFAULT_DECAY_TAU_HOURS;
 
+    const ef_override: ?usize = if (ctx.arg(7)) |raw_ef|
+        parseEfArg(raw_ef) orelse return ctx.err("vsearch: ef must be a positive integer")
+    else
+        null;
+
     // ── Load query vector (locks internally, safe before scans) ──
     const query_bytes = (try ctx.getCopy(query_key)) orelse
         return ctx.err("vsearch: query key not found");
@@ -487,6 +508,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
         .decay = decay,
         .mode = mode,
         .decay_tau_hours = decay_tau_hours,
+        .ef = ef_override,
     }, &final_heap)) |msg| return ctx.err(msg);
 
     return emitJson(ctx, final_heap.sortedDesc());
@@ -521,8 +543,7 @@ pub fn runSearch(
     // Preferred path when available — ~5-50× faster than BQ at large N.
     // The namespace's HNSW must have been built with the same metric the
     // caller is querying with; mismatches fall through to BQ, which
-    // doesn't depend on the graph's distance choice. Stage-2 refine
-    // re-ranks with the caller's metric regardless.
+    // doesn't depend on the graph's distance choice.
     if (mode == .auto) {
         if (ctx.vector_registry) |reg| {
             if (reg.get(namespace)) |ns_idx| {
@@ -536,6 +557,7 @@ pub fn runSearch(
                         metric,
                         decay,
                         decay_tau_hours,
+                        params.ef,
                         now_ms,
                         final_heap,
                     )) {
@@ -742,7 +764,7 @@ pub fn runSearch(
 // ║  vsearch_local_raw — inline-query peer sub-search  ║
 // ╚═══════════════════════════════════════════════════╝
 //
-// EXEC vsearch_local_raw <query_b64> <top_k> [namespace] [metric] [decay] [mode] [decay_tau_hours]
+// EXEC vsearch_local_raw <query_b64> <top_k> [namespace] [metric] [decay] [mode] [decay_tau_hours] [ef]
 //
 // Same search as `vsearch` but the query vector is passed INLINE as
 // standard base64 of the raw little-endian f32 bytes — no key lookup.
@@ -758,7 +780,7 @@ pub fn runSearch(
 
 pub fn executeLocalRaw(ctx: *Ctx) anyerror!Ctx.Result {
     const query_b64 = ctx.arg(0) orelse
-        return ctx.err("vsearch_local_raw requires at least 2 args: <query_b64> <top_k> [namespace] [metric] [decay] [mode] [decay_tau_hours]");
+        return ctx.err("vsearch_local_raw requires at least 2 args: <query_b64> <top_k> [namespace] [metric] [decay] [mode] [decay_tau_hours] [ef]");
 
     const top_k_raw = ctx.argInt(usize, 1) orelse
         return ctx.err("vsearch_local_raw: top_k must be a positive integer");
@@ -781,6 +803,10 @@ pub fn executeLocalRaw(ctx: *Ctx) anyerror!Ctx.Result {
         parseDecayTauHours(raw) orelse return ctx.err("vsearch_local_raw: decay_tau_hours must be positive")
     else
         DEFAULT_DECAY_TAU_HOURS;
+    const ef_override: ?usize = if (ctx.arg(7)) |raw|
+        parseEfArg(raw) orelse return ctx.err("vsearch_local_raw: ef must be a positive integer")
+    else
+        null;
 
     // ── Decode the inline query vector (base64 of raw f32 LE bytes) ──
     const decoder = std.base64.standard.Decoder;
@@ -805,6 +831,7 @@ pub fn executeLocalRaw(ctx: *Ctx) anyerror!Ctx.Result {
         .decay = decay,
         .mode = mode,
         .decay_tau_hours = decay_tau_hours,
+        .ef = ef_override,
     }, &final_heap)) |msg| return ctx.err(msg);
 
     return emitJson(ctx, final_heap.sortedDesc());
@@ -980,4 +1007,112 @@ test "vsearch: HNSW path excludes the query's own key" {
     try testing.expect(std.mem.indexOf(u8, top3.value.?, "\"k\":\"vec:t:q\"") == null);
     try testing.expect(std.mem.indexOf(u8, top3.value.?, "\"k\":\"vec:t:near\"") != null);
     try testing.expect(std.mem.indexOf(u8, top3.value.?, "\"k\":\"vec:t:far\"") != null);
+}
+
+test "vsearch: plain DEL and raw SET synchronize with HNSW index" {
+    var store = try Store.init(testing.allocator, Config{ .persistence = .none });
+    defer store.deinit();
+
+    var registry = IndexModule.NamespaceRegistry.init(testing.allocator, .{});
+    defer registry.deinit();
+    store.vector_registry = &registry;
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const q = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+    const a = [_]f32{ 0.95, 0.05, 0.0, 0.0 };
+    const b = [_]f32{ 0.6, 0.8, 0.0, 0.0 };
+    const c = [_]f32{ 0.0, 1.0, 0.0, 0.0 };
+
+    try store.set("qvec", try testPackF32(arena, &q), false);
+    const ns_idx = try registry.getOrCreate("vec:t:", .cosine);
+    inline for (.{
+        .{ "vec:t:a", &a },
+        .{ "vec:t:b", &b },
+        .{ "vec:t:c", &c },
+    }) |entry| {
+        try store.setWithTimestampNoVectorSync(entry[0], try testPackF32(arena, entry[1]), false, 1_700_000_000_000);
+        ns_idx.lock.lock();
+        defer ns_idx.lock.unlock();
+        _ = try ns_idx.insertLocked(entry[0], entry[1], 1_700_000_000_000);
+    }
+
+    // 1. Plain DEL on vec:t:a must tombstone it in HNSW and exclude it from results.
+    _ = try store.delete("vec:t:a");
+    try testing.expectEqual(@as(usize, 2), ns_idx.liveCount());
+
+    const after_del = try testRunProcWithRegistry(&store, execute, &.{ "qvec", "3", "vec:t:" }, arena, &registry);
+    try testing.expect(after_del == .value);
+    try testing.expect(std.mem.indexOf(u8, after_del.value.?, "\"k\":\"vec:t:a\"") == null);
+    try testing.expect(std.mem.startsWith(u8, after_del.value.?, "[{\"k\":\"vec:t:b\""));
+
+    // 2. Raw SET overwriting vec:t:c with the top-scoring vector must refresh HNSW AND bq:vec:t:c.
+    const c_updated = [_]f32{ 0.99, 0.01, -0.01, -0.01 };
+    try store.set("vec:t:c", try testPackF32(arena, &c_updated), false);
+    try testing.expect(store.exists("bq:vec:t:c"));
+    const after_set = try testRunProcWithRegistry(&store, execute, &.{ "qvec", "3", "vec:t:" }, arena, &registry);
+    try testing.expect(after_set == .value);
+    try testing.expect(std.mem.startsWith(u8, after_set.value.?, "[{\"k\":\"vec:t:c\""));
+
+    const q_bq = [_]f32{ 1.0, 1.0, -1.0, -1.0 };
+    try store.set("qvec_bq", try testPackF32(arena, &q_bq), false);
+    try store.set("vec:t:b", try testPackF32(arena, &[_]f32{ -1.0, -1.0, 1.0, 1.0 }), false);
+    const after_set_bq = try testRunProcWithRegistry(&store, execute, &.{ "qvec_bq", "2", "vec:t:", "cosine", "0", "bq" }, arena, &registry);
+    try testing.expect(after_set_bq == .value);
+    try testing.expect(std.mem.startsWith(u8, after_set_bq.value.?, "[{\"k\":\"vec:t:c\""));
+
+    // 3. Raw SET overwriting vec:t:c with non-vector payload must tombstone its HNSW entry and remove bq:vec:t:c.
+    try store.set("vec:t:c", "not-a-float-vector!", false);
+    try testing.expect(!store.exists("bq:vec:t:c"));
+    const after_bad_set = try testRunProcWithRegistry(&store, execute, &.{ "qvec", "3", "vec:t:" }, arena, &registry);
+    try testing.expect(after_bad_set == .value);
+    try testing.expect(std.mem.indexOf(u8, after_bad_set.value.?, "\"k\":\"vec:t:c\"") == null);
+}
+
+test "vsearch: optional ef argument accepts integer or ef=<N> and rejects 0" {
+    var store = try Store.init(testing.allocator, Config{ .persistence = .none });
+    defer store.deinit();
+
+    var registry = IndexModule.NamespaceRegistry.init(testing.allocator, .{});
+    defer registry.deinit();
+    store.vector_registry = &registry;
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const q = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+    const a = [_]f32{ 0.9, 0.1, 0.0, 0.0 };
+    try store.set("qvec", try testPackF32(arena, &q), false);
+    _ = try registry.getOrCreate("vec:t:", .cosine);
+    try store.set("vec:t:a", try testPackF32(arena, &a), false);
+
+    const ok_num = try testRunProcWithRegistry(
+        &store,
+        execute,
+        &.{ "qvec", "1", "vec:t:", "cosine", "0", "auto", "168", "64" },
+        arena,
+        &registry,
+    );
+    try testing.expect(ok_num == .value);
+
+    const ok_kv = try testRunProcWithRegistry(
+        &store,
+        execute,
+        &.{ "qvec", "1", "vec:t:", "cosine", "0", "auto", "168", "ef=200" },
+        arena,
+        &registry,
+    );
+    try testing.expect(ok_kv == .value);
+
+    const bad_zero = try testRunProcWithRegistry(
+        &store,
+        execute,
+        &.{ "qvec", "1", "vec:t:", "cosine", "0", "auto", "168", "0" },
+        arena,
+        &registry,
+    );
+    try testing.expect(bad_zero == .err);
 }

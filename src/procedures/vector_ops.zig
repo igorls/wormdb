@@ -43,38 +43,7 @@ fn encodeBqOwned(
     if (ns_idx) |idx| {
         idx.lock.lockShared();
         defer idx.lock.unlockShared();
-        if (idx.rabitq_params) |p| {
-            if (p.dim == vec_f32.len) {
-                // Full RaBitQ encode: code + l2 + corr.
-                const out = try allocator.alloc(u8, rabitq.encodedSize(vec_f32.len));
-                errdefer allocator.free(out);
-
-                const residual = try allocator.alloc(f32, vec_f32.len);
-                defer allocator.free(residual);
-                const rotated = try allocator.alloc(f32, vec_f32.len);
-                defer allocator.free(rotated);
-
-                // Cosine namespaces pre-normalize so the bit pattern
-                // matches the unit-sphere representation that vrabitq
-                // captured for the centroid + the query path uses.
-                const encode_input: []align(1) const f32 = if (idx.metric == .cosine) blk: {
-                    const norm_buf = allocator.alloc(f32, vec_f32.len) catch break :blk vec_f32;
-                    if (!rabitq.normalizeInto(vec_f32, norm_buf)) {
-                        allocator.free(norm_buf);
-                        // Zero vector — fall back to encoding raw (will
-                        // produce the all-zero degenerate code).
-                        break :blk vec_f32;
-                    }
-                    break :blk @ptrCast(norm_buf);
-                } else vec_f32;
-                defer if (encode_input.ptr != vec_f32.ptr) allocator.free(@constCast(encode_input));
-
-                const code_slice = out[0..rabitq.codeBytes(vec_f32.len)];
-                const enc = rabitq.encode(encode_input, p, residual, rotated, code_slice);
-                rabitq.serialize(enc, out);
-                return out;
-            }
-        }
+        return idx.encodeBqLocked(allocator, vec_f32);
     }
     // No params (or dim mismatch) — naive sign BQ.
     const out = try allocator.alloc(u8, distance.binaryQuantizedSize(vec_f32.len));
@@ -143,7 +112,7 @@ fn persistNamespaceConfig(
     ) catch return;
     defer allocator.free(value);
 
-    store.setWithTimestamp(key, value, false, timestamp) catch |err| {
+    store.setWithTimestampNoVectorSync(key, value, false, timestamp) catch |err| {
         std.log.warn("persistNamespaceConfig: '{s}': {s}", .{ namespace, @errorName(err) });
     };
 }
@@ -180,7 +149,7 @@ pub fn applyVinsert(
     }
 
     // ── Store the vec entry ──────────────────────────────────────
-    store.setWithTimestamp(args.key, args.vector, args.worm, args.timestamp) catch |e| {
+    store.setWithTimestampNoVectorSync(args.key, args.vector, args.worm, args.timestamp) catch |e| {
         return switch (e) {
             error.WormViolation => error.WormViolation,
             error.OutOfMemory => error.OutOfMemory,
@@ -202,7 +171,7 @@ pub fn applyVinsert(
     const bq_buf = try encodeBqOwned(allocator, vec_f32, ns_idx_for_bq);
     defer allocator.free(bq_buf);
 
-    store.setWithTimestamp(bq_key, bq_buf, args.worm, args.timestamp) catch |e| {
+    store.setWithTimestampNoVectorSync(bq_key, bq_buf, args.worm, args.timestamp) catch |e| {
         std.log.warn("applyVinsert: BQ store failed for '{s}': {s}", .{ bq_key, @errorName(e) });
     };
 
@@ -335,7 +304,7 @@ pub fn applyVbulkinsert(
             }
         } else dim_check = item.vector.len;
 
-        store.setWithTimestamp(item.key, item.vector, worm, item.timestamp) catch |e| {
+        store.setWithTimestampNoVectorSync(item.key, item.vector, worm, item.timestamp) catch |e| {
             std.log.warn("applyVbulkinsert: store vec '{s}' failed: {s}", .{ item.key, @errorName(e) });
             continue;
         };
@@ -348,7 +317,7 @@ pub fn applyVbulkinsert(
         const vec_f32 = distance.bytesToF32(item.vector).?;
         const bq_buf = encodeBqOwned(allocator, vec_f32, ns_idx_for_bq) catch continue;
         defer allocator.free(bq_buf);
-        store.setWithTimestamp(bq_key, bq_buf, worm, item.timestamp) catch |e| {
+        store.setWithTimestampNoVectorSync(bq_key, bq_buf, worm, item.timestamp) catch |e| {
             std.log.warn("applyVbulkinsert: store bq '{s}' failed: {s}", .{ bq_key, @errorName(e) });
         };
     }

@@ -183,6 +183,7 @@ pub fn generateRotation(allocator: Allocator, dim: usize, seed: u64) ![]f32 {
     // normalize. "Modified" = subtract projections one-by-one rather
     // than computing them all from the original row (numerically
     // stabler for small/degenerate gaussian draws).
+    const vec_dim = dim - (dim % LANES);
     var i: usize = 0;
     while (i < dim) : (i += 1) {
         const row_i = m[i * dim ..][0..dim];
@@ -190,26 +191,54 @@ pub fn generateRotation(allocator: Allocator, dim: usize, seed: u64) ![]f32 {
         var j: usize = 0;
         while (j < i) : (j += 1) {
             const row_j = m[j * dim ..][0..dim];
-            var dp: f32 = 0.0;
-            for (0..dim) |k| dp += row_i[k] * row_j[k];
-            for (0..dim) |k| row_i[k] -= dp * row_j[k];
+            var dp_acc: F32xN = ZERO;
+            var k: usize = 0;
+            while (k < vec_dim) : (k += LANES) {
+                const ri: F32xN = row_i[k..][0..LANES].*;
+                const rj: F32xN = row_j[k..][0..LANES].*;
+                dp_acc = @mulAdd(F32xN, ri, rj, dp_acc);
+            }
+            var dp: f32 = @reduce(.Add, dp_acc);
+            while (k < dim) : (k += 1) dp += row_i[k] * row_j[k];
+
+            const neg_dp_v: F32xN = @splat(-dp);
+            k = 0;
+            while (k < vec_dim) : (k += LANES) {
+                const ri: F32xN = row_i[k..][0..LANES].*;
+                const rj: F32xN = row_j[k..][0..LANES].*;
+                row_i[k..][0..LANES].* = @mulAdd(F32xN, neg_dp_v, rj, ri);
+            }
+            while (k < dim) : (k += 1) row_i[k] -= dp * row_j[k];
         }
 
-        var norm_sq: f32 = 0.0;
-        for (row_i) |x| norm_sq += x * x;
+        var norm_acc: F32xN = ZERO;
+        var k: usize = 0;
+        while (k < vec_dim) : (k += LANES) {
+            const ri: F32xN = row_i[k..][0..LANES].*;
+            norm_acc = @mulAdd(F32xN, ri, ri, norm_acc);
+        }
+        var norm_sq: f32 = @reduce(.Add, norm_acc);
+        while (k < dim) : (k += 1) norm_sq += row_i[k] * row_i[k];
+
         const norm = @sqrt(norm_sq);
         if (norm < 1e-12) return error.DegenerateRotation;
 
         const inv = 1.0 / norm;
-        for (row_i) |*x| x.* *= inv;
+        const inv_v: F32xN = @splat(inv);
+        k = 0;
+        while (k < vec_dim) : (k += LANES) {
+            const ri: F32xN = row_i[k..][0..LANES].*;
+            row_i[k..][0..LANES].* = ri * inv_v;
+        }
+        while (k < dim) : (k += 1) row_i[k] *= inv;
     }
 
     return m;
 }
 
 /// Compute `out = rotation @ v`. All three slices have length `dim`;
-/// `rotation` is row-major d×d (length `dim * dim`). 8-wide SIMD over
-/// the inner dot product; LLVM auto-widens to AVX-512 when available.
+/// `rotation` is row-major d×d (length `dim * dim`). 4-row register-blocked
+/// 8-wide SIMD over the inner dot product so `v` is loaded once per 4 rows.
 pub fn applyRotation(rotation: []const f32, v: []align(1) const f32, out: []f32) void {
     const dim = v.len;
     std.debug.assert(out.len == dim);
@@ -218,6 +247,40 @@ pub fn applyRotation(rotation: []const f32, v: []align(1) const f32, out: []f32)
     const vec_dim = dim - (dim % LANES);
 
     var i: usize = 0;
+    while (i + 4 <= dim) : (i += 4) {
+        const row0 = rotation[(i + 0) * dim ..];
+        const row1 = rotation[(i + 1) * dim ..];
+        const row2 = rotation[(i + 2) * dim ..];
+        const row3 = rotation[(i + 3) * dim ..];
+        var acc0: F32xN = ZERO;
+        var acc1: F32xN = ZERO;
+        var acc2: F32xN = ZERO;
+        var acc3: F32xN = ZERO;
+        var k: usize = 0;
+        while (k < vec_dim) : (k += LANES) {
+            const v_chunk: F32xN = v[k..][0..LANES].*;
+            acc0 = @mulAdd(F32xN, @as(F32xN, row0[k..][0..LANES].*), v_chunk, acc0);
+            acc1 = @mulAdd(F32xN, @as(F32xN, row1[k..][0..LANES].*), v_chunk, acc1);
+            acc2 = @mulAdd(F32xN, @as(F32xN, row2[k..][0..LANES].*), v_chunk, acc2);
+            acc3 = @mulAdd(F32xN, @as(F32xN, row3[k..][0..LANES].*), v_chunk, acc3);
+        }
+        var s0 = @reduce(.Add, acc0);
+        var s1 = @reduce(.Add, acc1);
+        var s2 = @reduce(.Add, acc2);
+        var s3 = @reduce(.Add, acc3);
+        while (k < dim) : (k += 1) {
+            const vk = v[k];
+            s0 += row0[k] * vk;
+            s1 += row1[k] * vk;
+            s2 += row2[k] * vk;
+            s3 += row3[k] * vk;
+        }
+        out[i + 0] = s0;
+        out[i + 1] = s1;
+        out[i + 2] = s2;
+        out[i + 3] = s3;
+    }
+
     while (i < dim) : (i += 1) {
         const row = rotation[i * dim ..];
         var acc: F32xN = ZERO;
@@ -310,11 +373,10 @@ pub fn encode(
     applyRotation(params.rotation, resid_unit_bytes, rotated_scratch);
 
     // Quantize (1-bit code) + accumulate Σ |rotated[i]|.
-    // Per byte (8 dims): pack signs branchlessly via the f32 sign bit,
+    // Per byte (8 dims): pack signs branchlessly via @Vector(8, bool) bitcast,
     // and accumulate |r| via @abs across the lane.
-    const SHIFTS: U32xN = .{ 7, 6, 5, 4, 3, 2, 1, 0 };
     const SIGN_BIT: U32xN = @splat(0x80000000);
-    const ONE_U32: U32xN = @splat(1);
+    const ZERO_U32: U32xN = @splat(0);
     var abs_acc: F32xN = ZERO;
     {
         var i: usize = 0;
@@ -322,24 +384,15 @@ pub fn encode(
             const r_chunk: F32xN = rotated_scratch[i..][0..LANES].*;
             abs_acc += @abs(r_chunk);
 
-            // bit = 1 iff r_chunk[k] >= 0. The f32 sign bit is set iff
-            // negative, so invert it and isolate the LSB.
+            // bit = 1 iff r_chunk[k] sign bit is 0.
             const r_bits: U32xN = @bitCast(r_chunk);
-            const non_neg: U32xN = (~r_bits >> @splat(@as(u5, 31))) & ONE_U32;
-            const positioned: U32xN = non_neg << @intCast(SHIFTS);
-            // (Note: if the sign bit was set and value was -0, we'd
-            // record bit=0 — semantically v[k] is treated as < 0, which
-            // is fine as a tiebreak.)
-            _ = SIGN_BIT;
-            const byte: u8 = @intCast(@reduce(.Or, positioned));
-            code_out[i / 8] = byte;
+            const mask: u8 = @bitCast((r_bits & SIGN_BIT) == ZERO_U32);
+            code_out[i / 8] = @bitReverse(mask);
         }
         // Tail: scalar fallback when dim is not a multiple of 8.
         while (i < dim) : (i += 1) {
             const r = rotated_scratch[i];
-            // abs accumulation via scalar path (not lane-merged with abs_acc).
             const abs_r = @abs(r);
-            // Fold into a single lane of abs_acc to avoid a separate scalar tally.
             var single: [LANES]f32 = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
             single[0] = abs_r;
             abs_acc += @as(F32xN, single);
@@ -432,9 +485,8 @@ pub fn prepareQuery(
 ///
 /// Strategy: for each byte of the code (8 dimensions), build a sign
 /// vector `s ∈ {-1, +1}^8` from the bits and accumulate
-/// `acc += s * q_rot_unit[i..i+8]` via FMA. The sign vector is built
-/// branchlessly by mapping `bit_set` to a u32 mask and XOR-flipping
-/// the sign bit of the corresponding q lane.
+/// `acc += s * q_rot_unit[i..i+8]`. The sign flip is built via SIMD
+/// bitmask test (`(b_vec & BIT_MASKS) == 0`) and `@select`.
 pub fn estimateL2Sq(
     q_rot_unit: []const f32,
     q_l2: f32,
@@ -445,42 +497,35 @@ pub fn estimateL2Sq(
     const dim = q_rot_unit.len;
     const vec_dim = dim - (dim % LANES);
 
-    var acc: F32xN = ZERO;
+    var acc0: F32xN = ZERO;
+    var acc1: F32xN = ZERO;
 
-    // Per-byte unpack: bits 7..0 (MSB-first) map to lanes 0..7.
-    // We compute, for each lane k, mask_lane[k] = 0xFFFFFFFF if bit clear,
-    // 0 if bit set. XOR mask_lane with 0x80000000 selects the sign:
-    //   bit set   → mask=0       → XOR with 0x80000000 ⇒ FLIPPED later? No.
-    // Cleaner: precompute per-lane shift to extract bit, then map to
-    // (1 - 2·bit) ∈ {-1, +1} as f32. Inline-for-8 produces a fully
-    // unrolled, branchless sign builder.
+    const BIT_MASKS: U32xN = .{ 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01 };
+    const ZERO_U32: U32xN = @splat(0);
     const SIGN_BIT: U32xN = @splat(0x80000000);
 
     var i: usize = 0;
-    while (i < vec_dim) : (i += LANES) {
-        const byte: u32 = code[i / 8];
-        // Per lane k: extract bit (7 - k). Build per-lane mask in
-        // {0, 1} where 1 = "bit set" = "DB component non-negative" =
-        // "no sign flip on q".
-        var bit_mask: U32xN = undefined;
-        inline for (0..LANES) |k| {
-            const bit_set: u32 = (byte >> @as(u5, @intCast(7 - k))) & 1;
-            bit_mask[k] = bit_set;
-        }
-        // flip[k] = 0x80000000 if bit clear (DB negative → flip q's sign),
-        //          0          if bit set   (DB non-negative → keep q sign).
-        // Equivalently: flip = (1 ^ bit_mask) << 31.
-        const ones: U32xN = @splat(1);
-        const inv_bit: U32xN = bit_mask ^ ones;
-        const flip: U32xN = inv_bit << @splat(@as(u5, 31));
-        _ = SIGN_BIT;
+    const step2 = LANES * 2;
+    const vec2_dim = dim - (dim % step2);
+    while (i < vec2_dim) : (i += step2) {
+        const b0: U32xN = @splat(@as(u32, code[i / 8]));
+        const b1: U32xN = @splat(@as(u32, code[i / 8 + 1]));
+        const flip0 = @select(u32, (b0 & BIT_MASKS) == ZERO_U32, SIGN_BIT, ZERO_U32);
+        const flip1 = @select(u32, (b1 & BIT_MASKS) == ZERO_U32, SIGN_BIT, ZERO_U32);
 
-        const q_chunk: F32xN = q_rot_unit[i..][0..LANES].*;
-        const q_bits: U32xN = @bitCast(q_chunk);
-        const flipped_q: F32xN = @bitCast(q_bits ^ flip);
-        acc += flipped_q;
+        const q0_bits: U32xN = @bitCast(@as(F32xN, q_rot_unit[i..][0..LANES].*));
+        const q1_bits: U32xN = @bitCast(@as(F32xN, q_rot_unit[i + LANES ..][0..LANES].*));
+        acc0 += @as(F32xN, @bitCast(q0_bits ^ flip0));
+        acc1 += @as(F32xN, @bitCast(q1_bits ^ flip1));
     }
-    var ip_raw = @reduce(.Add, acc);
+
+    while (i < vec_dim) : (i += LANES) {
+        const b0: U32xN = @splat(@as(u32, code[i / 8]));
+        const flip0 = @select(u32, (b0 & BIT_MASKS) == ZERO_U32, SIGN_BIT, ZERO_U32);
+        const q0_bits: U32xN = @bitCast(@as(F32xN, q_rot_unit[i..][0..LANES].*));
+        acc0 += @as(F32xN, @bitCast(q0_bits ^ flip0));
+    }
+    var ip_raw = @reduce(.Add, acc0 + acc1);
 
     // Tail (only if dim % 8 != 0).
     while (i < dim) : (i += 1) {
@@ -822,7 +867,7 @@ test "rabitq: cosine path — d² estimator on unit sphere converts to cosine" {
     try testing.expect(cos_est > 0.5); // identical input → strong agreement
 
     // Query orthogonal to v: cosine should be near 0 (within estimator noise).
-    var q_orth: [32]f32 = .{0} ** 32;
+    var q_orth: [32]f32 = @splat(0);
     q_orth[0] = -v_unit[1];
     q_orth[1] = v_unit[0];
     // Normalize q_orth (won't be quite unit since we're in 32-D and

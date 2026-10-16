@@ -66,24 +66,31 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
 
 /// Escape a string for safe JSON embedding.
 fn appendJsonEscaped(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, s: []const u8) !void {
-    for (s) |c| {
-        switch (c) {
-            '"' => try list.appendSlice(alloc, "\\\""),
-            '\\' => try list.appendSlice(alloc, "\\\\"),
-            '\n' => try list.appendSlice(alloc, "\\n"),
-            '\r' => try list.appendSlice(alloc, "\\r"),
-            '\t' => try list.appendSlice(alloc, "\\t"),
-            else => {
-                if (c < 0x20) {
-                    // Control character — emit as \u00XX
-                    try list.appendSlice(alloc, "\\u00");
-                    const hex = "0123456789abcdef";
-                    try list.append(alloc, hex[c >> 4]);
-                    try list.append(alloc, hex[c & 0x0f]);
-                } else {
-                    try list.append(alloc, c);
-                }
-            },
+    var chunk_start: usize = 0;
+    for (s, 0..) |c, i| {
+        const esc: ?[]const u8 = switch (c) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            else => if (c < 0x20) "" else null,
+        };
+        if (esc) |e| {
+            if (i > chunk_start) {
+                try list.appendSlice(alloc, s[chunk_start..i]);
+            }
+            if (e.len > 0) {
+                try list.appendSlice(alloc, e);
+            } else {
+                const hex = "0123456789abcdef";
+                const u_esc = [6]u8{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 0x0f] };
+                try list.appendSlice(alloc, &u_esc);
+            }
+            chunk_start = i + 1;
         }
+    }
+    if (chunk_start < s.len) {
+        try list.appendSlice(alloc, s[chunk_start..]);
     }
 }

@@ -41,7 +41,7 @@ shared libsodium for mesh crypto; `-Dcrypto-backend=std` avoids that dependency.
 
 ## Prerequisites
 
-- **Zig 0.16.0** — the tested build toolchain
+- **Zig 0.17.0** — the tested build toolchain
 - **libsodium** — optional crypto backend, selected by default on Linux
 - **Bun** — runs the reference client, admin UI, browser demo tooling, and docs site
 - **Git submodules** — `deps/meshguard` is required; QUIC builds also need `deps/msquic` and `deps/libwtf`

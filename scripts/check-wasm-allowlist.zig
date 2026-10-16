@@ -78,7 +78,7 @@ fn containsNode(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index, at: usiz
 /// clauses and ignore strings/comments that happen to contain gate syntax.
 fn compiledOnWasm(tree: *const std.zig.Ast, at: usize) bool {
     for (0..tree.nodes.len) |i| {
-        const branch = tree.fullIf(@enumFromInt(i)) orelse continue;
+        const branch = tree.fullIf(@fromBackingInt(@intCast(i))) orelse continue;
         const negated = gateNegated(nodeSource(tree, branch.ast.cond_expr)) orelse continue;
         if (negated and containsNode(tree, branch.ast.then_expr, at)) return false;
         if (!negated) {
@@ -94,8 +94,8 @@ fn compiledOnWasm(tree: *const std.zig.Ast, at: usize) bool {
 /// hide imports. A computed import path cannot be resolved here and fails closed.
 /// All returned storage belongs to the caller's arena.
 fn readImports(allocator: std.mem.Allocator, source: []const u8) ![]Import {
-    const terminated = try allocator.dupeZ(u8, source);
-    var tree = try std.zig.Ast.parse(allocator, terminated, .zig);
+    const terminated = try allocator.dupeSentinel(u8, source, 0);
+    var tree = try std.zig.Ast.parse(allocator, terminated, .{ .mode = .zig });
     defer tree.deinit(allocator);
     if (tree.errors.len != 0) return error.InvalidZigSource;
     var imports: std.ArrayListUnmanaged(Import) = .empty;

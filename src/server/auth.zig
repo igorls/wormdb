@@ -274,8 +274,8 @@ pub fn encode(
     pos += 1;
 
     for (caps) |cap| {
-        buf[pos] = @intFromEnum(cap.op);
-        buf[pos + 1] = @intFromEnum(cap.match_type);
+        buf[pos] = @backingInt(cap.op);
+        buf[pos + 1] = @backingInt(cap.match_type);
         pos += 2;
         std.mem.writeInt(u32, buf[pos..][0..4], @intCast(cap.pattern.len), .big);
         pos += 4;
@@ -620,7 +620,7 @@ test "operationForCommand agrees with commandToOperation for every Command id" {
         .{ T.Command{ .vrabitq_install = .{ .namespace = "vec:n:", .dim = 1, .seed = 0, .centroid = "\x00\x00\x00\x00", .rotation = "\x00\x00\x00\x00" } }, T.CommandId.vrabitq_install },
     };
     inline for (cases) |tc| {
-        try testing.expectEqual(commandToOperation(@intFromEnum(tc[1])), operationForCommand(tc[0]));
+        try testing.expectEqual(commandToOperation(@backingInt(tc[1])), operationForCommand(tc[0]));
     }
     // Public commands map to no operation on both keyings.
     try testing.expectEqual(@as(?Operation, null), operationForCommand(.status));

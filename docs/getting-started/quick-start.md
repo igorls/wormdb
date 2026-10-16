@@ -1,7 +1,7 @@
 # Quick Start
 
 This walkthrough uses a local, unauthenticated development server. Use Zig
-**0.16.0**, Git, and Bun. Linux is the primary target; Windows supports standalone
+**0.17.0**, Git, and Bun. Linux is the primary target; Windows supports standalone
 use with the threadpool backend.
 
 ## 1. Build the Binary

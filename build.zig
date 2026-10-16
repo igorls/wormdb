@@ -32,6 +32,16 @@ fn linkCrypto(b: *std.Build, mod: *std.Build.Module, os_tag: std.Target.Os.Tag, 
 /// `bin/Release/libmsquic.so`). The binary then needs libmsquic.so at runtime (set LD_LIBRARY_PATH or an
 /// rpath to deps/msquic/build/bin/Release). Build/verify on Linux (see docker/build-linux.sh).
 fn linkQuic(b: *std.Build, mod: *std.Build.Module) void {
+    const wtf_c = b.addTranslateC(.{
+        .root_source_file = b.path("deps/libwtf/include/wtf.h"),
+        .target = mod.resolved_target.?,
+        .optimize = mod.optimize orelse .Debug,
+    });
+    wtf_c.addIncludePath(b.path("deps/msquic/src/inc"));
+    wtf_c.addIncludePath(b.path("deps/libwtf/include"));
+    wtf_c.addIncludePath(b.path("deps/libwtf/build/include"));
+    mod.addImport("wtf_c", wtf_c.createModule());
+
     // MsQuic's default build is a shared library — link libmsquic.so from its build output dir.
     mod.addLibraryPath(b.path("deps/msquic/build/bin/Release"));
     mod.linkSystemLibrary("msquic", .{});
@@ -145,7 +155,9 @@ pub fn build(b: *std.Build) void {
     // The engine library module — exposed via addModule so the server exe + domain packages consume the
     // real engine types (Store, Ctx, Segment, Domain, …) with `@import("wormdb")`. linkCrypto is applied
     // to the module so consumers inherit the libsodium link transitively.
-    const wormdb_mod = b.addModule("wormdb", .{
+    // On a narrow-atomics target the public "wormdb" name belongs to the reduced root (engine_mod
+    // below), and Zig 0.17 panics if a name is added twice, so this one stays private there.
+    const wormdb_mod_opts: std.Build.Module.CreateOptions = .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
@@ -154,7 +166,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "meshguard", .module = meshguard_mod },
             .{ .name = "build_options", .module = build_options_mod },
         },
-    });
+    };
+    const wormdb_mod = if (narrow_target) b.createModule(wormdb_mod_opts) else b.addModule("wormdb", wormdb_mod_opts);
     linkCrypto(b, wormdb_mod, os_tag, abi, use_libsodium);
     if (enable_quic) linkQuic(b, wormdb_mod); // QUIC C deps inherited by consumers (server exe)
 
@@ -183,7 +196,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     const run_exe = b.addRunArtifact(exe);
-    if (b.args) |args| run_exe.addArgs(args);
+    run_exe.addPassthruArgs();
     const run_step = b.step("run", "Run the basic WormDB server");
     run_step.dependOn(&run_exe.step);
 
@@ -371,4 +384,35 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     }) });
     test_step.dependOn(&b.addRunArtifact(checker_tests).step);
+
+    // `zig build bench` compiles and installs all benchmark binaries under bench/*.zig.
+    const bench_step = b.step("bench", "Build benchmark binaries (bench/*.zig)");
+    inline for (.{
+        .{ "chacha_backend_bench", "bench/chacha_backend_bench.zig", false },
+        .{ "engine_bench", "bench/engine_bench.zig", true },
+        .{ "vsearch_and_wal_mt_bench", "bench/vsearch_and_wal_mt_bench.zig", true },
+        .{ "wire_load_bench", "bench/wire_load_bench.zig", true },
+    }) |entry| {
+        const bench_mod = b.createModule(.{
+            .root_source_file = b.path(entry[1]),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = if (entry[2]) &.{
+                .{ .name = "wormdb", .module = wormdb_mod },
+                .{ .name = "meshguard", .module = meshguard_mod },
+                .{ .name = "build_options", .module = build_options_mod },
+            } else &.{},
+        });
+        if (entry[2]) {
+            linkCrypto(b, bench_mod, os_tag, abi, use_libsodium);
+            if (enable_quic) linkQuic(b, bench_mod);
+        }
+        const bench_exe = b.addExecutable(.{
+            .name = entry[0],
+            .root_module = bench_mod,
+        });
+        const bench_install = b.addInstallArtifact(bench_exe, .{});
+        bench_step.dependOn(&bench_install.step);
+    }
 }

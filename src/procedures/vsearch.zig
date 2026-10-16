@@ -1048,15 +1048,24 @@ test "vsearch: plain DEL and raw SET synchronize with HNSW index" {
     try testing.expect(std.mem.indexOf(u8, after_del.value.?, "\"k\":\"vec:t:a\"") == null);
     try testing.expect(std.mem.startsWith(u8, after_del.value.?, "[{\"k\":\"vec:t:b\""));
 
-    // 2. Raw SET overwriting vec:t:c with the top-scoring vector must refresh HNSW so vec:t:c ranks #1.
-    const c_updated = [_]f32{ 0.99, 0.01, 0.0, 0.0 };
+    // 2. Raw SET overwriting vec:t:c with the top-scoring vector must refresh HNSW AND bq:vec:t:c.
+    const c_updated = [_]f32{ 0.99, 0.01, -0.01, -0.01 };
     try store.set("vec:t:c", try testPackF32(arena, &c_updated), false);
+    try testing.expect(store.exists("bq:vec:t:c"));
     const after_set = try testRunProcWithRegistry(&store, execute, &.{ "qvec", "3", "vec:t:" }, arena, &registry);
     try testing.expect(after_set == .value);
     try testing.expect(std.mem.startsWith(u8, after_set.value.?, "[{\"k\":\"vec:t:c\""));
 
-    // 3. Raw SET overwriting vec:t:c with non-vector payload must tombstone its HNSW entry.
+    const q_bq = [_]f32{ 1.0, 1.0, -1.0, -1.0 };
+    try store.set("qvec_bq", try testPackF32(arena, &q_bq), false);
+    try store.set("vec:t:b", try testPackF32(arena, &[_]f32{ -1.0, -1.0, 1.0, 1.0 }), false);
+    const after_set_bq = try testRunProcWithRegistry(&store, execute, &.{ "qvec_bq", "2", "vec:t:", "cosine", "0", "bq" }, arena, &registry);
+    try testing.expect(after_set_bq == .value);
+    try testing.expect(std.mem.startsWith(u8, after_set_bq.value.?, "[{\"k\":\"vec:t:c\""));
+
+    // 3. Raw SET overwriting vec:t:c with non-vector payload must tombstone its HNSW entry and remove bq:vec:t:c.
     try store.set("vec:t:c", "not-a-float-vector!", false);
+    try testing.expect(!store.exists("bq:vec:t:c"));
     const after_bad_set = try testRunProcWithRegistry(&store, execute, &.{ "qvec", "3", "vec:t:" }, arena, &registry);
     try testing.expect(after_bad_set == .value);
     try testing.expect(std.mem.indexOf(u8, after_bad_set.value.?, "\"k\":\"vec:t:c\"") == null);

@@ -511,7 +511,45 @@ pub const Store = struct {
     pub fn setWithTimestamp(self: *Store, key: []const u8, value: []const u8, is_worm: bool, timestamp: u64) StoreError!void {
         try self.setWithTimestampNoVectorSync(key, value, is_worm, timestamp);
         if (self.vector_registry) |reg| {
-            reg.syncRawSet(key, value, timestamp);
+            self.syncVectorSetWithRegistry(reg, key, value, is_worm, timestamp);
+        }
+    }
+
+    pub fn syncVectorSetWithRegistry(
+        self: *Store,
+        reg: *NamespaceRegistry,
+        key: []const u8,
+        value: []const u8,
+        is_worm: bool,
+        timestamp: u64,
+    ) void {
+        switch (reg.syncRawSetWithBq(key, value, timestamp)) {
+            .none => {},
+            .upsert => |bq_buf| {
+                defer reg.allocator.free(bq_buf);
+                var stack_buf: [256]u8 = undefined;
+                const bq_key = std.fmt.bufPrint(&stack_buf, "bq:{s}", .{key}) catch
+                    (std.fmt.allocPrint(self.allocator, "bq:{s}", .{key}) catch return);
+                defer if (bq_key.ptr != &stack_buf) self.allocator.free(bq_key);
+                self.setWithTimestampNoVectorSync(bq_key, bq_buf, is_worm, timestamp) catch {};
+            },
+            .delete => {
+                var stack_buf: [256]u8 = undefined;
+                const bq_key = std.fmt.bufPrint(&stack_buf, "bq:{s}", .{key}) catch
+                    (std.fmt.allocPrint(self.allocator, "bq:{s}", .{key}) catch return);
+                defer if (bq_key.ptr != &stack_buf) self.allocator.free(bq_key);
+                self.delete(bq_key) catch {};
+            },
+        }
+    }
+
+    pub fn syncVectorDeleteWithRegistry(self: *Store, reg: *NamespaceRegistry, key: []const u8) void {
+        if (reg.syncRawDelete(key)) {
+            var stack_buf: [256]u8 = undefined;
+            const bq_key = std.fmt.bufPrint(&stack_buf, "bq:{s}", .{key}) catch
+                (std.fmt.allocPrint(self.allocator, "bq:{s}", .{key}) catch return);
+            defer if (bq_key.ptr != &stack_buf) self.allocator.free(bq_key);
+            self.delete(bq_key) catch {};
         }
     }
 
@@ -818,7 +856,7 @@ pub const Store = struct {
         }
         if (did_exist) {
             if (self.vector_registry) |reg| {
-                reg.syncRawDelete(key);
+                self.syncVectorDeleteWithRegistry(reg, key);
             }
         }
         // Snapshot takes every shard; never enter it with one already held.

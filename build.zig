@@ -381,4 +381,34 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     }) });
     test_step.dependOn(&b.addRunArtifact(checker_tests).step);
+
+    // `zig build bench` compiles and installs all benchmark binaries under bench/*.zig.
+    const bench_step = b.step("bench", "Build benchmark binaries (bench/*.zig)");
+    inline for (.{
+        .{ "chacha_backend_bench", "bench/chacha_backend_bench.zig", false },
+        .{ "engine_bench", "bench/engine_bench.zig", true },
+        .{ "vsearch_and_wal_mt_bench", "bench/vsearch_and_wal_mt_bench.zig", true },
+    }) |entry| {
+        const bench_mod = b.createModule(.{
+            .root_source_file = b.path(entry[1]),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = if (entry[2]) &.{
+                .{ .name = "wormdb", .module = wormdb_mod },
+                .{ .name = "meshguard", .module = meshguard_mod },
+                .{ .name = "build_options", .module = build_options_mod },
+            } else &.{},
+        });
+        if (entry[2]) {
+            linkCrypto(b, bench_mod, os_tag, abi, use_libsodium);
+            if (enable_quic) linkQuic(b, bench_mod);
+        }
+        const bench_exe = b.addExecutable(.{
+            .name = entry[0],
+            .root_module = bench_mod,
+        });
+        const bench_install = b.addInstallArtifact(bench_exe, .{});
+        bench_step.dependOn(&bench_install.step);
+    }
 }

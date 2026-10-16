@@ -76,6 +76,7 @@ const Sodium = struct {
     name: []const u8,
 
     fn load() ?Sodium {
+        if (@import("builtin").os.tag == .windows) return null;
         // Try the common runtime names across platforms; dlopen walks the
         // loader search path (honours LD_LIBRARY_PATH / DYLD_LIBRARY_PATH).
         const candidates = [_][:0]const u8{

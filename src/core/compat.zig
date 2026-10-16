@@ -376,16 +376,19 @@ pub fn setSendTimeoutMs(handle: std.posix.fd_t, timeout_ms: u32) void {
 }
 
 /// Windows sockets created by Zig use AFD directly and are not Winsock socket
-/// objects. Submit the same AFD read/write as std.Io, but wait on a private event
-/// with a deadline. Always cancel AND drain a pending request before its stack
-/// buffers or the destination can go out of scope.
-fn socketWindowsBefore(comptime reading: bool, handle: std.posix.fd_t, buf: if (reading) []u8 else []const u8, deadline_ns: i128) !usize {
+/// objects. Submit the same AFD read/write as std.Io, but wait on a per-Stream
+/// reusable event handle with a deadline. Always cancel AND drain a pending
+/// request before its stack buffers or the destination can go out of scope.
+fn socketWindowsBefore(comptime reading: bool, event_slot: *?std.os.windows.HANDLE, handle: std.posix.fd_t, buf: if (reading) []u8 else []const u8, deadline_ns: i128) !usize {
     const win = std.os.windows;
     if (deadline_ns <= nowNs()) return error.Timeout;
-    var event: win.HANDLE = undefined;
-    const event_all_access: win.ACCESS_MASK = @bitCast(@as(u32, 0x001f0003));
-    if (win.ntdll.NtCreateEvent(&event, event_all_access, null, .Notification, .FALSE) != .SUCCESS) return error.SystemResources;
-    defer win.CloseHandle(event);
+    const event = event_slot.* orelse blk: {
+        var ev: win.HANDLE = undefined;
+        const event_all_access: win.ACCESS_MASK = @bitCast(@as(u32, 0x001f0003));
+        if (win.ntdll.NtCreateEvent(&ev, event_all_access, null, .Notification, .FALSE) != .SUCCESS) return error.SystemResources;
+        event_slot.* = ev;
+        break :blk ev;
+    };
     var iovec = win.AFD.WSABUF(if (reading) .@"var" else .@"const"){ .len = @intCast(@min(buf.len, std.math.maxInt(u32))), .buf = buf.ptr };
     const request: if (reading) win.AFD.RECV_INFO else win.AFD.SEND_INFO = .{
         .BufferArray = @ptrCast(&iovec),
@@ -499,6 +502,9 @@ pub fn getPeerAddress(handle: std.posix.fd_t) ?net.Address {
 /// internals lower to `memory.atomic.wait32`, which wasm32 has no instruction for. Nothing in
 /// the wasm entry root opens sockets — that is the whole point of the reduced root.
 pub const net = if (wasm_target) struct {} else struct {
+    const AfdEvent = if (builtin.os.tag == .windows) ?std.os.windows.HANDLE else void;
+    const default_afd_event: AfdEvent = if (builtin.os.tag == .windows) null else {};
+
     /// Compatibility wrapper for std.net.Address → std.Io.net.IpAddress.
     pub const Address = struct {
         inner: std.Io.net.IpAddress,
@@ -557,6 +563,8 @@ pub const net = if (wasm_target) struct {} else struct {
         /// cannot extend it. The owner clears it only after authentication.
         read_limit_ns: ?i128 = null,
         write_timeout_ms: usize = 0,
+        afd_read_event: AfdEvent = default_afd_event,
+        afd_write_event: AfdEvent = default_afd_event,
 
         pub fn beginRead(self: *Stream, timeout_ms: usize, allow_idle: bool) void {
             self.read_timeout_ms = timeout_ms;
@@ -569,7 +577,7 @@ pub const net = if (wasm_target) struct {} else struct {
             if (self.read_limit_ns) |limit| deadline = if (deadline) |d| @min(d, limit) else limit;
             const handle = self.inner.socket.handle;
             const n = if (deadline) |d| blk: {
-                if (builtin.os.tag == .windows) break :blk try socketWindowsBefore(true, handle, buf, d);
+                if (builtin.os.tag == .windows) break :blk try socketWindowsBefore(true, &self.afd_read_event, handle, buf, d);
                 try waitReadable(handle, d);
                 break :blk try self.readAvailable(buf);
             } else try self.readAvailable(buf);
@@ -616,7 +624,7 @@ pub const net = if (wasm_target) struct {} else struct {
                 while (written < data.len) {
                     const chunk = [_][]const u8{data[written..]};
                     const n = if (deadline) |d|
-                        try socketWindowsBefore(false, handle, data[written..], d)
+                        try socketWindowsBefore(false, &self.afd_write_event, handle, data[written..], d)
                     else
                         try (try zio.operate(.{ .net_write = .{
                             .socket_handle = handle,
@@ -650,7 +658,17 @@ pub const net = if (wasm_target) struct {} else struct {
             }
         }
 
-        pub fn close(self: *const Stream) void {
+        pub fn close(self: *Stream) void {
+            if (builtin.os.tag == .windows) {
+                if (self.afd_read_event) |ev| {
+                    std.os.windows.CloseHandle(ev);
+                    self.afd_read_event = null;
+                }
+                if (self.afd_write_event) |ev| {
+                    std.os.windows.CloseHandle(ev);
+                    self.afd_write_event = null;
+                }
+            }
             self.inner.close(io());
         }
 
@@ -708,3 +726,77 @@ pub const ClusterStub = struct {
         return error.ClusterUnsupportedOnThisTarget;
     }
 };
+
+test "Stream lazily creates, reuses, and closes deadline event handles" {
+    if (comptime wasm_target) return error.SkipZigTest;
+    const testing = std.testing;
+
+    const listen_addr = try net.Address.parseIp("127.0.0.1", 0);
+    var listener = try listen_addr.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    const bound_port = listener.inner.socket.address.getPort();
+
+    const PeerCtx = struct {
+        listener: *net.ServerCompat,
+        fn run(ctx: @This()) void {
+            var conn = ctx.listener.accept() catch return;
+            defer conn.stream.close();
+            conn.stream.beginRead(2_000, false);
+            conn.stream.write_timeout_ms = 2_000;
+            var buf: [4]u8 = undefined;
+            _ = conn.stream.read(&buf) catch return;
+            conn.stream.writeAll("pong") catch return;
+            _ = conn.stream.read(&buf) catch return;
+            conn.stream.writeAll("done") catch return;
+        }
+    };
+
+    const thread = try std.Thread.spawn(.{}, PeerCtx.run, .{PeerCtx{ .listener = &listener }});
+    defer thread.join();
+
+    const connect_addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, bound_port);
+    var client = try net.tcpConnectToAddress(connect_addr);
+    var closed = false;
+    defer if (!closed) client.close();
+
+    if (builtin.os.tag == .windows) {
+        try testing.expect(client.afd_read_event == null);
+        try testing.expect(client.afd_write_event == null);
+    }
+
+    client.beginRead(2_000, false);
+    client.write_timeout_ms = 2_000;
+
+    try client.writeAll("ping");
+    var reply: [4]u8 = undefined;
+    const n1 = try client.read(&reply);
+    try testing.expectEqual(@as(usize, 4), n1);
+    try testing.expectEqualStrings("pong", &reply);
+
+    const first_read_ev = client.afd_read_event;
+    const first_write_ev = client.afd_write_event;
+    if (builtin.os.tag == .windows) {
+        try testing.expect(first_read_ev != null);
+        try testing.expect(first_write_ev != null);
+    }
+
+    // Second round-trip must reuse the same handles on Stream
+    try client.writeAll("next");
+    const n2 = try client.read(&reply);
+    try testing.expectEqual(@as(usize, 4), n2);
+    try testing.expectEqualStrings("done", &reply);
+
+    if (builtin.os.tag == .windows) {
+        try testing.expectEqual(first_read_ev, client.afd_read_event);
+        try testing.expectEqual(first_write_ev, client.afd_write_event);
+    }
+
+    client.close();
+    closed = true;
+
+    if (builtin.os.tag == .windows) {
+        try testing.expect(client.afd_read_event == null);
+        try testing.expect(client.afd_write_event == null);
+    }
+}

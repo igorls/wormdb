@@ -203,7 +203,7 @@ const PeerConnection = struct {
     }
 
     fn disconnect(self: *PeerConnection) void {
-        if (self.stream) |s| {
+        if (self.stream) |*s| {
             s.close();
             self.stream = null;
         }

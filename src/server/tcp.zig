@@ -385,7 +385,7 @@ pub const Server = struct {
         stream.write_timeout_ms = 2_000;
         var conn_ctx = ConnectionContext.init(self.allocator, self.event_bus, &stream);
         conn_ctx.auth_enforce = self.config.auth_enforce;
-        defer conn.stream.close();
+        defer stream.close();
         defer conn_ctx.deinit();
 
         var handshake: [2]u8 = undefined;

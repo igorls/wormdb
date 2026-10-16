@@ -30,13 +30,86 @@ fn printRow(name: []const u8, ops: usize, elapsed_ns: u64, extra: []const u8) vo
     });
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     const alloc = std.heap.c_allocator;
 
+    var only_ns_sync = false;
+    var args_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
+    defer args_it.deinit();
+    _ = args_it.next();
+    while (args_it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--only-ns-sync")) only_ns_sync = true;
+    }
+
+    try benchMtNamespaceSync(alloc);
+    if (only_ns_sync) return;
     try benchMtWalContention(alloc);
     try benchVsearchModes(alloc);
     try benchVsearchRecallAndEf(alloc);
     try benchProceduresSuite(alloc);
+}
+
+fn benchMtNamespaceSync(alloc: std.mem.Allocator) !void {
+    printHeader("7b. MULTI-THREADED NON-MATCHING KV SET vs REGISTERED NAMESPACES (1/8/16 thr x 0/1/50 ns)");
+
+    const KEYSPACE: usize = 65_536;
+    const OPS_PER_THREAD: usize = 200_000;
+    const val_64: []const u8 = &@as([64]u8, @splat('x'));
+
+    const keys = try alloc.alloc([]u8, KEYSPACE);
+    defer {
+        for (keys) |k| alloc.free(k);
+        alloc.free(keys);
+    }
+    for (0..KEYSPACE) |i| {
+        keys[i] = try std.fmt.allocPrint(alloc, "kv:key:{d:0>8}", .{i});
+    }
+
+    for ([_]usize{ 0, 1, 50 }) |ns_count| {
+        var store = try Store.init(alloc, .{ .persistence = .none, .sync_writes = false });
+        defer store.deinit();
+        var reg = NamespaceRegistry.init(alloc, .{});
+        defer reg.deinit();
+        store.vector_registry = &reg;
+
+        for (0..ns_count) |n| {
+            var ns_buf: [32]u8 = undefined;
+            const ns_name = try std.fmt.bufPrint(&ns_buf, "vec:ns{d:0>2}:", .{n});
+            _ = try reg.getOrCreate(ns_name, .cosine);
+        }
+
+        // Pre-populate keys so threads measure steady-state in-place overwrites
+        for (keys) |k| {
+            try store.setWithTimestampNoVectorSync(k, val_64, false, 100);
+        }
+
+        const Worker = struct {
+            fn run(s: *Store, ks: []const []u8, count: usize, tid: usize) void {
+                var idx: usize = tid * 4099;
+                for (0..count) |_| {
+                    const k = ks[idx & (KEYSPACE - 1)];
+                    s.setWithTimestamp(k, val_64, false, 100) catch {};
+                    idx +%= 7919;
+                }
+            }
+        };
+
+        for ([_]usize{ 1, 8, 16 }) |tc| {
+            const threads = try alloc.alloc(std.Thread, tc);
+            defer alloc.free(threads);
+
+            const t0 = nowNs();
+            for (0..tc) |t| {
+                threads[t] = try std.Thread.spawn(.{}, Worker.run, .{ &store, keys, OPS_PER_THREAD, t });
+            }
+            for (threads) |th| th.join();
+            const t1 = nowNs();
+
+            var label_buf: [64]u8 = undefined;
+            const label = try std.fmt.bufPrint(&label_buf, "MT Store.set non-vec ({d:>2} thr, {d:>2} namespaces)", .{ tc, ns_count });
+            printRow(label, OPS_PER_THREAD * tc, t1 - t0, "[syncRawSet filter]");
+        }
+    }
 }
 
 fn benchMtWalContention(alloc: std.mem.Allocator) !void {

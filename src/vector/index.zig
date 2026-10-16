@@ -849,6 +849,15 @@ pub const NamespaceRegistry = struct {
     /// Lock-free count of active namespaces so non-vector KV workloads skip
     /// `syncRawSet` / `syncRawDelete` without acquiring `lock`.
     active_namespaces: std.atomic.Value(usize) = .init(0),
+    /// Lock-free first-byte refcount table of registered namespaces, indexed by
+    /// `namespace[0]`. Rejects non-matching keys before taking `lock`.
+    first_byte_counts: [256]std.atomic.Value(u32) align(64) = initFirstByteCounts(),
+
+    fn initFirstByteCounts() [256]std.atomic.Value(u32) {
+        var table: [256]std.atomic.Value(u32) = undefined;
+        for (&table) |*slot| slot.* = .init(0);
+        return table;
+    }
 
     pub fn init(allocator: std.mem.Allocator, default_params: HnswParams) NamespaceRegistry {
         return .{
@@ -857,6 +866,7 @@ pub const NamespaceRegistry = struct {
             .lock = .{},
             .default_params = default_params,
             .active_namespaces = .init(0),
+            .first_byte_counts = initFirstByteCounts(),
         };
     }
 
@@ -870,6 +880,7 @@ pub const NamespaceRegistry = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.map.deinit(self.allocator);
+        for (&self.first_byte_counts) |*slot| slot.store(0, .monotonic);
         self.active_namespaces.store(0, .monotonic);
     }
 
@@ -918,6 +929,9 @@ pub const NamespaceRegistry = struct {
         idx.* = NamespaceIndex.init(self.allocator, self.default_params, m);
 
         try self.map.put(self.allocator, ns_copy, idx);
+        if (ns_copy.len > 0) {
+            _ = self.first_byte_counts[ns_copy[0]].fetchAdd(1, .release);
+        }
         _ = self.active_namespaces.fetchAdd(1, .release);
         return idx;
     }
@@ -928,6 +942,9 @@ pub const NamespaceRegistry = struct {
         self.lock.lock();
         defer self.lock.unlock();
         if (self.map.fetchRemove(namespace)) |kv| {
+            if (kv.key.len > 0) {
+                _ = self.first_byte_counts[kv.key[0]].fetchSub(1, .release);
+            }
             _ = self.active_namespaces.fetchSub(1, .release);
             self.allocator.free(kv.key);
             kv.value.deinit();
@@ -935,11 +952,18 @@ pub const NamespaceRegistry = struct {
         }
     }
 
+    inline fn mayMatchRegisteredNamespace(self: *const NamespaceRegistry, key: []const u8) bool {
+        if (key.len == 0) return false;
+        if (self.first_byte_counts[key[0]].load(.acquire) == 0) return false;
+        if (self.active_namespaces.load(.acquire) == 0) return false;
+        if (std.mem.startsWith(u8, key, "bq:") or std.mem.startsWith(u8, key, "__meta:")) return false;
+        return true;
+    }
+
     /// Synchronize a plain `DEL` against any registered vector namespace whose
     /// prefix matches `key`. Must be called with NO shard locks held.
     pub fn syncRawDelete(self: *NamespaceRegistry, key: []const u8) void {
-        if (self.active_namespaces.load(.acquire) == 0) return;
-        if (std.mem.startsWith(u8, key, "bq:") or std.mem.startsWith(u8, key, "__meta:")) return;
+        if (!self.mayMatchRegisteredNamespace(key)) return;
 
         self.lock.lockShared();
         defer self.lock.unlockShared();
@@ -961,8 +985,7 @@ pub const NamespaceRegistry = struct {
     /// and matches an active namespace with a frozen dimension, it is inserted.
     /// Must be called with NO shard locks held.
     pub fn syncRawSet(self: *NamespaceRegistry, key: []const u8, value: []const u8, timestamp: u64) void {
-        if (self.active_namespaces.load(.acquire) == 0) return;
-        if (std.mem.startsWith(u8, key, "bq:") or std.mem.startsWith(u8, key, "__meta:")) return;
+        if (!self.mayMatchRegisteredNamespace(key)) return;
         const distance = @import("distance.zig");
 
         self.lock.lockShared();
@@ -1109,6 +1132,9 @@ pub const NamespaceRegistry = struct {
             errdefer idx_ptr.deinit();
 
             try self.map.put(self.allocator, ns_copy, idx_ptr);
+            if (ns_copy.len > 0) {
+                _ = self.first_byte_counts[ns_copy[0]].fetchAdd(1, .release);
+            }
             _ = self.active_namespaces.fetchAdd(1, .release);
         }
     }
@@ -1127,6 +1153,13 @@ test "registry: getOrCreate is idempotent" {
     const a = try reg.getOrCreate("vec:", .cosine);
     const b = try reg.getOrCreate("vec:", .cosine);
     try testing.expectEqual(a, b);
+    try testing.expectEqual(@as(u32, 1), reg.first_byte_counts['v'].load(.acquire));
+    try testing.expect(!reg.mayMatchRegisteredNamespace("kv:1"));
+    try testing.expect(reg.mayMatchRegisteredNamespace("vec:1"));
+
+    reg.remove("vec:");
+    try testing.expectEqual(@as(u32, 0), reg.first_byte_counts['v'].load(.acquire));
+    try testing.expect(!reg.mayMatchRegisteredNamespace("vec:1"));
 }
 
 test "registry: distinct namespaces get distinct indexes" {

@@ -35,6 +35,7 @@ pub fn main() !void {
 
     try benchMtWalContention(alloc);
     try benchVsearchModes(alloc);
+    try benchVsearchRecallAndEf(alloc);
     try benchProceduresSuite(alloc);
 }
 
@@ -217,6 +218,172 @@ fn benchVsearchModes(alloc: std.mem.Allocator) !void {
                 const label = try std.fmt.bufPrint(&label_buf, "EXEC vsearch+RaBitQ mode={s} (N=5k, d={d})", .{ mode_str, dim });
                 printRow(label, n_queries, t1 - t0, "");
             }
+        }
+    }
+}
+
+fn extractJsonKeys(json: []const u8, out: *[10][]const u8) usize {
+    var count: usize = 0;
+    var pos: usize = 0;
+    const needle = "\"k\":\"";
+    while (count < out.len) {
+        const rel = std.mem.indexOfPos(u8, json, pos, needle) orelse break;
+        const start = rel + needle.len;
+        const end = std.mem.indexOfScalarPos(u8, json, start, '"') orelse break;
+        out[count] = json[start..end];
+        count += 1;
+        pos = end + 1;
+    }
+    return count;
+}
+
+fn benchVsearchRecallAndEf(alloc: std.mem.Allocator) !void {
+    printHeader("9b. VSEARCH HNSW EF vs RECALL@10 & LATENCY (dim=128, N=5k & N=100k)");
+
+    const dim: usize = 128;
+    const n_queries: usize = 100;
+
+    const Case = struct {
+        n: usize,
+        clustered: bool,
+        tag: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .n = 5_000, .clustered = false, .tag = "N=5k iso" },
+        .{ .n = 100_000, .clustered = false, .tag = "N=100k iso" },
+        .{ .n = 100_000, .clustered = true, .tag = "N=100k clust" },
+    };
+
+    for (cases) |c| {
+        const N = c.n;
+        var prng = std.Random.DefaultPrng.init(0xBEEF_0000 + N + @as(u64, @intFromBool(c.clustered)) * 777);
+        const rand = prng.random();
+
+        var store = try Store.init(alloc, .{ .persistence = .none, .sync_writes = false });
+        defer store.deinit();
+        var reg = NamespaceRegistry.init(alloc, .{});
+        defer reg.deinit();
+        store.vector_registry = &reg;
+        var bus = EventBus.init(alloc);
+        defer bus.deinit();
+
+        const vec_floats = try alloc.alloc(f32, N * dim);
+        defer alloc.free(vec_floats);
+        if (c.clustered) {
+            const n_clusters: usize = 100;
+            const centers = try alloc.alloc(f32, n_clusters * dim);
+            defer alloc.free(centers);
+            for (centers) |*f| f.* = rand.floatNorm(f32);
+            for (0..N) |i| {
+                const cid = i % n_clusters;
+                const center = centers[cid * dim .. (cid + 1) * dim];
+                const dst = vec_floats[i * dim .. (i + 1) * dim];
+                for (0..dim) |d| {
+                    dst[d] = center[d] + 0.30 * rand.floatNorm(f32);
+                }
+            }
+        } else {
+            for (vec_floats) |*f| f.* = rand.floatNorm(f32);
+        }
+
+        const keys = try alloc.alloc([]u8, N);
+        defer {
+            for (keys) |k| alloc.free(k);
+            alloc.free(keys);
+        }
+
+        const ns_idx = try reg.getOrCreate("vec:ns:", .cosine);
+        const build_t0 = nowNs();
+        for (0..N) |i| {
+            keys[i] = try std.fmt.allocPrint(alloc, "vec:ns:{d}", .{i});
+            const slice = vec_floats[i * dim .. (i + 1) * dim];
+            const byte_ptr: [*]const u8 = @ptrCast(slice.ptr);
+            try store.setWithTimestampNoVectorSync(keys[i], byte_ptr[0 .. dim * 4], false, 1_700_000_000_000);
+            ns_idx.lock.lock();
+            _ = try ns_idx.insertLocked(keys[i], slice, 1_700_000_000_000);
+            ns_idx.lock.unlock();
+        }
+        const build_t1 = nowNs();
+        {
+            var build_label: [64]u8 = undefined;
+            printRow(
+                try std.fmt.bufPrint(&build_label, "HNSW+Store populate ({s}, d=128)", .{c.tag}),
+                N,
+                build_t1 - build_t0,
+                "",
+            );
+        }
+
+        // Ground truth via mode=exact for n_queries distinct query keys
+        var gt_arena = std.heap.ArenaAllocator.init(alloc);
+        defer gt_arena.deinit();
+        const gt_alloc = gt_arena.allocator();
+        const gt_top10 = try gt_alloc.alloc([10][]const u8, n_queries);
+        const gt_counts = try gt_alloc.alloc(usize, n_queries);
+
+        const exact_t0 = nowNs();
+        for (0..n_queries) |q| {
+            const qkey = keys[q * (N / n_queries)];
+            const qctx = executor.ExecContext{
+                .allocator = gt_alloc,
+                .store = &store,
+                .event_bus = &bus,
+                .cluster = null,
+                .vector_registry = &reg,
+            };
+            const args = [_][]const u8{ qkey, "10", "vec:ns:", "cosine", "0", "exact" };
+            const resp = try executor.execute(qctx, .{ .exec = .{ .procedure = "vsearch", .args = &args } });
+            gt_counts[q] = extractJsonKeys(resp.value.?, &gt_top10[q]);
+        }
+        const exact_t1 = nowNs();
+        {
+            var exact_label: [64]u8 = undefined;
+            printRow(
+                try std.fmt.bufPrint(&exact_label, "EXEC vsearch exact ({s}, d=128)", .{c.tag}),
+                n_queries,
+                exact_t1 - exact_t0,
+                "[recall@10=1.0000]",
+            );
+        }
+
+        var query_arena = std.heap.ArenaAllocator.init(alloc);
+        defer query_arena.deinit();
+
+        for ([_][]const u8{ "64", "128", "200" }) |ef_str| {
+            var hits: usize = 0;
+            var total_gt: usize = 0;
+            const t0 = nowNs();
+            for (0..n_queries) |q| {
+                _ = query_arena.reset(.retain_capacity);
+                const qkey = keys[q * (N / n_queries)];
+                const qctx = executor.ExecContext{
+                    .allocator = query_arena.allocator(),
+                    .store = &store,
+                    .event_bus = &bus,
+                    .cluster = null,
+                    .vector_registry = &reg,
+                };
+                const args = [_][]const u8{ qkey, "10", "vec:ns:", "cosine", "0", "auto", "168", ef_str };
+                const resp = try executor.execute(qctx, .{ .exec = .{ .procedure = "vsearch", .args = &args } });
+                var hnsw_keys: [10][]const u8 = undefined;
+                const hnsw_cnt = extractJsonKeys(resp.value.?, &hnsw_keys);
+                total_gt += gt_counts[q];
+                for (hnsw_keys[0..hnsw_cnt]) |hk| {
+                    for (gt_top10[q][0..gt_counts[q]]) |gk| {
+                        if (std.mem.eql(u8, hk, gk)) {
+                            hits += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            const t1 = nowNs();
+            const recall = @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(total_gt));
+            var label_buf: [64]u8 = undefined;
+            var extra_buf: [32]u8 = undefined;
+            const label = try std.fmt.bufPrint(&label_buf, "EXEC vsearch HNSW ef={s} ({s})", .{ ef_str, c.tag });
+            const extra = try std.fmt.bufPrint(&extra_buf, "[recall@10={d:.4}]", .{recall});
+            printRow(label, n_queries, t1 - t0, extra);
         }
     }
 }

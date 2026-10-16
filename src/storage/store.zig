@@ -478,6 +478,15 @@ pub const Store = struct {
     /// Used by provenance primitives that include a local DB receipt timestamp
     /// inside their hashed envelope and need the stored entry metadata to match.
     pub fn setWithTimestamp(self: *Store, key: []const u8, value: []const u8, is_worm: bool, timestamp: u64) StoreError!void {
+        try self.setWithTimestampNoVectorSync(key, value, is_worm, timestamp);
+        if (self.vector_registry) |reg| {
+            reg.syncRawSet(key, value, timestamp);
+        }
+    }
+
+    /// Write with caller-supplied timestamp without triggering raw-SET HNSW sync
+    /// (used by `applyVinsert` / `applyVbulkinsert`, which manage HNSW updates directly).
+    pub fn setWithTimestampNoVectorSync(self: *Store, key: []const u8, value: []const u8, is_worm: bool, timestamp: u64) StoreError!void {
         const si = shardIndex(key);
         const shard = &self.shards[si];
 
@@ -637,6 +646,7 @@ pub const Store = struct {
     /// Delete a key.
     pub fn delete(self: *Store, key: []const u8) StoreError!void {
         const si = shardIndex(key);
+        var did_exist = false;
         {
             // Match SET's wal_enqueue -> shard order and keep append+remove
             // together, so compaction cannot truncate an unapplied deletion.
@@ -651,6 +661,12 @@ pub const Store = struct {
 
             if (shardRemoveLocked(self, shard, key)) |removed| {
                 self.destroyEntry(removed);
+                did_exist = true;
+            }
+        }
+        if (did_exist) {
+            if (self.vector_registry) |reg| {
+                reg.syncRawDelete(key);
             }
         }
         // Snapshot takes every shard; never enter it with one already held.

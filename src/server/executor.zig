@@ -70,6 +70,11 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
                     else => err,
                 };
             };
+            if (ctx.store.vector_registry == null) {
+                if (ctx.vector_registry) |reg| {
+                    reg.syncRawSet(params.key, params.value, @intCast(core.compat.nowMs()));
+                }
+            }
 
             if (ctx.cluster) |cluster| {
                 cluster.replicateWrite(params.key, params.value, params.worm) catch |err| {
@@ -86,6 +91,11 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
                     else => err,
                 };
             };
+            if (ctx.store.vector_registry == null) {
+                if (ctx.vector_registry) |reg| {
+                    reg.syncRawDelete(key);
+                }
+            }
 
             if (ctx.cluster) |cluster| {
                 cluster.replicateDelete(key) catch |err| {

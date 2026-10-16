@@ -397,6 +397,18 @@ pub const NamespaceIndex = struct {
             if (vector.len != d) return RegistryError.DimensionMismatch;
         }
 
+        if (self.key_to_node.get(key)) |old_id| {
+            if (!self.tombstones.isSet(old_id)) {
+                const old_vec = self.hnsw.nodes.items[old_id].vector;
+                if (old_vec.len == vector.len and std.mem.eql(u8, std.mem.sliceAsBytes(old_vec), std.mem.sliceAsBytes(vector))) {
+                    self.timestamps.items[old_id] = timestamp;
+                    return old_id;
+                }
+                self.tombstones.set(old_id);
+                self.tombstone_count += 1;
+            }
+        }
+
         const key_copy = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(key_copy);
 
@@ -834,6 +846,9 @@ pub const NamespaceRegistry = struct {
     lock: RwLock,
     /// Default params applied to newly-created namespaces.
     default_params: HnswParams,
+    /// Lock-free count of active namespaces so non-vector KV workloads skip
+    /// `syncRawSet` / `syncRawDelete` without acquiring `lock`.
+    active_namespaces: std.atomic.Value(usize) = .init(0),
 
     pub fn init(allocator: std.mem.Allocator, default_params: HnswParams) NamespaceRegistry {
         return .{
@@ -841,6 +856,7 @@ pub const NamespaceRegistry = struct {
             .map = .empty,
             .lock = .{},
             .default_params = default_params,
+            .active_namespaces = .init(0),
         };
     }
 
@@ -854,6 +870,7 @@ pub const NamespaceRegistry = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.map.deinit(self.allocator);
+        self.active_namespaces.store(0, .monotonic);
     }
 
     /// Look up an existing index. Returns null if the namespace has no
@@ -901,6 +918,7 @@ pub const NamespaceRegistry = struct {
         idx.* = NamespaceIndex.init(self.allocator, self.default_params, m);
 
         try self.map.put(self.allocator, ns_copy, idx);
+        _ = self.active_namespaces.fetchAdd(1, .release);
         return idx;
     }
 
@@ -910,9 +928,88 @@ pub const NamespaceRegistry = struct {
         self.lock.lock();
         defer self.lock.unlock();
         if (self.map.fetchRemove(namespace)) |kv| {
+            _ = self.active_namespaces.fetchSub(1, .release);
             self.allocator.free(kv.key);
             kv.value.deinit();
             self.allocator.destroy(kv.value);
+        }
+    }
+
+    /// Synchronize a plain `DEL` against any registered vector namespace whose
+    /// prefix matches `key`. Must be called with NO shard locks held.
+    pub fn syncRawDelete(self: *NamespaceRegistry, key: []const u8) void {
+        if (self.active_namespaces.load(.acquire) == 0) return;
+        if (std.mem.startsWith(u8, key, "bq:") or std.mem.startsWith(u8, key, "__meta:")) return;
+
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.startsWith(u8, key, entry.key_ptr.*)) {
+                const idx = entry.value_ptr.*;
+                idx.lock.lock();
+                defer idx.lock.unlock();
+                _ = idx.markTombstoneLocked(key);
+            }
+        }
+    }
+
+    /// Synchronize a raw `SET` against registered vector namespaces. If `key`
+    /// already exists in a namespace index, the old node is tombstoned and replaced
+    /// when `value` is a valid f32 vector of matching dimension. If `key` is new
+    /// and matches an active namespace with a frozen dimension, it is inserted.
+    /// Must be called with NO shard locks held.
+    pub fn syncRawSet(self: *NamespaceRegistry, key: []const u8, value: []const u8, timestamp: u64) void {
+        if (self.active_namespaces.load(.acquire) == 0) return;
+        if (std.mem.startsWith(u8, key, "bq:") or std.mem.startsWith(u8, key, "__meta:")) return;
+        const distance = @import("distance.zig");
+
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+
+        var best_ns_len: usize = 0;
+        var best_idx: ?*NamespaceIndex = null;
+        var refreshed_existing = false;
+
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            const ns = entry.key_ptr.*;
+            if (!std.mem.startsWith(u8, key, ns)) continue;
+            const idx = entry.value_ptr.*;
+            idx.lock.lock();
+            defer idx.lock.unlock();
+            if (idx.nodeIdFor(key) != null) {
+                refreshed_existing = true;
+                if (distance.bytesToF32(value)) |vec| {
+                    if (idx.dim == null or vec.len == idx.dim.?) {
+                        _ = idx.insertLocked(key, vec, timestamp) catch {
+                            _ = idx.markTombstoneLocked(key);
+                        };
+                    } else {
+                        _ = idx.markTombstoneLocked(key);
+                    }
+                } else {
+                    _ = idx.markTombstoneLocked(key);
+                }
+            } else if (ns.len > best_ns_len) {
+                best_ns_len = ns.len;
+                best_idx = idx;
+            }
+        }
+
+        if (!refreshed_existing) {
+            if (best_idx) |idx| {
+                idx.lock.lock();
+                defer idx.lock.unlock();
+                if (idx.dim) |d| {
+                    if (distance.bytesToF32(value)) |vec| {
+                        if (vec.len == d) {
+                            _ = idx.insertLocked(key, vec, timestamp) catch {};
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1012,6 +1109,7 @@ pub const NamespaceRegistry = struct {
             errdefer idx_ptr.deinit();
 
             try self.map.put(self.allocator, ns_copy, idx_ptr);
+            _ = self.active_namespaces.fetchAdd(1, .release);
         }
     }
 };

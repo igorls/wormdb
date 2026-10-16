@@ -143,7 +143,7 @@ fn persistNamespaceConfig(
     ) catch return;
     defer allocator.free(value);
 
-    store.setWithTimestamp(key, value, false, timestamp) catch |err| {
+    store.setWithTimestampNoVectorSync(key, value, false, timestamp) catch |err| {
         std.log.warn("persistNamespaceConfig: '{s}': {s}", .{ namespace, @errorName(err) });
     };
 }
@@ -180,7 +180,7 @@ pub fn applyVinsert(
     }
 
     // ── Store the vec entry ──────────────────────────────────────
-    store.setWithTimestamp(args.key, args.vector, args.worm, args.timestamp) catch |e| {
+    store.setWithTimestampNoVectorSync(args.key, args.vector, args.worm, args.timestamp) catch |e| {
         return switch (e) {
             error.WormViolation => error.WormViolation,
             error.OutOfMemory => error.OutOfMemory,
@@ -202,7 +202,7 @@ pub fn applyVinsert(
     const bq_buf = try encodeBqOwned(allocator, vec_f32, ns_idx_for_bq);
     defer allocator.free(bq_buf);
 
-    store.setWithTimestamp(bq_key, bq_buf, args.worm, args.timestamp) catch |e| {
+    store.setWithTimestampNoVectorSync(bq_key, bq_buf, args.worm, args.timestamp) catch |e| {
         std.log.warn("applyVinsert: BQ store failed for '{s}': {s}", .{ bq_key, @errorName(e) });
     };
 
@@ -335,7 +335,7 @@ pub fn applyVbulkinsert(
             }
         } else dim_check = item.vector.len;
 
-        store.setWithTimestamp(item.key, item.vector, worm, item.timestamp) catch |e| {
+        store.setWithTimestampNoVectorSync(item.key, item.vector, worm, item.timestamp) catch |e| {
             std.log.warn("applyVbulkinsert: store vec '{s}' failed: {s}", .{ item.key, @errorName(e) });
             continue;
         };
@@ -348,7 +348,7 @@ pub fn applyVbulkinsert(
         const vec_f32 = distance.bytesToF32(item.vector).?;
         const bq_buf = encodeBqOwned(allocator, vec_f32, ns_idx_for_bq) catch continue;
         defer allocator.free(bq_buf);
-        store.setWithTimestamp(bq_key, bq_buf, worm, item.timestamp) catch |e| {
+        store.setWithTimestampNoVectorSync(bq_key, bq_buf, worm, item.timestamp) catch |e| {
             std.log.warn("applyVbulkinsert: store bq '{s}' failed: {s}", .{ bq_key, @errorName(e) });
         };
     }

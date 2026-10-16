@@ -92,3 +92,21 @@ test "proof_prefix_root returns full and limited roots" {
     const limited = try runProc(&store, &.{ "p:", "limit=1" }, allocator);
     try testing.expect(std.mem.containsAtLeast(u8, limited.value.?, 1, "\"entry_count\":1"));
 }
+
+test "proof_prefix_root with huge limit does not pre-allocate" {
+    const testing = std.testing;
+    const Store = @import("../storage/store.zig").Store;
+    const Config = @import("../core/config.zig").Config;
+
+    var store = try Store.init(testing.allocator, Config{ .persistence = .none });
+    defer store.deinit();
+    try store.setWithTimestamp("p:a", "one", true, 10);
+    try store.setWithTimestamp("p:b", "two", true, 20);
+
+    var buf: [128 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+
+    const res = try runProc(&store, &.{ "p:", "limit=1000000000" }, fba.allocator());
+    try testing.expect(res.value != null);
+    try testing.expect(std.mem.containsAtLeast(u8, res.value.?, 1, "\"entry_count\":2"));
+}

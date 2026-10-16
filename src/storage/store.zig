@@ -1011,7 +1011,7 @@ pub const Store = struct {
             results.deinit(alloc);
         }
         if (limit > 0) {
-            try results.ensureTotalCapacity(alloc, limit);
+            try results.ensureTotalCapacity(alloc, @min(limit, 1024));
         }
 
         // Collect each shard's match range. With a bounded heap of size `limit`

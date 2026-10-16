@@ -1,0 +1,280 @@
+# WormDB binary release workflow.
+#
+# Triggered by a `v*` tag push (or manual dispatch). Builds the standalone
+# `wormdb` server, the `wormdb-sst` tool, and the `libwormdb_ffi` embedding
+# library for five targets, packages them with SHA-256 checksums, and
+# publishes a GitHub Release.
+#
+# ── Build matrix ─────────────────────────────────────────────────────────
+#   linux-x86_64   native on ubuntu; links vendored libsodium.so (bundled
+#                  into the archive with an $ORIGIN rpath so it's portable).
+#   linux-aarch64  cross-compiled from ubuntu with -Dcrypto-backend=std (no
+#                  vendored aarch64 libsodium exists, so std.crypto is used).
+#   windows-x86_64  native on windows; auto crypto = std.crypto on Windows
+#                  (auto_libsodium is Linux-only), so the binary is static
+#                  and self-contained.
+#   macos-aarch64  native on macos-latest (arm64); std.crypto.
+#   macos-x86_64   native on macos-13 (x86_64); std.crypto.
+#
+# ── Submodules ───────────────────────────────────────────────────────────
+#   Only deps/meshguard is fetched (the QUIC submodules — msquic, libwtf —
+#   require a CMake build and are deliberately excluded from releases).
+#
+# ── Artifacts per target ─────────────────────────────────────────────────
+#   wormdb          the server executable
+#   wormdb-sst       offline SST segment builder
+#   libwormdb_ffi.*  shared FFI library (.so / .dll / .dylib)
+#   wormdb.h         C header for FFI consumers
+#   libsodium.so.23  bundled only for linux-x86_64
+#
+# See CLAUDE.md / AGENTS.md for build details and docs/WINDOWS.md for the
+# Windows feature matrix.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and release'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Linux x86_64 ─ native, libsodium (auto), bundle .so ──
+          - name: linux-x86_64
+            runner: ubuntu-latest
+            target: ''
+            extra-flags: ''
+            archive: wormdb-linux-x86_64.tar.gz
+            needs-sodium: true
+            bundle-sodium: true
+
+          # ── Linux aarch64 ─ cross-compiled, std.crypto (no aarch64 libsodium) ──
+          - name: linux-aarch64
+            runner: ubuntu-latest
+            target: aarch64-linux-gnu
+            extra-flags: '-Dcrypto-backend=std'
+            archive: wormdb-linux-aarch64.tar.gz
+            needs-sodium: false
+            bundle-sodium: false
+
+          # ── Windows x86_64 ─ native, std.crypto (auto on Windows) ──
+          - name: windows-x86_64
+            runner: windows-latest
+            target: ''
+            extra-flags: ''
+            archive: wormdb-windows-x86_64.zip
+            needs-sodium: false
+            bundle-sodium: false
+
+          # ── macOS aarch64 (Apple Silicon) ─ native, std.crypto ──
+          - name: macos-aarch64
+            runner: macos-latest
+            target: ''
+            extra-flags: ''
+            archive: wormdb-macos-aarch64.tar.gz
+            needs-sodium: false
+            bundle-sodium: false
+
+          # ── macOS x86_64 (Intel) ─ native, std.crypto ──
+          - name: macos-x86_64
+            runner: macos-13
+            target: ''
+            extra-flags: ''
+            archive: wormdb-macos-x86_64.tar.gz
+            needs-sodium: false
+            bundle-sodium: false
+
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: false # skip the heavy QUIC submodules
+
+      - name: Fetch meshguard submodule
+        run: git submodule update --init --depth 1 deps/meshguard
+
+      # Linux x86_64 links the vendored deps/lib/libsodium.so at build time;
+      # the -dev package provides the same soname at link time.
+      - name: Install libsodium (Linux x86_64 only)
+        if: matrix.needs-sodium
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libsodium-dev patchelf
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.17.0
+
+      - name: Build
+        run: |
+          zig build -Doptimize=ReleaseSmall ${{ matrix.target != '' && format('-Dtarget={0}', matrix.target) || '' }} ${{ matrix.extra-flags }}
+
+      # Smoke-test the binary on native builds (cross-compiled binaries can't
+      # run on the host). `--help` exits 0 after printing usage.
+      - name: Smoke test (native builds only)
+        if: matrix.target == ''
+        run: ${{ matrix.runner == 'windows-latest' && '.\zig-out\bin\wormdb.exe' || './zig-out/bin/wormdb' }} --help
+
+      # ──────────────────────────────────────────────────────────────────
+      # Packaging — Unix (Linux + macOS)
+      # ──────────────────────────────────────────────────────────────────
+      - name: Package (Linux / macOS)
+        if: matrix.runner != 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg="wormdb-${{ matrix.name }}"
+          mkdir -p "$pkg"
+
+          # Binaries
+          cp zig-out/bin/wormdb      "$pkg/"
+          cp zig-out/bin/wormdb-sst  "$pkg/"
+
+          # FFI shared library — .so on Linux, .dylib on macOS
+          cp zig-out/lib/libwormdb_ffi.so    "$pkg/" 2>/dev/null || \
+          cp zig-out/lib/libwormdb_ffi.dylib "$pkg/" 2>/dev/null || true
+
+          # FFI header
+          cp ffi/wormdb.h "$pkg/"
+
+          # Bundle libsodium with $ORIGIN rpath for a portable Linux x86_64 build.
+          # The SONAME is libsodium.so.23; the dynamic linker resolves via rpath.
+          if [ "${{ matrix.bundle-sodium }}" = "true" ]; then
+            cp deps/lib/libsodium.so "$pkg/libsodium.so.23"
+            patchelf --set-rpath '$ORIGIN' "$pkg/wormdb"
+            patchelf --set-rpath '$ORIGIN' "$pkg/wormdb-sst"
+            patchelf --set-rpath '$ORIGIN' "$pkg/libwormdb_ffi.so"
+          fi
+
+          tar czf "${{ matrix.archive }}" "$pkg"
+          sha256sum "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+
+          echo "### ${{ matrix.name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          ls -lh "$pkg"/ >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # ──────────────────────────────────────────────────────────────────
+      # Packaging — Windows
+      # ──────────────────────────────────────────────────────────────────
+      - name: Package (Windows)
+        if: matrix.runner == 'windows-latest'
+        shell: pwsh
+        run: |
+          $pkg = "wormdb-${{ matrix.name }}"
+          New-Item -ItemType Directory -Path $pkg -Force
+
+          # Binaries
+          Copy-Item zig-out/bin/wormdb.exe     $pkg/
+          Copy-Item zig-out/bin/wormdb-sst.exe $pkg/
+
+          # FFI shared library — .dll on Windows
+          $ffi = Get-ChildItem zig-out/lib/*.dll -ErrorAction SilentlyContinue
+          if ($ffi) { Copy-Item $ffi.FullName $pkg/ }
+
+          # FFI header
+          Copy-Item ffi/wormdb.h $pkg/
+
+          Compress-Archive -Path "$pkg/*" -DestinationPath "${{ matrix.archive }}"
+          $hash = (Get-FileHash "${{ matrix.archive }}" -Algorithm SHA256).Hash
+          "$hash  ${{ matrix.archive }}" | Out-File -Encoding ascii "${{ matrix.archive }}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}
+            ${{ matrix.archive }}.sha256
+          retention-days: 7
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Release job — collect all artifacts and create the GitHub Release.
+  # ────────────────────────────────────────────────────────────────────────
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/*.sha256
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
+          body: |
+            ## WormDB ${{ inputs.tag || github.ref_name }}
+
+            Pre-built binaries for Linux, Windows, and macOS.
+
+            ### Downloads
+
+            | Platform | Archive |
+            |----------|---------|
+            | Linux x86_64 | `wormdb-linux-x86_64.tar.gz` |
+            | Linux aarch64 | `wormdb-linux-aarch64.tar.gz` |
+            | Windows x86_64 | `wormdb-windows-x86_64.zip` |
+            | macOS aarch64 (Apple Silicon) | `wormdb-macos-aarch64.tar.gz` |
+            | macOS x86_64 (Intel) | `wormdb-macos-x86_64.tar.gz` |
+
+            ### Contents
+
+            Each archive contains:
+            - **`wormdb`** — the WormDB server (single static binary)
+            - **`wormdb-sst`** — offline SST segment builder tool
+            - **`libwormdb_ffi.{so,dll,dylib}`** — embedding FFI shared library
+            - **`wormdb.h`** — C header for FFI consumers
+
+            The **Linux x86_64** archive also bundles `libsodium.so.23` (with
+            an `$ORIGIN` rpath so it runs without a system libsodium install).
+            All other targets use Zig's built-in `std.crypto` and have no
+            external dependencies.
+
+            ### Quick start
+
+            ```bash
+            tar xzf wormdb-linux-x86_64.tar.gz
+            cd wormdb-linux-x86_64
+            ./wormdb --port 6389 --data ./data
+            ```
+
+            See the [README](https://github.com/igorls/wormdb#readme) for full
+            documentation.
+
+            ### Verification
+
+            ```bash
+            sha256sum -c wormdb-linux-x86_64.tar.gz.sha256
+            ```

@@ -155,7 +155,9 @@ pub fn build(b: *std.Build) void {
     // The engine library module — exposed via addModule so the server exe + domain packages consume the
     // real engine types (Store, Ctx, Segment, Domain, …) with `@import("wormdb")`. linkCrypto is applied
     // to the module so consumers inherit the libsodium link transitively.
-    const wormdb_mod = b.addModule("wormdb", .{
+    // On a narrow-atomics target the public "wormdb" name belongs to the reduced root (engine_mod
+    // below), and Zig 0.17 panics if a name is added twice, so this one stays private there.
+    const wormdb_mod_opts: std.Build.Module.CreateOptions = .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
@@ -164,7 +166,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "meshguard", .module = meshguard_mod },
             .{ .name = "build_options", .module = build_options_mod },
         },
-    });
+    };
+    const wormdb_mod = if (narrow_target) b.createModule(wormdb_mod_opts) else b.addModule("wormdb", wormdb_mod_opts);
     linkCrypto(b, wormdb_mod, os_tag, abi, use_libsodium);
     if (enable_quic) linkQuic(b, wormdb_mod); // QUIC C deps inherited by consumers (server exe)
 

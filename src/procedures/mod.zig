@@ -27,6 +27,7 @@ pub const coordination = @import("coordination.zig");
 pub const cluster_presence = @import("cluster_presence.zig");
 pub const proof_prefix_root = @import("proof_prefix_root.zig");
 pub const trust_log = @import("trust_log.zig");
+pub const sandbox = @import("sandbox.zig");
 // Domain procedures are NOT here — each domain lives in its own external package
 // and registers via the manifest at startup.
 

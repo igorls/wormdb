@@ -385,6 +385,45 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(checker_tests).step);
 
+    // Sample laws for sandboxed procedures (examples/laws), compiled the way a law author would:
+    // plain wasm32 MVP (integer-only code stays small), no entry point, exports kept.
+    const law_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+        .cpu_model = .{ .explicit = &std.Target.wasm.cpu.mvp },
+    });
+    const ford_toll = b.addExecutable(.{
+        .name = "ford_toll",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/laws/ford_toll.zig"),
+            .target = law_target,
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    ford_toll.entry = .disabled;
+    ford_toll.rdynamic = true;
+    const laws_step = b.step("laws", "Build the sample laws for sandboxed procedures (examples/laws)");
+    laws_step.dependOn(&b.addInstallArtifact(ford_toll, .{}).step);
+
+    // The sandbox procedures are tested against that law from their own test root, so the engine
+    // module never depends on an example.
+    const sandbox_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/sandbox_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "meshguard", .module = meshguard_mod },
+            .{ .name = "build_options", .module = build_options_mod },
+        },
+    });
+    sandbox_test_mod.addAnonymousImport("ford_toll_wasm", .{ .root_source_file = ford_toll.getEmittedBin() });
+    linkCrypto(b, sandbox_test_mod, os_tag, abi, use_libsodium);
+    if (enable_quic) linkQuic(b, sandbox_test_mod);
+    // Filtered: the engine's own tests are reachable from this root too, and already run above.
+    const sandbox_tests = b.addTest(.{ .root_module = sandbox_test_mod, .filters = &.{"sandbox_test."} });
+    test_step.dependOn(&b.addRunArtifact(sandbox_tests).step);
+
     // `zig build bench` compiles and installs all benchmark binaries under bench/*.zig.
     const bench_step = b.step("bench", "Build benchmark binaries (bench/*.zig)");
     inline for (.{

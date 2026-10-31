@@ -39,6 +39,7 @@ pub const coordination = @import("coordination.zig");
 pub const cluster_presence = if (cluster_on) @import("cluster_presence.zig") else struct {};
 pub const proof_prefix_root = @import("proof_prefix_root.zig");
 pub const trust_log = if (cluster_on) @import("trust_log.zig") else struct {};
+pub const sandbox = @import("sandbox.zig");
 // Domain procedures are NOT imported here — each domain lives in its own external
 // package and is registered at startup via registerDomains() from its manifest.
 
@@ -99,6 +100,9 @@ const PROCEDURES = [_]Entry{
     .{ .name = "trust_grant", .func = if (cluster_on) trust_log.grantExecute else clusterUnsupported },
     .{ .name = "trust_revoke", .func = if (cluster_on) trust_log.revokeExecute else clusterUnsupported },
     .{ .name = "trust_fold", .func = if (cluster_on) trust_log.foldExecute else clusterUnsupported },
+    .{ .name = "sandbox_install", .func = sandbox.installExecute },
+    .{ .name = "sandbox_call", .func = sandbox.callExecute },
+    .{ .name = "sandbox_replay", .func = sandbox.replayExecute },
     .{ .name = "mem_init", .func = memory.memInit },
     .{ .name = "mem_add", .func = memory.memAdd },
     .{ .name = "mem_meta_set", .func = memory.memMetaSet },

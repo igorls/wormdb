@@ -45,6 +45,7 @@ Module map (each is a directory with `mod.zig`):
 - **event** — `bus.zig`, prefix-matched pub/sub channels. `SUB vec:` catches every `vec:*` event.
 - **cluster** — `node.zig` embeds meshguard for SWIM gossip discovery, failure detection, and encrypted (ChaCha20-Poly1305) replication over WireGuard tunnels. No central coordinator. Holds persistent `PeerConnection`s; new peers trigger an anti-entropy full-state sync.
 - **procedures** — compiled-in `EXEC` handlers (see below).
+- **sandbox** — wasm decoder (`module.zig`) and fuel-metered, integer-only interpreter (`interp.zig`) behind the `sandbox_*` procedures. See [docs/sandbox.md](docs/sandbox.md).
 - **vector** — `distance.zig` (SIMD AVX2/NEON cosine/dot/L2 + Hamming + binary quantization), `hnsw.zig` (graph index), `index.zig` (`NamespaceIndex` + `NamespaceRegistry`, per-namespace), `metric.zig`, `topk.zig` (bounded min-heap), `rabitq.zig` (1-bit quantization).
 
 ### Write path
@@ -59,7 +60,9 @@ Writes go through the normal durable/replicated WormWire path (`VINSERT`/`VBULKI
 
 Procedures are native Zig functions compiled into the binary, executed server-side under automatic shard locking — atomic multi-key ops in one round-trip. **There is a dedicated skill at [.agent/skills/wormdb-procedures/SKILL.md](.agent/skills/wormdb-procedures/SKILL.md) — read it before writing a procedure.**
 
-Adding one touches three files:
+Procedures can also be shipped at runtime as wasm (`sandbox_install` / `sandbox_call` / `sandbox_replay`, in `src/procedures/sandbox.zig`): each module is scoped to a key prefix, integer-only and fuel-metered, and every committed call goes into a hash-chained log that `sandbox_replay` re-runs. Its tests live in `src/sandbox_test.zig` (own test root, because they need `examples/laws/ford_toll.zig` compiled to wasm). Don't make `src/sandbox/interp.zig` faster with anything that changes results: replay depends on every machine computing the same thing.
+
+Adding a compiled-in one touches three files:
 1. `src/procedures/<name>.zig` — `pub fn execute(ctx: *Ctx) anyerror!Ctx.Result`
 2. `src/procedures/registry.zig` — add the `@import` and a `PROCEDURES` table entry (name → fn)
 3. `src/procedures/mod.zig` — add the `pub const` re-export

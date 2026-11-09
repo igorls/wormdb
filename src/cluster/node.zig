@@ -21,6 +21,7 @@ const EventBus = event.EventBus;
 const NamespaceIndex = @import("../vector/index.zig").NamespaceIndex;
 const prefix_root = @import("../proof/prefix_root.zig");
 const org_trust = @import("org_trust.zig");
+const secure_channel = @import("secure_channel.zig");
 const presence = @import("presence.zig");
 
 const Keys = meshguard.identity.Keys;
@@ -159,6 +160,12 @@ const PeerConnection = struct {
     root_sync: RootSyncState,
     root_sync_last_ms: u64,
     root_sync_missing_ranges: usize,
+    /// Set by a completed W3 handshake: the peer's proven org + session keys.
+    /// Null on a legacy (WR) link. Under enforcement a peer without a session
+    /// receives nothing (see `Cluster.peerMayReceive`).
+    session: ?org_trust.PeerSession = null,
+    /// Cipher state for the W3 link; every frame on `stream` goes through it.
+    secure: ?secure_channel.SecureStream = null,
 
     fn connect(self: *PeerConnection, cluster: *const Cluster) void {
         if (self.stream != null) return;
@@ -187,7 +194,7 @@ const PeerConnection = struct {
         }
 
         var stream_mut = stream;
-        cluster.replOutboundHandshake(&stream_mut) catch |err| {
+        const session = cluster.replOutboundHandshake(&stream_mut) catch |err| {
             std.log.warn("cluster: replication handshake to {d}.{d}.{d}.{d}:{d} failed: {s}", .{
                 ip[0], ip[1], ip[2], ip[3], port, @errorName(err),
             });
@@ -196,6 +203,8 @@ const PeerConnection = struct {
         };
 
         self.stream = stream_mut;
+        self.session = session;
+        if (session) |sess| self.secure = secure_channel.SecureStream.init(cluster.allocator, sess.keys);
         self.needs_sync = true;
         std.log.info("cluster: connected to peer {d}.{d}.{d}.{d}:{d}", .{
             ip[0], ip[1], ip[2], ip[3], port,
@@ -203,6 +212,10 @@ const PeerConnection = struct {
     }
 
     fn disconnect(self: *PeerConnection) void {
+        if (self.secure) |*sec| sec.deinit();
+        self.secure = null;
+        if (self.session) |*sess| sess.keys.wipe();
+        self.session = null;
         if (self.stream) |*s| {
             s.close();
             self.stream = null;
@@ -211,6 +224,20 @@ const PeerConnection = struct {
 
     fn sendCommand(self: *PeerConnection, cmd: Command) bool {
         if (self.stream == null) return false;
+        if (self.secure) |*sec| {
+            // W3 link: the frame is sealed into encrypted records and flushed
+            // as one message.
+            var bound = sec.bind(&self.stream.?);
+            wire.writeCommand(&bound, cmd) catch {
+                self.disconnect();
+                return false;
+            };
+            bound.flush() catch {
+                self.disconnect();
+                return false;
+            };
+            return true;
+        }
         // wire.writeCommand takes an anytype writer with a `.writeAll` method;
         // core.compat.net.Stream.writeAll requires `*Stream`, so pass by pointer.
         wire.writeCommand(&self.stream.?, cmd) catch {
@@ -326,36 +353,59 @@ pub const Cluster = struct {
         return try Keys.sign(message, self.identity.secret_key);
     }
 
-    /// Open a replication stream's protocol: write the magic and, when org
-    /// trust + our node cert are configured, complete the "W2" org handshake
-    /// (read the server's 32B challenge, reply [186B cert][64B Ed25519 sig
-    /// over challenge++cert] signed with the cluster identity key — the same
-    /// std Ed25519 detached form as signWithIdentity, which the server-side
-    /// verify expects). Without a cert we speak legacy "WR"; an enforcing
-    /// peer will reject that loudly, which is the intended fail-closed
-    /// behavior rather than a silent identity-less write path.
-    fn replOutboundHandshake(self: *const Cluster, stream: *core.compat.net.Stream) !void {
+    /// Open a replication stream's protocol. Without org trust + our node
+    /// cert we speak legacy "WR" (unauthenticated, plaintext) and return null;
+    /// an enforcing peer rejects that loudly, which is the intended fail-closed
+    /// behavior. With a cert we run the mutual "W3" handshake:
+    ///
+    ///   1. send magic ++ our 32B challenge;
+    ///   2. read the server's [32B challenge][cert][sig over the role-labeled
+    ///      transcript: both challenges ++ its cert] and verify it — the
+    ///      server must prove membership in an org we trust BEFORE we send
+    ///      anything else (a rogue gossip joiner can no longer receive a
+    ///      full-state dump);
+    ///   3. reply [our cert][sig over the client-labeled transcript]; the two
+    ///      labels keep either signature from being replayed in the other
+    ///      role or as a legacy W2 proof;
+    ///   4. derive the per-direction session keys from both identities and
+    ///      both challenges; every later byte is an encrypted record.
+    ///
+    /// Returns the proven peer identity + keys.
+    fn replOutboundHandshake(self: *const Cluster, stream: *core.compat.net.Stream) !?org_trust.PeerSession {
         const trust = self.config.org_trust orelse {
             try stream.writeAll(&wire.REPL_MAGIC);
-            return;
+            return null;
         };
         const cert_wire = trust.node_cert_wire orelse {
             if (trust.enforce) {
                 std.log.warn("cluster: org trust enforced but no node_cert_path configured — speaking legacy replication (enforcing peers will reject)", .{});
             }
             try stream.writeAll(&wire.REPL_MAGIC);
-            return;
+            return null;
         };
 
-        try stream.writeAll(&wire.REPL_MAGIC_V2);
+        var client_challenge: [org_trust.CHALLENGE_LEN]u8 = undefined;
+        core.compat.randomBytes(&client_challenge);
+        try stream.writeAll(&wire.REPL_MAGIC_V3);
+        try stream.writeAll(&client_challenge);
 
-        var challenge: [org_trust.CHALLENGE_LEN]u8 = undefined;
-        try readExactFromStream(stream, &challenge);
+        var hello: [org_trust.SERVER_HELLO_LEN]u8 = undefined;
+        try readExactFromStream(stream, &hello);
+        const server_challenge = hello[0..org_trust.CHALLENGE_LEN];
+        const server_cert = hello[org_trust.CHALLENGE_LEN..][0..org_trust.CERT_WIRE_LEN];
+        const server_sig = hello[org_trust.CHALLENGE_LEN + org_trust.CERT_WIRE_LEN ..][0..org_trust.SIG_LEN];
+        const server = org_trust.verifyW3Server(trust, &client_challenge, server_challenge, server_cert, server_sig) catch |err| {
+            std.log.warn("cluster: peer failed to prove org membership: {s}", .{@errorName(err)});
+            return err;
+        };
 
-        const msg = org_trust.handshakeMessage(&challenge, &cert_wire);
+        const msg = org_trust.w3ClientMessage(&client_challenge, server_challenge, &cert_wire);
         const sig = try Keys.sign(&msg, self.identity.secret_key);
         try stream.writeAll(&cert_wire);
         try stream.writeAll(&sig);
+
+        const keys = try secure_channel.deriveSessionKeys(.client, self.identity.secret_key, server.node_pubkey, &client_challenge, server_challenge);
+        return .{ .org = server, .keys = keys };
     }
 
     /// Start the mesh network: bind gossip socket, init SWIM, seed peers, start discovery thread.
@@ -413,6 +463,24 @@ pub const Cluster = struct {
                 .onPeerPunched = &onPeerPunched,
             },
         );
+
+        // Membership trust: with org trust enforced, only nodes that present a
+        // certificate from our own org or a granted org may join the gossip
+        // mesh at all — anyone else never becomes a peer we connect to. Our
+        // own cert rides in gossip so trusted peers admit us in turn.
+        if (self.config.org_trust) |trust| {
+            if (trust.enforce) {
+                if (self.swim) |*swim| {
+                    for (trust.grants) |g| swim.addTrustedOrg(g.org_pubkey);
+                    if (trust.node_cert) |cert| swim.addTrustedOrg(cert.org_pubkey);
+                    if (trust.node_cert_wire) |cert_wire| swim.setOrgCert(cert_wire);
+                    swim.enableTrust();
+                    std.log.info("cluster: SWIM membership trust enforced ({d} trusted org(s))", .{
+                        trust.grants.len + @as(usize, if (trust.node_cert != null) 1 else 0),
+                    });
+                }
+            }
+        }
 
         // Resolve and seed peers (uses libc getaddrinfo for Docker DNS compatibility)
         var seed_buf: [16]messages.Endpoint = undefined;
@@ -513,6 +581,9 @@ pub const Cluster = struct {
 
             if (peer.needs_sync and peer.stream != null) {
                 peer.needs_sync = false;
+                // Sync sends run inside store iteration (shard locks held) and
+                // may only consult the delegated-trust cache — warm it here.
+                self.refreshDynamicTrust();
                 var ip_buf: [15]u8 = undefined;
                 const ip_str = WgIp.formatIp(peer.mesh_ip, &ip_buf);
                 std.log.info("cluster: anti-entropy sync starting for {s}", .{ip_str});
@@ -556,6 +627,51 @@ pub const Cluster = struct {
                 });
             }
         }
+    }
+
+    // ── Outbound authorization ──────────────────────────────────────────
+    //
+    // Inbound writes are checked by the receiving node (`replicationKeyAuthorized`).
+    // These are the mirror image for what WE send: under org-trust enforcement a
+    // peer must have completed the W3 handshake, and a peer from another org only
+    // receives the key prefixes its static grant or a delegated trust-log capability
+    // covers. Members of our own org receive everything.
+
+    /// May `peer` receive `key`? `may_refresh` must be false while store shard
+    /// locks are held (the delegated-trust fold scans the store).
+    fn peerMayReceive(self: *const Cluster, peer: *const PeerConnection, key: []const u8, may_refresh: bool) bool {
+        const trust = self.config.org_trust orelse return true;
+        if (!trust.enforce) return true;
+        const session = peer.session orelse return false;
+        const org = session.org.org_pubkey;
+        if (trust.sameOrg(org)) return true;
+        if (trust.keyAuthorized(org, key)) return true;
+        const dynamic = trust.dynamic orelse return false;
+        return if (may_refresh)
+            dynamic.authorized(org, key, org_trust.CAP_READ)
+        else
+            dynamic.authorizedCached(org, key, org_trust.CAP_READ);
+    }
+
+    /// Every item of a bulk frame must be in scope — one frame, one decision.
+    fn peerMayReceiveAll(self: *const Cluster, peer: *const PeerConnection, items: []const Command.VbulkinsertParams.BulkItem) bool {
+        for (items) |item| {
+            if (!self.peerMayReceive(peer, item.key, true)) return false;
+        }
+        return true;
+    }
+
+    /// Proof-layer requests carry no key; under enforcement they still go only
+    /// to peers that completed the mutual handshake.
+    fn peerAuthenticated(self: *const Cluster, peer: *const PeerConnection) bool {
+        const trust = self.config.org_trust orelse return true;
+        if (!trust.enforce) return true;
+        return peer.session != null;
+    }
+
+    fn refreshDynamicTrust(self: *const Cluster) void {
+        const trust = self.config.org_trust orelse return;
+        if (trust.dynamic) |dynamic| dynamic.refresh();
     }
 
     fn snapshotVectorRegistry(self: *Cluster) std.ArrayListUnmanaged(RegSnap) {
@@ -602,7 +718,10 @@ pub const Cluster = struct {
         is_worm: bool,
         stats: *SyncStats,
     ) void {
-        _ = self;
+        // Outbound scope: a foreign-org peer only receives keys its grants
+        // cover. Runs inside the store iteration (shard locks held), so this
+        // is a cache-only check.
+        if (!self.peerMayReceive(peer, key, false)) return;
         const BQ_PREFIX = "bq:";
         if (std.mem.startsWith(u8, key, BQ_PREFIX)) {
             const stripped = key[BQ_PREFIX.len..];
@@ -716,27 +835,23 @@ pub const Cluster = struct {
             std.posix.setsockopt(stream.getHandle(), std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
         }
 
-        // Same protocol negotiation as persistent peer connections: W2 org
-        // handshake when we can authenticate, legacy WR otherwise.
-        try self.replOutboundHandshake(&stream);
+        // Same protocol negotiation as persistent peer connections: mutual W3
+        // handshake (encrypted) when we can authenticate, legacy WR otherwise.
+        const session = try self.replOutboundHandshake(&stream);
+        var secure: ?secure_channel.SecureStream = if (session) |sess| secure_channel.SecureStream.init(self.allocator, sess.keys) else null;
+        defer if (secure) |*sec| sec.deinit();
+        var io = secure_channel.Transport{ .stream = &stream, .secure = if (secure) |*sec| sec else null };
 
         var limit_buf: [48]u8 = undefined;
         const limit_arg = try std.fmt.bufPrint(&limit_buf, "limit={d}", .{first_limit});
         var args = [_][]const u8{ prefix, limit_arg };
-        try wire.writeCommand(&stream, .{ .exec = .{
+        try wire.writeCommand(&io, .{ .exec = .{
             .procedure = "proof_prefix_root",
             .args = args[0..],
         } });
+        try io.flush();
 
-        const ReadAdapter = struct {
-            stream: *core.compat.net.Stream,
-
-            pub fn read(adapter: *@This(), dest: []u8) !usize {
-                return adapter.stream.read(dest);
-            }
-        };
-        var reader = ReadAdapter{ .stream = &stream };
-        const response = try wire.readResponseAlloc(&reader, self.allocator);
+        const response = try wire.readResponseAlloc(&io, self.allocator);
         defer protocol.deinitResponse(self.allocator, response);
 
         return switch (response) {
@@ -920,9 +1035,12 @@ pub const Cluster = struct {
             std.posix.setsockopt(stream.getHandle(), std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
         }
 
-        // Same protocol negotiation as persistent peer connections: W2 org
-        // handshake when we can authenticate, legacy WR otherwise.
-        try self.replOutboundHandshake(&stream);
+        // Same protocol negotiation as persistent peer connections: mutual W3
+        // handshake (encrypted) when we can authenticate, legacy WR otherwise.
+        const session = try self.replOutboundHandshake(&stream);
+        var secure: ?secure_channel.SecureStream = if (session) |sess| secure_channel.SecureStream.init(allocator, sess.keys) else null;
+        defer if (secure) |*sec| sec.deinit();
+        var io = secure_channel.Transport{ .stream = &stream, .secure = if (secure) |*sec| sec else null };
 
         var topk_buf: [24]u8 = undefined;
         var decay_buf: [48]u8 = undefined;
@@ -933,20 +1051,13 @@ pub const Cluster = struct {
         var args = [_][]const u8{
             query_b64, topk_arg, params.namespace, params.metric, decay_arg, params.mode, tau_arg,
         };
-        try wire.writeCommand(&stream, .{ .exec = .{
+        try wire.writeCommand(&io, .{ .exec = .{
             .procedure = "vsearch_local_raw",
             .args = args[0..],
         } });
+        try io.flush();
 
-        const ReadAdapter = struct {
-            stream: *core.compat.net.Stream,
-
-            pub fn read(adapter: *@This(), dest: []u8) !usize {
-                return adapter.stream.read(dest);
-            }
-        };
-        var reader = ReadAdapter{ .stream = &stream };
-        const response = try wire.readResponseAlloc(&reader, allocator);
+        const response = try wire.readResponseAlloc(&io, allocator);
 
         return switch (response) {
             .value => |maybe_value| maybe_value orelse error.Corruption,
@@ -1012,6 +1123,7 @@ pub const Cluster = struct {
         var iter = self.peers.iterator();
         while (iter.next()) |entry| {
             var peer = entry.value_ptr;
+            if (!self.peerMayReceive(peer, key, true)) continue;
             _ = peer.sendCommand(.{ .set = .{
                 .key = key,
                 .value = value,
@@ -1035,6 +1147,7 @@ pub const Cluster = struct {
         var iter = self.peers.iterator();
         while (iter.next()) |entry| {
             var peer = entry.value_ptr;
+            if (!self.peerMayReceive(peer, params.key, true)) continue;
             _ = peer.sendCommand(.{ .vinsert = params });
         }
     }
@@ -1053,6 +1166,7 @@ pub const Cluster = struct {
         var iter = self.peers.iterator();
         while (iter.next()) |entry| {
             var peer = entry.value_ptr;
+            if (!self.peerMayReceiveAll(peer, params.items)) continue;
             _ = peer.sendCommand(.{ .vbulkinsert = params });
         }
     }
@@ -1071,6 +1185,7 @@ pub const Cluster = struct {
         var iter = self.peers.iterator();
         while (iter.next()) |entry| {
             var peer = entry.value_ptr;
+            if (!self.peerMayReceive(peer, key, true)) continue;
             _ = peer.sendCommand(.{ .vdelete = .{ .key = key, .namespace = namespace } });
         }
     }
@@ -1093,6 +1208,7 @@ pub const Cluster = struct {
         var iter = self.peers.iterator();
         while (iter.next()) |entry| {
             var peer = entry.value_ptr;
+            if (!self.peerAuthenticated(peer)) continue;
             if (peer.sendCommand(.{ .exec = .{
                 .procedure = "append_log_witness",
                 .args = args[0..],
@@ -1125,6 +1241,7 @@ pub const Cluster = struct {
         var iter = self.peers.iterator();
         while (iter.next()) |entry| {
             var peer = entry.value_ptr;
+            if (!self.peerMayReceive(peer, params.namespace, true)) continue;
             _ = peer.sendCommand(.{ .vrabitq_install = params });
         }
     }
@@ -1138,6 +1255,7 @@ pub const Cluster = struct {
         while (iter.next()) |entry| {
             var peer = entry.value_ptr;
             peer.connect(self);
+            if (!self.peerMayReceive(peer, key, true)) continue;
             _ = peer.sendCommand(.{ .delete = key });
         }
     }

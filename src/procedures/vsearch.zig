@@ -490,6 +490,10 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     else
         null;
 
+    // ── Authorize: the query key is read, the namespace is scanned ──
+    try ctx.requireRead(query_key);
+    try ctx.requirePrefix(namespace, .read);
+
     // ── Load query vector (locks internally, safe before scans) ──
     const query_bytes = (try ctx.getCopy(query_key)) orelse
         return ctx.err("vsearch: query key not found");
@@ -807,6 +811,9 @@ pub fn executeLocalRaw(ctx: *Ctx) anyerror!Ctx.Result {
         parseEfArg(raw) orelse return ctx.err("vsearch_local_raw: ef must be a positive integer")
     else
         null;
+
+    // ── Authorize: results come from the whole namespace ──
+    try ctx.requirePrefix(namespace, .read);
 
     // ── Decode the inline query vector (base64 of raw f32 LE bytes) ──
     const decoder = std.base64.standard.Decoder;

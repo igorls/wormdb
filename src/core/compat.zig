@@ -672,6 +672,26 @@ pub const net = if (wasm_target) struct {} else struct {
             self.inner.close(io());
         }
 
+        /// Shut both directions down WITHOUT releasing the handle, so a thread blocked
+        /// in `read` wakes up (POSIX: poll reports HUP and read returns 0; Windows: the
+        /// pending AFD receive is cancelled) and the owning thread can run its normal
+        /// teardown. Unlike `close`, this is safe to call from another thread while the
+        /// owner may still be using the stream — the handle stays valid until the owner
+        /// closes it. Used by the publish path to evict stalled subscribers.
+        pub fn shutdown(self: *Stream) void {
+            if (comptime wasm_target) return;
+            self.inner.shutdown(io(), .both) catch {};
+            if (builtin.os.tag == .windows) {
+                // shutdown() alone does not complete an in-flight AFD receive IRP:
+                // cancel every pending I/O on the handle so the blocked reader returns.
+                const cancel_io_ex = @extern(
+                    *const fn (std.os.windows.HANDLE, ?*anyopaque) callconv(.winapi) std.os.windows.BOOL,
+                    .{ .name = "CancelIoEx", .library_name = "kernel32" },
+                );
+                _ = cancel_io_ex(self.inner.socket.handle, null);
+            }
+        }
+
         /// Raw fd handle for setsockopt etc.
         pub fn getHandle(self: *const Stream) std.posix.fd_t {
             return self.inner.socket.handle;
@@ -799,4 +819,54 @@ test "Stream lazily creates, reuses, and closes deadline event handles" {
         try testing.expect(client.afd_read_event == null);
         try testing.expect(client.afd_write_event == null);
     }
+}
+
+test "Stream.shutdown from another thread wakes a blocked reader" {
+    if (comptime wasm_target) return error.SkipZigTest;
+    const testing = std.testing;
+
+    const listen_addr = try net.Address.parseIp("127.0.0.1", 0);
+    var listener = try listen_addr.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+    const bound_port = listener.inner.socket.address.getPort();
+
+    // A peer that connects and then stays silent until told to go away.
+    const Peer = struct {
+        port: u16,
+        done: *std.atomic.Value(bool),
+        fn run(p: @This()) void {
+            var s = net.tcpConnectToAddress(net.Address.initIp4(.{ 127, 0, 0, 1 }, p.port)) catch return;
+            defer s.close();
+            while (!p.done.load(.acquire)) std.Thread.yield() catch {};
+        }
+    };
+    var done = std.atomic.Value(bool).init(false);
+    const peer = try std.Thread.spawn(.{}, Peer.run, .{Peer{ .port = bound_port, .done = &done }});
+    defer peer.join();
+    defer done.store(true, .release);
+
+    var conn = try listener.accept();
+    defer conn.stream.close();
+
+    // Shut the accepted stream down from a third thread while the reader is parked.
+    const Shutter = struct {
+        stream: *net.Stream,
+        fn run(sh: @This()) void {
+            const t0 = nowNs();
+            while (nowNs() - t0 < 150 * 1_000_000) std.Thread.yield() catch {};
+            sh.stream.shutdown();
+        }
+    };
+    const shutter = try std.Thread.spawn(.{}, Shutter.run, .{Shutter{ .stream = &conn.stream }});
+    defer shutter.join();
+
+    // Long deadline: if shutdown failed to wake the reader this would take 8 s and
+    // fail the elapsed-time check below instead of hanging the suite.
+    conn.stream.beginRead(8_000, false);
+    const started = nowNs();
+    var buf: [16]u8 = undefined;
+    const result = conn.stream.read(&buf);
+    const elapsed_ms = @divTrunc(nowNs() - started, 1_000_000);
+    if (result) |n| try testing.expectEqual(@as(usize, 0), n) else |_| {}
+    try testing.expect(elapsed_ms < 4_000);
 }

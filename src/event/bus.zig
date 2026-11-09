@@ -96,6 +96,9 @@ pub const EventBus = struct {
         subscriber_count: compat.AtomicU64,
         /// Events dropped because a subscriber's write path was busy (tryLock fail).
         drop_count: compat.AtomicU64 = compat.AtomicU64.init(0),
+        /// Subscribers evicted because their socket could not take an event frame
+        /// within the transport's send deadline (stalled consumer).
+        evict_count: compat.AtomicU64 = compat.AtomicU64.init(0),
     };
 
     pub fn init(allocator: std.mem.Allocator) EventBus {
@@ -107,6 +110,7 @@ pub const EventBus = struct {
                 .publish_count = if (build_options.single_threaded) @as(u64, 0) else compat.AtomicU64.init(0),
                 .subscriber_count = compat.AtomicU64.init(0),
                 .drop_count = compat.AtomicU64.init(0),
+                .evict_count = compat.AtomicU64.init(0),
             },
         };
     }
@@ -338,6 +342,16 @@ pub const EventBus = struct {
     /// Record a dropped event delivery (busy write path). Called from transports.
     pub fn recordDrop(self: *EventBus) void {
         _ = self.stats.drop_count.fetchAdd(1, .monotonic);
+    }
+
+    pub fn evictionCount(self: *EventBus) u64 {
+        return self.stats.evict_count.load(.monotonic);
+    }
+
+    /// Record a stalled-subscriber eviction. Called from transports when a send
+    /// deadline expires on the publish path and the connection is shut down.
+    pub fn recordEviction(self: *EventBus) void {
+        _ = self.stats.evict_count.fetchAdd(1, .monotonic);
     }
 };
 

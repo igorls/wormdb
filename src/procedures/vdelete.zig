@@ -28,6 +28,8 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     if (!std.mem.startsWith(u8, key, namespace))
         return ctx.err("vdelete: key does not start with namespace prefix");
 
+    try ctx.requireDelete(key);
+
     // Query the tombstone state *before* apply so the JSON response can
     // distinguish "deleted (was live)" from "noop (already tombstoned)" from
     // "missing (no HNSW entry)". applyVdelete itself is void-returning for

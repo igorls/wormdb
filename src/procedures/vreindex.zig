@@ -88,6 +88,10 @@ fn onVectorMatch(
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const namespace = ctx.arg(0) orelse DEFAULT_NAMESPACE;
 
+    // Rebuilding the serving index for a namespace is a write over that
+    // namespace (it stalls inserts and swaps the graph every reader sees).
+    try ctx.requirePrefix(namespace, .write);
+
     const reg = ctx.vector_registry orelse
         return ctx.err("vreindex: vector registry not enabled on this server");
 

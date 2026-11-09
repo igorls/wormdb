@@ -85,6 +85,45 @@ pub const TokenState = struct {
         return false;
     }
 
+    /// Whether this token authorizes `op` on EVERY key under `prefix` — the check for
+    /// range operations (scans, counts, drops, rebuilds). Only a prefix capability whose
+    /// pattern is a prefix of (or equal to) `prefix`, or a wildcard, qualifies: an exact
+    /// capability names one key and never a range, so `permits(op, prefix)` would
+    /// over-grant it when the scan prefix happens to equal the exact pattern.
+    pub fn permitsPrefix(self: *const TokenState, op: Operation, prefix: []const u8) bool {
+        for (self.capabilities) |cap| {
+            if (cap.op != .all and cap.op != op) continue;
+            switch (cap.match_type) {
+                .wildcard => return true,
+                .prefix => if (std.mem.startsWith(u8, prefix, cap.pattern)) return true,
+                .exact => {},
+            }
+        }
+        return false;
+    }
+
+    /// Like `permits`, but only an EXPLICIT grant counts. Used for pseudo-targets of the
+    /// form `<family>:<name>` that confer authority beyond the operation itself
+    /// (`auth:mint:<ns>`, `chat:<room>`): a token allowed to run every procedure must still
+    /// be named for them. A wildcard never qualifies, and neither does a prefix that stops
+    /// short of the target's family — `""` is universal authority in disguise and `"auth"`
+    /// would reach `auth:mint:*` from any procedure-name grant that merely starts the same
+    /// way. A prefix must therefore spell out at least the family including its ':'
+    /// (`"auth:"`, `"auth:mint:"`, `"chat:"`); an exact match always qualifies.
+    pub fn permitsExplicit(self: *const TokenState, op: Operation, target: []const u8) bool {
+        const family_len = if (std.mem.indexOfScalar(u8, target, ':')) |i| i + 1 else target.len;
+        for (self.capabilities) |cap| {
+            if (cap.op != .all and cap.op != op) continue;
+            switch (cap.match_type) {
+                .wildcard => {},
+                .exact => if (std.mem.eql(u8, cap.pattern, target)) return true,
+                .prefix => if (cap.pattern.len >= family_len and cap.pattern.len > 0 and
+                    std.mem.startsWith(u8, target, cap.pattern)) return true,
+            }
+        }
+        return false;
+    }
+
     /// Check if the token is expired based on current time.
     pub fn isExpired(self: *const TokenState) bool {
         const now: u64 = @intCast(@divFloor(compat.nowMs(), 1000));
@@ -695,4 +734,51 @@ test "namespace capability expansion scopes memory access" {
 
 test {
     @import("std").testing.refAllDecls(@This());
+}
+
+test "permitsPrefix: only prefix/wildcard caps cover a range; permitsExplicit ignores wildcard" {
+    const testing = std.testing;
+    const caps = [_]Capability{
+        .{ .op = .get, .match_type = .exact, .pattern = "chat:lobby:" },
+        .{ .op = .set, .match_type = .prefix, .pattern = "chat:lobby:" },
+        .{ .op = .exec, .match_type = .wildcard, .pattern = "" },
+        .{ .op = .exec, .match_type = .prefix, .pattern = "auth:mint:team-" },
+    };
+    const state = TokenState{ .subject = "s", .iat = 0, .exp = 0, .jti = 0, .capabilities = &caps };
+
+    // An exact cap equal to the scan prefix names ONE key, not the range.
+    try testing.expect(state.permits(.get, "chat:lobby:"));
+    try testing.expect(!state.permitsPrefix(.get, "chat:lobby:"));
+    // A prefix cap covers the range it is a prefix of — and narrower ranges.
+    try testing.expect(state.permitsPrefix(.set, "chat:lobby:"));
+    try testing.expect(state.permitsPrefix(.set, "chat:lobby:2026"));
+    try testing.expect(!state.permitsPrefix(.set, "chat:"));
+    try testing.expect(!state.permitsPrefix(.set, ""));
+    // Wildcard covers everything, including the empty (whole-keyspace) prefix.
+    try testing.expect(state.permitsPrefix(.exec, ""));
+
+    // permitsExplicit: the exec wildcard does not confer the pseudo-target.
+    try testing.expect(state.permits(.exec, "auth:mint:other"));
+    try testing.expect(!state.permitsExplicit(.exec, "auth:mint:other"));
+    try testing.expect(state.permitsExplicit(.exec, "auth:mint:team-a"));
+
+    // Neither does a prefix that stops short of the family: "" is a wildcard in
+    // disguise and "auth" would be reached from unrelated procedure-name grants.
+    const short_caps = [_]Capability{
+        .{ .op = .exec, .match_type = .prefix, .pattern = "" },
+        .{ .op = .exec, .match_type = .prefix, .pattern = "auth" },
+        .{ .op = .exec, .match_type = .prefix, .pattern = "cha" },
+    };
+    const short = TokenState{ .subject = "s", .iat = 0, .exp = 0, .jti = 0, .capabilities = &short_caps };
+    try testing.expect(short.permits(.exec, "auth:mint:other"));
+    try testing.expect(!short.permitsExplicit(.exec, "auth:mint:other"));
+    try testing.expect(!short.permitsExplicit(.exec, "chat:lobby"));
+    const family_caps = [_]Capability{
+        .{ .op = .exec, .match_type = .prefix, .pattern = "auth:" },
+        .{ .op = .exec, .match_type = .prefix, .pattern = "chat:" },
+    };
+    const family = TokenState{ .subject = "f", .iat = 0, .exp = 0, .jti = 0, .capabilities = &family_caps };
+    try testing.expect(family.permitsExplicit(.exec, "auth:mint:other"));
+    try testing.expect(family.permitsExplicit(.exec, "chat:lobby"));
+    try testing.expect(!family.permitsExplicit(.exec, "mem:astrid"));
 }

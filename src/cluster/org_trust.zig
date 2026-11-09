@@ -14,6 +14,7 @@ const meshguard = @import("meshguard");
 const core = @import("../core/mod.zig");
 const trust_log = @import("../proof/trust_log.zig");
 const Store = @import("../storage/store.zig").Store;
+const secure_channel = @import("secure_channel.zig");
 
 pub const Org = meshguard.identity.Org;
 const Ed25519 = std.crypto.sign.Ed25519;
@@ -31,6 +32,9 @@ pub const CERT_WIRE_LEN = Org.NodeCertificate.WIRE_SIZE; // 186
 pub const SIG_LEN = 64;
 /// The peer's full handshake reply: [186B cert][64B signature].
 pub const HANDSHAKE_REPLY_LEN = CERT_WIRE_LEN + SIG_LEN; // 250
+/// Server hello of the mutual "W3" handshake: [32B server challenge][186B server
+/// cert][64B sig over client_challenge ++ server cert].
+pub const SERVER_HELLO_LEN = CHALLENGE_LEN + CERT_WIRE_LEN + SIG_LEN; // 282
 
 /// One org → namespace grant: nodes certified by `org_pubkey` may replicate
 /// keys starting with any of `prefixes`.
@@ -41,10 +45,17 @@ pub const Grant = struct {
     prefixes: []const []const u8 = &.{},
 };
 
-/// The identity proven by a successful W2 handshake.
+/// The identity proven by a successful W2/W3 handshake.
 pub const PeerOrg = struct {
     org_pubkey: [32]u8,
     node_pubkey: [32]u8,
+};
+
+/// A fully authenticated replication peer (W3) plus the session keys agreed
+/// with it. Null on a legacy link.
+pub const PeerSession = struct {
+    org: PeerOrg,
+    keys: secure_channel.SessionKeys,
 };
 
 pub const HandshakeError = error{
@@ -67,6 +78,11 @@ pub const OrgTrust = struct {
     /// replicated key is checked against the peer org's grants.
     enforce: bool = false,
     grants: []const Grant = &.{},
+    /// Accept inbound legacy "W2" handshakes (one-way authenticated,
+    /// plaintext) while enforcing. Needed only during a rolling upgrade of
+    /// peers that predate W3; set false afterwards so the plaintext path is
+    /// closed. Outbound always speaks W3 when this node has a certificate.
+    accept_w2: bool = true,
     /// Our own org-signed certificate — required to answer a W2 challenge
     /// on outbound connections. Null means we can only speak legacy "WR".
     node_cert: ?Org.NodeCertificate = null,
@@ -84,6 +100,22 @@ pub const OrgTrust = struct {
             if (std.mem.eql(u8, &g.org_pubkey, &org_pubkey)) return true;
         }
         return false;
+    }
+
+    /// True when `org_pubkey` is the org that certified THIS node. Members of
+    /// our own org are full peers: they pass the handshake in both directions
+    /// and replicate every key, with no grant entry needed.
+    pub fn sameOrg(self: *const OrgTrust, org_pubkey: [32]u8) bool {
+        const cert = self.node_cert orelse return false;
+        return std.mem.eql(u8, &cert.org_pubkey, &org_pubkey);
+    }
+
+    /// Orgs whose certified nodes may complete a replication handshake with
+    /// us, inbound or outbound: our own org, or any org with a configured
+    /// grant. List a delegated org with `"prefixes": []` to admit it while its
+    /// key scope comes from the trust log.
+    pub fn peerOrgTrusted(self: *const OrgTrust, org_pubkey: [32]u8) bool {
+        return self.sameOrg(org_pubkey) or self.orgTrusted(org_pubkey);
     }
 
     /// Deny-by-default: a key is authorized only if the org has a grant and
@@ -105,6 +137,7 @@ pub const OrgTrust = struct {
     pub fn fromConfig(allocator: std.mem.Allocator, cfg: core.config.OrgTrustConfig) !OrgTrust {
         var out = OrgTrust{
             .enforce = cfg.enforce or cfg.grants.len > 0,
+            .accept_w2 = cfg.accept_w2,
         };
 
         if (cfg.grants.len > 0) {
@@ -196,6 +229,31 @@ pub const DynamicTrust = struct {
             std.log.warn("org trust: dynamic fold failed (deny): {s}", .{@errorName(err)});
             return false;
         };
+        return self.matchLocked(to_org, key, cap_bits, now);
+    }
+
+    /// Warm the fold cache. Call outside any store shard lock (a re-fold scans
+    /// the log) before work that may only consult the cache, such as a
+    /// full-state sync whose store iteration holds shard locks.
+    pub fn refresh(self: *DynamicTrust) void {
+        const now: u64 = @intCast(core.compat.nowMs());
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.refreshLocked(now) catch |err| {
+            std.log.warn("org trust: dynamic fold refresh failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Like `authorized`, but never re-folds: consults the cache as-is and
+    /// denies when there is none. Safe to call while holding store shard locks.
+    pub fn authorizedCached(self: *DynamicTrust, to_org: [32]u8, key: []const u8, cap_bits: u8) bool {
+        const now: u64 = @intCast(core.compat.nowMs());
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.matchLocked(to_org, key, cap_bits, now);
+    }
+
+    fn matchLocked(self: *DynamicTrust, to_org: [32]u8, key: []const u8, cap_bits: u8, now: u64) bool {
         const cache = self.cache orelse return false;
         for (cache.caps) |cap| {
             if (!std.mem.eql(u8, cap.to_org[0..], to_org[0..])) continue;
@@ -243,9 +301,9 @@ pub const DynamicTrust = struct {
     }
 };
 
-/// The message signed by the peer's node key: challenge ++ serialized cert.
-/// Including the cert binds the signature to this identity claim; including
-/// the fresh server challenge prevents replay.
+/// The legacy W2 client proof: challenge ++ serialized cert. Including the
+/// cert binds the signature to this identity claim; including the fresh
+/// server challenge prevents replay.
 pub fn handshakeMessage(
     challenge: *const [CHALLENGE_LEN]u8,
     cert_wire: *const [CERT_WIRE_LEN]u8,
@@ -256,33 +314,118 @@ pub fn handshakeMessage(
     return msg;
 }
 
-/// Pure server-side verification of a W2 handshake reply. Checks, in order:
+// ── W3 transcript messages ──────────────────────────────────────────────
+//
+// Both W3 signatures cover a role label, BOTH challenges and the signer's
+// cert. The label is what keeps a node from being a signing oracle: a W3
+// server hello the attacker extracts by sending a chosen "client challenge"
+// can be verified only as a server hello, never as a W3 client proof nor as a
+// legacy W2 proof (whose message is the bare challenge ++ cert). Binding both
+// challenges ties each signature to this one connection's transcript.
+
+pub const W3_LABEL_LEN = 22;
+pub const W3_SERVER_LABEL: *const [W3_LABEL_LEN]u8 = "wormdb w3 server hello";
+pub const W3_CLIENT_LABEL: *const [W3_LABEL_LEN]u8 = "wormdb w3 client proof";
+pub const W3_MESSAGE_LEN = W3_LABEL_LEN + 2 * CHALLENGE_LEN + CERT_WIRE_LEN;
+
+fn w3Message(
+    label: *const [W3_LABEL_LEN]u8,
+    client_challenge: *const [CHALLENGE_LEN]u8,
+    server_challenge: *const [CHALLENGE_LEN]u8,
+    cert_wire: *const [CERT_WIRE_LEN]u8,
+) [W3_MESSAGE_LEN]u8 {
+    var msg: [W3_MESSAGE_LEN]u8 = undefined;
+    var pos: usize = 0;
+    @memcpy(msg[pos..][0..W3_LABEL_LEN], label);
+    pos += W3_LABEL_LEN;
+    @memcpy(msg[pos..][0..CHALLENGE_LEN], client_challenge);
+    pos += CHALLENGE_LEN;
+    @memcpy(msg[pos..][0..CHALLENGE_LEN], server_challenge);
+    pos += CHALLENGE_LEN;
+    @memcpy(msg[pos..][0..CERT_WIRE_LEN], cert_wire);
+    return msg;
+}
+
+/// What the W3 SERVER signs in its hello (with its own node key).
+pub fn w3ServerMessage(
+    client_challenge: *const [CHALLENGE_LEN]u8,
+    server_challenge: *const [CHALLENGE_LEN]u8,
+    cert_wire: *const [CERT_WIRE_LEN]u8,
+) [W3_MESSAGE_LEN]u8 {
+    return w3Message(W3_SERVER_LABEL, client_challenge, server_challenge, cert_wire);
+}
+
+/// What the W3 CLIENT signs in its proof (with its own node key).
+pub fn w3ClientMessage(
+    client_challenge: *const [CHALLENGE_LEN]u8,
+    server_challenge: *const [CHALLENGE_LEN]u8,
+    cert_wire: *const [CERT_WIRE_LEN]u8,
+) [W3_MESSAGE_LEN]u8 {
+    return w3Message(W3_CLIENT_LABEL, client_challenge, server_challenge, cert_wire);
+}
+
+/// Shared verification core. Checks, in order:
 ///   (a) org signature over the certificate (Org.verifyCertificate)
 ///   (b) certificate validity window (isValid: version + expiry)
-///   (c) the issuing org is one we have grants for
-///   (d) possession: Ed25519 verify of sig over (challenge ++ cert_wire)
-///       against the certified node key
-pub fn verifyPeerHandshake(
+///   (c) the issuing org is our own or one we have grants for
+///   (d) possession: Ed25519 verify of `sig` over `msg` against the certified
+///       node key — `msg` is the role-specific transcript the caller expects
+fn verifyProof(
     trust: *const OrgTrust,
-    challenge: *const [CHALLENGE_LEN]u8,
+    msg: []const u8,
     cert_wire: *const [CERT_WIRE_LEN]u8,
     sig: *const [SIG_LEN]u8,
 ) HandshakeError!PeerOrg {
     const cert = Org.NodeCertificate.deserialize(cert_wire);
     if (!Org.verifyCertificate(&cert)) return error.BadCertSignature;
     if (!cert.isValid()) return error.CertExpired;
-    if (!trust.orgTrusted(cert.org_pubkey)) return error.OrgNotTrusted;
+    if (!trust.peerOrgTrusted(cert.org_pubkey)) return error.OrgNotTrusted;
 
-    const msg = handshakeMessage(challenge, cert_wire);
     const node_pk = Ed25519.PublicKey.fromBytes(cert.node_pubkey) catch
         return error.BadChallengeSignature;
     const signature = Ed25519.Signature.fromBytes(sig.*);
-    signature.verify(&msg, node_pk) catch return error.BadChallengeSignature;
+    signature.verify(msg, node_pk) catch return error.BadChallengeSignature;
 
     return .{
         .org_pubkey = cert.org_pubkey,
         .node_pubkey = cert.node_pubkey,
     };
+}
+
+/// Server-side verification of a legacy W2 client proof (sig over
+/// challenge ++ cert_wire).
+pub fn verifyPeerHandshake(
+    trust: *const OrgTrust,
+    challenge: *const [CHALLENGE_LEN]u8,
+    cert_wire: *const [CERT_WIRE_LEN]u8,
+    sig: *const [SIG_LEN]u8,
+) HandshakeError!PeerOrg {
+    const msg = handshakeMessage(challenge, cert_wire);
+    return verifyProof(trust, &msg, cert_wire, sig);
+}
+
+/// Client-side verification of a W3 server hello.
+pub fn verifyW3Server(
+    trust: *const OrgTrust,
+    client_challenge: *const [CHALLENGE_LEN]u8,
+    server_challenge: *const [CHALLENGE_LEN]u8,
+    cert_wire: *const [CERT_WIRE_LEN]u8,
+    sig: *const [SIG_LEN]u8,
+) HandshakeError!PeerOrg {
+    const msg = w3ServerMessage(client_challenge, server_challenge, cert_wire);
+    return verifyProof(trust, &msg, cert_wire, sig);
+}
+
+/// Server-side verification of a W3 client proof.
+pub fn verifyW3Client(
+    trust: *const OrgTrust,
+    client_challenge: *const [CHALLENGE_LEN]u8,
+    server_challenge: *const [CHALLENGE_LEN]u8,
+    cert_wire: *const [CERT_WIRE_LEN]u8,
+    sig: *const [SIG_LEN]u8,
+) HandshakeError!PeerOrg {
+    const msg = w3ClientMessage(client_challenge, server_challenge, cert_wire);
+    return verifyProof(trust, &msg, cert_wire, sig);
 }
 
 // ─── Tests ───
@@ -468,4 +611,86 @@ test "OrgTrust.fromConfig: base64 grants, enforce inference, bad pubkey" {
     const short_b64 = std.base64.standard.Encoder.encode(&short_buf, org_pk[0..16]);
     const short = [_]core.config.OrgGrantConfig{.{ .org_pubkey = short_b64, .prefixes = prefixes[0..] }};
     try testing.expectError(error.InvalidOrgPubkey, OrgTrust.fromConfig(alloc, .{ .grants = short[0..] }));
+}
+
+test "W3 mutual handshake: both sides verify each other and agree on session keys" {
+    const org_kp = Org.generateOrgKeyPair();
+    const client_kp = Ed25519.KeyPair.generate(testIo());
+    const server_kp = Ed25519.KeyPair.generate(testIo());
+
+    const client_cert = try Org.issueCertificate(org_kp, client_kp.public_key.toBytes(), "client", 0);
+    const server_cert = try Org.issueCertificate(org_kp, server_kp.public_key.toBytes(), "server", 0);
+    var client_cert_wire: [CERT_WIRE_LEN]u8 = undefined;
+    var server_cert_wire: [CERT_WIRE_LEN]u8 = undefined;
+    client_cert.serialize(&client_cert_wire);
+    server_cert.serialize(&server_cert_wire);
+
+    // Neither side lists the org in grants: same-org membership alone admits a peer.
+    const client_trust = OrgTrust{ .enforce = true, .node_cert = client_cert, .node_cert_wire = client_cert_wire };
+    const server_trust = OrgTrust{ .enforce = true, .node_cert = server_cert, .node_cert_wire = server_cert_wire };
+    try testing.expect(client_trust.sameOrg(org_kp.public_key.toBytes()));
+    try testing.expect(client_trust.peerOrgTrusted(org_kp.public_key.toBytes()));
+    try testing.expect(!client_trust.orgTrusted(org_kp.public_key.toBytes()));
+
+    // Client → server: challenge. Server → client: challenge + labeled proof.
+    const client_challenge: [CHALLENGE_LEN]u8 = @splat(0xC1);
+    const server_challenge: [CHALLENGE_LEN]u8 = @splat(0x5E);
+    const server_msg = w3ServerMessage(&client_challenge, &server_challenge, &server_cert_wire);
+    const server_sig = (try server_kp.sign(&server_msg, null)).toBytes();
+    const server_identity = try verifyW3Server(&client_trust, &client_challenge, &server_challenge, &server_cert_wire, &server_sig);
+    try testing.expectEqualSlices(u8, &server_kp.public_key.toBytes(), &server_identity.node_pubkey);
+
+    // Client → server: labeled proof over the same transcript.
+    const client_msg = w3ClientMessage(&client_challenge, &server_challenge, &client_cert_wire);
+    const client_sig = (try client_kp.sign(&client_msg, null)).toBytes();
+    const client_identity = try verifyW3Client(&server_trust, &client_challenge, &server_challenge, &client_cert_wire, &client_sig);
+    try testing.expectEqualSlices(u8, &client_kp.public_key.toBytes(), &client_identity.node_pubkey);
+
+    // Either challenge differing (replay of an old hello or proof) is rejected.
+    const stale: [CHALLENGE_LEN]u8 = @splat(0x00);
+    try testing.expectError(error.BadChallengeSignature, verifyW3Server(&client_trust, &stale, &server_challenge, &server_cert_wire, &server_sig));
+    try testing.expectError(error.BadChallengeSignature, verifyW3Server(&client_trust, &client_challenge, &stale, &server_cert_wire, &server_sig));
+    try testing.expectError(error.BadChallengeSignature, verifyW3Client(&server_trust, &client_challenge, &stale, &client_cert_wire, &client_sig));
+
+    // A server from an unrelated org cannot pass the client's check.
+    const other_org = Org.generateOrgKeyPair();
+    const rogue = try Org.issueCertificate(other_org, server_kp.public_key.toBytes(), "rogue", 0);
+    var rogue_wire: [CERT_WIRE_LEN]u8 = undefined;
+    rogue.serialize(&rogue_wire);
+    const rogue_sig = (try server_kp.sign(&w3ServerMessage(&client_challenge, &server_challenge, &rogue_wire), null)).toBytes();
+    try testing.expectError(error.OrgNotTrusted, verifyW3Server(&client_trust, &client_challenge, &server_challenge, &rogue_wire, &rogue_sig));
+
+    // Both ends derive matching per-direction keys from the transcript.
+    const client_keys = try secure_channel.deriveSessionKeys(.client, client_kp.secret_key, server_identity.node_pubkey, &client_challenge, &server_challenge);
+    const server_keys = try secure_channel.deriveSessionKeys(.server, server_kp.secret_key, client_identity.node_pubkey, &client_challenge, &server_challenge);
+    try testing.expectEqualSlices(u8, &client_keys.send, &server_keys.recv);
+    try testing.expectEqualSlices(u8, &client_keys.recv, &server_keys.send);
+}
+
+test "W3 signatures are domain-separated: a server hello is never a client proof (W3 or legacy W2)" {
+    const org_kp = Org.generateOrgKeyPair();
+    const node_kp = Ed25519.KeyPair.generate(testIo());
+    const cert = try Org.issueCertificate(org_kp, node_kp.public_key.toBytes(), "node-a", 0);
+    var cert_wire: [CERT_WIRE_LEN]u8 = undefined;
+    cert.serialize(&cert_wire);
+    const trust = OrgTrust{ .enforce = true, .node_cert = cert, .node_cert_wire = cert_wire };
+
+    // The oracle attempt: an attacker reads node A's W2 challenge S on one
+    // connection, then opens a W3 connection to A and presents S as the
+    // "client challenge". A answers with a signed server hello.
+    const s_w2: [CHALLENGE_LEN]u8 = @splat(0x5A);
+    const a_server_challenge: [CHALLENGE_LEN]u8 = @splat(0xA7);
+    const hello_sig = (try node_kp.sign(&w3ServerMessage(&s_w2, &a_server_challenge, &cert_wire), null)).toBytes();
+
+    // Replayed on the W2 connection as A's own client proof: rejected.
+    try testing.expectError(error.BadChallengeSignature, verifyPeerHandshake(&trust, &s_w2, &cert_wire, &hello_sig));
+    // Replayed as a W3 client proof on any connection: rejected.
+    try testing.expectError(error.BadChallengeSignature, verifyW3Client(&trust, &s_w2, &a_server_challenge, &cert_wire, &hello_sig));
+    try testing.expectError(error.BadChallengeSignature, verifyW3Client(&trust, &a_server_challenge, &s_w2, &cert_wire, &hello_sig));
+    // And a client proof is never accepted as a server hello.
+    const proof_sig = (try node_kp.sign(&w3ClientMessage(&s_w2, &a_server_challenge, &cert_wire), null)).toBytes();
+    try testing.expectError(error.BadChallengeSignature, verifyW3Server(&trust, &s_w2, &a_server_challenge, &cert_wire, &proof_sig));
+    // Each signature still verifies in its own role.
+    _ = try verifyW3Server(&trust, &s_w2, &a_server_challenge, &cert_wire, &hello_sig);
+    _ = try verifyW3Client(&trust, &s_w2, &a_server_challenge, &cert_wire, &proof_sig);
 }

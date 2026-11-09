@@ -33,6 +33,9 @@ const DEFAULT_NAMESPACE: []const u8 = "vec:";
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const namespace = ctx.arg(0) orelse DEFAULT_NAMESPACE;
 
+    // Counts, dimensions and index shape are a read over the whole namespace.
+    try ctx.requirePrefix(namespace, .read);
+
     // Count vectors via prefix scan (lightweight — no value copying)
     const vec_count = ctx.countKeys(namespace);
 

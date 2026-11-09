@@ -10,6 +10,15 @@
 //!
 //! - Stores as: chat:<room>:<timestamp_ms>:<random_hex> = {"user":"...","text":"...","ts":...}
 //! - Returns the generated key
+//!
+//! Authorization: the caller needs procedure-only authority over the room,
+//! an explicit `exec` capability covering the pseudo-target `chat:<room>`
+//! (for example `exec prefix "chat:"` for every room), or admin authority.
+//! It deliberately does NOT accept a raw `set` capability on `chat:*`: that
+//! grant would also let a client write arbitrary history records with any
+//! "user" field, bypassing the identity this procedure binds from the token.
+//! The room event is published by the procedure (server-authored), so no
+//! `publish` capability is needed either.
 
 const std = @import("std");
 const Ctx = @import("context.zig").Ctx;
@@ -41,6 +50,10 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
 
     // Copy key before building value (fmt reuses buffer)
     const key_dupe = try ctx.allocator.dupe(u8, key);
+
+    // Room authority (see the header): an explicit exec grant on chat:<room>.
+    const room_target = try std.fmt.allocPrint(ctx.allocator, "chat:{s}", .{room});
+    try ctx.requireExecTarget(room_target);
 
     // Build message JSON value
     var json: std.ArrayListUnmanaged(u8) = .empty;
@@ -129,4 +142,46 @@ test "chat_send publishes stored message to room channel" {
     try testing.expect(std.mem.startsWith(u8, event, ">EVENT chat:lobby\r\n"));
     try testing.expect(std.mem.containsAtLeast(u8, event, 1, "\"user\":\"ada\""));
     try testing.expect(std.mem.containsAtLeast(u8, event, 1, "\"text\":\"hello\""));
+}
+
+test "chat_send: room authority is an explicit exec grant, not a raw set capability" {
+    const testing = std.testing;
+    const auth = @import("../server/auth.zig");
+
+    var store = try Store.init(testing.allocator, Config{ .persistence = .none });
+    defer store.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Token: may run chat_send, may post in rooms under "lob", may raw-write chat:* (irrelevant).
+    const caps = [_]auth.Capability{
+        .{ .op = .exec, .match_type = .exact, .pattern = "chat_send" },
+        .{ .op = .exec, .match_type = .prefix, .pattern = "chat:lob" },
+        .{ .op = .set, .match_type = .prefix, .pattern = "chat:" },
+    };
+    const state = auth.TokenState{ .subject = "ada", .iat = 0, .exp = 0, .jti = 0, .capabilities = &caps };
+
+    var ok_ctx = Ctx.initWithAuth(&store, &.{ "lobby", "hello" }, arena, .{ .enforce = &state }, null, null, null, null);
+    defer ok_ctx.deinit();
+    const ok = try execute(&ok_ctx);
+    try testing.expect(ok == .value);
+    // The stored record carries the token identity, not a caller-chosen name.
+    const stored = store.getUnsafe(ok.value.?) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, stored.value, "\"user\":\"ada\"") != null);
+
+    var denied_ctx = Ctx.initWithAuth(&store, &.{ "ops", "hello" }, arena, .{ .enforce = &state }, null, null, null, null);
+    defer denied_ctx.deinit();
+    try testing.expectError(error.PermissionDenied, execute(&denied_ctx));
+
+    // A raw set grant alone is not room authority.
+    const set_only = [_]auth.Capability{
+        .{ .op = .exec, .match_type = .exact, .pattern = "chat_send" },
+        .{ .op = .set, .match_type = .prefix, .pattern = "chat:" },
+    };
+    const set_state = auth.TokenState{ .subject = "eve", .iat = 0, .exp = 0, .jti = 0, .capabilities = &set_only };
+    var set_ctx = Ctx.initWithAuth(&store, &.{ "lobby", "hi" }, arena, .{ .enforce = &set_state }, null, null, null, null);
+    defer set_ctx.deinit();
+    try testing.expectError(error.PermissionDenied, execute(&set_ctx));
 }

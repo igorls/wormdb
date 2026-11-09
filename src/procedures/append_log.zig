@@ -29,9 +29,20 @@ const Config = @import("../core/config.zig").Config;
 const CHECKPOINT_PREFIX = "proof:append-log-checkpoint:v1:";
 const WITNESS_PREFIX = "proof:append-log-witness:v1:";
 
+/// Authorization target for every append-log procedure: the log's event-key
+/// prefix (`proof:append-log:v1:<sha256(log_id) hex>:…`). Checkpoint, witness
+/// and accumulator-state keys are derived from the same log_id, so one range
+/// grant covers a log; `set prefix "proof:append-log:v1:"` covers all logs.
+fn requireLog(ctx: *Ctx, log_id: []const u8, access: Ctx.NamespaceAccess) !void {
+    const prefix = try append_log.eventKeyPrefix(ctx.allocator, log_id);
+    defer ctx.allocator.free(prefix);
+    try ctx.requirePrefix(prefix, access);
+}
+
 pub fn appendExecute(ctx: *Ctx) anyerror!Ctx.Result {
     const log_id = ctx.arg(0) orelse
         return ctx.err("append_log_append requires: <log_id> <payload> [ts=<ms>] [attachment_hash_hex...]");
+    try requireLog(ctx, log_id, .write);
     const payload = ctx.arg(1) orelse
         return ctx.err("append_log_append requires: <log_id> <payload> [ts=<ms>] [attachment_hash_hex...]");
 
@@ -72,6 +83,7 @@ pub fn appendExecute(ctx: *Ctx) anyerror!Ctx.Result {
 pub fn verifyExecute(ctx: *Ctx) anyerror!Ctx.Result {
     const log_id = ctx.arg(0) orelse
         return ctx.err("append_log_verify requires: <log_id>");
+    try requireLog(ctx, log_id, .read);
     if (ctx.argCount() != 1)
         return ctx.err("append_log_verify requires: <log_id>");
 
@@ -98,6 +110,7 @@ pub fn verifyExecute(ctx: *Ctx) anyerror!Ctx.Result {
 pub fn mmrProofExecute(ctx: *Ctx) anyerror!Ctx.Result {
     const log_id = ctx.arg(0) orelse
         return ctx.err("append_log_mmr_proof requires: <log_id> <seq>");
+    try requireLog(ctx, log_id, .read);
     const seq = ctx.argInt(u64, 1) orelse
         return ctx.err("append_log_mmr_proof requires: <log_id> <seq>");
     if (seq == 0) return ctx.err("append_log_mmr_proof: seq must be >= 1");
@@ -153,6 +166,7 @@ pub fn mmrVerifyExecute(ctx: *Ctx) anyerror!Ctx.Result {
 pub fn checkpointExecute(ctx: *Ctx) anyerror!Ctx.Result {
     const log_id = ctx.arg(0) orelse
         return ctx.err("append_log_checkpoint requires: <log_id> <from_seq> <to_seq> <creator_pubkey_hex> sk=<secret_key_hex>|sig=<signature_hex> [created_at_ms=<ms>] [ingested_at_ms=<ms>] [prev=<checkpoint_hash_hex>] [ext=<hex>]");
+    try requireLog(ctx, log_id, .write);
     const from_seq = ctx.argInt(u64, 1) orelse
         return ctx.err("append_log_checkpoint requires: <log_id> <from_seq> <to_seq> <creator_pubkey_hex> sk=<secret_key_hex>|sig=<signature_hex> [created_at_ms=<ms>] [ingested_at_ms=<ms>] [prev=<checkpoint_hash_hex>] [ext=<hex>]");
     const to_seq = ctx.argInt(u64, 2) orelse
@@ -258,6 +272,7 @@ pub fn checkpointExecute(ctx: *Ctx) anyerror!Ctx.Result {
 pub fn proofBundleExecute(ctx: *Ctx) anyerror!Ctx.Result {
     const log_id = ctx.arg(0) orelse
         return ctx.err("append_log_proof_bundle requires: <log_id> <from_seq> <to_seq> <checkpoint_hash_hex>");
+    try requireLog(ctx, log_id, .read);
     const from_seq = ctx.argInt(u64, 1) orelse
         return ctx.err("append_log_proof_bundle requires: <log_id> <from_seq> <to_seq> <checkpoint_hash_hex>");
     const to_seq = ctx.argInt(u64, 2) orelse
@@ -296,6 +311,7 @@ pub fn proofBundleExecute(ctx: *Ctx) anyerror!Ctx.Result {
 pub fn proofVerifyExecute(ctx: *Ctx) anyerror!Ctx.Result {
     const log_id = ctx.arg(0) orelse
         return ctx.err("append_log_proof_verify requires: <log_id> <seq> <record_hash_hex> <checkpoint_hash_hex> <proof_hex>");
+    try requireLog(ctx, log_id, .read);
     const seq = ctx.argInt(u64, 1) orelse
         return ctx.err("append_log_proof_verify requires: <log_id> <seq> <record_hash_hex> <checkpoint_hash_hex> <proof_hex>");
     const record_hash = parseHashHex(ctx.arg(2) orelse
@@ -334,6 +350,7 @@ pub fn proofVerifyExecute(ctx: *Ctx) anyerror!Ctx.Result {
 pub fn witnessExecute(ctx: *Ctx) anyerror!Ctx.Result {
     const usage = "append_log_witness requires: <log_id> <checkpoint_hash_hex> [witness_pubkey_hex] [sk=<secret_key_hex>|sig=<signature_hex>] [observed_at_ms=<ms>] [ext=<hex>]";
     const log_id = ctx.arg(0) orelse return ctx.err(usage);
+    try requireLog(ctx, log_id, .write);
     const checkpoint_hash = parseHashHex(ctx.arg(1) orelse return ctx.err(usage)) catch
         return ctx.err("append_log_witness: checkpoint hash must be 64 hex chars");
 
@@ -433,6 +450,7 @@ pub fn witnessExecute(ctx: *Ctx) anyerror!Ctx.Result {
 pub fn witnessRequestExecute(ctx: *Ctx) anyerror!Ctx.Result {
     const usage = "append_log_witness_request requires: <log_id> <checkpoint_hash_hex>";
     const log_id = ctx.arg(0) orelse return ctx.err(usage);
+    try requireLog(ctx, log_id, .read);
     const checkpoint_hash_hex = ctx.arg(1) orelse return ctx.err(usage);
     if (ctx.argCount() != 2) return ctx.err(usage);
 
@@ -467,6 +485,7 @@ pub fn witnessRequestExecute(ctx: *Ctx) anyerror!Ctx.Result {
 pub fn witnessImportExecute(ctx: *Ctx) anyerror!Ctx.Result {
     const log_id = ctx.arg(0) orelse
         return ctx.err("append_log_witness_import requires: <log_id> <checkpoint_hash_hex> <canonical_witness_hex>");
+    try requireLog(ctx, log_id, .write);
     const checkpoint_hash = parseHashHex(ctx.arg(1) orelse
         return ctx.err("append_log_witness_import requires: <log_id> <checkpoint_hash_hex> <canonical_witness_hex>")) catch
         return ctx.err("append_log_witness_import: checkpoint hash must be 64 hex chars");
@@ -504,6 +523,7 @@ pub fn witnessImportExecute(ctx: *Ctx) anyerror!Ctx.Result {
 pub fn witnessVerifyExecute(ctx: *Ctx) anyerror!Ctx.Result {
     const log_id = ctx.arg(0) orelse
         return ctx.err("append_log_witness_verify requires: <log_id> <checkpoint_hash_hex> <witness_pubkey_hex>");
+    try requireLog(ctx, log_id, .read);
     const checkpoint_hash = parseHashHex(ctx.arg(1) orelse
         return ctx.err("append_log_witness_verify requires: <log_id> <checkpoint_hash_hex> <witness_pubkey_hex>")) catch
         return ctx.err("append_log_witness_verify: checkpoint hash must be 64 hex chars");

@@ -53,6 +53,10 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const vec_key = try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ namespace, id });
     defer ctx.allocator.free(vec_key);
 
+    // The BQ companion (bq:<key>) and the __meta: counter are derived from
+    // this key; authorizing the vector key authorizes them.
+    try ctx.requireWrite(vec_key);
+
     vector_ops.applyVinsert(
         ctx.store,
         ctx.cluster,

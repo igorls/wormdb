@@ -51,6 +51,22 @@ pub const ServerConfig = struct {
     /// Whole handshake/frame timeout in milliseconds; must be positive.
     timeout_ms: usize = 30000,
 
+    /// Max concurrent TCP connections per client IP. 0 (default) = unlimited — a
+    /// small default breaks NAT'd fleets and localhost benches (see the gateway
+    /// setting of the same name). Loopback is exempt unless
+    /// `per_ip_exempt_loopback` is false.
+    max_connections_per_ip: u32 = 0,
+
+    /// Exempt loopback peers (127.0.0.0/8, ::1) from `max_connections_per_ip`.
+    per_ip_exempt_loopback: bool = true,
+
+    /// Per-connection command rate limit (frames per second, burst of one
+    /// second). 0 (default) = unlimited. Over the limit a command is answered
+    /// with `ERR rate limited` and not executed. Recommended whenever untrusted
+    /// clients hold tokens: one chatty client otherwise monopolizes the shared
+    /// worker pool.
+    max_commands_per_sec: u32 = 0,
+
     /// Server backend
     backend: Backend = .threadpool,
 
@@ -137,6 +153,10 @@ pub const GatewayConfig = struct {
     /// benches can open hundreds of sockets from one address (#89).
     per_ip_exempt_loopback: bool = true,
 
+    /// Per-connection command rate limit for WebSocket data frames (binary WormWire and
+    /// JSON-RPC text), frames per second with a one-second burst. 0 (default) = unlimited.
+    max_commands_per_sec: u32 = 0,
+
     /// Per-transport auth opt-out for the QUIC/WebTransport gateway. Secure by default (true).
     quic_auth_enabled: bool = true,
 };
@@ -175,6 +195,10 @@ pub const OrgGrantConfig = struct {
 pub const OrgTrustConfig = struct {
     /// Force enforcement even with an empty grant list (rejects everything).
     enforce: bool = false,
+    /// Accept inbound legacy "W2" replication handshakes (one-way authenticated,
+    /// plaintext) while enforcing. Keep true only while peers that predate the
+    /// mutual, encrypted "W3" handshake are still being upgraded; then set false.
+    accept_w2: bool = true,
     /// Path to this node's org-signed certificate (binary, 186 bytes,
     /// as written by meshguard `Org.saveCertificate`). Required for this node
     /// to authenticate its own outbound replication connections.
@@ -273,6 +297,24 @@ test "loadFromJson: empty object uses defaults" {
     // Per-IP cap ships OFF (#89): a default cap breaks NAT'd players and localhost benches.
     try std.testing.expectEqual(@as(u32, 0), cfg.gateway.max_connections_per_ip);
     try std.testing.expectEqual(true, cfg.gateway.per_ip_exempt_loopback);
+    // Request budgets ship OFF too; the deployment checklist turns them on.
+    try std.testing.expectEqual(@as(u32, 0), cfg.server.max_connections_per_ip);
+    try std.testing.expectEqual(true, cfg.server.per_ip_exempt_loopback);
+    try std.testing.expectEqual(@as(u32, 0), cfg.server.max_commands_per_sec);
+    try std.testing.expectEqual(@as(u32, 0), cfg.gateway.max_commands_per_sec);
+}
+
+test "loadFromJson: request budget overrides" {
+    const cfg = try loadFromJson(
+        \\{
+        \\  "server": { "max_connections_per_ip": 64, "per_ip_exempt_loopback": false, "max_commands_per_sec": 2000 },
+        \\  "gateway": { "max_commands_per_sec": 500 }
+        \\}
+    , std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 64), cfg.server.max_connections_per_ip);
+    try std.testing.expectEqual(false, cfg.server.per_ip_exempt_loopback);
+    try std.testing.expectEqual(@as(u32, 2000), cfg.server.max_commands_per_sec);
+    try std.testing.expectEqual(@as(u32, 500), cfg.gateway.max_commands_per_sec);
 }
 
 test "loadFromJson: gateway per-IP cap overrides" {

@@ -10,7 +10,7 @@ const compat = core.compat;
 const Command = core.types.Command;
 pub const CommandId = core.types.CommandId;
 const Response = core.types.Response;
-const MAX_PAYLOAD_LENGTH = core.types.MAX_PAYLOAD_LENGTH;
+pub const MAX_PAYLOAD_LENGTH = core.types.MAX_PAYLOAD_LENGTH;
 
 pub const WIRE_MAGIC = [2]u8{ 0x57, 0x57 }; // "WW" — WormWire client
 pub const REPL_MAGIC = [2]u8{ 0x57, 0x52 }; // "WR" — WormWire replication (legacy, unauthenticated)
@@ -21,6 +21,15 @@ pub const REPL_MAGIC = [2]u8{ 0x57, 0x52 }; // "WR" — WormWire replication (le
 /// "W2". Handshake: server sends a 32-byte random challenge; peer replies with
 /// [186B org NodeCertificate][64B Ed25519 signature over challenge++cert].
 pub const REPL_MAGIC_V2 = [2]u8{ 0x57, 0x32 }; // "W2" — WormWire replication + org handshake
+/// "W3": mutual org handshake + encrypted channel. Client sends magic ++ 32B
+/// challenge; server answers [32B challenge][cert][64B sig over the
+/// server-labeled transcript "wormdb w3 server hello" ++ client_challenge ++
+/// server_challenge ++ cert]; client replies [cert][64B sig over the
+/// client-labeled transcript]. The role labels make each signature usable in
+/// one role only (never as the other side's proof, never as a W2 proof). Every
+/// byte after that is a `cluster.secure_channel` record (ChaCha20-Poly1305,
+/// per-direction keys derived from both identities and both challenges).
+pub const REPL_MAGIC_V3 = [2]u8{ 0x57, 0x33 }; // "W3" — WormWire replication, mutual auth + encryption
 
 pub const WireError = error{
     EndOfStream,
@@ -66,6 +75,14 @@ pub fn readFrameAlloc(reader: anytype, allocator: std.mem.Allocator) !Command {
 /// No per-field frees needed — the arena reset handles everything.
 /// Only safe when the allocator is an ArenaAllocator (payload stays alive until reset).
 pub fn readFrameZeroCopy(reader: anytype, allocator: std.mem.Allocator) !Command {
+    return readFrameZeroCopyLimited(reader, allocator, MAX_PAYLOAD_LENGTH);
+}
+
+/// `readFrameZeroCopy` with a caller-chosen payload cap (clamped to
+/// `MAX_PAYLOAD_LENGTH`). Transports pass a small cap until a connection has
+/// authenticated, so an anonymous peer cannot make the server reserve 16 MiB
+/// per connection just by announcing a large frame.
+pub fn readFrameZeroCopyLimited(reader: anytype, allocator: std.mem.Allocator, max_payload: usize) !Command {
     var header: [5]u8 = undefined;
     readExact(reader, &header) catch |err| {
         if (err == error.EndOfStream) return error.EndOfStream;
@@ -74,7 +91,7 @@ pub fn readFrameZeroCopy(reader: anytype, allocator: std.mem.Allocator) !Command
 
     const cmd_id_byte = header[0];
     const payload_len = std.mem.readInt(u32, header[1..5], .big);
-    if (payload_len > MAX_PAYLOAD_LENGTH) return error.PayloadTooLarge;
+    if (payload_len > @min(max_payload, MAX_PAYLOAD_LENGTH)) return error.PayloadTooLarge;
 
     // Payload stays alive until arena reset — fields are sliced from it.
     const payload = try allocator.alloc(u8, payload_len);

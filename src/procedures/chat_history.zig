@@ -29,6 +29,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
 
     // Build prefix: chat:<room>:
     const prefix = try std.fmt.allocPrint(ctx.allocator, "chat:{s}:", .{room});
+    try ctx.requirePrefix(prefix, .read);
 
     // Scan for matching messages (already sorted by key = chronological)
     const results = try ctx.scan(prefix, limit);

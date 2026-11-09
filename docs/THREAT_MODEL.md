@@ -404,12 +404,17 @@ our org plus every granted org and gossips our certificate, so uncertified nodes
 enter the membership table. Outbound replication speaks the new mutual `W3` handshake
 ([wire.zig](../src/protocol/wire.zig), [org_trust.zig](../src/cluster/org_trust.zig)): the
 server must prove membership in our org or a granted org before the client sends a single
-frame, then the client proves itself as in `W2`. Outbound data is also scoped
+frame, then the client proves itself. Both W3 signatures cover a role label and both
+challenges, so a server hello can never be replayed as a client proof (W3 or legacy W2)
+and a node cannot be used as a signing oracle by feeding it a chosen challenge. Outbound
+data is also scoped
 (`Cluster.peerMayReceive`): same-org peers receive everything, other orgs only the
 prefixes their static grant or delegated trust-log capability covers, and unauthenticated
 links receive nothing. `WR` outbound is still spoken only when this node has no
 certificate (the enforcing peer rejects it). Inbound `W2` is still accepted for rolling
-upgrades, with a warning.
+upgrades, with a warning; set `org_trust.accept_w2: false` once every peer speaks W3 to
+close the plaintext, one-way-authenticated path (its bare `challenge ++ cert` proof is
+relay-prone by design).
 
 **D2. Replication runs over plaintext TCP, not WireGuard.** Severity: High.
 Where: `PeerConnection.connect` prefers `real_addr` from gossip over the mesh IP
@@ -617,7 +622,8 @@ C1 remainder: per-connection writer queues so fan-out leaves the publisher's thr
 C4 `MAX_DIM` (admin gating for `vrabitq`/`vreindex`/`vnsdrop` is covered by A1's range
 checks); D3 read-side grants (outbound scoping now exists; inbound reads of proof RPCs are
 still org-level); D5 remove `sk=`; B6 QUIC fixes (pre-auth cap and expiry re-check);
-E2 secret handling; SWIM admission for delegated orgs that have no static grant entry.
+E2 secret handling; SWIM admission for delegated orgs that have no static grant entry;
+flip `org_trust.accept_w2` to default false once no W2-only peers remain.
 
 P2:
 A6, A7, A8, A9, B4, B5, B7, B8, C5, C6, D6, E1 documentation, E3 fuzzing and ReleaseSafe

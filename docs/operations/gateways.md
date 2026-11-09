@@ -110,7 +110,8 @@ continue to work without changing the token format.
 The standalone binary also rejects unauthenticated legacy replication on the
 client port, even when no cluster is running. `--cluster-open` explicitly opts
 into that legacy path; configured org grants continue to require org
-authentication (W3 mutual handshake, or legacy W2 for peers not yet upgraded).
+authentication (W3 mutual handshake, or legacy W2 for peers not yet upgraded —
+disable the latter with `org_trust.accept_w2: false` once the fleet speaks W3).
 
 ```json
 {

@@ -22,11 +22,13 @@ pub const REPL_MAGIC = [2]u8{ 0x57, 0x52 }; // "WR" — WormWire replication (le
 /// [186B org NodeCertificate][64B Ed25519 signature over challenge++cert].
 pub const REPL_MAGIC_V2 = [2]u8{ 0x57, 0x32 }; // "W2" — WormWire replication + org handshake
 /// "W3": mutual org handshake + encrypted channel. Client sends magic ++ 32B
-/// challenge; server answers [32B challenge][186B cert][64B sig over
-/// client_challenge ++ cert]; client replies [186B cert][64B sig over
-/// server_challenge ++ cert]. Every byte after that is a
-/// `cluster.secure_channel` record (ChaCha20-Poly1305, per-direction keys
-/// derived from both identities and both challenges).
+/// challenge; server answers [32B challenge][cert][64B sig over the
+/// server-labeled transcript "wormdb w3 server hello" ++ client_challenge ++
+/// server_challenge ++ cert]; client replies [cert][64B sig over the
+/// client-labeled transcript]. The role labels make each signature usable in
+/// one role only (never as the other side's proof, never as a W2 proof). Every
+/// byte after that is a `cluster.secure_channel` record (ChaCha20-Poly1305,
+/// per-direction keys derived from both identities and both challenges).
 pub const REPL_MAGIC_V3 = [2]u8{ 0x57, 0x33 }; // "W3" — WormWire replication, mutual auth + encryption
 
 pub const WireError = error{

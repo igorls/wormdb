@@ -359,11 +359,14 @@ pub const Cluster = struct {
     /// behavior. With a cert we run the mutual "W3" handshake:
     ///
     ///   1. send magic ++ our 32B challenge;
-    ///   2. read the server's [32B challenge][cert][sig over OUR challenge ++
-    ///      its cert] and verify it — the server must prove membership in an
-    ///      org we trust BEFORE we send anything else (a rogue gossip joiner
-    ///      can no longer receive a full-state dump);
-    ///   3. reply [our cert][sig over ITS challenge ++ our cert];
+    ///   2. read the server's [32B challenge][cert][sig over the role-labeled
+    ///      transcript: both challenges ++ its cert] and verify it — the
+    ///      server must prove membership in an org we trust BEFORE we send
+    ///      anything else (a rogue gossip joiner can no longer receive a
+    ///      full-state dump);
+    ///   3. reply [our cert][sig over the client-labeled transcript]; the two
+    ///      labels keep either signature from being replayed in the other
+    ///      role or as a legacy W2 proof;
     ///   4. derive the per-direction session keys from both identities and
     ///      both challenges; every later byte is an encrypted record.
     ///
@@ -391,12 +394,12 @@ pub const Cluster = struct {
         const server_challenge = hello[0..org_trust.CHALLENGE_LEN];
         const server_cert = hello[org_trust.CHALLENGE_LEN..][0..org_trust.CERT_WIRE_LEN];
         const server_sig = hello[org_trust.CHALLENGE_LEN + org_trust.CERT_WIRE_LEN ..][0..org_trust.SIG_LEN];
-        const server = org_trust.verifyPeerHandshake(trust, &client_challenge, server_cert, server_sig) catch |err| {
+        const server = org_trust.verifyW3Server(trust, &client_challenge, server_challenge, server_cert, server_sig) catch |err| {
             std.log.warn("cluster: peer failed to prove org membership: {s}", .{@errorName(err)});
             return err;
         };
 
-        const msg = org_trust.handshakeMessage(server_challenge, &cert_wire);
+        const msg = org_trust.w3ClientMessage(&client_challenge, server_challenge, &cert_wire);
         const sig = try Keys.sign(&msg, self.identity.secret_key);
         try stream.writeAll(&cert_wire);
         try stream.writeAll(&sig);

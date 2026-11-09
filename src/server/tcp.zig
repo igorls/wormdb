@@ -515,6 +515,13 @@ pub const Server = struct {
         // node's peers speak legacy "WR", so a W2 arrival means misconfiguration.
         if (std.mem.eql(u8, &handshake, &wire.REPL_MAGIC_V2)) {
             conn_ctx.binary_mode = true;
+            if (self.config.org_trust) |trust| {
+                if (trust.enforce and !trust.accept_w2) {
+                    std.log.warn("replication: legacy W2 handshake rejected (org_trust.accept_w2 is false; peer must speak W3)", .{});
+                    wire.writeResponse(&stream, .{ .err = "unauthorized: legacy W2 replication disabled" }) catch {};
+                    return;
+                }
+            }
             const peer_org = self.replicationOrgHandshake(&stream) orelse return;
             stream.read_limit_ns = null;
             // Accepted for rolling upgrades: the peer proved its org, but this
@@ -741,7 +748,10 @@ pub const Server = struct {
 
         var server_challenge: [org_trust_mod.CHALLENGE_LEN]u8 = undefined;
         core.compat.randomBytes(&server_challenge);
-        const our_msg = org_trust_mod.handshakeMessage(&client_challenge, &cert_wire);
+        // Role-labeled, both-challenge-bound transcript (see org_trust.w3ServerMessage):
+        // this signature verifies only as a W3 server hello, so answering an anonymous
+        // caller's chosen challenge cannot hand it a client proof for W3 or legacy W2.
+        const our_msg = org_trust_mod.w3ServerMessage(&client_challenge, &server_challenge, &cert_wire);
         const our_sig = cluster.signWithIdentity(&our_msg) catch {
             std.log.warn("replication: W3 handshake failed: cannot sign with the cluster identity", .{});
             return null;
@@ -757,8 +767,9 @@ pub const Server = struct {
             std.log.warn("replication: W3 handshake failed: peer closed before sending cert+signature", .{});
             return null;
         };
-        const peer = org_trust_mod.verifyPeerHandshake(
+        const peer = org_trust_mod.verifyW3Client(
             trust,
+            &client_challenge,
             &server_challenge,
             reply[0..org_trust_mod.CERT_WIRE_LEN],
             reply[org_trust_mod.CERT_WIRE_LEN..][0..org_trust_mod.SIG_LEN],

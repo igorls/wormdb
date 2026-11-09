@@ -195,6 +195,10 @@ pub const OrgGrantConfig = struct {
 pub const OrgTrustConfig = struct {
     /// Force enforcement even with an empty grant list (rejects everything).
     enforce: bool = false,
+    /// Accept inbound legacy "W2" replication handshakes (one-way authenticated,
+    /// plaintext) while enforcing. Keep true only while peers that predate the
+    /// mutual, encrypted "W3" handshake are still being upgraded; then set false.
+    accept_w2: bool = true,
     /// Path to this node's org-signed certificate (binary, 186 bytes,
     /// as written by meshguard `Org.saveCertificate`). Required for this node
     /// to authenticate its own outbound replication connections.

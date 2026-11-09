@@ -87,9 +87,11 @@ Authorization to mint:
   namespace.
 - Namespace mint permission is represented as `Operation.exec` with an exact
   or prefix pattern covering `auth:mint:<namespace>` (for example the prefix
-  `auth:mint:` for every namespace). An `exec` *wildcard* does not count: being
-  allowed to run every procedure must not turn into the right to mint
-  data-access tokens for namespaces the caller cannot read itself.
+  `auth:mint:` for every namespace). An `exec` *wildcard* does not count, and
+  neither does an empty prefix or a prefix that stops short of `auth:` (such
+  as `auth`): being allowed to run every procedure must not turn into the
+  right to mint data-access tokens for namespaces the caller cannot read
+  itself.
 
 ## Namespace Capability Expansion
 

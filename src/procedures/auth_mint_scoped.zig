@@ -37,10 +37,12 @@ fn appendJsonEscaped(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator
 }
 
 /// Mint authority: a wildcard admin token, or `exec auth_mint_scoped` plus an
-/// EXPLICIT `exec auth:mint:<ns>` grant (exact, or a prefix such as
-/// `auth:mint:` for all namespaces). A bare `exec` wildcard — "may run every
-/// procedure" — is deliberately not enough: it would let any such token mint
-/// data-access tokens for namespaces it cannot read itself.
+/// EXPLICIT `exec auth:mint:<ns>` grant (exact, or a prefix that spells out at
+/// least `auth:` — e.g. `auth:mint:` for all namespaces). A bare `exec`
+/// wildcard, an empty prefix or a prefix that stops short of `auth:` — all
+/// of them "may run every procedure" in some disguise — is deliberately not
+/// enough: it would let any such token mint data-access tokens for namespaces
+/// it cannot read itself.
 fn canMint(ctx: *Ctx, ns: []const u8) !bool {
     if (ctx.permits(.all, "")) return true;
     if (!ctx.permits(.exec, "auth_mint_scoped")) return false;

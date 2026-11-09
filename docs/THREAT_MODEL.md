@@ -157,9 +157,11 @@ Attack: with `auth.mint_secret_key` configured, any demo user mints a read/write
 for every memory namespace.
 Fix: require a distinct operation for mint authority instead of overloading `exec`, or
 require `all` authority for minting.
-**Status: fixed.** `canMint` now requires an explicit exact or prefix `exec` capability
-covering `auth:mint:<ns>` (`TokenState.permitsExplicit`); an `exec` wildcard no longer
-confers mint authority. Admin (`all` wildcard) still mints.
+**Status: fixed.** `canMint` now requires an explicit `exec` capability covering
+`auth:mint:<ns>` (`TokenState.permitsExplicit`): exact, or a prefix that spells out at least
+the `auth:` family. An `exec` wildcard, an empty prefix and family-short prefixes such as
+`auth` no longer confer mint authority. Admin (`all` wildcard) still mints. The same rule
+guards every procedure pseudo-target (`Ctx.requireExecTarget`).
 
 **A3. Clients with `publish` can forge server events.** Severity: Medium.
 Where: `PUB` is a plain capability check ([auth.zig:460](../src/server/auth.zig));

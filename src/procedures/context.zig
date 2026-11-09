@@ -536,7 +536,9 @@ pub const Ctx = struct {
 
     /// Procedure-only authority over a pseudo-target such as `chat:<room>` or
     /// `auth:mint:<ns>`: admin (`all`) authority, or an explicit `exec` capability
-    /// (exact or prefix, never a wildcard) covering `target`. Use this when a
+    /// covering `target` — exact, or a prefix that spells out at least the target's
+    /// family including its ':' (`"chat:"`, `"auth:mint:"`); never a wildcard, an
+    /// empty prefix or a prefix that stops short of the family. Use this when a
     /// procedure builds its keys itself and binds the caller's identity into
     /// what it writes: granting the raw `set` on those keys instead would let a
     /// client bypass the procedure and forge records under another name.
@@ -755,6 +757,15 @@ test "Ctx.requireKey/requirePrefix honor the enforce context; trusted bypasses" 
     var wild = Ctx.initWithAuth(&store, &.{}, testing.allocator, .{ .enforce = &wild_state }, null, null, null, null);
     defer wild.deinit();
     try testing.expectError(error.PermissionDenied, wild.requireExecTarget("chat:lobby"));
+    // An empty or family-short exec prefix is the same thing in disguise.
+    const short_caps = [_]auth.Capability{
+        .{ .op = .exec, .match_type = .prefix, .pattern = "" },
+        .{ .op = .exec, .match_type = .prefix, .pattern = "ch" },
+    };
+    const short_state = auth.TokenState{ .subject = "s", .iat = 0, .exp = 0, .jti = 0, .capabilities = &short_caps };
+    var short = Ctx.initWithAuth(&store, &.{}, testing.allocator, .{ .enforce = &short_state }, null, null, null, null);
+    defer short.deinit();
+    try testing.expectError(error.PermissionDenied, short.requireExecTarget("chat:lobby"));
 
     var trusted = Ctx.init(&store, &.{}, testing.allocator, null, null, null, null);
     defer trusted.deinit();

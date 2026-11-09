@@ -140,9 +140,12 @@ GET/SET/DEL over the same keys would need (`scan`, `kv_*`, `increment`, `transfe
 `vnsdrop`, `proof_prefix_root`, `cluster_presence agents_log=`, all `append_log_*` and
 claim procedures). Range checks only accept prefix/wildcard capabilities
 (`TokenState.permitsPrefix`) — an exact capability never covers a scan.
-`requireNamespace` uses the same rule. The executor maps `error.PermissionDenied` to the
-standard `permission denied` response. Trusted callers (replication, maintenance) are
-unaffected. Domain packages must call the same helpers; the seam does not do it for them.
+`requireNamespace` uses the same rule. Procedures that build their own keys and bind the
+caller's identity into the record (`chat_send`) check a procedure-only pseudo-target
+(`Ctx.requireExecTarget("chat:<room>")`) instead of a raw `set`, so posting rights never
+imply raw write rights. The executor maps `error.PermissionDenied` to the standard
+`permission denied` response. Trusted callers (replication, maintenance) are unaffected.
+Domain packages must call the same helpers; the seam does not do it for them.
 
 **A2. `exec` wildcard or empty-prefix tokens can mint tokens for any namespace.**
 Severity: Medium.
@@ -530,10 +533,15 @@ Impact: because of A1, every chat user can `scan ""`, `kv_put` any key, `vnsdrop
 namespace and mint tokens (A2). The demo is the template people will copy.
 Fix: grant `exec exact chat_send` and `exec exact chat_history` only, after those
 procedures gain scope checks; drop the 24 h TTL to match the server default.
-**Status: fixed.** Chat tokens grant exactly `exec chat_send`/`chat_history`, `get`/`set`
-on `chat:`, `subscribe` on `chat:`/`presence:` and `publish` on `presence:` only (chat
-messages are published by the server from `chat_send`; the page no longer publishes them
-itself); benchmark tokens grant `get`/`set` on `bench:` only; TTL is 1 h.
+**Status: fixed.** Chat tokens grant exactly `exec chat_send`/`chat_history`, the
+procedure-only room grant `exec chat:` (a pseudo-target checked by `chat_send` through
+`Ctx.requireExecTarget`; no raw `set` on `chat:*`, which would let a client forge stored
+history under another name), `get` on `chat:` for history, `subscribe` on
+`chat:`/`presence:` and `publish` on `presence:` only. Chat messages are stored and
+published by the server from `chat_send`; the page no longer publishes them itself, and
+nothing in the timeline is built from client-published presence events (those remain
+self-declared until A3 adds server-stamped provenance). Benchmark tokens grant `get`/`set`
+on `bench:` only; TTL is 1 h.
 
 **F2. Client libraries.** Severity: Informational.
 The Bun and browser clients keep the token in memory, re-send it on reconnect, and never

@@ -534,6 +534,18 @@ pub const Ctx = struct {
         if (!self.permitsPrefix(operationFor(access), prefix)) return error.PermissionDenied;
     }
 
+    /// Procedure-only authority over a pseudo-target such as `chat:<room>` or
+    /// `auth:mint:<ns>`: admin (`all`) authority, or an explicit `exec` capability
+    /// (exact or prefix, never a wildcard) covering `target`. Use this when a
+    /// procedure builds its keys itself and binds the caller's identity into
+    /// what it writes: granting the raw `set` on those keys instead would let a
+    /// client bypass the procedure and forge records under another name.
+    /// Pseudo-targets contain ':' so they never collide with procedure names.
+    pub fn requireExecTarget(self: *const Ctx, target: []const u8) error{PermissionDenied}!void {
+        if (self.permits(.all, "")) return;
+        if (!self.permitsExplicit(.exec, target)) return error.PermissionDenied;
+    }
+
     pub fn requireNamespace(self: *Ctx, ns: []const u8, access: NamespaceAccess) !void {
         const mem_prefix = try std.fmt.allocPrint(self.allocator, "mem:{s}:", .{ns});
         defer self.allocator.free(mem_prefix);
@@ -726,6 +738,23 @@ test "Ctx.requireKey/requirePrefix honor the enforce context; trusted bypasses" 
     var anon = Ctx.initWithAuth(&store, &.{}, testing.allocator, .{ .enforce = null }, null, null, null, null);
     defer anon.deinit();
     try testing.expectError(error.PermissionDenied, anon.requireRead("anything"));
+    try testing.expectError(error.PermissionDenied, anon.requireExecTarget("chat:lobby"));
+
+    // Pseudo-target authority: explicit exec grants pass, exec wildcard and raw set do not.
+    const room_caps = [_]auth.Capability{
+        .{ .op = .exec, .match_type = .prefix, .pattern = "chat:lob" },
+        .{ .op = .set, .match_type = .prefix, .pattern = "chat:" },
+    };
+    const room_state = auth.TokenState{ .subject = "r", .iat = 0, .exp = 0, .jti = 0, .capabilities = &room_caps };
+    var room = Ctx.initWithAuth(&store, &.{}, testing.allocator, .{ .enforce = &room_state }, null, null, null, null);
+    defer room.deinit();
+    try room.requireExecTarget("chat:lobby");
+    try testing.expectError(error.PermissionDenied, room.requireExecTarget("chat:ops"));
+    const wild_caps = [_]auth.Capability{.{ .op = .exec, .match_type = .wildcard, .pattern = "" }};
+    const wild_state = auth.TokenState{ .subject = "w", .iat = 0, .exp = 0, .jti = 0, .capabilities = &wild_caps };
+    var wild = Ctx.initWithAuth(&store, &.{}, testing.allocator, .{ .enforce = &wild_state }, null, null, null, null);
+    defer wild.deinit();
+    try testing.expectError(error.PermissionDenied, wild.requireExecTarget("chat:lobby"));
 
     var trusted = Ctx.init(&store, &.{}, testing.allocator, null, null, null, null);
     defer trusted.deinit();

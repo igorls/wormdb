@@ -982,10 +982,10 @@
           try {
             const evt = JSON.parse(data);
             const presence = getPresence(room);
-            if (evt.type === 'join') {
-              // The presence 'join' event doubles as the room's join notice.
-              addMessage(room, { type: 'system', text: `${evt.user} joined #${room}`, time: timeStr(), ts: evt.ts || Date.now() });
-            }
+            // Presence events are client-published and carry a self-declared
+            // user; they only drive the (best-effort) member list. Nothing in
+            // the message timeline is built from them — a join notice would
+            // need a server-stamped identity.
             if (evt.type === 'leave') {
               presence.delete(evt.user);
             } else {
@@ -1150,7 +1150,7 @@
       // Switch to general (this loads history)
       await switchRoom('general');
 
-      // Start the presence heartbeat; its first 'join' event announces us.
+      // Start the presence heartbeat (member list only; no timeline notice).
       startHeartbeat();
 
       // Start latency polling

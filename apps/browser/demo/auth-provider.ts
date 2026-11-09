@@ -15,12 +15,15 @@
  * The token `sub` claim = username. This is the source of truth for identity.
  *
  * Token policy — least privilege, because this file is the template people copy:
- *   - `chat` (default): run ONLY chat_send / chat_history, read+write ONLY
- *     chat:* keys, subscribe to chat:* and presence:*, publish ONLY presence:*.
- *     Chat messages are published by the server (chat_send), so no client can
- *     forge a message from someone else. No `exec` wildcard: EXEC authorizes
- *     the procedure name, and a wildcard would reach every built-in (scan,
- *     kv_put, vnsdrop, auth_mint_scoped, ...).
+ *   - `chat` (default): run ONLY chat_send / chat_history, post in rooms via
+ *     the procedure-only `exec chat:<room>` grant, read chat:* keys (history),
+ *     subscribe to chat:* and presence:*, publish ONLY presence:*. There is no
+ *     raw `set` on chat:*: chat_send binds the token identity into every stored
+ *     message, and a raw write right would let a client forge history under
+ *     another name. Chat messages are published by the server (chat_send), so
+ *     no client can forge a live message either. No `exec` wildcard: EXEC
+ *     authorizes the procedure name, and a wildcard would reach every built-in
+ *     (scan, kv_put, vnsdrop, auth_mint_scoped, ...).
  *   - `benchmark`: read/write bench:* keys only. Never `all`/wildcard — a
  *     wildcard token is an admin token (it can SAVE, mint tokens, drop data).
  *   - TTL 1 h, the server's default `token_max_age_s`; clients re-AUTH.
@@ -83,13 +86,15 @@ const TOKEN_TTL_S = 3600;
 
 function chatCapabilities(): Capability[] {
     return [
-        // Exactly the two procedures the chat UI calls. chat_send checks write
-        // access on the chat:<room>:* key it creates; chat_history checks read
-        // access on the chat:<room>: range.
+        // Exactly the two procedures the chat UI calls. chat_send requires the
+        // procedure-only room grant `exec chat:<room>` (a pseudo-target; this
+        // prefix covers every room) and writes the record itself with the token
+        // identity — no raw SET right on chat:* is granted. chat_history checks
+        // read access on the chat:<room>: range.
         { op: OP.EXEC, match: MATCH.EXACT, pattern: "chat_send" },
         { op: OP.EXEC, match: MATCH.EXACT, pattern: "chat_history" },
+        { op: OP.EXEC, match: MATCH.PREFIX, pattern: "chat:" },
         { op: OP.GET, match: MATCH.PREFIX, pattern: "chat:" },
-        { op: OP.SET, match: MATCH.PREFIX, pattern: "chat:" },
         // Live feeds: chat rooms + presence.
         { op: OP.SUBSCRIBE, match: MATCH.PREFIX, pattern: "chat:" },
         { op: OP.SUBSCRIBE, match: MATCH.PREFIX, pattern: "presence:" },

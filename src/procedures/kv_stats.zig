@@ -13,6 +13,9 @@
 const Ctx = @import("context.zig").Ctx;
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
+    try ctx.requireRead("stats:reads");
+    try ctx.requireRead("stats:writes");
+
     // Lock both stat shards for a consistent read
     ctx.lockKeys2("stats:reads", "stats:writes");
 

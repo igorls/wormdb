@@ -34,6 +34,10 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
         }
     }
 
+    // The root commits to every entry under the prefix — a range read.
+    // Cluster anti-entropy calls this over the replication channel (trusted).
+    try ctx.requirePrefix(prefix, .read);
+
     const summary = prefix_root.compute(ctx.allocator, ctx.store, prefix, first_limit) catch
         return ctx.err("proof_prefix_root: root computation failed");
 

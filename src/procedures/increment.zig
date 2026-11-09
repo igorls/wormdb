@@ -13,6 +13,10 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const key = ctx.arg(0) orelse return ctx.err("increment requires at least 1 arg: <key> [<delta>]");
     const delta = ctx.argInt(i64, 1) orelse 1;
 
+    // Read-modify-write: the same authority a raw GET + SET would need.
+    try ctx.requireRead(key);
+    try ctx.requireWrite(key);
+
     ctx.lockKey(key);
 
     const current = ctx.getInt(i64, key) orelse 0;

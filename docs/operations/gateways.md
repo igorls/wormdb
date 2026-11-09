@@ -39,7 +39,7 @@ Both settings must be positive. Embedders set `gateway.max_connections` and
 The TCP listener applies `server.max_connections` (default **1024**) to accepted
 and queued connections, and `server.timeout_ms` (default **30000**) from accept.
 Queued sockets do not get a fresh authentication deadline at worker pickup.
-Established subscriptions and authenticated W2 replication may wait between
+Established subscriptions and authenticated W2/W3 replication may wait between
 frames. Other idle TCP sessions expire. The fixed TCP worker pool still limits
 the number of simultaneous long-lived sessions; these bounds do not guarantee
 fairness between authenticated clients.
@@ -62,6 +62,36 @@ fairness between authenticated clients.
 - Each rejection is logged with the peer address and active count, and counted in the `STATUS` field `gateway_per_ip_rejections`.
 - The stock `wormdb` binary applies these settings from `wormdb.json` automatically. Embedders starting the gateway themselves apply them with `gateway.setPerIpLimit(cfg.gateway.max_connections_per_ip, cfg.gateway.per_ip_exempt_loopback)` before `gateway.start()`.
 
+### Request budgets
+
+Both client listeners also take a per-connection command rate limit and the TCP
+listener takes the same per-IP connection cap as the gateway. All default to
+**0 = unlimited** for the same reason as above; turn them on whenever untrusted
+clients hold tokens, because one chatty connection otherwise monopolizes the
+worker pool that every tenant on the node shares.
+
+```json
+{
+  "server": {
+    "max_connections_per_ip": 64,
+    "per_ip_exempt_loopback": true,
+    "max_commands_per_sec": 2000
+  },
+  "gateway": {
+    "max_commands_per_sec": 500
+  }
+}
+```
+
+- `max_commands_per_sec` is a token bucket per connection: a client may burst one
+  second's worth, then sustain the rate. A frame over the limit is answered with
+  `ERR rate limited` (a JSON-RPC error for text frames) and not executed; the
+  connection stays open. Pipelining benchmarks need this off or set high.
+- Independently of these settings, an enforcing listener reads only frames up to
+  16 KiB until the connection has authenticated, and returns per-connection
+  arena memory above 256 KiB after each command, so anonymous connections cannot
+  reserve the 16 MiB frame maximum each.
+
 ## WormWire Over WebSocket
 
 Binary WebSocket frames carry WormWire command and response frames without the raw TCP `WW` preface. Browser clients can use `apps/browser/src/client.ts` and the demo pages under `apps/browser/demo/`.
@@ -79,7 +109,8 @@ continue to work without changing the token format.
 
 The standalone binary also rejects unauthenticated legacy replication on the
 client port, even when no cluster is running. `--cluster-open` explicitly opts
-into that legacy path; configured org grants continue to require W2 authentication.
+into that legacy path; configured org grants continue to require org
+authentication (W3 mutual handshake, or legacy W2 for peers not yet upgraded).
 
 ```json
 {

@@ -21,6 +21,9 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
 
     const metric_str = ctx.arg(2) orelse "cosine";
 
+    try ctx.requireRead(key_a);
+    try ctx.requireRead(key_b);
+
     // Lock both keys before reading
     ctx.lockKeys2(key_a, key_b);
 

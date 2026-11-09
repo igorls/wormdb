@@ -99,6 +99,10 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
 
     const purge = if (ctx.arg(1)) |p| std.mem.eql(u8, p, "1") else false;
 
+    // Dropping the index (or purging the data) affects every key under the
+    // namespace: require delete authority over the whole range, purge or not.
+    try ctx.requirePrefix(namespace, .delete);
+
     // ── Drop the HNSW index (if any) ──
     var index_dropped = false;
     if (ctx.vector_registry) |reg| {

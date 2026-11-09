@@ -141,10 +141,15 @@ after committing locally: peer failures do not turn a successful local write int
 Joining peers receive a full-state synchronization.
 
 Configure `org_trust.grants` and `org_trust.node_cert_path` for replication
-authorization. A cluster without trust enforcement requires an explicit
-`--cluster-open`, intended for isolated tests. Replication uses TCP, and connections
-to real peer addresses are not inherently encrypted. Verify the actual route and
-provide transport protection. See [replication trust](docs/architecture/replication-proofs.md).
+authorization. With a node certificate, peers run a mutual org handshake
+("W3") before any data flows — each side proves membership in a trusted org,
+gossip membership admits only certified nodes, and the replication stream is
+encrypted end to end (ChaCha20-Poly1305 with per-session keys), whatever route
+it takes. Nodes of your own org replicate everything; other orgs receive only
+the key prefixes their grants cover. A cluster without trust enforcement
+requires an explicit `--cluster-open`, intended for isolated tests: that mode
+is unauthenticated and unencrypted. See
+[replication trust](docs/architecture/replication-proofs.md).
 
 ## Current boundaries
 

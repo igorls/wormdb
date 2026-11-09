@@ -166,6 +166,9 @@ fn deriveDefaultSeed(namespace: []const u8) u64 {
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const namespace = ctx.arg(0) orelse DEFAULT_NAMESPACE;
 
+    // Installs quantizer params and rewrites every bq:<namespace>* entry.
+    try ctx.requirePrefix(namespace, .write);
+
     const seed: u64 = if (ctx.arg(1)) |s|
         std.fmt.parseInt(u64, s, 0) catch deriveDefaultSeed(namespace)
     else

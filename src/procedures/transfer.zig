@@ -16,6 +16,12 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
 
     if (amount <= 0) return ctx.err("amount must be positive");
 
+    // Both balances are read and rewritten.
+    try ctx.requireRead(from);
+    try ctx.requireWrite(from);
+    try ctx.requireRead(to);
+    try ctx.requireWrite(to);
+
     ctx.lockKeys2(from, to);
 
     const from_bal = ctx.getInt(i64, from) orelse return ctx.err("from account not found");

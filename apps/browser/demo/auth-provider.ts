@@ -13,6 +13,17 @@
  *   cap = [1B op_code][1B match_type][4B pattern_len][pattern]
  *
  * The token `sub` claim = username. This is the source of truth for identity.
+ *
+ * Token policy — least privilege, because this file is the template people copy:
+ *   - `chat` (default): run ONLY chat_send / chat_history, read+write ONLY
+ *     chat:* keys, subscribe to chat:* and presence:*, publish ONLY presence:*.
+ *     Chat messages are published by the server (chat_send), so no client can
+ *     forge a message from someone else. No `exec` wildcard: EXEC authorizes
+ *     the procedure name, and a wildcard would reach every built-in (scan,
+ *     kv_put, vnsdrop, auth_mint_scoped, ...).
+ *   - `benchmark`: read/write bench:* keys only. Never `all`/wildcard — a
+ *     wildcard token is an admin token (it can SAVE, mint tokens, drop data).
+ *   - TTL 1 h, the server's default `token_max_age_s`; clients re-AUTH.
  */
 
 import { readFileSync } from "fs";
@@ -66,32 +77,41 @@ const MATCH = {
 
 type Capability = { op: number; match: number; pattern: string };
 
+/// Token lifetime: the server rejects anything longer than `auth.token_max_age_s`
+/// (default 3600). Clients re-AUTH with a fresh token when it expires.
+const TOKEN_TTL_S = 3600;
+
 function chatCapabilities(): Capability[] {
     return [
-        // Can execute any procedure (chat_send, chat_history, scan, etc.)
-        { op: OP.EXEC, match: MATCH.WILDCARD, pattern: "" },
-        // Can subscribe to chat + presence channels
+        // Exactly the two procedures the chat UI calls. chat_send checks write
+        // access on the chat:<room>:* key it creates; chat_history checks read
+        // access on the chat:<room>: range.
+        { op: OP.EXEC, match: MATCH.EXACT, pattern: "chat_send" },
+        { op: OP.EXEC, match: MATCH.EXACT, pattern: "chat_history" },
+        { op: OP.GET, match: MATCH.PREFIX, pattern: "chat:" },
+        { op: OP.SET, match: MATCH.PREFIX, pattern: "chat:" },
+        // Live feeds: chat rooms + presence.
         { op: OP.SUBSCRIBE, match: MATCH.PREFIX, pattern: "chat:" },
         { op: OP.SUBSCRIBE, match: MATCH.PREFIX, pattern: "presence:" },
-        // Can publish to chat + presence channels
-        { op: OP.PUBLISH, match: MATCH.PREFIX, pattern: "chat:" },
+        // Presence heartbeats are client-published (ephemeral, not stored).
+        // Chat messages are NOT: the server publishes them from chat_send, so
+        // a client cannot forge a message under another user's name.
         { op: OP.PUBLISH, match: MATCH.PREFIX, pattern: "presence:" },
-        // Can read any chat key
-        { op: OP.GET, match: MATCH.PREFIX, pattern: "chat:" },
     ];
 }
 
 function benchmarkCapabilities(): Capability[] {
     return [
-        // Full access for benchmark workloads
-        { op: OP.ALL, match: MATCH.WILDCARD, pattern: "" },
+        // The benchmark page only SETs/GETs bench:* keys. Nothing else.
+        { op: OP.GET, match: MATCH.PREFIX, pattern: "bench:" },
+        { op: OP.SET, match: MATCH.PREFIX, pattern: "bench:" },
     ];
 }
 
 async function encodeSCT(
     subject: string,
     caps: Capability[],
-    ttlSeconds: number = 86400, // 24 hours
+    ttlSeconds: number = TOKEN_TTL_S,
 ): Promise<Uint8Array> {
     const now = Math.floor(Date.now() / 1000);
     const exp = now + ttlSeconds;
@@ -199,10 +219,10 @@ const server = Bun.serve({
                 // Return as hex string (browser can convert to Uint8Array easily)
                 const hex = Buffer.from(token).toString("hex");
 
-                console.log(`[auth] Minted token for "${username}" (${caps.length} caps, expires 24h)`);
+                console.log(`[auth] Minted ${scope} token for "${username}" (${caps.length} caps, expires in ${TOKEN_TTL_S}s)`);
 
                 return Response.json(
-                    { token: hex, subject: username, expiresIn: 86400 },
+                    { token: hex, subject: username, expiresIn: TOKEN_TTL_S },
                     { headers: corsHeaders },
                 );
             } catch (err) {

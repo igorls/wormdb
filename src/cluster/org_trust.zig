@@ -14,6 +14,7 @@ const meshguard = @import("meshguard");
 const core = @import("../core/mod.zig");
 const trust_log = @import("../proof/trust_log.zig");
 const Store = @import("../storage/store.zig").Store;
+const secure_channel = @import("secure_channel.zig");
 
 pub const Org = meshguard.identity.Org;
 const Ed25519 = std.crypto.sign.Ed25519;
@@ -31,6 +32,9 @@ pub const CERT_WIRE_LEN = Org.NodeCertificate.WIRE_SIZE; // 186
 pub const SIG_LEN = 64;
 /// The peer's full handshake reply: [186B cert][64B signature].
 pub const HANDSHAKE_REPLY_LEN = CERT_WIRE_LEN + SIG_LEN; // 250
+/// Server hello of the mutual "W3" handshake: [32B server challenge][186B server
+/// cert][64B sig over client_challenge ++ server cert].
+pub const SERVER_HELLO_LEN = CHALLENGE_LEN + CERT_WIRE_LEN + SIG_LEN; // 282
 
 /// One org → namespace grant: nodes certified by `org_pubkey` may replicate
 /// keys starting with any of `prefixes`.
@@ -41,10 +45,17 @@ pub const Grant = struct {
     prefixes: []const []const u8 = &.{},
 };
 
-/// The identity proven by a successful W2 handshake.
+/// The identity proven by a successful W2/W3 handshake.
 pub const PeerOrg = struct {
     org_pubkey: [32]u8,
     node_pubkey: [32]u8,
+};
+
+/// A fully authenticated replication peer (W3) plus the session keys agreed
+/// with it. Null on a legacy link.
+pub const PeerSession = struct {
+    org: PeerOrg,
+    keys: secure_channel.SessionKeys,
 };
 
 pub const HandshakeError = error{
@@ -84,6 +95,22 @@ pub const OrgTrust = struct {
             if (std.mem.eql(u8, &g.org_pubkey, &org_pubkey)) return true;
         }
         return false;
+    }
+
+    /// True when `org_pubkey` is the org that certified THIS node. Members of
+    /// our own org are full peers: they pass the handshake in both directions
+    /// and replicate every key, with no grant entry needed.
+    pub fn sameOrg(self: *const OrgTrust, org_pubkey: [32]u8) bool {
+        const cert = self.node_cert orelse return false;
+        return std.mem.eql(u8, &cert.org_pubkey, &org_pubkey);
+    }
+
+    /// Orgs whose certified nodes may complete a replication handshake with
+    /// us, inbound or outbound: our own org, or any org with a configured
+    /// grant. List a delegated org with `"prefixes": []` to admit it while its
+    /// key scope comes from the trust log.
+    pub fn peerOrgTrusted(self: *const OrgTrust, org_pubkey: [32]u8) bool {
+        return self.sameOrg(org_pubkey) or self.orgTrusted(org_pubkey);
     }
 
     /// Deny-by-default: a key is authorized only if the org has a grant and
@@ -196,6 +223,31 @@ pub const DynamicTrust = struct {
             std.log.warn("org trust: dynamic fold failed (deny): {s}", .{@errorName(err)});
             return false;
         };
+        return self.matchLocked(to_org, key, cap_bits, now);
+    }
+
+    /// Warm the fold cache. Call outside any store shard lock (a re-fold scans
+    /// the log) before work that may only consult the cache, such as a
+    /// full-state sync whose store iteration holds shard locks.
+    pub fn refresh(self: *DynamicTrust) void {
+        const now: u64 = @intCast(core.compat.nowMs());
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.refreshLocked(now) catch |err| {
+            std.log.warn("org trust: dynamic fold refresh failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Like `authorized`, but never re-folds: consults the cache as-is and
+    /// denies when there is none. Safe to call while holding store shard locks.
+    pub fn authorizedCached(self: *DynamicTrust, to_org: [32]u8, key: []const u8, cap_bits: u8) bool {
+        const now: u64 = @intCast(core.compat.nowMs());
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.matchLocked(to_org, key, cap_bits, now);
+    }
+
+    fn matchLocked(self: *DynamicTrust, to_org: [32]u8, key: []const u8, cap_bits: u8, now: u64) bool {
         const cache = self.cache orelse return false;
         for (cache.caps) |cap| {
             if (!std.mem.eql(u8, cap.to_org[0..], to_org[0..])) continue;
@@ -271,7 +323,7 @@ pub fn verifyPeerHandshake(
     const cert = Org.NodeCertificate.deserialize(cert_wire);
     if (!Org.verifyCertificate(&cert)) return error.BadCertSignature;
     if (!cert.isValid()) return error.CertExpired;
-    if (!trust.orgTrusted(cert.org_pubkey)) return error.OrgNotTrusted;
+    if (!trust.peerOrgTrusted(cert.org_pubkey)) return error.OrgNotTrusted;
 
     const msg = handshakeMessage(challenge, cert_wire);
     const node_pk = Ed25519.PublicKey.fromBytes(cert.node_pubkey) catch
@@ -468,4 +520,56 @@ test "OrgTrust.fromConfig: base64 grants, enforce inference, bad pubkey" {
     const short_b64 = std.base64.standard.Encoder.encode(&short_buf, org_pk[0..16]);
     const short = [_]core.config.OrgGrantConfig{.{ .org_pubkey = short_b64, .prefixes = prefixes[0..] }};
     try testing.expectError(error.InvalidOrgPubkey, OrgTrust.fromConfig(alloc, .{ .grants = short[0..] }));
+}
+
+test "W3 mutual handshake: both sides verify each other and agree on session keys" {
+    const org_kp = Org.generateOrgKeyPair();
+    const client_kp = Ed25519.KeyPair.generate(testIo());
+    const server_kp = Ed25519.KeyPair.generate(testIo());
+
+    const client_cert = try Org.issueCertificate(org_kp, client_kp.public_key.toBytes(), "client", 0);
+    const server_cert = try Org.issueCertificate(org_kp, server_kp.public_key.toBytes(), "server", 0);
+    var client_cert_wire: [CERT_WIRE_LEN]u8 = undefined;
+    var server_cert_wire: [CERT_WIRE_LEN]u8 = undefined;
+    client_cert.serialize(&client_cert_wire);
+    server_cert.serialize(&server_cert_wire);
+
+    // Neither side lists the org in grants: same-org membership alone admits a peer.
+    const client_trust = OrgTrust{ .enforce = true, .node_cert = client_cert, .node_cert_wire = client_cert_wire };
+    const server_trust = OrgTrust{ .enforce = true, .node_cert = server_cert, .node_cert_wire = server_cert_wire };
+    try testing.expect(client_trust.sameOrg(org_kp.public_key.toBytes()));
+    try testing.expect(client_trust.peerOrgTrusted(org_kp.public_key.toBytes()));
+    try testing.expect(!client_trust.orgTrusted(org_kp.public_key.toBytes()));
+
+    // Client → server: challenge. Server → client: challenge + proof.
+    const client_challenge: [CHALLENGE_LEN]u8 = @splat(0xC1);
+    const server_challenge: [CHALLENGE_LEN]u8 = @splat(0x5E);
+    const server_msg = handshakeMessage(&client_challenge, &server_cert_wire);
+    const server_sig = (try server_kp.sign(&server_msg, null)).toBytes();
+    const server_identity = try verifyPeerHandshake(&client_trust, &client_challenge, &server_cert_wire, &server_sig);
+    try testing.expectEqualSlices(u8, &server_kp.public_key.toBytes(), &server_identity.node_pubkey);
+
+    // Client → server: proof over the server's challenge.
+    const client_msg = handshakeMessage(&server_challenge, &client_cert_wire);
+    const client_sig = (try client_kp.sign(&client_msg, null)).toBytes();
+    const client_identity = try verifyPeerHandshake(&server_trust, &server_challenge, &client_cert_wire, &client_sig);
+    try testing.expectEqualSlices(u8, &client_kp.public_key.toBytes(), &client_identity.node_pubkey);
+
+    // A proof over the wrong challenge (replay of an old hello) is rejected.
+    const stale: [CHALLENGE_LEN]u8 = @splat(0x00);
+    try testing.expectError(error.BadChallengeSignature, verifyPeerHandshake(&client_trust, &stale, &server_cert_wire, &server_sig));
+
+    // A server from an unrelated org cannot pass the client's check.
+    const other_org = Org.generateOrgKeyPair();
+    const rogue = try Org.issueCertificate(other_org, server_kp.public_key.toBytes(), "rogue", 0);
+    var rogue_wire: [CERT_WIRE_LEN]u8 = undefined;
+    rogue.serialize(&rogue_wire);
+    const rogue_sig = (try server_kp.sign(&handshakeMessage(&client_challenge, &rogue_wire), null)).toBytes();
+    try testing.expectError(error.OrgNotTrusted, verifyPeerHandshake(&client_trust, &client_challenge, &rogue_wire, &rogue_sig));
+
+    // Both ends derive matching per-direction keys from the transcript.
+    const client_keys = try secure_channel.deriveSessionKeys(.client, client_kp.secret_key, server_identity.node_pubkey, &client_challenge, &server_challenge);
+    const server_keys = try secure_channel.deriveSessionKeys(.server, server_kp.secret_key, client_identity.node_pubkey, &client_challenge, &server_challenge);
+    try testing.expectEqualSlices(u8, &client_keys.send, &server_keys.recv);
+    try testing.expectEqualSlices(u8, &client_keys.recv, &server_keys.send);
 }

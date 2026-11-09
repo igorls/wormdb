@@ -82,10 +82,14 @@ Return:
 Authorization to mint:
 
 - The caller must already be authenticated.
-- The caller must either have wildcard admin capability or be permitted to
-  execute `auth_mint_scoped` and mint the target namespace.
-- Namespace mint permission is represented as `Operation.exec` with prefix
-  pattern `auth:mint:<namespace>` or wildcard admin capability.
+- The caller must either have wildcard admin capability (`Operation.all` +
+  wildcard) or be permitted to execute `auth_mint_scoped` and mint the target
+  namespace.
+- Namespace mint permission is represented as `Operation.exec` with an exact
+  or prefix pattern covering `auth:mint:<namespace>` (for example the prefix
+  `auth:mint:` for every namespace). An `exec` *wildcard* does not count: being
+  allowed to run every procedure must not turn into the right to mint
+  data-access tokens for namespaces the caller cannot read itself.
 
 ## Namespace Capability Expansion
 

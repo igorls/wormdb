@@ -464,6 +464,76 @@ pub const Ctx = struct {
         };
     }
 
+    /// Whether the caller may perform `op` on every key under `prefix`. See
+    /// `TokenState.permitsPrefix` — exact capabilities never cover a range.
+    pub fn permitsPrefix(self: *const Ctx, op: auth.Operation, prefix: []const u8) bool {
+        return switch (self.auth_context) {
+            .trusted, .disabled => true,
+            .enforce => |maybe_state| blk: {
+                const state = maybe_state orelse break :blk false;
+                break :blk state.permitsPrefix(op, prefix);
+            },
+        };
+    }
+
+    /// Like `permits`, but a wildcard capability does not count (see
+    /// `TokenState.permitsExplicit`). `.trusted`/`.disabled` still pass.
+    pub fn permitsExplicit(self: *const Ctx, op: auth.Operation, target: []const u8) bool {
+        return switch (self.auth_context) {
+            .trusted, .disabled => true,
+            .enforce => |maybe_state| blk: {
+                const state = maybe_state orelse break :blk false;
+                break :blk state.permitsExplicit(op, target);
+            },
+        };
+    }
+
+    fn operationFor(access: NamespaceAccess) auth.Operation {
+        return switch (access) {
+            .read => .get,
+            .write => .set,
+            .delete => .delete,
+        };
+    }
+
+    // ╔═══════════════════════════════════════════════╗
+    // ║  Key-scope authorization                       ║
+    // ╚═══════════════════════════════════════════════╝
+    //
+    // `EXEC` is gated on the procedure NAME only. A procedure that reads or
+    // writes keys named by its arguments must check those keys itself, or a
+    // token holding `exec <proc>` reaches the whole keyspace. Rule of thumb:
+    // require the capabilities a client would need to do the same work with
+    // raw GET/SET/DEL — `requireKey` for a single key, `requirePrefix` for a
+    // range (scan, count, drop, rebuild). Derived bookkeeping keys the
+    // procedure writes on its own behalf (counters, `meta:` records, BQ
+    // companions) are not re-checked. The executor maps
+    // `error.PermissionDenied` to the same "permission denied" response the
+    // wire-level gate produces, so `try ctx.requireRead(key)` is enough.
+
+    /// Require `access` on one key. `.trusted`/`.disabled` callers always pass.
+    pub fn requireKey(self: *const Ctx, key: []const u8, access: NamespaceAccess) error{PermissionDenied}!void {
+        if (!self.permits(operationFor(access), key)) return error.PermissionDenied;
+    }
+
+    pub fn requireRead(self: *const Ctx, key: []const u8) error{PermissionDenied}!void {
+        return self.requireKey(key, .read);
+    }
+
+    pub fn requireWrite(self: *const Ctx, key: []const u8) error{PermissionDenied}!void {
+        return self.requireKey(key, .write);
+    }
+
+    pub fn requireDelete(self: *const Ctx, key: []const u8) error{PermissionDenied}!void {
+        return self.requireKey(key, .delete);
+    }
+
+    /// Require `access` on every key under `prefix` (scans, counts, drops,
+    /// rebuilds). Only a prefix/wildcard capability covering `prefix` passes.
+    pub fn requirePrefix(self: *const Ctx, prefix: []const u8, access: NamespaceAccess) error{PermissionDenied}!void {
+        if (!self.permitsPrefix(operationFor(access), prefix)) return error.PermissionDenied;
+    }
+
     pub fn requireNamespace(self: *Ctx, ns: []const u8, access: NamespaceAccess) !void {
         const mem_prefix = try std.fmt.allocPrint(self.allocator, "mem:{s}:", .{ns});
         defer self.allocator.free(mem_prefix);
@@ -474,16 +544,14 @@ pub const Ctx = struct {
         const config_prefix = try std.fmt.allocPrint(self.allocator, "__meta:mem:{s}:", .{ns});
         defer self.allocator.free(config_prefix);
 
-        const op: auth.Operation = switch (access) {
-            .read => .get,
-            .write => .set,
-            .delete => .delete,
-        };
-
-        if (!self.permits(op, mem_prefix)) return error.PermissionDenied;
-        if (!self.permits(op, vec_prefix)) return error.PermissionDenied;
-        if (!self.permits(op, bq_prefix)) return error.PermissionDenied;
-        if (!self.permits(op, config_prefix)) return error.PermissionDenied;
+        // Namespace access is a RANGE grant — every key under the four
+        // prefixes — so an exact capability that merely equals a prefix
+        // string must not pass (see `permitsPrefix`).
+        const op = operationFor(access);
+        if (!self.permitsPrefix(op, mem_prefix)) return error.PermissionDenied;
+        if (!self.permitsPrefix(op, vec_prefix)) return error.PermissionDenied;
+        if (!self.permitsPrefix(op, bq_prefix)) return error.PermissionDenied;
+        if (!self.permitsPrefix(op, config_prefix)) return error.PermissionDenied;
     }
 
     pub fn authMintConfig(self: *const Ctx) ?AuthMintConfig {
@@ -631,4 +699,36 @@ test "Ctx.publish releases shard locks during fanout" {
     // Locks re-acquired after fanout.
     try testing.expect(ctx.lock_count >= 1);
     try testing.expect(probe.saw_unlocked_shard);
+}
+
+test "Ctx.requireKey/requirePrefix honor the enforce context; trusted bypasses" {
+    const testing = std.testing;
+    var store: Store = undefined; // never touched by the checks
+    const caps = [_]auth.Capability{
+        .{ .op = .get, .match_type = .prefix, .pattern = "user:alice:" },
+        .{ .op = .set, .match_type = .exact, .pattern = "user:alice:profile" },
+    };
+    const state = auth.TokenState{ .subject = "alice", .iat = 0, .exp = 0, .jti = 0, .capabilities = &caps };
+
+    var scoped = Ctx.initWithAuth(&store, &.{}, testing.allocator, .{ .enforce = &state }, null, null, null, null);
+    defer scoped.deinit();
+    try scoped.requireRead("user:alice:profile");
+    try scoped.requireWrite("user:alice:profile");
+    try testing.expectError(error.PermissionDenied, scoped.requireRead("user:bob:profile"));
+    try testing.expectError(error.PermissionDenied, scoped.requireWrite("user:alice:other"));
+    try testing.expectError(error.PermissionDenied, scoped.requireDelete("user:alice:profile"));
+    try scoped.requirePrefix("user:alice:", .read);
+    try scoped.requirePrefix("user:alice:posts:", .read);
+    try testing.expectError(error.PermissionDenied, scoped.requirePrefix("user:", .read));
+    // The exact set cap does not authorize a range write even on its own key as prefix.
+    try testing.expectError(error.PermissionDenied, scoped.requirePrefix("user:alice:profile", .write));
+
+    var anon = Ctx.initWithAuth(&store, &.{}, testing.allocator, .{ .enforce = null }, null, null, null, null);
+    defer anon.deinit();
+    try testing.expectError(error.PermissionDenied, anon.requireRead("anything"));
+
+    var trusted = Ctx.init(&store, &.{}, testing.allocator, null, null, null, null);
+    defer trusted.deinit();
+    try trusted.requireDelete("anything");
+    try trusted.requirePrefix("", .delete);
 }

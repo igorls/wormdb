@@ -20,8 +20,11 @@ const Metric = @import("../vector/metric.zig").Metric;
 const AuthMintConfig = @import("../procedures/context.zig").AuthMintConfig;
 const auth = @import("auth.zig");
 const org_trust_mod = @import("../cluster/org_trust.zig");
+const secure_channel = @import("../cluster/secure_channel.zig");
 const ServerMetrics = @import("metrics.zig").ServerMetrics;
 const ConnectionLimit = @import("connection_limit.zig").ConnectionLimit;
+const IpLimiter = @import("connection_limit.zig").IpLimiter;
+const CommandRateLimiter = @import("connection_limit.zig").CommandRateLimiter;
 
 /// Fallback trust when no org_trust is configured: enforce=false, zero grants.
 /// A W2 handshake verified against it always fails OrgNotTrusted (deny-by-default).
@@ -37,6 +40,13 @@ pub const ServerConfig = struct {
     vector_registry: ?*@import("../vector/index.zig").NamespaceRegistry = null,
     /// Number of worker threads. 0 = auto (cpu_count * 2, capped at 64).
     worker_count: usize = 0,
+    /// Max concurrent connections per peer IP. 0 = unlimited (NAT'd fleets and
+    /// localhost benches share one address — see `gateway.max_connections_per_ip`).
+    max_connections_per_ip: u32 = 0,
+    /// Skip the per-IP cap for loopback peers.
+    per_ip_exempt_loopback: bool = true,
+    /// Per-connection command rate limit (frames per second); 0 = unlimited.
+    max_commands_per_sec: u32 = 0,
     /// Whether this binary listener enforces auth. Set by the composition root to
     /// `cfg.auth.require_auth && cfg.server.auth_enabled`. Binary connections authenticate with
     /// an AUTH frame (verified against `auth_public_keys`); enforce ⇒ protected commands fail
@@ -74,19 +84,27 @@ pub const Server = struct {
     conn_queue: ConnQueue,
     workers: []std.Thread,
     connection_limit: ConnectionLimit = .{},
+    ip_limiter: IpLimiter,
 
     const CONN_QUEUE_CAP = 1024;
 
+    /// An accepted connection waiting for a worker, with the per-IP slot it
+    /// holds (null when the cap is off or the peer address was unresolvable).
+    const QueuedConn = struct {
+        conn: core.compat.net.ServerCompat.Connection,
+        ip_key: ?IpLimiter.Key = null,
+    };
+
     /// Bounded queue for accepted connections awaiting worker pickup.
     const ConnQueue = struct {
-        items: [CONN_QUEUE_CAP]core.compat.net.ServerCompat.Connection = undefined,
+        items: [CONN_QUEUE_CAP]QueuedConn = undefined,
         head: usize = 0,
         tail: usize = 0,
         count: usize = 0,
         mutex: core.compat.Mutex = .{},
         futex: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
-        fn push(self: *ConnQueue, conn: core.compat.net.ServerCompat.Connection) bool {
+        fn push(self: *ConnQueue, conn: QueuedConn) bool {
             self.mutex.lock();
             defer self.mutex.unlock();
             if (self.count >= CONN_QUEUE_CAP) return false;
@@ -99,7 +117,7 @@ pub const Server = struct {
             return true;
         }
 
-        fn pop(self: *ConnQueue) ?core.compat.net.ServerCompat.Connection {
+        fn pop(self: *ConnQueue) ?QueuedConn {
             self.mutex.lock();
             defer self.mutex.unlock();
             if (self.count == 0) return null;
@@ -117,6 +135,20 @@ pub const Server = struct {
     };
 
     const TEXT_READ_BUF_SIZE = 16384;
+    /// Send deadline for ONE event frame on the publish path. A subscriber whose
+    /// socket cannot take a frame within this window is evicted (see
+    /// `ConnectionContext.evictStalled`), so a publisher stalls at most once,
+    /// briefly, per stalled subscriber — not for every publish until its token
+    /// expires. Command responses keep the connection's 2 s write timeout.
+    const EVENT_SEND_TIMEOUT_MS: usize = 500;
+    /// Largest frame payload accepted before AUTH succeeds on an enforcing
+    /// listener: an SCT is well under 1 KiB, so an anonymous peer never gets
+    /// to reserve megabytes per connection by announcing a large frame (B3).
+    const PRE_AUTH_MAX_PAYLOAD: usize = 16 * 1024;
+    /// Per-connection arena memory kept across commands; anything beyond is
+    /// returned after a large frame instead of staying mapped for the
+    /// connection's lifetime.
+    const ARENA_RETAIN_LIMIT: usize = 256 * 1024;
 
     const ConnectionContext = struct {
         allocator: std.mem.Allocator,
@@ -130,6 +162,8 @@ pub const Server = struct {
         /// `allocator` (NOT the per-command arena — it must outlive commands).
         auth_state: ?auth.TokenState,
         auth_enforce: bool = false,
+        /// Per-connection command budget; null = unlimited. Connection thread only.
+        rate_limiter: ?CommandRateLimiter = null,
         closed: std.atomic.Value(bool) = .init(false),
         in_flight: std.atomic.Value(u32) = .init(0),
 
@@ -263,7 +297,11 @@ pub const Server = struct {
 
             if (self.binary_mode) {
                 if (self.stream) |stream| {
-                    wire.writeResponse(stream, .{ .event = .{ .channel = channel, .message = message } }) catch {};
+                    const saved = stream.write_timeout_ms;
+                    stream.write_timeout_ms = EVENT_SEND_TIMEOUT_MS;
+                    defer stream.write_timeout_ms = saved;
+                    wire.writeResponse(stream, .{ .event = .{ .channel = channel, .message = message } }) catch |err|
+                        self.evictStalled(stream, err);
                 }
                 return;
             }
@@ -271,7 +309,25 @@ pub const Server = struct {
             const data = std.fmt.allocPrint(self.allocator, ">EVENT {s}\r\n{s}\r\n", .{ channel, message }) catch return;
             defer self.allocator.free(data);
             if (self.write_capture) |capture| capture.appendSlice(self.allocator, data) catch {};
-            if (self.stream) |stream| stream.writeAll(data) catch {};
+            if (self.stream) |stream| {
+                const saved = stream.write_timeout_ms;
+                stream.write_timeout_ms = EVENT_SEND_TIMEOUT_MS;
+                defer stream.write_timeout_ms = saved;
+                stream.writeAll(data) catch |err| self.evictStalled(stream, err);
+            }
+        }
+
+        /// A subscriber that cannot take an event frame within `EVENT_SEND_TIMEOUT_MS`
+        /// (or whose socket errored) is a stalled consumer. Evict it: mark the
+        /// connection closed so every later publish skips it immediately, and shut the
+        /// socket down so the connection thread — possibly parked in an idle read with
+        /// no deadline — wakes up and runs the normal teardown (unsubscribe, free).
+        /// Called with `write_mutex` held.
+        fn evictStalled(self: *ConnectionContext, stream: *core.compat.net.Stream, err: anyerror) void {
+            self.closed.store(true, .release);
+            stream.shutdown();
+            self.event_bus.recordEviction();
+            std.log.warn("evicted stalled subscriber ({s})", .{@errorName(err)});
         }
     };
 
@@ -291,7 +347,13 @@ pub const Server = struct {
             .running = std.atomic.Value(bool).init(false),
             .conn_queue = .{},
             .workers = &.{},
+            .ip_limiter = IpLimiter.init(allocator),
         };
+    }
+
+    /// Release per-IP accounting memory. Call after `run` has returned.
+    pub fn deinit(self: *Server) void {
+        self.ip_limiter.deinit();
     }
 
     pub fn run(self: *Server) !void {
@@ -326,13 +388,34 @@ pub const Server = struct {
                 conn.stream.close();
                 continue;
             }
+            // Per-IP admission (C3): enforced only when a cap is configured AND the
+            // peer address resolves; an unattributable peer is admitted uncounted.
+            var ip_key: ?IpLimiter.Key = null;
+            if (self.config.max_connections_per_ip > 0) {
+                if (core.compat.getPeerAddress(conn.stream.getHandle())) |peer| {
+                    const key = IpLimiter.keyFromAddress(peer.inner);
+                    if (!(self.config.per_ip_exempt_loopback and IpLimiter.isLoopback(key))) {
+                        if (self.ip_limiter.acquire(key, self.config.max_connections_per_ip)) {
+                            ip_key = key;
+                        } else {
+                            std.log.warn("rejecting connection from {f}: per-IP cap reached ({d} active)", .{
+                                peer.inner, self.config.max_connections_per_ip,
+                            });
+                            conn.stream.close();
+                            self.connection_limit.release();
+                            continue;
+                        }
+                    }
+                }
+            }
             // Preserve accept time through the queue and all pre-AUTH frames.
             conn.stream.read_limit_ns = core.compat.nowNs() + @as(i128, self.config.timeout_ms) * 1_000_000;
-            if (!self.conn_queue.push(conn)) {
+            if (!self.conn_queue.push(.{ .conn = conn, .ip_key = ip_key })) {
                 // Queue full — reject connection
                 std.log.warn("Connection queue full, rejecting", .{});
                 if (self.metrics) |metrics| metrics.setTcpConnectionQueueDepth(self.conn_queue.len());
                 conn.stream.close();
+                if (ip_key) |key| self.ip_limiter.release(key);
                 self.connection_limit.release();
                 continue;
             }
@@ -351,18 +434,18 @@ pub const Server = struct {
 
     fn workerLoop(self: *Server) void {
         while (self.running.load(.acquire)) {
-            if (self.conn_queue.pop()) |conn| {
+            if (self.conn_queue.pop()) |queued| {
                 if (self.metrics) |metrics| metrics.setTcpConnectionQueueDepth(self.conn_queue.len());
-                self.handleConnection(conn);
+                self.handleConnection(queued.conn, queued.ip_key);
             } else {
                 // Wait for new connections
                 core.compat.Futex.timedWait(&self.conn_queue.futex, self.conn_queue.futex.load(.acquire), 10_000_000);
             }
         }
         // Drain remaining connections on shutdown
-        while (self.conn_queue.pop()) |conn| {
+        while (self.conn_queue.pop()) |queued| {
             if (self.metrics) |metrics| metrics.setTcpConnectionQueueDepth(self.conn_queue.len());
-            self.handleConnection(conn);
+            self.handleConnection(queued.conn, queued.ip_key);
         }
     }
 
@@ -370,8 +453,9 @@ pub const Server = struct {
         self.running.store(false, .release);
     }
 
-    fn handleConnection(self: *Server, conn: core.compat.net.ServerCompat.Connection) void {
+    fn handleConnection(self: *Server, conn: core.compat.net.ServerCompat.Connection, ip_key: ?IpLimiter.Key) void {
         defer self.connection_limit.release();
+        defer if (ip_key) |key| self.ip_limiter.release(key);
         var stream = conn.stream;
         stream.beginRead(self.config.timeout_ms, false);
         if (self.metrics) |metrics| metrics.beginTcpConnection();
@@ -385,6 +469,7 @@ pub const Server = struct {
         stream.write_timeout_ms = 2_000;
         var conn_ctx = ConnectionContext.init(self.allocator, self.event_bus, &stream);
         conn_ctx.auth_enforce = self.config.auth_enforce;
+        conn_ctx.rate_limiter = CommandRateLimiter.init(self.config.max_commands_per_sec, core.compat.nowNs());
         defer stream.close();
         defer conn_ctx.deinit();
 
@@ -419,7 +504,8 @@ pub const Server = struct {
             }
             conn_ctx.binary_mode = true;
             stream.read_limit_ns = null;
-            self.handleReplicationConnection(&stream, null);
+            var transport = secure_channel.Transport{ .stream = &stream };
+            self.handleReplicationConnection(&transport, null);
             return;
         }
 
@@ -431,7 +517,26 @@ pub const Server = struct {
             conn_ctx.binary_mode = true;
             const peer_org = self.replicationOrgHandshake(&stream) orelse return;
             stream.read_limit_ns = null;
-            self.handleReplicationConnection(&stream, peer_org);
+            // Accepted for rolling upgrades: the peer proved its org, but this
+            // link is one-way authenticated and unencrypted. Upgrade it to W3.
+            std.log.warn("replication: peer uses legacy W2 handshake (unencrypted, server not authenticated) — upgrade the peer", .{});
+            var transport = secure_channel.Transport{ .stream = &stream };
+            self.handleReplicationConnection(&transport, peer_org);
+            return;
+        }
+
+        // Mutual org-authenticated, encrypted replication ("W3"): both ends
+        // prove membership in a trusted org before any frame flows, and every
+        // frame after the handshake travels in an encrypted record.
+        if (std.mem.eql(u8, &handshake, &wire.REPL_MAGIC_V3)) {
+            conn_ctx.binary_mode = true;
+            var session = self.replicationMutualHandshake(&stream) orelse return;
+            stream.read_limit_ns = null;
+            var secure = secure_channel.SecureStream.init(self.allocator, session.keys);
+            defer secure.deinit();
+            session.keys.wipe();
+            var transport = secure_channel.Transport{ .stream = &stream, .secure = &secure };
+            self.handleReplicationConnection(&transport, session.org.org_pubkey);
             return;
         }
 
@@ -514,7 +619,7 @@ pub const Server = struct {
 
         while (true) {
             // Reset arena for this command cycle (key/value/args)
-            _ = cmd_arena.reset(.retain_capacity);
+            _ = cmd_arena.reset(.{ .retain_with_limit = ARENA_RETAIN_LIMIT });
             const arena_alloc = cmd_arena.allocator();
 
             self.expireAuthState(conn_ctx);
@@ -522,7 +627,12 @@ pub const Server = struct {
                 conn_ctx.subscriptions.count() > 0 and
                 (!self.config.auth_enforce or conn_ctx.auth_state != null);
             stream.beginRead(self.config.timeout_ms, may_idle);
-            const cmd = wire.readFrameZeroCopy(&reader, arena_alloc) catch |err| {
+            // Until this connection has authenticated, accept only small frames (B3).
+            const max_payload: usize = if (self.config.auth_enforce and conn_ctx.auth_state == null)
+                PRE_AUTH_MAX_PAYLOAD
+            else
+                wire.MAX_PAYLOAD_LENGTH;
+            const cmd = wire.readFrameZeroCopyLimited(&reader, arena_alloc, max_payload) catch |err| {
                 switch (err) {
                     error.EndOfStream, error.Timeout => return,
                     error.PayloadTooLarge => {
@@ -538,6 +648,16 @@ pub const Server = struct {
                 }
             };
             // No need for deinitCommand — arena reset handles cleanup
+
+            // Per-connection command budget (C3): over the limit, the frame is
+            // answered with an error and not executed.
+            if (conn_ctx.rate_limiter) |*limiter| {
+                if (!limiter.allow(core.compat.nowNs())) {
+                    wire.writeResponse(&w, .{ .err = "rate limited" }) catch return;
+                    w.flush() catch return;
+                    continue;
+                }
+            }
 
             if (self.metrics) |metrics| metrics.beginTcpCommand();
             defer if (self.metrics) |metrics| metrics.endTcpCommand();
@@ -593,6 +713,68 @@ pub const Server = struct {
         return peer.org_pubkey;
     }
 
+    /// Server side of the mutual "W3" handshake (client side: `Cluster.replOutboundHandshake`).
+    /// Reads the client's challenge, answers with our challenge + our cert + a signature over
+    /// (client_challenge ++ our cert) so the CLIENT can verify us before it sends anything,
+    /// then verifies the client's [cert][sig over our challenge ++ its cert] exactly like W2.
+    /// Returns the proven peer identity and the session keys. Fails closed when this node
+    /// has no certificate or no cluster identity to sign with.
+    fn replicationMutualHandshake(self: *Server, stream: *core.compat.net.Stream) ?org_trust_mod.PeerSession {
+        const trust = self.config.org_trust orelse &EMPTY_ORG_TRUST;
+
+        var client_challenge: [org_trust_mod.CHALLENGE_LEN]u8 = undefined;
+        readExactFromStream(stream, &client_challenge) catch {
+            std.log.warn("replication: W3 handshake failed: peer closed before sending its challenge", .{});
+            return null;
+        };
+
+        const cert_wire = trust.node_cert_wire orelse {
+            std.log.warn("replication: W3 handshake rejected: this node has no node_cert_path to prove its identity", .{});
+            wire.writeResponse(stream, .{ .err = "unauthorized: server has no org certificate" }) catch {};
+            return null;
+        };
+        const cluster = self.config.cluster orelse {
+            std.log.warn("replication: W3 handshake rejected: no cluster identity to sign with", .{});
+            wire.writeResponse(stream, .{ .err = "unauthorized: no cluster identity" }) catch {};
+            return null;
+        };
+
+        var server_challenge: [org_trust_mod.CHALLENGE_LEN]u8 = undefined;
+        core.compat.randomBytes(&server_challenge);
+        const our_msg = org_trust_mod.handshakeMessage(&client_challenge, &cert_wire);
+        const our_sig = cluster.signWithIdentity(&our_msg) catch {
+            std.log.warn("replication: W3 handshake failed: cannot sign with the cluster identity", .{});
+            return null;
+        };
+        var hello: [org_trust_mod.SERVER_HELLO_LEN]u8 = undefined;
+        @memcpy(hello[0..org_trust_mod.CHALLENGE_LEN], &server_challenge);
+        @memcpy(hello[org_trust_mod.CHALLENGE_LEN..][0..org_trust_mod.CERT_WIRE_LEN], &cert_wire);
+        @memcpy(hello[org_trust_mod.CHALLENGE_LEN + org_trust_mod.CERT_WIRE_LEN ..][0..org_trust_mod.SIG_LEN], &our_sig);
+        stream.writeAll(&hello) catch return null;
+
+        var reply: [org_trust_mod.HANDSHAKE_REPLY_LEN]u8 = undefined;
+        readExactFromStream(stream, &reply) catch {
+            std.log.warn("replication: W3 handshake failed: peer closed before sending cert+signature", .{});
+            return null;
+        };
+        const peer = org_trust_mod.verifyPeerHandshake(
+            trust,
+            &server_challenge,
+            reply[0..org_trust_mod.CERT_WIRE_LEN],
+            reply[org_trust_mod.CERT_WIRE_LEN..][0..org_trust_mod.SIG_LEN],
+        ) catch |err| {
+            std.log.warn("replication: W3 handshake rejected: {s}", .{@errorName(err)});
+            wire.writeResponse(stream, .{ .err = "unauthorized: replication handshake rejected" }) catch {};
+            return null;
+        };
+
+        const keys = secure_channel.deriveSessionKeys(.server, cluster.identity.secret_key, peer.node_pubkey, &client_challenge, &server_challenge) catch {
+            std.log.warn("replication: W3 handshake failed: session key derivation failed", .{});
+            return null;
+        };
+        return .{ .org = peer, .keys = keys };
+    }
+
     /// True when the replicated key is allowed for this connection. Only
     /// meaningful while org trust is enforced; open mode allows everything.
     ///
@@ -609,7 +791,8 @@ pub const Server = struct {
     fn replicationKeyAuthorized(self: *Server, peer_org: ?[32]u8, key: []const u8) bool {
         const trust = self.config.org_trust orelse return true;
         if (!trust.enforce) return true;
-        const org = peer_org orelse return false; // enforcing ⇒ only W2 connections reach the loop
+        const org = peer_org orelse return false; // enforcing ⇒ only W2/W3 connections reach the loop
+        if (trust.sameOrg(org)) return true; // members of our own org are full replicas
         if (trust.keyAuthorized(org, key)) return true;
         const dynamic = trust.dynamic orelse return false;
         return dynamic.authorized(org, key, org_trust_mod.CAP_WRITE);
@@ -628,24 +811,14 @@ pub const Server = struct {
     /// the 2 s send timeout). Only one-shot request/response replication RPCs
     /// (`EXEC proof_prefix_root`, `EXEC vsearch_local_raw`) write a response frame
     /// because their callers explicitly drain it with `wire.readResponseAlloc`.
-    fn handleReplicationConnection(self: *Server, stream: *core.compat.net.Stream, peer_org: ?[32]u8) void {
-        const ReadAdapter = struct {
-            stream: *core.compat.net.Stream,
-
-            pub fn read(adapter: *@This(), dest: []u8) !usize {
-                return adapter.stream.read(dest);
-            }
-        };
-
-        var reader = ReadAdapter{ .stream = stream };
-
+    fn handleReplicationConnection(self: *Server, transport: *secure_channel.Transport, peer_org: ?[32]u8) void {
         while (true) {
             // Both accepted handshakes (legacy WR in explicit open mode and
             // authenticated W2) are persistent replication sessions. Idle is
             // valid; once the first frame byte arrives, Stream.read starts the
             // normal whole-frame deadline so trickled frames still expire.
-            stream.beginRead(self.config.timeout_ms, true);
-            const cmd = wire.readFrameAlloc(&reader, self.allocator) catch return;
+            transport.beginRead(self.config.timeout_ms, true);
+            const cmd = wire.readFrameAlloc(transport, self.allocator) catch return;
             defer protocol.deinitCommand(self.allocator, cmd);
 
             switch (cmd) {
@@ -825,7 +998,8 @@ pub const Server = struct {
                 .exec => |params| {
                     const one_way = isOneWayReplicationProcedure(params.procedure);
                     if (!isAllowedReplicationProcedure(params.procedure)) {
-                        wire.writeResponse(stream, .{ .err = "unsupported replication command" }) catch return;
+                        wire.writeResponse(transport, .{ .err = "unsupported replication command" }) catch return;
+                        transport.flush() catch return;
                         continue;
                     }
                     // Proof-layer procedures (witness/prefix-root) take no per-key
@@ -834,7 +1008,8 @@ pub const Server = struct {
                     if (self.config.org_trust) |trust| {
                         if (trust.enforce and peer_org == null) {
                             if (!one_way) {
-                                wire.writeResponse(stream, .{ .err = "unauthorized: org handshake required" }) catch return;
+                                wire.writeResponse(transport, .{ .err = "unauthorized: org handshake required" }) catch return;
+                                transport.flush() catch return;
                             }
                             continue;
                         }
@@ -853,12 +1028,14 @@ pub const Server = struct {
                     }, cmd) catch |e| {
                         std.log.warn("replication: EXEC {s} failed: {s}", .{ params.procedure, @errorName(e) });
                         if (!one_way) {
-                            wire.writeResponse(stream, .{ .err = "replication EXEC failed" }) catch return;
+                            wire.writeResponse(transport, .{ .err = "replication EXEC failed" }) catch return;
+                            transport.flush() catch return;
                         }
                         continue;
                     };
                     if (!one_way) {
-                        wire.writeResponse(stream, response) catch return;
+                        wire.writeResponse(transport, response) catch return;
+                        transport.flush() catch return;
                     }
                 },
                 else => {
@@ -1631,7 +1808,8 @@ test "handleReplicationConnection does not emit unread acks on one-way replicati
         fn run(ctx: @This()) void {
             var conn = ctx.listener.accept() catch return;
             defer conn.stream.close();
-            ctx.server.handleReplicationConnection(&conn.stream, null);
+            var transport = secure_channel.Transport{ .stream = &conn.stream };
+            ctx.server.handleReplicationConnection(&transport, null);
         }
     };
 
@@ -1717,7 +1895,8 @@ test "handleReplicationConnection applies vrabitq_install without emitting unrea
         fn run(ctx: @This()) void {
             var conn = ctx.listener.accept() catch return;
             defer conn.stream.close();
-            ctx.server.handleReplicationConnection(&conn.stream, null);
+            var transport = secure_channel.Transport{ .stream = &conn.stream };
+            ctx.server.handleReplicationConnection(&transport, null);
         }
     };
 
@@ -1775,4 +1954,72 @@ test "handleReplicationConnection applies vrabitq_install without emitting unrea
     try testing.expectApproxEqAbs(@as(f32, 0.25), params.centroid[0], 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 1.0), params.centroid[3], 1e-6);
     try testing.expectEqual(Metric.cosine, idx.metric);
+}
+
+test "stalled subscriber is evicted instead of stalling publishers" {
+    if (comptime core.compat.wasm_target) return error.SkipZigTest;
+    const testing = std.testing;
+    const net = core.compat.net;
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    const listen_addr = try net.Address.parseIp("127.0.0.1", 0);
+    var listener = try listen_addr.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+    const port = listener.inner.socket.address.getPort();
+
+    // The subscriber's end of the socket: connects and never reads.
+    var client = try net.tcpConnectToAddress(net.Address.initIp4(.{ 127, 0, 0, 1 }, port));
+    defer client.close();
+    var accepted = try listener.accept();
+    defer accepted.stream.close();
+    accepted.stream.write_timeout_ms = 2_000;
+
+    var conn_ctx = Server.ConnectionContext.init(testing.allocator, &bus, &accepted.stream);
+    conn_ctx.binary_mode = true;
+    defer conn_ctx.deinit();
+    try conn_ctx.subscribe("feed", null);
+
+    // Publish large events until the peer's buffers are full and one send hits the
+    // event deadline. Before this change every publish from here on blocked 2 s.
+    const payload = try testing.allocator.alloc(u8, 64 * 1024);
+    defer testing.allocator.free(payload);
+    @memset(payload, 'x');
+    const started = core.compat.nowNs();
+    var published: usize = 0;
+    while (published < 4096 and !conn_ctx.closed.load(.acquire)) : (published += 1) {
+        try bus.publish("feed", payload);
+    }
+    const until_evicted_ms = @divTrunc(core.compat.nowNs() - started, 1_000_000);
+
+    try testing.expect(conn_ctx.closed.load(.acquire));
+    try testing.expectEqual(@as(u64, 1), bus.evictionCount());
+    // One bounded send deadline, not an unbounded stall.
+    try testing.expect(until_evicted_ms < 10_000);
+
+    // Once evicted, publishing to the dead subscriber costs nothing.
+    const t2 = core.compat.nowNs();
+    var i: usize = 0;
+    while (i < 100) : (i += 1) try bus.publish("feed", payload);
+    try testing.expect(@divTrunc(core.compat.nowNs() - t2, 1_000_000) < 1_000);
+    try testing.expectEqual(@as(u64, 1), bus.evictionCount());
+
+    // The peer sees the shutdown (EOF or error) after draining what was buffered,
+    // rather than a hung socket.
+    client.beginRead(5_000, false);
+    var sink: [4096]u8 = undefined;
+    var saw_end = false;
+    var reads: usize = 0;
+    while (reads < 1_000_000) : (reads += 1) {
+        const n = client.read(&sink) catch {
+            saw_end = true;
+            break;
+        };
+        if (n == 0) {
+            saw_end = true;
+            break;
+        }
+    }
+    try testing.expect(saw_end);
 }

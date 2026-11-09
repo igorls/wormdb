@@ -97,6 +97,9 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
 
     // ── agents (optional coordination-log fold) ──
     if (agents_log) |log_id| {
+        // Folding a coordination log reads every event in it.
+        const log_prefix = try append_log.eventKeyPrefix(arena, log_id);
+        try ctx.requirePrefix(log_prefix, .read);
         try json.appendSlice(arena, ",\"agents\":[");
         try appendAgentsJson(&json, arena, ctx.store, log_id);
         try json.appendSlice(arena, "]");

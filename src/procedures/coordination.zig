@@ -340,12 +340,21 @@ fn appendWithRetry(
 // ║  EXEC: append_log_claim                        ║
 // ╚═══════════════════════════════════════════════╝
 
+/// Claims live in the task log; authorize on its event-key prefix (same rule
+/// as the append_log_* procedures).
+fn requireLog(ctx: *Ctx, log_id: []const u8, access: Ctx.NamespaceAccess) !void {
+    const prefix = try append_log.eventKeyPrefix(ctx.allocator, log_id);
+    defer ctx.allocator.free(prefix);
+    try ctx.requirePrefix(prefix, access);
+}
+
 pub fn claimExecute(ctx: *Ctx) anyerror!Ctx.Result {
     const usage = "append_log_claim requires: <log_id> <task_id> <worker_id> [lease_ms=<ms>] [hlc=<hex16>]";
     const log_id = ctx.arg(0) orelse return ctx.err(usage);
     const task_id = ctx.arg(1) orelse return ctx.err(usage);
     const worker = ctx.arg(2) orelse return ctx.err(usage);
     if (log_id.len == 0 or task_id.len == 0 or worker.len == 0) return ctx.err(usage);
+    try requireLog(ctx, log_id, .write);
 
     var lease_ms: u64 = DEFAULT_LEASE_MS;
     var remote_hlc: ?u64 = null;
@@ -452,6 +461,7 @@ pub fn statusExecute(ctx: *Ctx) anyerror!Ctx.Result {
     const log_id = ctx.arg(0) orelse return ctx.err(usage);
     const task_id = ctx.arg(1) orelse return ctx.err(usage);
     if (ctx.argCount() != 2) return ctx.err(usage);
+    try requireLog(ctx, log_id, .read);
 
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena_state.deinit();
@@ -474,6 +484,7 @@ pub fn releaseExecute(ctx: *Ctx) anyerror!Ctx.Result {
     const worker = ctx.arg(2) orelse return ctx.err(usage);
     const outcome = ctx.arg(3) orelse return ctx.err(usage);
     if (log_id.len == 0 or task_id.len == 0 or worker.len == 0) return ctx.err(usage);
+    try requireLog(ctx, log_id, .write);
 
     if (!std.mem.eql(u8, outcome, "applied") and
         !std.mem.eql(u8, outcome, "failed") and
@@ -536,6 +547,7 @@ pub fn supersedeExecute(ctx: *Ctx) anyerror!Ctx.Result {
     const stale_seq = ctx.argInt(u64, 2) orelse return ctx.err(usage);
     if (ctx.argCount() != 3) return ctx.err(usage);
     if (log_id.len == 0 or task_id.len == 0 or stale_seq == 0) return ctx.err(usage);
+    try requireLog(ctx, log_id, .write);
 
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena_state.deinit();

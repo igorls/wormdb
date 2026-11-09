@@ -32,6 +32,7 @@ event_bus_channels=4
 event_bus_subscribers=41
 event_bus_publishes=516
 event_bus_drops=3
+event_bus_evictions=0
 ```
 
 | Field                                         | Type    | Description                                         |
@@ -59,6 +60,7 @@ event_bus_drops=3
 | `event_bus_subscribers`                       | integer | Active pub/sub subscriptions                        |
 | `event_bus_publishes`                         | integer | Publish calls accepted by the EventBus              |
 | `event_bus_drops`                             | integer | Event deliveries dropped because a subscriber write path was busy |
+| `event_bus_evictions`                         | integer | Subscriber connections closed because their socket could not take an event frame within the send deadline (stalled consumer) |
 
 ### Transport Metric Wiring
 
@@ -98,6 +100,7 @@ event_bus_channels=4
 event_bus_subscribers=41
 event_bus_publishes=516
 event_bus_drops=3
+event_bus_evictions=0
 ```
 
 | Field                      | Type    | Description                                                  |

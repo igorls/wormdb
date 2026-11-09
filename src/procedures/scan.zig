@@ -19,6 +19,8 @@ const MAX_LIMIT: usize = 1000;
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const prefix = ctx.arg(0) orelse return ctx.err("scan requires at least 1 arg: <prefix> [limit] [cut]");
+    // Range read: the token must cover every key under the prefix.
+    try ctx.requirePrefix(prefix, .read);
 
     // Parse optional limit
     var limit: usize = DEFAULT_LIMIT;

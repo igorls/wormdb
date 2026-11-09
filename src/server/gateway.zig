@@ -51,69 +51,19 @@ const Sha1 = std.crypto.hash.Sha1;
 const ServerMetrics = @import("metrics.zig").ServerMetrics;
 const ConnectionLimit = @import("connection_limit.zig").ConnectionLimit;
 
-/// Per-IP concurrent-connection accounting for the gateway accept path (#89).
-/// Keys are peer IPs normalized to 16 bytes (IPv4 mapped to ::ffff:a.b.c.d) so a
-/// v4 peer and the same peer seen as v4-mapped-v6 share one bucket. Guarded by
-/// `core.compat.Mutex` (NOT `std.Thread.Mutex`, which is gone in Zig 0.16).
-/// Fails open: an OOM while tracking admits the connection uncounted — the cap
-/// is a brake against address-sharing floods, not a security boundary.
-pub const IpLimiter = struct {
-    allocator: std.mem.Allocator,
-    mutex: core.compat.Mutex = .{},
-    counts: std.AutoHashMapUnmanaged(Key, u32) = .empty,
+/// Per-IP accounting lives with the other admission budgets; the gateway's
+/// name is kept so existing embedders and tests keep compiling.
+pub const IpLimiter = @import("connection_limit.zig").IpLimiter;
+const CommandRateLimiter = @import("connection_limit.zig").CommandRateLimiter;
 
-    pub const Key = [16]u8;
-
-    const v4_mapped_prefix = [12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
-
-    pub fn init(allocator: std.mem.Allocator) IpLimiter {
-        return .{ .allocator = allocator };
-    }
-
-    pub fn deinit(self: *IpLimiter) void {
-        self.counts.deinit(self.allocator);
-    }
-
-    pub fn keyFromAddress(addr: std.Io.net.IpAddress) Key {
-        return std.Io.net.Ip6Address.fromAny(addr).bytes;
-    }
-
-    /// ::1 or ::ffff:127.0.0.0/8.
-    pub fn isLoopback(key: Key) bool {
-        const v6_loopback = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
-        if (std.mem.eql(u8, &key, &v6_loopback)) return true;
-        return std.mem.eql(u8, key[0..12], &v4_mapped_prefix) and key[12] == 127;
-    }
-
-    /// Reserve one connection slot for `key`. Returns false when the peer
-    /// already holds `max` slots (caller rejects the connection).
-    pub fn acquire(self: *IpLimiter, key: Key, max: u32) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const gop = self.counts.getOrPut(self.allocator, key) catch return true; // fail open
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        if (gop.value_ptr.* >= max) return false;
-        gop.value_ptr.* += 1;
-        return true;
-    }
-
-    /// Return a slot taken by `acquire`. Tolerates keys it never counted
-    /// (fail-open admissions) so a stray release cannot underflow.
-    pub fn release(self: *IpLimiter, key: Key) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const entry = self.counts.getPtr(key) orelse return;
-        if (entry.* > 0) entry.* -= 1;
-        if (entry.* == 0) _ = self.counts.remove(key);
-    }
-
-    /// Current active count for `key` (tests/diagnostics).
-    pub fn activeCount(self: *IpLimiter, key: Key) u32 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.counts.get(key) orelse 0;
-    }
-};
+/// Largest WebSocket payload accepted from an authenticated (or auth-exempt) client.
+const WS_MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+/// Largest payload accepted before AUTH succeeds on an enforcing listener: an SCT is
+/// well under 1 KiB, so an anonymous peer never gets to reserve megabytes per connection.
+const PRE_AUTH_MAX_PAYLOAD: usize = 16 * 1024;
+/// Per-connection arena memory kept across commands; anything beyond is returned after a
+/// large frame instead of staying mapped for the connection's lifetime.
+const ARENA_RETAIN_LIMIT: usize = 256 * 1024;
 
 /// WebSocket gateway server.
 pub const Gateway = struct {
@@ -146,6 +96,9 @@ pub const Gateway = struct {
     /// Global budget also covers loopback, unknown IPs and HTTP handshakes.
     max_connections: usize = 256,
     timeout_ms: usize = 30000,
+    /// Per-connection command rate limit (data frames per second); 0 = unlimited.
+    /// Set before start(), e.g. from `cfg.gateway.max_commands_per_sec`.
+    max_commands_per_sec: u32 = 0,
     connection_limit: ConnectionLimit = .{},
 
     pub fn init(
@@ -326,6 +279,7 @@ pub const Gateway = struct {
         const conn_ctx = self.allocator.create(ConnContext) catch return;
         conn_ctx.* = ConnContext.init(self.allocator, self.event_bus, &stream);
         conn_ctx.auth_required = self.auth_required;
+        conn_ctx.rate_limiter = CommandRateLimiter.init(self.max_commands_per_sec, core.compat.nowNs());
         defer conn_ctx.connectionDone();
 
         var cmd_arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -337,7 +291,9 @@ pub const Gateway = struct {
 
             // Read one WebSocket frame
             stream.beginRead(self.timeout_ms, !self.auth_required or conn_ctx.auth_state != null);
-            const ws_frame = readWsFrame(&stream, self.allocator) orelse return;
+            // Until AUTH succeeds on an enforcing listener only small frames are read (B3).
+            const max_payload: usize = if (self.auth_required and conn_ctx.auth_state == null) PRE_AUTH_MAX_PAYLOAD else WS_MAX_PAYLOAD;
+            const ws_frame = readWsFrame(&stream, self.allocator, max_payload) orelse return;
             defer if (ws_frame.allocated) self.allocator.free(ws_frame.payload);
             // The token can expire while waiting for this frame.
             self.expireAuthState(conn_ctx, &stream);
@@ -358,7 +314,13 @@ pub const Gateway = struct {
                 0x01 => {
                     // Text frame — the domain WebSocket dialect (JSON-RPC 2.0). Reuses the
                     // same store/segment; streams notifications back as text frames.
-                    _ = cmd_arena.reset(.retain_capacity);
+                    if (conn_ctx.rate_limiter) |*limiter| {
+                        if (!limiter.allow(core.compat.nowNs())) {
+                            conn_ctx.sendWsFrame(0x01, "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32000,\"message\":\"rate limited\"}}") catch return;
+                            continue;
+                        }
+                    }
+                    _ = cmd_arena.reset(.{ .retain_with_limit = ARENA_RETAIN_LIMIT });
                     self.handleJsonRpc(conn_ctx, cmd_arena.allocator(), ws_frame.payload);
                     continue;
                 },
@@ -369,8 +331,17 @@ pub const Gateway = struct {
                 },
             }
 
+            // Per-connection command budget (C3): over the limit, the frame is
+            // answered with an error and not executed.
+            if (conn_ctx.rate_limiter) |*limiter| {
+                if (!limiter.allow(core.compat.nowNs())) {
+                    conn_ctx.sendWireResponse(.{ .err = "rate limited" }) catch return;
+                    continue;
+                }
+            }
+
             // Step 3: Parse WormWire command from WebSocket binary payload
-            _ = cmd_arena.reset(.retain_capacity);
+            _ = cmd_arena.reset(.{ .retain_with_limit = ARENA_RETAIN_LIMIT });
             const arena_alloc = cmd_arena.allocator();
 
             const payload = ws_frame.payload;
@@ -775,7 +746,7 @@ pub const Gateway = struct {
         allocated: bool, // true if payload was heap-allocated (needs free)
     };
 
-    fn readWsFrame(stream: *core.compat.net.Stream, allocator: std.mem.Allocator) ?WsFrame {
+    fn readWsFrame(stream: *core.compat.net.Stream, allocator: std.mem.Allocator, max_payload: usize) ?WsFrame {
         // Read 2 byte header
         var header: [2]u8 = undefined;
         readExact(stream, &header) orelse return null;
@@ -794,8 +765,8 @@ pub const Gateway = struct {
             payload_len = std.mem.readInt(u64, &ext, .big);
         }
 
-        // Sanity check — reject frames > 16 MiB
-        if (payload_len > 16 * 1024 * 1024) return null;
+        // Reject frames over the caller's cap (16 MiB once authenticated, a few KiB before).
+        if (payload_len > max_payload) return null;
 
         var mask_key: [4]u8 = undefined;
         if (masked) {
@@ -988,6 +959,11 @@ pub const Gateway = struct {
 
     // --- Connection Context (manages subscriptions per WebSocket client) ---
 
+    /// Send deadline for ONE event frame on the publish path; mirrors tcp.zig's
+    /// EVENT_SEND_TIMEOUT_MS. A WebSocket subscriber that cannot take a frame in
+    /// this window is evicted (`ConnContext.evictStalled`).
+    const EVENT_SEND_TIMEOUT_MS: usize = 500;
+
     const ConnContext = struct {
         allocator: std.mem.Allocator,
         event_bus: *EventBus,
@@ -1000,6 +976,8 @@ pub const Gateway = struct {
         auth_required: bool = false,
         /// Set before unsub/teardown; event writers check this under write_mutex.
         closed: std.atomic.Value(bool) = .init(false),
+        /// Per-connection command budget; null = unlimited. Connection thread only.
+        rate_limiter: ?CommandRateLimiter = null,
         /// Ownership refs: 1 for the connection thread + 1 per EventBus retain.
         /// Freed only when the last ref drops (safe mid-deliver teardown — #91).
         refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
@@ -1122,10 +1100,23 @@ pub const Gateway = struct {
                 const state = if (self.auth_state) |*s| s else return;
                 if (state.isExpired() or !state.permits(.subscribe, channel)) return;
             }
+            const saved = self.stream.write_timeout_ms;
+            self.stream.write_timeout_ms = EVENT_SEND_TIMEOUT_MS;
+            defer self.stream.write_timeout_ms = saved;
             Gateway.sendWireResponseFrame(self.stream, self.allocator, .{ .event = .{
                 .channel = channel,
                 .message = message,
-            } }) catch {};
+            } }) catch |err| self.evictStalled(err);
+        }
+
+        /// Stalled-consumer eviction, mirroring the TCP path: mark closed so later
+        /// publishes skip this connection at once, shut the socket so the parked
+        /// connection thread wakes and runs `connectionDone`. `write_mutex` held.
+        fn evictStalled(self: *ConnContext, err: anyerror) void {
+            self.closed.store(true, .release);
+            self.stream.shutdown();
+            self.event_bus.recordEviction();
+            std.log.warn("gateway: evicted stalled subscriber ({s})", .{@errorName(err)});
         }
     };
 };
@@ -1247,7 +1238,7 @@ test "sendWireResponseFrame handles 65,536-byte payload without u16 header overf
     defer client.close();
 
     // Verify frame 1 (encoded WormWire payload == 65,536 bytes)
-    const ws_frame1 = Gateway.readWsFrame(&client, testing.allocator) orelse return error.TestUnexpectedResult;
+    const ws_frame1 = Gateway.readWsFrame(&client, testing.allocator, WS_MAX_PAYLOAD) orelse return error.TestUnexpectedResult;
     defer if (ws_frame1.allocated) testing.allocator.free(ws_frame1.payload);
     try testing.expectEqual(@as(u4, 0x02), ws_frame1.opcode);
     try testing.expectEqual(@as(usize, 65536), ws_frame1.payload.len);
@@ -1255,7 +1246,7 @@ test "sendWireResponseFrame handles 65,536-byte payload without u16 header overf
     try testing.expectEqual(@as(u32, 65531), std.mem.readInt(u32, ws_frame1.payload[1..5], .big));
 
     // Verify frame 2 (value payload == 65,536 bytes, encoded WormWire payload == 65,541 bytes)
-    const ws_frame2 = Gateway.readWsFrame(&client, testing.allocator) orelse return error.TestUnexpectedResult;
+    const ws_frame2 = Gateway.readWsFrame(&client, testing.allocator, WS_MAX_PAYLOAD) orelse return error.TestUnexpectedResult;
     defer if (ws_frame2.allocated) testing.allocator.free(ws_frame2.payload);
     try testing.expectEqual(@as(u4, 0x02), ws_frame2.opcode);
     try testing.expectEqual(@as(usize, 65536 + 5), ws_frame2.payload.len);

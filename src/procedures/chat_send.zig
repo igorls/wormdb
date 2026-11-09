@@ -42,6 +42,11 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     // Copy key before building value (fmt reuses buffer)
     const key_dupe = try ctx.allocator.dupe(u8, key);
 
+    // The message lands under chat:<room>: — the caller needs write access
+    // there. The room event is published by the procedure on its own behalf
+    // (server-authored), so no `publish` capability is required.
+    try ctx.requireWrite(key_dupe);
+
     // Build message JSON value
     var json: std.ArrayListUnmanaged(u8) = .empty;
     try json.appendSlice(ctx.allocator, "{\"user\":\"");

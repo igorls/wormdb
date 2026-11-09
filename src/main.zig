@@ -277,6 +277,9 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
         .port = cfg.server.port,
         .max_connections = cfg.server.max_connections,
         .timeout_ms = cfg.server.timeout_ms,
+        .max_connections_per_ip = cfg.server.max_connections_per_ip,
+        .per_ip_exempt_loopback = cfg.server.per_ip_exempt_loopback,
+        .max_commands_per_sec = cfg.server.max_commands_per_sec,
         .cluster = if (cluster) |*c| c else null,
         .vector_registry = &vector_registry,
         .org_trust = &org_trust,
@@ -309,6 +312,7 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
         gateway.auth_mint = auth_mint;
         gateway.max_connections = cfg.gateway.max_connections;
         gateway.timeout_ms = cfg.gateway.timeout_ms;
+        gateway.max_commands_per_sec = cfg.gateway.max_commands_per_sec;
         gateway.setPerIpLimit(
             cfg.gateway.max_connections_per_ip,
             cfg.gateway.per_ip_exempt_loopback,

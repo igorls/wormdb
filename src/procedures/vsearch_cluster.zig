@@ -89,6 +89,10 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
         break :blk !std.mem.eql(u8, raw, "0");
     };
 
+    // ── Authorize before any local read or peer fan-out ──
+    try ctx.requireRead(query_key);
+    try ctx.requirePrefix(namespace, .read);
+
     // ── Resolve the query vector locally (same path as vsearch) ──
     const query_bytes = (try ctx.getCopy(query_key)) orelse
         return ctx.err("vsearch_cluster: query key not found");

@@ -955,10 +955,10 @@
         } else {
           await db.exec('chat_send', currentRoom, username, text);
         }
-
-        // Build local msg for instant display + PubSub broadcast
-        const msg = { user: username, text, ts: Date.now() };
-        await db.publish(`chat:${currentRoom}`, JSON.stringify(msg));
+        // chat_send stores the message AND publishes it to chat:<room> as a
+        // server-authored event, so it arrives here through the subscription.
+        // Clients hold no publish right on chat channels: nobody can forge a
+        // message under another user's name.
       } catch (err) {
         console.error('Send failed:', err);
       }
@@ -982,6 +982,10 @@
           try {
             const evt = JSON.parse(data);
             const presence = getPresence(room);
+            if (evt.type === 'join') {
+              // The presence 'join' event doubles as the room's join notice.
+              addMessage(room, { type: 'system', text: `${evt.user} joined #${room}`, time: timeStr(), ts: evt.ts || Date.now() });
+            }
             if (evt.type === 'leave') {
               presence.delete(evt.user);
             } else {
@@ -1047,14 +1051,6 @@
           <span class="member-name">${escHtml(name)}${name === username ? ' (you)' : ''}</span>
         </div>
       `).join('');
-    }
-
-    // ── Announce join ────────────────────────────────────────────
-    async function announceJoin(room) {
-      const msg = { type: 'system', text: `${username} joined #${room}`, time: timeStr(), ts: Date.now() };
-      try {
-        await db.publish(`chat:${room}`, JSON.stringify(msg));
-      } catch { /* best effort */ }
     }
 
     // ── Status Polling ──────────────────────────────────────────
@@ -1154,8 +1150,7 @@
       // Switch to general (this loads history)
       await switchRoom('general');
 
-      // Announce join + start presence heartbeat
-      await announceJoin('general');
+      // Start the presence heartbeat; its first 'join' event announces us.
       startHeartbeat();
 
       // Start latency polling
@@ -1206,7 +1201,6 @@
       await subscribePresence(name);
       await switchRoom(name);
       sendPresence('join');
-      await announceJoin(name);
     });
 
     // Send leave on page close

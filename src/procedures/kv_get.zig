@@ -16,6 +16,7 @@ const Ctx = @import("context.zig").Ctx;
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const key = ctx.arg(0) orelse return ctx.err("kv_get requires 1 arg: <key>");
+    try ctx.requireRead(key);
 
     // Build the metadata key. Copy immediately since fmt_buf is shared.
     const meta_key = ctx.fmt("meta:{s}", .{key});

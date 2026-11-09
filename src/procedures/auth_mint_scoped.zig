@@ -36,12 +36,17 @@ fn appendJsonEscaped(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator
     }
 }
 
+/// Mint authority: a wildcard admin token, or `exec auth_mint_scoped` plus an
+/// EXPLICIT `exec auth:mint:<ns>` grant (exact, or a prefix such as
+/// `auth:mint:` for all namespaces). A bare `exec` wildcard — "may run every
+/// procedure" — is deliberately not enough: it would let any such token mint
+/// data-access tokens for namespaces it cannot read itself.
 fn canMint(ctx: *Ctx, ns: []const u8) !bool {
     if (ctx.permits(.all, "")) return true;
     if (!ctx.permits(.exec, "auth_mint_scoped")) return false;
     const target = try std.fmt.allocPrint(ctx.allocator, "auth:mint:{s}", .{ns});
     defer ctx.allocator.free(target);
-    return ctx.permits(.exec, target);
+    return ctx.permitsExplicit(.exec, target);
 }
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
@@ -235,4 +240,52 @@ test "auth_mint_scoped: rejects missing config and missing mint authority" {
     const denied = try execute(&no_scope);
     try testing.expect(denied == .err);
     try testing.expectEqualStrings("permission denied", denied.err);
+}
+
+test "auth_mint_scoped: an exec wildcard cannot mint; an explicit auth:mint grant can" {
+    var store = try @import("../storage/store.zig").Store.init(testing.allocator, .{
+        .wal_path = "unused.wal",
+        .snapshot_path = "unused.snapshot",
+        .persistence = .none,
+    });
+    defer store.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const kp = auth.generateKeypair();
+    const mint = @import("context.zig").AuthMintConfig{
+        .secret_key = &kp.secret_key,
+        .default_ttl_s = 60,
+        .max_ttl_s = 3600,
+    };
+
+    // "May run every procedure" is not mint authority for arbitrary namespaces.
+    const wildcard_caps = [_]auth.Capability{
+        .{ .op = .exec, .match_type = .wildcard, .pattern = "" },
+    };
+    const wildcard_exec = auth.TokenState{ .subject = "runner", .iat = 0, .exp = 0, .jti = 0, .capabilities = &wildcard_caps };
+    var denied_ctx = Ctx.initWithAuth(&store, &.{"astrid"}, arena, .{ .enforce = &wildcard_exec }, mint, null, null, null);
+    defer denied_ctx.deinit();
+    const denied = try execute(&denied_ctx);
+    try testing.expect(denied == .err);
+    try testing.expectEqualStrings("permission denied", denied.err);
+
+    // An explicit grant for the namespace family mints.
+    const explicit_caps = [_]auth.Capability{
+        .{ .op = .exec, .match_type = .exact, .pattern = "auth_mint_scoped" },
+        .{ .op = .exec, .match_type = .prefix, .pattern = "auth:mint:ast" },
+    };
+    const explicit = auth.TokenState{ .subject = "minter", .iat = 0, .exp = 0, .jti = 0, .capabilities = &explicit_caps };
+    var ok_ctx = Ctx.initWithAuth(&store, &.{"astrid"}, arena, .{ .enforce = &explicit }, mint, null, null, null);
+    defer ok_ctx.deinit();
+    const ok = try execute(&ok_ctx);
+    try testing.expect(ok == .value);
+
+    var other_ctx = Ctx.initWithAuth(&store, &.{"raven"}, arena, .{ .enforce = &explicit }, mint, null, null, null);
+    defer other_ctx.deinit();
+    const other = try execute(&other_ctx);
+    try testing.expect(other == .err);
+    try testing.expectEqualStrings("permission denied", other.err);
 }

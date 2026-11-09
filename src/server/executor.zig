@@ -114,7 +114,7 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
                 const s = cluster.status();
                 const payload = try std.fmt.allocPrint(
                     ctx.allocator,
-                    "keys={d}\nwal_size={d}\ncluster_nodes={d}\ncluster_alive={d}\ncluster_suspected={d}\ncluster_dead={d}\nreplication_factor={d}\nproof_checkpoint_records={d}\nproof_witness_records={d}\nproof_last_verified_ms={d}\nanti_entropy_mode={s}\nserver_started_ms={d}\nstatus_generated_ms={d}\ntcp_connections_active={d}\ntcp_commands_in_flight={d}\ntcp_commands_completed={d}\ntcp_commands_succeeded={d}\ntcp_last_successful_command_completed_ms={d}\ntcp_connection_queue_depth={d}\ngateway_connections_active={d}\ngateway_websocket_connections_active={d}\ngateway_threads_active={d}\ngateway_commands_in_flight={d}\ngateway_commands_completed={d}\ngateway_commands_succeeded={d}\ngateway_last_successful_command_completed_ms={d}\ngateway_per_ip_rejections={d}\nevent_bus_channels={d}\nevent_bus_subscribers={d}\nevent_bus_publishes={d}\nevent_bus_drops={d}\n",
+                    "keys={d}\nwal_size={d}\ncluster_nodes={d}\ncluster_alive={d}\ncluster_suspected={d}\ncluster_dead={d}\nreplication_factor={d}\nproof_checkpoint_records={d}\nproof_witness_records={d}\nproof_last_verified_ms={d}\nanti_entropy_mode={s}\nserver_started_ms={d}\nstatus_generated_ms={d}\ntcp_connections_active={d}\ntcp_commands_in_flight={d}\ntcp_commands_completed={d}\ntcp_commands_succeeded={d}\ntcp_last_successful_command_completed_ms={d}\ntcp_connection_queue_depth={d}\ngateway_connections_active={d}\ngateway_websocket_connections_active={d}\ngateway_threads_active={d}\ngateway_commands_in_flight={d}\ngateway_commands_completed={d}\ngateway_commands_succeeded={d}\ngateway_last_successful_command_completed_ms={d}\ngateway_per_ip_rejections={d}\nevent_bus_channels={d}\nevent_bus_subscribers={d}\nevent_bus_publishes={d}\nevent_bus_drops={d}\nevent_bus_evictions={d}\n",
                     .{
                         key_count,
                         wal_size,
@@ -147,6 +147,7 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
                         ctx.event_bus.subscriberCount(),
                         ctx.event_bus.publishCount(),
                         ctx.event_bus.dropCount(),
+                        ctx.event_bus.evictionCount(),
                     },
                 );
                 break :blk Response{ .value = payload };
@@ -154,7 +155,7 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
 
             const payload = try std.fmt.allocPrint(
                 ctx.allocator,
-                "keys={d}\nwal_size={d}\ncluster_enabled=0\nserver_started_ms={d}\nstatus_generated_ms={d}\ntcp_connections_active={d}\ntcp_commands_in_flight={d}\ntcp_commands_completed={d}\ntcp_commands_succeeded={d}\ntcp_last_successful_command_completed_ms={d}\ntcp_connection_queue_depth={d}\ngateway_connections_active={d}\ngateway_websocket_connections_active={d}\ngateway_threads_active={d}\ngateway_commands_in_flight={d}\ngateway_commands_completed={d}\ngateway_commands_succeeded={d}\ngateway_last_successful_command_completed_ms={d}\ngateway_per_ip_rejections={d}\nevent_bus_channels={d}\nevent_bus_subscribers={d}\nevent_bus_publishes={d}\nevent_bus_drops={d}\n",
+                "keys={d}\nwal_size={d}\ncluster_enabled=0\nserver_started_ms={d}\nstatus_generated_ms={d}\ntcp_connections_active={d}\ntcp_commands_in_flight={d}\ntcp_commands_completed={d}\ntcp_commands_succeeded={d}\ntcp_last_successful_command_completed_ms={d}\ntcp_connection_queue_depth={d}\ngateway_connections_active={d}\ngateway_websocket_connections_active={d}\ngateway_threads_active={d}\ngateway_commands_in_flight={d}\ngateway_commands_completed={d}\ngateway_commands_succeeded={d}\ngateway_last_successful_command_completed_ms={d}\ngateway_per_ip_rejections={d}\nevent_bus_channels={d}\nevent_bus_subscribers={d}\nevent_bus_publishes={d}\nevent_bus_drops={d}\nevent_bus_evictions={d}\n",
                 .{
                     key_count,
                     wal_size,
@@ -178,6 +179,7 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
                     ctx.event_bus.subscriberCount(),
                     ctx.event_bus.publishCount(),
                     ctx.event_bus.dropCount(),
+                    ctx.event_bus.evictionCount(),
                 },
             );
             break :blk Response{ .value = payload };
@@ -244,8 +246,11 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
                 ctx.vector_registry,
             );
             defer proc_ctx.deinit(); // auto-unlock all shard locks
-            const result = proc_fn(&proc_ctx) catch |e| {
-                break :blk Response{ .err = try ctx.allocator.dupe(u8, @errorName(e)) };
+            const result = proc_fn(&proc_ctx) catch |e| switch (e) {
+                // Key-scope denial inside the procedure (Ctx.requireKey/requirePrefix):
+                // same response as the wire-level capability gate above.
+                error.PermissionDenied => break :blk Response{ .err = "permission denied" },
+                else => break :blk Response{ .err = try ctx.allocator.dupe(u8, @errorName(e)) },
             };
             break :blk result;
         },
@@ -498,4 +503,68 @@ test "SAVE requires universal admin authority before reaching storage" {
     try testing.expect(try execute(ctx, .save) == .ok);
     ctx.auth = .disabled;
     try testing.expect(try execute(ctx, .save) == .ok);
+}
+
+test "EXEC key scope: procedures authorize the keys they touch, not just their name" {
+    const testing = std.testing;
+    var store = try Store.init(testing.allocator, .{ .persistence = .none });
+    defer store.deinit();
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    const base = ExecContext{
+        .allocator = arena_state.allocator(),
+        .store = &store,
+        .event_bus = &bus,
+        .cluster = null,
+    };
+
+    // Token: may run any procedure, but only owns tenant:a:*.
+    const caps = [_]auth.Capability{
+        .{ .op = .exec, .match_type = .wildcard, .pattern = "" },
+        .{ .op = .get, .match_type = .prefix, .pattern = "tenant:a:" },
+        .{ .op = .set, .match_type = .prefix, .pattern = "tenant:a:" },
+    };
+    const state = auth.TokenState{ .subject = "a", .iat = 0, .exp = 0, .jti = 0, .capabilities = &caps };
+    var ctx = base;
+    ctx.auth = .{ .enforce = &state };
+
+    try store.set("tenant:b:secret", "42", false);
+
+    // increment inside scope works; outside scope is denied and leaves the key untouched.
+    const ok = try execute(ctx, Command{ .exec = .{ .procedure = "increment", .args = &.{"tenant:a:counter"} } });
+    try testing.expect(ok == .value);
+    const denied = try execute(ctx, Command{ .exec = .{ .procedure = "increment", .args = &.{"tenant:b:secret"} } });
+    try testing.expect(denied == .err);
+    try testing.expectEqualStrings("permission denied", denied.err);
+    try testing.expect(store.getUnsafe("tenant:b:secret") != null);
+    try testing.expectEqualStrings("42", store.getUnsafe("tenant:b:secret").?.value);
+
+    // scan: a range read needs a covering prefix capability.
+    const scan_ok = try execute(ctx, Command{ .exec = .{ .procedure = "scan", .args = &.{"tenant:a:"} } });
+    try testing.expect(scan_ok == .value);
+    const scan_denied = try execute(ctx, Command{ .exec = .{ .procedure = "scan", .args = &.{"tenant:"} } });
+    try testing.expect(scan_denied == .err);
+    try testing.expectEqualStrings("permission denied", scan_denied.err);
+    const scan_all_denied = try execute(ctx, Command{ .exec = .{ .procedure = "scan", .args = &.{""} } });
+    try testing.expect(scan_all_denied == .err);
+
+    // kv_get / kv_put / transfer honor the same scope.
+    const get_denied = try execute(ctx, Command{ .exec = .{ .procedure = "kv_get", .args = &.{"tenant:b:secret"} } });
+    try testing.expectEqualStrings("permission denied", get_denied.err);
+    const put_denied = try execute(ctx, Command{ .exec = .{ .procedure = "kv_put", .args = &.{ "tenant:b:x", "1" } } });
+    try testing.expectEqualStrings("permission denied", put_denied.err);
+    try testing.expect(store.getUnsafe("tenant:b:x") == null);
+    const xfer_denied = try execute(ctx, Command{ .exec = .{ .procedure = "transfer", .args = &.{ "tenant:a:counter", "tenant:b:secret", "1" } } });
+    try testing.expectEqualStrings("permission denied", xfer_denied.err);
+
+    // vnsdrop (admin-ish) is denied without delete authority over the namespace.
+    const drop_denied = try execute(ctx, Command{ .exec = .{ .procedure = "vnsdrop", .args = &.{ "tenant:a:", "1" } } });
+    try testing.expectEqualStrings("permission denied", drop_denied.err);
+
+    // Trusted callers (replication, maintenance) are unaffected.
+    const trusted = try execute(base, Command{ .exec = .{ .procedure = "scan", .args = &.{""} } });
+    try testing.expect(trusted == .value);
 }

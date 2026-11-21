@@ -67,6 +67,7 @@ export type WormEventIterator = AsyncIterableIterator<WormEvent> & {
 };
 
 export type VsearchHit = { k: string; s: number; ts: number };
+export type VsearchFilteredHit = { k: string; s: number; ts: number; m?: Record<string, unknown> };
 
 export type VsearchOptions = {
   namespace?: string;
@@ -74,6 +75,82 @@ export type VsearchOptions = {
   decay?: number;
   mode?: string;
   decayTauHours?: number;
+  ef?: number;
+};
+
+export type VsearchFilteredOptions = {
+  metric?: "cosine" | "dot" | "l2";
+  ef?: number;
+  oversample?: number;
+  eq?: Record<string, string | number | boolean | null>;
+  neq?: Record<string, string | number | boolean | null>;
+  prefix?: Record<string, string>;
+  min?: Record<string, number>;
+  max?: Record<string, number>;
+  dedup_field?: string;
+  include_meta?: boolean;
+};
+
+export type ScanEntry = { k: string; v: string; ts: number };
+
+export type VstatsResult = {
+  count: number;
+  inserts?: number;
+  namespace: string;
+  dimensions: number;
+  bq_count: number;
+  tombstones?: number;
+  pending_async?: number;
+};
+
+export type VclusterOptions = {
+  k?: number;
+  ef?: number;
+  min_sim?: number;
+  resolution?: number;
+  min_cluster_size?: number;
+  dedup_sim?: number;
+  merge_sim?: number;
+  meta_prefix?: string;
+  exclude_field?: string;
+  dedup_group_field?: string;
+};
+
+export type VclusterResult = {
+  count: number;
+  elapsed_ms: number;
+  keys: string[];
+  labels: number[];
+  stacks: number[][];
+  clusters: Array<{
+    id: number;
+    size: number;
+    cohesion: number;
+    medoids: number[];
+  }>;
+  merge_candidates: Array<{
+    a: number;
+    b: number;
+    sim: number;
+  }>;
+};
+
+export type Vproject2dOptions = {
+  iters?: number;
+  k?: number;
+  ef?: number;
+  neg_samples?: number;
+  meta_prefix?: string;
+  exclude_field?: string;
+  seed?: number;
+};
+
+export type Vproject2dResult = {
+  count: number;
+  elapsed_ms: number;
+  keys: string[];
+  x: number[];
+  y: number[];
 };
 
 export interface AppendLogReceipt {
@@ -488,6 +565,11 @@ export class WormDB {
   // Vector wrappers
   // -------------------------------------------------------------------------
 
+  /**
+   * Insert a vector into `namespace`. Note: `key` MUST start with `namespace`
+   * (e.g. `key: "vec:vis:42"`, `namespace: "vec:vis:"`), otherwise the server
+   * rejects it with `vinsert: key outside its declared namespace`.
+   */
   async vinsert(
     key: string,
     vector: Uint8Array,
@@ -515,6 +597,10 @@ export class WormDB {
     );
   }
 
+  /**
+   * Bulk-insert vectors into `namespace`. Every item's `key` MUST start with
+   * `namespace` (e.g. `"vec:vis:42"` for `namespace: "vec:vis:"`).
+   */
   async vbulkinsert(
     items: { key: string; vector: Uint8Array; timestamp?: bigint }[],
     options: {
@@ -547,17 +633,87 @@ export class WormDB {
     this.expectOk(await this.request(encodeVdelete(key, namespace)));
   }
 
+  async mget(keys: string[]): Promise<(string | null)[]> {
+    if (keys.length === 0) return [];
+    return this.execJson<(string | null)[]>("mget", keys);
+  }
+
+  async scan(
+    prefix: string,
+    opts: { limit?: number; cut?: "first" | "last"; after?: string } = {},
+  ): Promise<ScanEntry[]> {
+    const args: string[] = [prefix, String(opts.limit ?? 100), opts.cut ?? (opts.after != null ? "first" : "last")];
+    if (opts.after != null) args.push(`after=${opts.after}`);
+    return this.execJson<ScanEntry[]>("scan", args);
+  }
+
+  async vstats(namespace?: string): Promise<VstatsResult> {
+    return this.execJson<VstatsResult>("vstats", namespace ? [namespace] : []);
+  }
+
   async vsearch(queryKey: string, topK: number, opts: VsearchOptions = {}): Promise<VsearchHit[]> {
     // Args are positional: <query_key> <top_k> [namespace] [metric] [decay]
-    // [mode] [decay_tau_hours] — a later option requires every earlier slot
+    // [mode] [decay_tau_hours] [ef] — a later option requires every earlier slot
     // on the wire, so skipped slots are padded with the server's defaults.
-    const values = [opts.namespace, opts.metric, opts.decay, opts.mode, opts.decayTauHours];
-    const defaults = ["vec:", "cosine", "0", "auto", "168"];
+    const values = [opts.namespace, opts.metric, opts.decay, opts.mode, opts.decayTauHours, opts.ef];
+    const defaults = ["vec:", "cosine", "0", "auto", "168", "128"];
     let count = 0;
     for (let i = 0; i < values.length; i++) if (values[i] != null) count = i + 1;
     const args: string[] = [queryKey, String(topK)];
     for (let i = 0; i < count; i++) args.push(values[i] != null ? String(values[i]) : defaults[i]);
     return this.execJson<VsearchHit[]>("vsearch", args);
+  }
+
+  /** Search using an inline raw query vector (Float32Array or Uint8Array) via `vsearch_local_raw`. */
+  async vsearchRaw(
+    queryVector: Float32Array | Uint8Array,
+    topK: number,
+    opts: VsearchOptions = {},
+  ): Promise<VsearchHit[]> {
+    const bytes =
+      queryVector instanceof Uint8Array
+        ? queryVector
+        : new Uint8Array(queryVector.buffer, queryVector.byteOffset, queryVector.byteLength);
+    const b64 = Buffer.from(bytes).toString("base64");
+    const values = [opts.namespace, opts.metric, opts.decay, opts.mode, opts.decayTauHours, opts.ef];
+    const defaults = ["vec:", "cosine", "0", "auto", "168", "128"];
+    let count = 0;
+    for (let i = 0; i < values.length; i++) if (values[i] != null) count = i + 1;
+    const args: string[] = [b64, String(topK)];
+    for (let i = 0; i < count; i++) args.push(values[i] != null ? String(values[i]) : defaults[i]);
+    return this.execJson<VsearchHit[]>("vsearch_local_raw", args);
+  }
+
+  /** In-DB HNSW search with server-side metadata filtering and optional field deduplication. */
+  async vsearchFiltered(
+    queryVector: Float32Array | Uint8Array,
+    topK: number,
+    namespace: string,
+    metaPrefix: string,
+    opts: VsearchFilteredOptions = {},
+  ): Promise<VsearchFilteredHit[]> {
+    const bytes =
+      queryVector instanceof Uint8Array
+        ? queryVector
+        : new Uint8Array(queryVector.buffer, queryVector.byteOffset, queryVector.byteLength);
+    const b64 = Buffer.from(bytes).toString("base64");
+    const args: string[] = [b64, String(topK), namespace, metaPrefix];
+    if (Object.keys(opts).length > 0) args.push(JSON.stringify(opts));
+    return this.execJson<VsearchFilteredHit[]>("vsearch_filtered", args);
+  }
+
+  /** Run in-DB HNSW k-NN + near-duplicate stacks + 2-phase Louvain clustering. */
+  async vcluster(namespace: string, opts: VclusterOptions = {}): Promise<VclusterResult> {
+    const args: string[] = [namespace];
+    if (Object.keys(opts).length > 0) args.push(JSON.stringify(opts));
+    return this.execJson<VclusterResult>("vcluster", args);
+  }
+
+  /** Run in-DB zero-copy SIMD 2D PCA + grid-free UMAP-style negative-sampling projection. */
+  async vproject2d(namespace: string, opts: Vproject2dOptions = {}): Promise<Vproject2dResult> {
+    const args: string[] = [namespace];
+    if (Object.keys(opts).length > 0) args.push(JSON.stringify(opts));
+    return this.execJson<Vproject2dResult>("vproject_2d", args);
   }
 
   // -------------------------------------------------------------------------

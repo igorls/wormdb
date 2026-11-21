@@ -573,3 +573,90 @@ describe("WormDB vsearch wrapper", () => {
     await db.close();
   });
 });
+
+describe("WormDB extended procedure wrappers (mget, scan, vstats, vsearchFiltered, vcluster, vproject2d)", () => {
+  test("mget, scan with cursor, and vstats encode EXEC frames cleanly", async () => {
+    const { conns } = installConnectMock();
+    const db = newDb();
+
+    const pMget = db.mget(["a", "b"]);
+    await tick();
+    expect(decodeExecFrame(conns[0].writes[conns[0].writes.length - 1])).toEqual({
+      procedure: "mget",
+      args: ["a", "b"],
+    });
+    feed(conns[0], responseFrame(0x01, utf8('["v1",null]')));
+    await expect(pMget).resolves.toEqual(["v1", null]);
+
+    const pScan = db.scan("meta:", { limit: 50, after: "meta:10" });
+    await tick();
+    expect(decodeExecFrame(conns[0].writes[conns[0].writes.length - 1])).toEqual({
+      procedure: "scan",
+      args: ["meta:", "50", "first", "after=meta:10"],
+    });
+    feed(conns[0], responseFrame(0x01, utf8('[{"k":"meta:11","v":"{}","ts":1}]')));
+    await expect(pScan).resolves.toEqual([{ k: "meta:11", v: "{}", ts: 1 }]);
+
+    const pStats = db.vstats("vec:vis:");
+    await tick();
+    expect(decodeExecFrame(conns[0].writes[conns[0].writes.length - 1])).toEqual({
+      procedure: "vstats",
+      args: ["vec:vis:"],
+    });
+    feed(conns[0], responseFrame(0x01, utf8('{"count":10,"namespace":"vec:vis:","dimensions":768,"bq_count":10}')));
+    await expect(pStats).resolves.toEqual({ count: 10, namespace: "vec:vis:", dimensions: 768, bq_count: 10 });
+
+    await db.close();
+  });
+
+  test("vsearchFiltered, vcluster, and vproject2d encode JSON options and parse payloads", async () => {
+    const { conns } = installConnectMock();
+    const db = newDb();
+
+    const q = new Float32Array([1, 0, 0, 0]);
+    const pF = db.vsearchFiltered(q, 20, "vec:vis:", "meta:", {
+      eq: { mediaType: "image" },
+      neq: { trashed: true },
+      dedup_field: "takeStackId",
+    });
+    await tick();
+    const fFrame = decodeExecFrame(conns[0].writes[conns[0].writes.length - 1]);
+    expect(fFrame.procedure).toBe("vsearch_filtered");
+    expect(fFrame.args[1]).toBe("20");
+    expect(fFrame.args[2]).toBe("vec:vis:");
+    expect(fFrame.args[3]).toBe("meta:");
+    expect(JSON.parse(fFrame.args[4])).toEqual({
+      eq: { mediaType: "image" },
+      neq: { trashed: true },
+      dedup_field: "takeStackId",
+    });
+    feed(conns[0], responseFrame(0x01, utf8('[{"k":"vec:vis:2","s":0.95,"ts":42}]')));
+    await expect(pF).resolves.toEqual([{ k: "vec:vis:2", s: 0.95, ts: 42 }]);
+
+    const pC = db.vcluster("vec:vis:", { k: 16, resolution: 1.15 });
+    await tick();
+    expect(decodeExecFrame(conns[0].writes[conns[0].writes.length - 1])).toEqual({
+      procedure: "vcluster",
+      args: ["vec:vis:", '{"k":16,"resolution":1.15}'],
+    });
+    feed(
+      conns[0],
+      responseFrame(
+        0x01,
+        utf8('{"count":2,"elapsed_ms":5,"keys":["1","2"],"labels":[0,0],"stacks":[],"clusters":[],"merge_candidates":[]}'),
+      ),
+    );
+    await expect(pC).resolves.toMatchObject({ count: 2, keys: ["1", "2"] });
+
+    const p2d = db.vproject2d("vec:vis:", { iters: 80 });
+    await tick();
+    expect(decodeExecFrame(conns[0].writes[conns[0].writes.length - 1])).toEqual({
+      procedure: "vproject_2d",
+      args: ["vec:vis:", '{"iters":80}'],
+    });
+    feed(conns[0], responseFrame(0x01, utf8('{"count":2,"elapsed_ms":4,"keys":["1","2"],"x":[-0.5,0.5],"y":[0.1,-0.1]}')));
+    await expect(p2d).resolves.toMatchObject({ count: 2, x: [-0.5, 0.5], y: [0.1, -0.1] });
+
+    await db.close();
+  });
+});

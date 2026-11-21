@@ -1,0 +1,87 @@
+# WormDB 3-Node Cluster — Test Harness
+#
+# A minimal 3-node cluster for replication, WORM, DEL, and failover testing.
+# SWIM gossip auto-discovers membership: node1 is the seed, node2 and node3
+# both seed from node1.
+#
+#   node1 (seed)  ← node2
+#                ← node3
+#
+# Host ports: 26389 (node1), 26390 (node2), 26391 (node3)
+#
+# Prerequisites:
+#   zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast -Dcrypto-backend=std
+#   docker build -t wormdb:latest .
+#
+# Usage:
+#   docker compose -f docker-compose.cluster-test.yml up -d
+#   bun run apps/bun/src/bin/cluster-test.ts
+#   docker compose -f docker-compose.cluster-test.yml down -v
+
+services:
+  node1:
+    build: .
+    image: wormdb:latest
+    container_name: wormdb-test-node1
+    hostname: node1
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    ports: ["26389:6389"]
+    volumes: [test-node1-data:/data]
+    command: ["--port", "6389", "--data", "/data", "--cluster", "cluster-test", "--cluster-open"]
+    networks: [cluster-test]
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "6389"]
+      interval: 2s
+      timeout: 2s
+      start_period: 3s
+      retries: 10
+
+  node2:
+    image: wormdb:latest
+    container_name: wormdb-test-node2
+    hostname: node2
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    ports: ["26390:6389"]
+    volumes: [test-node2-data:/data]
+    command: ["--port", "6389", "--data", "/data", "--cluster", "cluster-test", "--cluster-open", "--seed", "node1:51821"]
+    depends_on:
+      node1:
+        condition: service_healthy
+    networks: [cluster-test]
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "6389"]
+      interval: 2s
+      timeout: 2s
+      start_period: 3s
+      retries: 10
+
+  node3:
+    image: wormdb:latest
+    container_name: wormdb-test-node3
+    hostname: node3
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    ports: ["26391:6389"]
+    volumes: [test-node3-data:/data]
+    command: ["--port", "6389", "--data", "/data", "--cluster", "cluster-test", "--cluster-open", "--seed", "node1:51821"]
+    depends_on:
+      node1:
+        condition: service_healthy
+    networks: [cluster-test]
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "6389"]
+      interval: 2s
+      timeout: 2s
+      start_period: 3s
+      retries: 10
+
+networks:
+  cluster-test:
+    driver: bridge
+
+volumes:
+  test-node1-data:
+  test-node2-data:
+  test-node3-data:

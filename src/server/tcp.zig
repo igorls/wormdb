@@ -551,45 +551,14 @@ pub const Server = struct {
     }
 
     fn handleBinaryConnection(self: *Server, stream: *core.compat.net.Stream, conn_ctx: *ConnectionContext) void {
-        const ReadAdapter = struct {
-            stream: *core.compat.net.Stream,
-            buf: [16384]u8 = undefined,
-            pos: usize = 0,
-            end: usize = 0,
-
-            pub fn read(adapter: *@This(), dest: []u8) !usize {
-                if (adapter.pos < adapter.end) {
-                    const avail = adapter.end - adapter.pos;
-                    const n = @min(avail, dest.len);
-                    @memcpy(dest[0..n], adapter.buf[adapter.pos .. adapter.pos + n]);
-                    adapter.pos += n;
-                    if (adapter.pos == adapter.end) {
-                        adapter.pos = 0;
-                        adapter.end = 0;
-                    }
-                    return n;
-                }
-                if (dest.len >= adapter.buf.len) {
-                    return adapter.stream.read(dest);
-                }
-                const n_read = try adapter.stream.read(&adapter.buf);
-                if (n_read == 0) return 0;
-                const n = @min(n_read, dest.len);
-                @memcpy(dest[0..n], adapter.buf[0..n]);
-                if (n < n_read) {
-                    adapter.pos = n;
-                    adapter.end = n_read;
-                }
-                return n;
-            }
-        };
-
-        var reader = ReadAdapter{ .stream = stream };
-        // Buffered write adapter: coalesces small writes (frame header + length
-        // prefix + data) into a single sendmsg syscall per response.
+        // Buffered write adapter: coalesces small response frames across pipelined
+        // requests into a single send syscall whenever additional frames are already
+        // queued in `ReadAdapter.buf`, while still flushing immediately when the
+        // read buffer drains (zero extra latency for unpipelined inflight=1).
         const WriteAdapter = struct {
             s: *core.compat.net.Stream,
-            buf: [4096]u8 = undefined,
+            conn_ctx: *ConnectionContext,
+            buf: [16384]u8 = undefined,
             end: usize = 0,
 
             pub fn writeAll(wa: *@This(), data: []const u8) !void {
@@ -611,18 +580,91 @@ pub const Server = struct {
 
             pub fn flush(wa: *@This()) !void {
                 if (wa.end > 0) {
-                    try wa.s.writeAll(wa.buf[0..wa.end]);
+                    const pending = wa.buf[0..wa.end];
                     wa.end = 0;
+                    // Only synchronize with EventBus publishers when this connection
+                    // actually holds active subscriptions (zero lock overhead on KV paths).
+                    if (wa.conn_ctx.subscriptions.count() > 0) {
+                        wa.conn_ctx.write_mutex.lock();
+                        defer wa.conn_ctx.write_mutex.unlock();
+                        try wa.s.writeAll(pending);
+                    } else {
+                        try wa.s.writeAll(pending);
+                    }
                 }
             }
         };
 
-        var w = WriteAdapter{ .s = stream };
+        const ReadAdapter = struct {
+            stream: *core.compat.net.Stream,
+            writer: *WriteAdapter,
+            timeout_ms: usize,
+            allow_idle_at_cmd_start: bool = false,
+            deadline_armed: bool = false,
+            buf: [16384]u8 = undefined,
+            pos: usize = 0,
+            end: usize = 0,
+
+            inline fn hasBuffered(adapter: *const @This()) bool {
+                return adapter.pos < adapter.end;
+            }
+
+            pub fn read(adapter: *@This(), dest: []u8) !usize {
+                if (adapter.pos < adapter.end) {
+                    const avail = adapter.end - adapter.pos;
+                    const n = @min(avail, dest.len);
+                    @memcpy(dest[0..n], adapter.buf[adapter.pos .. adapter.pos + n]);
+                    adapter.pos += n;
+                    if (adapter.pos == adapter.end) {
+                        adapter.pos = 0;
+                        adapter.end = 0;
+                    }
+                    return n;
+                }
+                // Before blocking on the kernel socket (including mid-frame partial
+                // reads after a pipelined burst), flush every already-completed
+                // response so the client can never deadlock waiting for replies.
+                if (adapter.writer.end > 0) {
+                    adapter.writer.flush() catch return error.EndOfStream;
+                }
+                // Arm the per-command whole-frame deadline lazily on the first kernel
+                // read of this command (never extended on subsequent reads of the same
+                // frame, and skipped entirely for frames served from user-space buffer).
+                if (!adapter.deadline_armed) {
+                    adapter.stream.beginRead(adapter.timeout_ms, adapter.allow_idle_at_cmd_start);
+                    adapter.deadline_armed = true;
+                }
+                if (dest.len >= adapter.buf.len) {
+                    return adapter.stream.read(dest);
+                }
+                const n_read = try adapter.stream.read(&adapter.buf);
+                if (n_read == 0) return 0;
+                const n = @min(n_read, dest.len);
+                @memcpy(dest[0..n], adapter.buf[0..n]);
+                if (n < n_read) {
+                    adapter.pos = n;
+                    adapter.end = n_read;
+                }
+                return n;
+            }
+        };
+
+        var w = WriteAdapter{ .s = stream, .conn_ctx = conn_ctx };
+        var reader = ReadAdapter{
+            .stream = stream,
+            .writer = &w,
+            .timeout_ms = self.config.timeout_ms,
+        };
 
         // Per-command arena: avoids per-field malloc/free pairs.
         // Reset after each command instead of O(n) individual frees.
         var cmd_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer cmd_arena.deinit();
+
+        // Pin this connection to a dedicated cache-line-isolated metrics shard so
+        // concurrent worker threads never bounce global counter cache lines.
+        const metrics_shard: usize = if (self.metrics) |m| m.assignTcpShard() else 0;
+        var burst_had_success = false;
 
         while (true) {
             // Reset arena for this command cycle (key/value/args)
@@ -630,18 +672,24 @@ pub const Server = struct {
             const arena_alloc = cmd_arena.allocator();
 
             self.expireAuthState(conn_ctx);
-            const may_idle = (reader.pos == reader.end) and
+            reader.deadline_armed = false;
+            reader.allow_idle_at_cmd_start = !reader.hasBuffered() and
                 conn_ctx.subscriptions.count() > 0 and
                 (!self.config.auth_enforce or conn_ctx.auth_state != null);
-            stream.beginRead(self.config.timeout_ms, may_idle);
             // Until this connection has authenticated, accept only small frames (B3).
             const max_payload: usize = if (self.config.auth_enforce and conn_ctx.auth_state == null)
                 PRE_AUTH_MAX_PAYLOAD
             else
                 wire.MAX_PAYLOAD_LENGTH;
             const cmd = wire.readFrameZeroCopyLimited(&reader, arena_alloc, max_payload) catch |err| {
+                if (burst_had_success) {
+                    if (self.metrics) |metrics| metrics.touchTcpSuccessMsShard(metrics_shard);
+                }
                 switch (err) {
-                    error.EndOfStream, error.Timeout => return,
+                    error.EndOfStream, error.Timeout => {
+                        w.flush() catch {};
+                        return;
+                    },
                     error.PayloadTooLarge => {
                         wire.writeResponse(&w, .{ .err = "request too large" }) catch {};
                         w.flush() catch {};
@@ -661,13 +709,20 @@ pub const Server = struct {
             if (conn_ctx.rate_limiter) |*limiter| {
                 if (!limiter.allow(core.compat.nowNs())) {
                     wire.writeResponse(&w, .{ .err = "rate limited" }) catch return;
-                    w.flush() catch return;
+                    if (!reader.hasBuffered()) w.flush() catch return;
                     continue;
                 }
             }
 
-            if (self.metrics) |metrics| metrics.beginTcpCommand();
-            defer if (self.metrics) |metrics| metrics.endTcpCommand();
+            if (self.metrics) |metrics| {
+                // Flush deferred burst timestamp before STATUS so liveness reflects prior commands.
+                if (burst_had_success and cmd == .status) {
+                    metrics.touchTcpSuccessMsShard(metrics_shard);
+                    burst_had_success = false;
+                }
+                metrics.beginTcpCommandShard(metrics_shard);
+            }
+            defer if (self.metrics) |metrics| metrics.endTcpCommandShard(metrics_shard);
 
             const response = self.executeForConnectionWithAlloc(cmd, conn_ctx, arena_alloc) catch |err| {
                 const err_msg: []const u8 = switch (err) {
@@ -679,15 +734,31 @@ pub const Server = struct {
                     error.InvalidPredicate => "invalid filter predicate",
                 };
                 wire.writeResponse(&w, .{ .err = err_msg }) catch return;
-                w.flush() catch return;
-                if (self.metrics) |metrics| metrics.completeTcpCommand(false);
+                if (!reader.hasBuffered()) {
+                    if (burst_had_success) {
+                        if (self.metrics) |metrics| metrics.touchTcpSuccessMsShard(metrics_shard);
+                        burst_had_success = false;
+                    }
+                    w.flush() catch return;
+                }
+                if (self.metrics) |metrics| metrics.completeTcpCommandShard(metrics_shard, false, false);
                 continue;
             };
             // No defer deinitResponse needed — arena reset handles cleanup
 
+            const ok = responseSucceeded(response);
             wire.writeResponse(&w, response) catch return;
-            w.flush() catch return;
-            if (self.metrics) |metrics| metrics.completeTcpCommand(responseSucceeded(response));
+            const more_buffered = reader.hasBuffered();
+            if (self.metrics) |metrics| {
+                metrics.completeTcpCommandShard(metrics_shard, ok, ok and !more_buffered);
+                if (!more_buffered) {
+                    if (!ok and burst_had_success) metrics.touchTcpSuccessMsShard(metrics_shard);
+                    burst_had_success = false;
+                } else if (ok) {
+                    burst_had_success = true;
+                }
+            }
+            if (!more_buffered) w.flush() catch return;
         }
     }
 
@@ -2033,4 +2104,106 @@ test "stalled subscriber is evicted instead of stalling publishers" {
         }
     }
     try testing.expect(saw_end);
+}
+
+test "binary pipelining coalesces bursts and flushes before partial-frame read" {
+    if (comptime core.compat.wasm_target) return error.SkipZigTest;
+    const testing = std.testing;
+    const net = core.compat.net;
+
+    var store = try Store.init(testing.allocator, .{ .persistence = .none });
+    defer store.deinit();
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+    var metrics = ServerMetrics.init();
+
+    var server = Server.init(testing.allocator, &store, &bus, .{
+        .metrics = &metrics,
+        .timeout_ms = 5_000,
+    });
+
+    const listen_addr = try net.Address.parseIp("127.0.0.1", 0);
+    var listener = try listen_addr.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+    const port = listener.inner.socket.address.getPort();
+
+    const AcceptCtx = struct {
+        listener: *net.ServerCompat,
+        server: *Server,
+        fn run(ctx: @This()) void {
+            var conn = ctx.listener.accept() catch return;
+            _ = ctx.server.connection_limit.acquire(ctx.server.config.max_connections);
+            ctx.server.handleConnection(conn, null);
+            _ = &conn;
+        }
+    };
+    const th = try std.Thread.spawn(.{}, AcceptCtx.run, .{AcceptCtx{
+        .listener = &listener,
+        .server = &server,
+    }});
+    defer th.join();
+
+    var client = try net.tcpConnectToAddress(net.Address.initIp4(.{ 127, 0, 0, 1 }, port));
+    defer client.close();
+    core.compat.setNoDelay(client.getHandle());
+    client.beginRead(2_000, false);
+
+    // Serialize "WW" + 5 complete frames + the first 3 bytes of a 6th GET frame.
+    const VecWriter = struct {
+        list: std.ArrayListUnmanaged(u8) = .empty,
+        alloc: std.mem.Allocator,
+        pub fn writeAll(self: *@This(), data: []const u8) !void {
+            try self.list.appendSlice(self.alloc, data);
+        }
+    };
+    var batch = VecWriter{ .alloc = testing.allocator };
+    defer batch.list.deinit(testing.allocator);
+    try batch.writeAll(&wire.WIRE_MAGIC);
+    try wire.writeCommand(&batch, .{ .set = .{ .key = "pipe:1", .value = "v1", .worm = false } });
+    try wire.writeCommand(&batch, .{ .set = .{ .key = "pipe:2", .value = "v2", .worm = false } });
+    try wire.writeCommand(&batch, .{ .get = "pipe:1" });
+    try wire.writeCommand(&batch, .{ .get = "pipe:2" });
+    try wire.writeCommand(&batch, .{ .get = "pipe:missing" });
+
+    var tail_cmd = VecWriter{ .alloc = testing.allocator };
+    defer tail_cmd.list.deinit(testing.allocator);
+    try wire.writeCommand(&tail_cmd, .{ .get = "pipe:1" });
+    try testing.expect(tail_cmd.list.items.len > 3);
+
+    // Send 5 complete frames + partial 6th header in a single write.
+    try batch.writeAll(tail_cmd.list.items[0..3]);
+    try client.writeAll(batch.list.items);
+
+    const ReadAdapter = struct {
+        stream: *net.Stream,
+        pub fn read(a: *@This(), dest: []u8) !usize {
+            return a.stream.read(dest);
+        }
+    };
+    var reader = ReadAdapter{ .stream = &client };
+
+    // All 5 responses must arrive immediately even though frame 6 is incomplete
+    // (ReadAdapter must flush before blocking on the remaining bytes of frame 6).
+    for (0..5) |idx| {
+        const resp = try wire.readResponseAlloc(&reader, testing.allocator);
+        defer protocol.deinitResponse(testing.allocator, resp);
+        switch (idx) {
+            0, 1 => try testing.expect(resp == .ok),
+            2 => try testing.expectEqualStrings("v1", resp.value.?),
+            3 => try testing.expectEqualStrings("v2", resp.value.?),
+            4 => try testing.expect(resp == .value and resp.value == null),
+            else => unreachable,
+        }
+    }
+
+    // Complete frame 6 and verify reply + sharded metrics snapshot.
+    try client.writeAll(tail_cmd.list.items[3..]);
+    const resp6 = try wire.readResponseAlloc(&reader, testing.allocator);
+    defer protocol.deinitResponse(testing.allocator, resp6);
+    try testing.expectEqualStrings("v1", resp6.value.?);
+
+    const snap = metrics.snapshot();
+    try testing.expectEqual(@as(u64, 6), snap.tcp_commands_completed);
+    try testing.expectEqual(@as(u64, 6), snap.tcp_commands_succeeded);
+    try testing.expect(snap.tcp_last_successful_command_completed_ms > 0);
 }

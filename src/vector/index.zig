@@ -409,18 +409,298 @@ const RabitqSlab = struct {
 const STACK_DIM_CAP: usize = 1536;
 const STACK_SLAB_QUERY_CAP: usize = 2048;
 const STACK_LUT_GROUPS: usize = 512; // covers up to dim = 2048
+const MAX_BQ_BUCKET_BITS: usize = 2048;
+const RABITQ_SEL_STACK_CAP: usize = 1024;
+const RABITQ_SEL_GUARD: usize = 32;
+
+const is_x86_64 = builtin.cpu.arch == .x86_64;
+const has_avx512f = is_x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx512f);
+const has_avx2 = is_x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx2);
 
 const IdDist = struct { id: u32, dist: f32 };
 fn idDistOf(x: IdDist) f32 {
     return x.dist;
 }
+fn idDistLess(_: void, a: IdDist, b: IdDist) bool {
+    return a.dist < b.dist;
+}
 const IdDistHeap = topk_mod.BoundedMaxHeap(IdDist, idDistOf);
+
+const IdHam = struct { id: u32, ham: u16 };
 
 const IdScore = struct { id: u32, score: f32 };
 fn idScoreOf(x: IdScore) f32 {
     return x.score;
 }
 const IdScoreTopK = topk_mod.TopK(IdScore, idScoreOf);
+
+/// Compare 32 FastScan distances against `threshold` using SIMD vectors and pack
+/// strictly-passing lanes (`d2 < threshold`) into a `u32` bitmask (lane `i` = bit `i`).
+/// IEEE-754 ordered `<` naturally rejects `NaN` and `+inf` (including tombstones).
+inline fn blockLessThanMask32(d2_buf: *align(64) const [32]f32, threshold: f32) u32 {
+    if (comptime has_avx512f) {
+        const tv: @Vector(16, f32) = @splat(threshold);
+        const m0: u16 = @bitCast(@as(@Vector(16, f32), d2_buf[0..16].*) < tv);
+        const m1: u16 = @bitCast(@as(@Vector(16, f32), d2_buf[16..32].*) < tv);
+        return @as(u32, m0) | (@as(u32, m1) << 16);
+    } else if (comptime has_avx2) {
+        const tv: @Vector(8, f32) = @splat(threshold);
+        const m0: u8 = @bitCast(@as(@Vector(8, f32), d2_buf[0..8].*) < tv);
+        const m1: u8 = @bitCast(@as(@Vector(8, f32), d2_buf[8..16].*) < tv);
+        const m2: u8 = @bitCast(@as(@Vector(8, f32), d2_buf[16..24].*) < tv);
+        const m3: u8 = @bitCast(@as(@Vector(8, f32), d2_buf[24..32].*) < tv);
+        return @as(u32, m0) | (@as(u32, m1) << 8) | (@as(u32, m2) << 16) | (@as(u32, m3) << 24);
+    } else {
+        const tv: @Vector(4, f32) = @splat(threshold);
+        var mask: u32 = 0;
+        inline for (0..8) |chunk| {
+            const m: u4 = @bitCast(@as(@Vector(4, f32), d2_buf[chunk * 4 ..][0..4].*) < tv);
+            mask |= @as(u32, m) << @intCast(chunk * 4);
+        }
+        return mask;
+    }
+}
+
+/// AVX-512F branchless compress-store of strictly-passing (`v < tv`) 16-lane distance
+/// and node-ID vectors directly into contiguous SoA scratch buffers.
+/// Caller guarantees `dst_d` and `dst_i` have >= 16 writable slots remaining.
+inline fn compressStore16Avx512(
+    v: @Vector(16, f32),
+    ids: @Vector(16, u32),
+    tv: @Vector(16, f32),
+    dst_d: [*]f32,
+    dst_i: [*]u32,
+) usize {
+    const mask_vec = v < tv;
+    const m: u16 = @bitCast(mask_vec);
+    asm volatile (
+        \\vcompressps %[v], (%[dd]) {%[k]}
+        \\vpcompressd %[ids], (%[di]) {%[k]}
+        :
+        : [k] "{k1}" (mask_vec),
+          [v] "v" (v),
+          [ids] "v" (ids),
+          [dd] "r" (dst_d),
+          [di] "r" (dst_i),
+        : .{ .memory = true });
+    return @popCount(m);
+}
+
+/// In-place Sedgewick median-of-3 quickselect over SoA `(dists, ids)` ascending by `dist`.
+/// Used only as an OOM fallback when `dists.len > RABITQ_SEL_STACK_CAP + RABITQ_SEL_GUARD`
+/// and allocating temporary scratch fails.
+fn nthElementSoaInPlace(dists: []f32, ids: []u32, k: usize) f32 {
+    std.debug.assert(k < dists.len and dists.len == ids.len);
+    var lo: usize = 0;
+    var hi: usize = dists.len - 1;
+    while (lo < hi) {
+        if (hi - lo <= 16) {
+            var idx: usize = lo + 1;
+            while (idx <= hi) : (idx += 1) {
+                const kd = dists[idx];
+                const ki = ids[idx];
+                var p = idx;
+                while (p > lo and dists[p - 1] > kd) : (p -= 1) {
+                    dists[p] = dists[p - 1];
+                    ids[p] = ids[p - 1];
+                }
+                dists[p] = kd;
+                ids[p] = ki;
+            }
+            return dists[k];
+        }
+
+        const mid = lo + ((hi - lo) >> 1);
+        if (dists[mid] < dists[lo]) {
+            std.mem.swap(f32, &dists[lo], &dists[mid]);
+            std.mem.swap(u32, &ids[lo], &ids[mid]);
+        }
+        if (dists[hi] < dists[lo]) {
+            std.mem.swap(f32, &dists[lo], &dists[hi]);
+            std.mem.swap(u32, &ids[lo], &ids[hi]);
+        }
+        if (dists[hi] < dists[mid]) {
+            std.mem.swap(f32, &dists[mid], &dists[hi]);
+            std.mem.swap(u32, &ids[mid], &ids[hi]);
+        }
+
+        std.mem.swap(f32, &dists[mid], &dists[lo + 1]);
+        std.mem.swap(u32, &ids[mid], &ids[lo + 1]);
+        const pivot = dists[lo + 1];
+
+        var i = lo + 1;
+        var j = hi;
+        while (true) {
+            i += 1;
+            while (dists[i] < pivot) : (i += 1) {}
+            j -= 1;
+            while (dists[j] > pivot) : (j -= 1) {}
+            if (i >= j) break;
+            std.mem.swap(f32, &dists[i], &dists[j]);
+            std.mem.swap(u32, &ids[i], &ids[j]);
+        }
+        std.mem.swap(f32, &dists[lo + 1], &dists[j]);
+        std.mem.swap(u32, &ids[lo + 1], &ids[j]);
+
+        if (j == k) return dists[k];
+        if (k < j) {
+            hi = j - 1;
+        } else {
+            lo = j + 1;
+        }
+    }
+    return dists[k];
+}
+
+/// Branchless two-buffer SoA quickselect: places the `k` smallest `(dist, id)` pairs
+/// in `dists[0..k]` / `ids[0..k]` and returns the exact `k`-th smallest distance
+/// (`max(dists[0..k])`). Marked `noinline` + `.cold` so the FastScan32 loop stays
+/// compact and keeps ZMM registers live without spills.
+/// Precondition: `1 <= k <= dists.len`, `dists.len == ids.len`, no NaNs in `dists`.
+noinline fn branchlessSelectKSoa(
+    dists: []f32,
+    ids: []u32,
+    k: usize,
+    scratch_alloc: std.mem.Allocator,
+) f32 {
+    @branchHint(.cold);
+    std.debug.assert(k >= 1 and k <= dists.len and dists.len == ids.len);
+
+    var tmp_d_stack: [RABITQ_SEL_STACK_CAP + RABITQ_SEL_GUARD]f32 = undefined;
+    var tmp_i_stack: [RABITQ_SEL_STACK_CAP + RABITQ_SEL_GUARD]u32 = undefined;
+    var tmp_d_heap: ?[]f32 = null;
+    var tmp_i_heap: ?[]u32 = null;
+    defer if (tmp_d_heap) |b| scratch_alloc.free(b);
+    defer if (tmp_i_heap) |b| scratch_alloc.free(b);
+
+    const tmp_d: []f32 = if (dists.len <= tmp_d_stack.len)
+        tmp_d_stack[0..dists.len]
+    else blk: {
+        const bd = scratch_alloc.alloc(f32, dists.len) catch return nthElementSoaInPlace(dists, ids, k - 1);
+        tmp_d_heap = bd;
+        break :blk bd;
+    };
+    const tmp_i: []u32 = if (ids.len <= tmp_i_stack.len)
+        tmp_i_stack[0..ids.len]
+    else blk: {
+        const bi = scratch_alloc.alloc(u32, ids.len) catch return nthElementSoaInPlace(dists, ids, k - 1);
+        tmp_i_heap = bi;
+        break :blk bi;
+    };
+
+    var lo: usize = 0;
+    var hi: usize = dists.len;
+    var target = k;
+
+    while (hi - lo > 16) {
+        const mid = lo + ((hi - lo) >> 1);
+        const a = dists[lo];
+        const b = dists[mid];
+        const c = dists[hi - 1];
+        const pivot = @max(@min(a, b), @min(@max(a, b), c));
+
+        var nl: usize = 0;
+        var neq: usize = 0;
+        var nr: usize = 0;
+        for (lo..hi) |idx| {
+            const d = dists[idx];
+            const id = ids[idx];
+            const lt = d < pivot;
+            const dl_idx = lo + nl;
+            const dr_idx = hi - 1 - nr;
+            tmp_d[dl_idx] = d;
+            tmp_i[dl_idx] = id;
+            nl += @intFromBool(lt);
+            tmp_d[dr_idx] = d;
+            tmp_i[dr_idx] = id;
+            nr += @intFromBool(!lt);
+            neq += @intFromBool(d == pivot);
+        }
+
+        if (target <= nl) {
+            @memcpy(dists[lo .. lo + nl], tmp_d[lo .. lo + nl]);
+            @memcpy(ids[lo .. lo + nl], tmp_i[lo .. lo + nl]);
+            hi = lo + nl;
+        } else if (target <= nl + neq) {
+            @memcpy(dists[lo .. lo + nl], tmp_d[lo .. lo + nl]);
+            @memcpy(ids[lo .. lo + nl], tmp_i[lo .. lo + nl]);
+            var w = lo + nl;
+            for (hi - nr..hi) |idx| {
+                if (tmp_d[idx] == pivot) {
+                    dists[w] = tmp_d[idx];
+                    ids[w] = tmp_i[idx];
+                    w += 1;
+                    if (w == lo + target) break;
+                }
+            }
+            return pivot;
+        } else {
+            @memcpy(dists[lo .. lo + nl], tmp_d[lo .. lo + nl]);
+            @memcpy(ids[lo .. lo + nl], tmp_i[lo .. lo + nl]);
+            var w = lo + nl;
+            var ngt: usize = 0;
+            for (hi - nr..hi) |idx| {
+                const d = tmp_d[idx];
+                const id = tmp_i[idx];
+                const eq = d == pivot;
+                dists[w] = d;
+                ids[w] = id;
+                w += @intFromBool(eq);
+                tmp_d[ngt] = d;
+                tmp_i[ngt] = id;
+                ngt += @intFromBool(!eq);
+            }
+            @memcpy(dists[w .. w + ngt], tmp_d[0..ngt]);
+            @memcpy(ids[w .. w + ngt], tmp_i[0..ngt]);
+            target -= (nl + neq);
+            lo = w;
+            hi = w + ngt;
+        }
+    }
+
+    var idx = lo + 1;
+    while (idx < hi) : (idx += 1) {
+        const kd = dists[idx];
+        const ki = ids[idx];
+        var p = idx;
+        while (p > lo and dists[p - 1] > kd) : (p -= 1) {
+            dists[p] = dists[p - 1];
+            ids[p] = ids[p - 1];
+        }
+        dists[p] = kd;
+        ids[p] = ki;
+    }
+    return dists[k - 1];
+}
+
+/// Compact a full BQ passing-candidate buffer in-place to the exact top `stage1_k`
+/// items using the live `cutoff` histogram, preserving exact `counts[0..cutoff+1]`.
+fn compactBqBuf(
+    buf: []IdHam,
+    buf_len: *usize,
+    counts: []u32,
+    cutoff: u32,
+    stage1_k: usize,
+    total_le: *usize,
+) void {
+    const strictly_less = total_le.* - counts[cutoff];
+    const max_eq = stage1_k - strictly_less;
+    var kept_eq: usize = 0;
+    var write: usize = 0;
+    for (buf[0..buf_len.*]) |item| {
+        if (item.ham < cutoff) {
+            buf[write] = item;
+            write += 1;
+        } else if (item.ham == cutoff and kept_eq < max_eq) {
+            buf[write] = item;
+            write += 1;
+            kept_eq += 1;
+        }
+    }
+    buf_len.* = write;
+    counts[cutoff] = @intCast(kept_eq);
+    total_le.* = write;
+}
 
 inline fn applyDecayIndex(raw_sim: f32, timestamp: u64, decay: f32, now_ms: u64, decay_tau_hours: f32) f32 {
     if (decay <= 0.0) return raw_sim;
@@ -1385,7 +1665,10 @@ pub const NamespaceIndex = struct {
             const ids4 = [4]u32{ id0, id1, id2, id3 };
             inline for (0..4) |lane| {
                 const cid = ids4[lane];
-                const score = applyDecayIndex(raw_sims[lane], self.timestamps.items[cid], decay, now_ms, decay_tau_hours);
+                const score = if (decay > 0.0)
+                    applyDecayIndex(raw_sims[lane], self.timestamps.items[cid], decay, now_ms, decay_tau_hours)
+                else
+                    raw_sims[lane];
                 if (score > thresh) {
                     topk.push(.{ .id = cid, .score = score });
                     thresh = topk.thresholdScore();
@@ -1403,7 +1686,10 @@ pub const NamespaceIndex = struct {
                 .dot => distance.dotAligned(q_ptr, self.hnsw.vecPtr(cid), stride),
                 .l2 => 1.0 / (1.0 + distance.l2SquaredAligned(q_ptr, self.hnsw.vecPtr(cid), stride)),
             };
-            const score = applyDecayIndex(raw_sim, self.timestamps.items[cid], decay, now_ms, decay_tau_hours);
+            const score = if (decay > 0.0)
+                applyDecayIndex(raw_sim, self.timestamps.items[cid], decay, now_ms, decay_tau_hours)
+            else
+                raw_sim;
             if (score > thresh) {
                 topk.push(.{ .id = cid, .score = score });
                 thresh = topk.thresholdScore();
@@ -1481,34 +1767,173 @@ pub const NamespaceIndex = struct {
         var n_stage1: usize = 0;
 
         if (decay <= 0.0) {
-            var h_stack: [256]IdDist = undefined;
-            var h_heap: ?[]IdDist = null;
-            defer if (h_heap) |b| scratch_alloc.free(b);
-            const h_buf: []IdDist = if (stage1_k <= h_stack.len)
-                h_stack[0..stage1_k]
-            else blk: {
-                const b = try scratch_alloc.alloc(IdDist, stage1_k);
-                h_heap = b;
-                break :blk b;
-            };
-            var heap = IdDistHeap.init(h_buf);
-            var worst_ham: u32 = std.math.maxInt(u32);
+            const max_ham_usize = cb * 8;
+            if (max_ham_usize <= MAX_BQ_BUCKET_BITS) {
+                // Single-pass exact O(N) counting-bucket selection with dynamic integer cutoff:
+                // zero heap sifts, zero float conversions, single pass over `bq_codes`.
+                const max_ham: u32 = @intCast(max_ham_usize);
+                var counts: [MAX_BQ_BUCKET_BITS + 1]u32 = undefined;
+                @memset(counts[0 .. max_ham + 1], 0);
 
-            var i: usize = 0;
-            while (i + 4 <= n) : (i += 4) {
-                if (i + 16 < n) {
-                    @prefetch(slab.codes.ptr + (i + 16) * stride, .{ .locality = 3 });
+                const sel_cap = @max(stage1_k * 2, 512);
+                var buf_stack: [512]IdHam = undefined;
+                var buf_heap: ?[]IdHam = null;
+                defer if (buf_heap) |b| scratch_alloc.free(b);
+                const buf: []IdHam = if (sel_cap <= buf_stack.len)
+                    buf_stack[0..sel_cap]
+                else blk: {
+                    const b = try scratch_alloc.alloc(IdHam, sel_cap);
+                    buf_heap = b;
+                    break :blk b;
+                };
+
+                var buf_len: usize = 0;
+                var cutoff: u32 = max_ham;
+                var accept_limit: u32 = max_ham + 1;
+                var total_le: usize = 0;
+
+                var i: usize = 0;
+                while (i + 4 <= n) : (i += 4) {
+                    if (i + 16 < n) {
+                        @prefetch(slab.codes.ptr + (i + 16) * stride, .{ .locality = 3 });
+                    }
+                    const hs = distance.hammingBatch4(q_bq, .{
+                        slab.codeAt(i),
+                        slab.codeAt(i + 1),
+                        slab.codeAt(i + 2),
+                        slab.codeAt(i + 3),
+                    });
+                    const min_h = @min(@min(hs[0], hs[1]), @min(hs[2], hs[3]));
+                    if (min_h < accept_limit) {
+                        inline for (0..4) |lane| {
+                            const h = hs[lane];
+                            if (h < accept_limit) {
+                                const nid: u32 = @intCast(i + lane);
+                                if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
+                                    std.debug.assert(h <= max_ham);
+                                    if (buf_len == sel_cap) {
+                                        compactBqBuf(buf, &buf_len, counts[0 .. max_ham + 1], cutoff, stage1_k, &total_le);
+                                    }
+                                    counts[h] += 1;
+                                    total_le += 1;
+                                    buf[buf_len] = .{ .id = nid, .ham = @intCast(h) };
+                                    buf_len += 1;
+                                    if (total_le >= stage1_k) {
+                                        while (cutoff > 0 and total_le - counts[cutoff] >= stage1_k) {
+                                            total_le -= counts[cutoff];
+                                            cutoff -= 1;
+                                        }
+                                        accept_limit = cutoff;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-                const hs = distance.hammingBatch4(q_bq, .{
-                    slab.codeAt(i),
-                    slab.codeAt(i + 1),
-                    slab.codeAt(i + 2),
-                    slab.codeAt(i + 3),
-                });
-                inline for (0..4) |lane| {
-                    const h = hs[lane];
+                while (i < n) : (i += 1) {
+                    const h = distance.hamming(q_bq, slab.codeAt(i));
+                    if (h < accept_limit) {
+                        const nid: u32 = @intCast(i);
+                        if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
+                            std.debug.assert(h <= max_ham);
+                            if (buf_len == sel_cap) {
+                                compactBqBuf(buf, &buf_len, counts[0 .. max_ham + 1], cutoff, stage1_k, &total_le);
+                            }
+                            counts[h] += 1;
+                            total_le += 1;
+                            buf[buf_len] = .{ .id = nid, .ham = @intCast(h) };
+                            buf_len += 1;
+                            if (total_le >= stage1_k) {
+                                while (cutoff > 0 and total_le - counts[cutoff] >= stage1_k) {
+                                    total_le -= counts[cutoff];
+                                    cutoff -= 1;
+                                }
+                                accept_limit = cutoff;
+                            }
+                        }
+                    }
+                }
+
+                if (!rerank) {
+                    const emit_n = @min(total_le, @min(top_k, out.len));
+                    if (emit_n == 0) return .{ .count = 0, .needs_kv_rerank = false };
+                    var offsets: [MAX_BQ_BUCKET_BITS + 1]u32 = undefined;
+                    var acc: u32 = 0;
+                    for (0..cutoff + 1) |b| {
+                        offsets[b] = acc;
+                        acc += counts[b];
+                    }
+                    for (buf[0..buf_len]) |item| {
+                        if (item.ham <= cutoff) {
+                            const pos = offsets[item.ham];
+                            if (pos < emit_n) {
+                                out[pos] = .{
+                                    .key = self.keys.items[item.id],
+                                    .score = 1.0 - @as(f32, @floatFromInt(item.ham)) * inv_total_bits,
+                                    .timestamp = self.timestamps.items[item.id],
+                                };
+                                offsets[item.ham] = pos + 1;
+                            }
+                        }
+                    }
+                    return .{ .count = emit_n, .needs_kv_rerank = false };
+                }
+
+                const strictly_less = total_le - counts[cutoff];
+                const max_eq = if (total_le >= stage1_k) stage1_k - strictly_less else counts[cutoff];
+                var kept_eq: usize = 0;
+                for (buf[0..buf_len]) |item| {
+                    if (item.ham < cutoff) {
+                        cand_ids_buf[n_stage1] = item.id;
+                        n_stage1 += 1;
+                    } else if (item.ham == cutoff and kept_eq < max_eq) {
+                        cand_ids_buf[n_stage1] = item.id;
+                        n_stage1 += 1;
+                        kept_eq += 1;
+                    }
+                }
+            } else {
+                var h_stack: [256]IdDist = undefined;
+                var h_heap: ?[]IdDist = null;
+                defer if (h_heap) |b| scratch_alloc.free(b);
+                const h_buf: []IdDist = if (stage1_k <= h_stack.len)
+                    h_stack[0..stage1_k]
+                else blk: {
+                    const b = try scratch_alloc.alloc(IdDist, stage1_k);
+                    h_heap = b;
+                    break :blk b;
+                };
+                var heap = IdDistHeap.init(h_buf);
+                var worst_ham: u32 = std.math.maxInt(u32);
+
+                var i: usize = 0;
+                while (i + 4 <= n) : (i += 4) {
+                    if (i + 16 < n) {
+                        @prefetch(slab.codes.ptr + (i + 16) * stride, .{ .locality = 3 });
+                    }
+                    const hs = distance.hammingBatch4(q_bq, .{
+                        slab.codeAt(i),
+                        slab.codeAt(i + 1),
+                        slab.codeAt(i + 2),
+                        slab.codeAt(i + 3),
+                    });
+                    inline for (0..4) |lane| {
+                        const h = hs[lane];
+                        if (h < worst_ham) {
+                            const nid: u32 = @intCast(i + lane);
+                            if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
+                                heap.pushOrReplace(.{ .id = nid, .dist = @floatFromInt(h) });
+                                if (heap.isFull()) {
+                                    worst_ham = @intFromFloat(heap.worstDist());
+                                }
+                            }
+                        }
+                    }
+                }
+                while (i < n) : (i += 1) {
+                    const h = distance.hamming(q_bq, slab.codeAt(i));
                     if (h < worst_ham) {
-                        const nid: u32 = @intCast(i + lane);
+                        const nid: u32 = @intCast(i);
                         if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
                             heap.pushOrReplace(.{ .id = nid, .dist = @floatFromInt(h) });
                             if (heap.isFull()) {
@@ -1517,37 +1942,25 @@ pub const NamespaceIndex = struct {
                         }
                     }
                 }
-            }
-            while (i < n) : (i += 1) {
-                const h = distance.hamming(q_bq, slab.codeAt(i));
-                if (h < worst_ham) {
-                    const nid: u32 = @intCast(i);
-                    if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
-                        heap.pushOrReplace(.{ .id = nid, .dist = @floatFromInt(h) });
-                        if (heap.isFull()) {
-                            worst_ham = @intFromFloat(heap.worstDist());
-                        }
+
+                if (!rerank) {
+                    const sorted = heap.sortedAsc();
+                    const emit_n = @min(sorted.len, @min(top_k, out.len));
+                    for (0..emit_n) |idx| {
+                        const r = sorted[idx];
+                        out[idx] = .{
+                            .key = self.keys.items[r.id],
+                            .score = 1.0 - r.dist * inv_total_bits,
+                            .timestamp = self.timestamps.items[r.id],
+                        };
                     }
+                    return .{ .count = emit_n, .needs_kv_rerank = false };
                 }
-            }
 
-            if (!rerank) {
-                const sorted = heap.sortedAsc();
-                const emit_n = @min(sorted.len, @min(top_k, out.len));
-                for (0..emit_n) |idx| {
-                    const r = sorted[idx];
-                    out[idx] = .{
-                        .key = self.keys.items[r.id],
-                        .score = 1.0 - r.dist * inv_total_bits,
-                        .timestamp = self.timestamps.items[r.id],
-                    };
-                }
-                return .{ .count = emit_n, .needs_kv_rerank = false };
+                const items = heap.items();
+                n_stage1 = items.len;
+                for (items, 0..) |item, idx| cand_ids_buf[idx] = item.id;
             }
-
-            const items = heap.items();
-            n_stage1 = items.len;
-            for (items, 0..) |item, idx| cand_ids_buf[idx] = item.id;
         } else {
             var h_stack: [256]IdScore = undefined;
             var h_heap: ?[]IdScore = null;
@@ -1758,95 +2171,306 @@ pub const NamespaceIndex = struct {
         var n_stage1: usize = 0;
 
         if (decay <= 0.0) {
-            var h_stack: [256]IdDist = undefined;
-            var h_heap: ?[]IdDist = null;
-            defer if (h_heap) |b| scratch_alloc.free(b);
-            const h_buf: []IdDist = if (stage1_k <= h_stack.len)
-                h_stack[0..stage1_k]
-            else blk: {
-                const b = try scratch_alloc.alloc(IdDist, stage1_k);
-                h_heap = b;
-                break :blk b;
-            };
-            var heap = IdDistHeap.init(h_buf);
-            var worst_d2 = heap.worstDist();
+            var d2_buf: [32]f32 align(64) = undefined;
 
-            // 1. Full 32-vector FastScan blocks.
-            var d2_buf: [32]f32 = undefined;
-            for (0..n_blocks) |blk_idx| {
-                if (blk_idx + 2 < n_blocks) {
-                    @prefetch(slab.fastscan_blocks.ptr + (blk_idx + 2) * slab.block_bytes, .{ .locality = 3 });
-                    @prefetch(slab.f_add.ptr + (blk_idx + 2) * 32, .{ .locality = 3 });
-                }
-                const base = blk_idx * 32;
-                const packed_slice = slab.fastscan_blocks[blk_idx * slab.block_bytes ..][0..slab.block_bytes];
-                rabitq_mod.estimateFastScanBlock32(
-                    lut_slice,
-                    lut_scale.vl,
-                    lut_scale.delta,
-                    q_l2,
-                    q_l2_sq,
-                    packed_slice,
-                    slab.f_add[base..][0..32],
-                    slab.f_rescale[base..][0..32],
-                    &d2_buf,
-                );
-                inline for (0..32) |lane| {
-                    const d2 = d2_buf[lane];
-                    if (d2 < worst_d2) {
-                        const nid: u32 = @intCast(base + lane);
-                        if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
-                            heap.pushOrReplace(.{ .id = nid, .dist = d2 });
-                            worst_d2 = heap.worstDist();
+            if (stage1_k >= 32) {
+                // Batched SoA threshold-partition selection with 32-slot guard space so the
+                // hot FastScan32 block loop has zero per-element flush checks, zero mid-block
+                // threshold mutations, and zero branch mispredictions on AVX-512F via
+                // vcompressps/vpcompressd + cold branchless two-buffer quickselect.
+                const sel_cap = @max(stage1_k * 2, RABITQ_SEL_STACK_CAP);
+                const sel_total = sel_cap + RABITQ_SEL_GUARD;
+                var sel_d_stack: [RABITQ_SEL_STACK_CAP + RABITQ_SEL_GUARD]f32 align(64) = undefined;
+                var sel_i_stack: [RABITQ_SEL_STACK_CAP + RABITQ_SEL_GUARD]u32 align(64) = undefined;
+                var sel_d_heap: ?[]f32 = null;
+                var sel_i_heap: ?[]u32 = null;
+                defer if (sel_d_heap) |b| scratch_alloc.free(b);
+                defer if (sel_i_heap) |b| scratch_alloc.free(b);
+
+                const sel_d: []f32 = if (sel_total <= sel_d_stack.len)
+                    sel_d_stack[0..sel_total]
+                else blk: {
+                    const b = try scratch_alloc.alloc(f32, sel_total);
+                    sel_d_heap = b;
+                    break :blk b;
+                };
+                const sel_i: []u32 = if (sel_total <= sel_i_stack.len)
+                    sel_i_stack[0..sel_total]
+                else blk: {
+                    const b = try scratch_alloc.alloc(u32, sel_total);
+                    sel_i_heap = b;
+                    break :blk b;
+                };
+
+                var sel_len: usize = 0;
+                var threshold: f32 = std.math.inf(f32);
+
+                // 1. Full 32-vector FastScan blocks.
+                if (comptime has_avx512f) {
+                    if (!has_filter) {
+                        const iota0: @Vector(16, u32) = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+                        const iota1: @Vector(16, u32) = .{ 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 };
+                        for (0..n_blocks) |blk_idx| {
+                            if (blk_idx + 2 < n_blocks) {
+                                @prefetch(slab.fastscan_blocks.ptr + (blk_idx + 2) * slab.block_bytes, .{ .locality = 3 });
+                                @prefetch(slab.f_add.ptr + (blk_idx + 2) * 32, .{ .locality = 3 });
+                                @prefetch(slab.f_rescale.ptr + (blk_idx + 2) * 32, .{ .locality = 3 });
+                            }
+                            const base = blk_idx * 32;
+                            const packed_slice = slab.fastscan_blocks[blk_idx * slab.block_bytes ..][0..slab.block_bytes];
+                            rabitq_mod.estimateFastScanBlock32(
+                                lut_slice,
+                                lut_scale.vl,
+                                lut_scale.delta,
+                                q_l2,
+                                q_l2_sq,
+                                packed_slice,
+                                slab.f_add[base..][0..32],
+                                slab.f_rescale[base..][0..32],
+                                &d2_buf,
+                            );
+                            const tv: @Vector(16, f32) = @splat(threshold);
+                            const bv: @Vector(16, u32) = @splat(@as(u32, @intCast(base)));
+                            sel_len += compressStore16Avx512(d2_buf[0..16].*, bv + iota0, tv, sel_d.ptr + sel_len, sel_i.ptr + sel_len);
+                            sel_len += compressStore16Avx512(d2_buf[16..32].*, bv + iota1, tv, sel_d.ptr + sel_len, sel_i.ptr + sel_len);
+                            if (sel_len >= sel_cap) {
+                                @branchHint(.cold);
+                                threshold = branchlessSelectKSoa(sel_d[0..sel_len], sel_i[0..sel_len], stage1_k, scratch_alloc);
+                                sel_len = stage1_k;
+                            }
+                        }
+                    } else {
+                        for (0..n_blocks) |blk_idx| {
+                            if (blk_idx + 2 < n_blocks) {
+                                @prefetch(slab.fastscan_blocks.ptr + (blk_idx + 2) * slab.block_bytes, .{ .locality = 3 });
+                                @prefetch(slab.f_add.ptr + (blk_idx + 2) * 32, .{ .locality = 3 });
+                                @prefetch(slab.f_rescale.ptr + (blk_idx + 2) * 32, .{ .locality = 3 });
+                            }
+                            const base = blk_idx * 32;
+                            const packed_slice = slab.fastscan_blocks[blk_idx * slab.block_bytes ..][0..slab.block_bytes];
+                            rabitq_mod.estimateFastScanBlock32(
+                                lut_slice,
+                                lut_scale.vl,
+                                lut_scale.delta,
+                                q_l2,
+                                q_l2_sq,
+                                packed_slice,
+                                slab.f_add[base..][0..32],
+                                slab.f_rescale[base..][0..32],
+                                &d2_buf,
+                            );
+                            var mask = blockLessThanMask32(&d2_buf, threshold);
+                            if (mask != 0) {
+                                while (mask != 0) {
+                                    const lane: u5 = @intCast(@ctz(mask));
+                                    mask &= mask - 1;
+                                    const nid: u32 = @intCast(base + lane);
+                                    if (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid))) {
+                                        sel_d[sel_len] = d2_buf[lane];
+                                        sel_i[sel_len] = nid;
+                                        sel_len += 1;
+                                    }
+                                }
+                                if (sel_len >= sel_cap) {
+                                    @branchHint(.cold);
+                                    threshold = branchlessSelectKSoa(sel_d[0..sel_len], sel_i[0..sel_len], stage1_k, scratch_alloc);
+                                    sel_len = stage1_k;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for (0..n_blocks) |blk_idx| {
+                        if (blk_idx + 2 < n_blocks) {
+                            @prefetch(slab.fastscan_blocks.ptr + (blk_idx + 2) * slab.block_bytes, .{ .locality = 3 });
+                            @prefetch(slab.f_add.ptr + (blk_idx + 2) * 32, .{ .locality = 3 });
+                            @prefetch(slab.f_rescale.ptr + (blk_idx + 2) * 32, .{ .locality = 3 });
+                        }
+                        const base = blk_idx * 32;
+                        const packed_slice = slab.fastscan_blocks[blk_idx * slab.block_bytes ..][0..slab.block_bytes];
+                        rabitq_mod.estimateFastScanBlock32(
+                            lut_slice,
+                            lut_scale.vl,
+                            lut_scale.delta,
+                            q_l2,
+                            q_l2_sq,
+                            packed_slice,
+                            slab.f_add[base..][0..32],
+                            slab.f_rescale[base..][0..32],
+                            &d2_buf,
+                        );
+                        var mask = blockLessThanMask32(&d2_buf, threshold);
+                        if (mask != 0) {
+                            while (mask != 0) {
+                                const lane: u5 = @intCast(@ctz(mask));
+                                mask &= mask - 1;
+                                const nid: u32 = @intCast(base + lane);
+                                if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
+                                    sel_d[sel_len] = d2_buf[lane];
+                                    sel_i[sel_len] = nid;
+                                    sel_len += 1;
+                                }
+                            }
+                            if (sel_len >= sel_cap) {
+                                @branchHint(.cold);
+                                threshold = branchlessSelectKSoa(sel_d[0..sel_len], sel_i[0..sel_len], stage1_k, scratch_alloc);
+                                sel_len = stage1_k;
+                            }
                         }
                     }
                 }
-            }
 
-            // 2. Partial tail (< 32 vectors) via 4-bit AND-Popcount SoA batch4.
-            var i = tail_start;
-            while (i < n) : (i += 4) {
-                const rem = @min(@as(usize, 4), n - i);
-                const k0 = i;
-                const k1 = if (rem > 1) i + 1 else i;
-                const k2 = if (rem > 2) i + 2 else i;
-                const k3 = if (rem > 3) i + 3 else i;
-                const ds = rabitq_mod.estimateL2Sq4BitSlabBatch4(
-                    &pq,
-                    .{ slab.codeAt(k0), slab.codeAt(k1), slab.codeAt(k2), slab.codeAt(k3) },
-                    .{ slab.f_add[k0], slab.f_add[k1], slab.f_add[k2], slab.f_add[k3] },
-                    .{ slab.f_rescale[k0], slab.f_rescale[k1], slab.f_rescale[k2], slab.f_rescale[k3] },
-                    .{ slab.popc[k0], slab.popc[k1], slab.popc[k2], slab.popc[k3] },
-                );
-                for (0..rem) |lane| {
-                    const d2 = ds[lane];
-                    if (d2 < worst_d2) {
-                        const nid: u32 = @intCast(i + lane);
-                        if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
-                            heap.pushOrReplace(.{ .id = nid, .dist = d2 });
-                            worst_d2 = heap.worstDist();
+                // 2. Partial tail (< 32 vectors) via 4-bit AND-Popcount SoA batch4.
+                var i = tail_start;
+                while (i < n) : (i += 4) {
+                    const rem = @min(@as(usize, 4), n - i);
+                    const k0 = i;
+                    const k1 = if (rem > 1) i + 1 else i;
+                    const k2 = if (rem > 2) i + 2 else i;
+                    const k3 = if (rem > 3) i + 3 else i;
+                    const ds = rabitq_mod.estimateL2Sq4BitSlabBatch4(
+                        &pq,
+                        .{ slab.codeAt(k0), slab.codeAt(k1), slab.codeAt(k2), slab.codeAt(k3) },
+                        .{ slab.f_add[k0], slab.f_add[k1], slab.f_add[k2], slab.f_add[k3] },
+                        .{ slab.f_rescale[k0], slab.f_rescale[k1], slab.f_rescale[k2], slab.f_rescale[k3] },
+                        .{ slab.popc[k0], slab.popc[k1], slab.popc[k2], slab.popc[k3] },
+                    );
+                    for (0..rem) |lane| {
+                        const d2 = ds[lane];
+                        if (d2 < threshold) {
+                            const nid: u32 = @intCast(i + lane);
+                            if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
+                                sel_d[sel_len] = d2;
+                                sel_i[sel_len] = nid;
+                                sel_len += 1;
+                            }
                         }
                     }
+                    if (sel_len >= sel_cap) {
+                        @branchHint(.cold);
+                        threshold = branchlessSelectKSoa(sel_d[0..sel_len], sel_i[0..sel_len], stage1_k, scratch_alloc);
+                        sel_len = stage1_k;
+                    }
                 }
-            }
 
-            if (!rerank) {
-                const sorted = heap.sortedAsc();
-                const emit_n = @min(sorted.len, @min(top_k, out.len));
-                for (0..emit_n) |idx| {
-                    const r = sorted[idx];
-                    out[idx] = .{
-                        .key = self.keys.items[r.id],
-                        .score = rabitqD2ToSim(r.dist, cosine_score),
-                        .timestamp = self.timestamps.items[r.id],
+                if (sel_len > stage1_k) {
+                    _ = branchlessSelectKSoa(sel_d[0..sel_len], sel_i[0..sel_len], stage1_k, scratch_alloc);
+                    sel_len = stage1_k;
+                }
+
+                if (!rerank) {
+                    var sort_stack: [256]IdDist = undefined;
+                    var sort_heap: ?[]IdDist = null;
+                    defer if (sort_heap) |b| scratch_alloc.free(b);
+                    const sort_buf: []IdDist = if (sel_len <= sort_stack.len)
+                        sort_stack[0..sel_len]
+                    else blk: {
+                        const b = try scratch_alloc.alloc(IdDist, sel_len);
+                        sort_heap = b;
+                        break :blk b;
                     };
+                    for (0..sel_len) |idx| sort_buf[idx] = .{ .id = sel_i[idx], .dist = sel_d[idx] };
+                    std.sort.pdq(IdDist, sort_buf, {}, idDistLess);
+                    const emit_n = @min(sort_buf.len, @min(top_k, out.len));
+                    for (0..emit_n) |idx| {
+                        const r = sort_buf[idx];
+                        out[idx] = .{
+                            .key = self.keys.items[r.id],
+                            .score = rabitqD2ToSim(r.dist, cosine_score),
+                            .timestamp = self.timestamps.items[r.id],
+                        };
+                    }
+                    return .{ .count = emit_n, .needs_kv_rerank = false };
                 }
-                return .{ .count = emit_n, .needs_kv_rerank = false };
-            }
 
-            const items = heap.items();
-            n_stage1 = items.len;
-            for (items, 0..) |item, idx| cand_ids_buf[idx] = item.id;
+                n_stage1 = sel_len;
+                @memcpy(cand_ids_buf[0..sel_len], sel_i[0..sel_len]);
+            } else {
+                // Small-K path (stage1_k < 32): tiny bounded max-heap + SIMD 32-lane threshold mask.
+                var h_stack: [32]IdDist = undefined;
+                var heap = IdDistHeap.init(h_stack[0..stage1_k]);
+                var worst_d2 = heap.worstDist();
+
+                // 1. Full 32-vector FastScan blocks.
+                for (0..n_blocks) |blk_idx| {
+                    if (blk_idx + 2 < n_blocks) {
+                        @prefetch(slab.fastscan_blocks.ptr + (blk_idx + 2) * slab.block_bytes, .{ .locality = 3 });
+                        @prefetch(slab.f_add.ptr + (blk_idx + 2) * 32, .{ .locality = 3 });
+                        @prefetch(slab.f_rescale.ptr + (blk_idx + 2) * 32, .{ .locality = 3 });
+                    }
+                    const base = blk_idx * 32;
+                    const packed_slice = slab.fastscan_blocks[blk_idx * slab.block_bytes ..][0..slab.block_bytes];
+                    rabitq_mod.estimateFastScanBlock32(
+                        lut_slice,
+                        lut_scale.vl,
+                        lut_scale.delta,
+                        q_l2,
+                        q_l2_sq,
+                        packed_slice,
+                        slab.f_add[base..][0..32],
+                        slab.f_rescale[base..][0..32],
+                        &d2_buf,
+                    );
+                    var mask = blockLessThanMask32(&d2_buf, worst_d2);
+                    while (mask != 0) {
+                        const lane: u5 = @intCast(@ctz(mask));
+                        mask &= mask - 1;
+                        const d2 = d2_buf[lane];
+                        if (d2 < worst_d2) {
+                            const nid: u32 = @intCast(base + lane);
+                            if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
+                                heap.pushOrReplace(.{ .id = nid, .dist = d2 });
+                                worst_d2 = heap.worstDist();
+                            }
+                        }
+                    }
+                }
+
+                // 2. Partial tail (< 32 vectors) via 4-bit AND-Popcount SoA batch4.
+                var i = tail_start;
+                while (i < n) : (i += 4) {
+                    const rem = @min(@as(usize, 4), n - i);
+                    const k0 = i;
+                    const k1 = if (rem > 1) i + 1 else i;
+                    const k2 = if (rem > 2) i + 2 else i;
+                    const k3 = if (rem > 3) i + 3 else i;
+                    const ds = rabitq_mod.estimateL2Sq4BitSlabBatch4(
+                        &pq,
+                        .{ slab.codeAt(k0), slab.codeAt(k1), slab.codeAt(k2), slab.codeAt(k3) },
+                        .{ slab.f_add[k0], slab.f_add[k1], slab.f_add[k2], slab.f_add[k3] },
+                        .{ slab.f_rescale[k0], slab.f_rescale[k1], slab.f_rescale[k2], slab.f_rescale[k3] },
+                        .{ slab.popc[k0], slab.popc[k1], slab.popc[k2], slab.popc[k3] },
+                    );
+                    for (0..rem) |lane| {
+                        const d2 = ds[lane];
+                        if (d2 < worst_d2) {
+                            const nid: u32 = @intCast(i + lane);
+                            if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
+                                heap.pushOrReplace(.{ .id = nid, .dist = d2 });
+                                worst_d2 = heap.worstDist();
+                            }
+                        }
+                    }
+                }
+
+                if (!rerank) {
+                    const sorted = heap.sortedAsc();
+                    const emit_n = @min(sorted.len, @min(top_k, out.len));
+                    for (0..emit_n) |idx| {
+                        const r = sorted[idx];
+                        out[idx] = .{
+                            .key = self.keys.items[r.id],
+                            .score = rabitqD2ToSim(r.dist, cosine_score),
+                            .timestamp = self.timestamps.items[r.id],
+                        };
+                    }
+                    return .{ .count = emit_n, .needs_kv_rerank = false };
+                }
+
+                const items = heap.items();
+                n_stage1 = items.len;
+                for (items, 0..) |item, idx| cand_ids_buf[idx] = item.id;
+            }
         } else {
             var h_stack: [256]IdScore = undefined;
             var h_heap: ?[]IdScore = null;
@@ -2130,7 +2754,10 @@ pub const NamespaceIndex = struct {
             inline for (0..4) |lane| {
                 const nid: u32 = @intCast(i + lane);
                 if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
-                    const score = applyDecayIndex(raw_sims[lane], self.timestamps.items[nid], decay, now_ms, decay_tau_hours);
+                    const score = if (decay > 0.0)
+                        applyDecayIndex(raw_sims[lane], self.timestamps.items[nid], decay, now_ms, decay_tau_hours)
+                    else
+                        raw_sims[lane];
                     if (score > thresh) {
                         topk.push(.{ .id = nid, .score = score });
                         thresh = topk.thresholdScore();
@@ -2150,7 +2777,10 @@ pub const NamespaceIndex = struct {
                     .dot => distance.dotAligned(q_ptr, self.hnsw.vecPtr(nid), stride),
                     .l2 => 1.0 / (1.0 + distance.l2SquaredAligned(q_ptr, self.hnsw.vecPtr(nid), stride)),
                 };
-                const score = applyDecayIndex(raw_sim, self.timestamps.items[nid], decay, now_ms, decay_tau_hours);
+                const score = if (decay > 0.0)
+                    applyDecayIndex(raw_sim, self.timestamps.items[nid], decay, now_ms, decay_tau_hours)
+                else
+                    raw_sim;
                 if (score > thresh) {
                     topk.push(.{ .id = nid, .score = score });
                     thresh = topk.thresholdScore();
@@ -3850,4 +4480,195 @@ test "namespace index: ShardedRwLock concurrent readers + writer stress" {
     for (threads) |th| th.join();
     try testing.expect(!reader_err.load(.acquire));
     try testing.expect(idx.liveCount() >= 64);
+}
+
+test "vector slab helpers: blockLessThanMask32 lane order and NaN/inf rejection" {
+    var d2: [32]f32 align(64) = @splat(10.0);
+    d2[0] = 1.0;
+    d2[7] = 2.0;
+    d2[15] = 4.99;
+    d2[16] = 5.0; // equal -> MUST be rejected (strict `<`)
+    d2[17] = -3.0;
+    d2[24] = std.math.nan(f32);
+    d2[25] = std.math.inf(f32);
+    d2[26] = -std.math.inf(f32);
+    d2[31] = 0.0;
+
+    const mask = blockLessThanMask32(&d2, 5.0);
+    const expected: u32 = (@as(u32, 1) << 0) | (@as(u32, 1) << 7) | (@as(u32, 1) << 15) |
+        (@as(u32, 1) << 17) | (@as(u32, 1) << 26) | (@as(u32, 1) << 31);
+    try testing.expectEqual(expected, mask);
+
+    // Threshold +inf accepts all finite and -inf values, rejects NaN and +inf.
+    const inf_mask = blockLessThanMask32(&d2, std.math.inf(f32));
+    try testing.expect((inf_mask & (@as(u32, 1) << 24)) == 0); // NaN rejected
+    try testing.expect((inf_mask & (@as(u32, 1) << 25)) == 0); // +inf rejected
+    try testing.expect((inf_mask & (@as(u32, 1) << 16)) != 0); // finite 5.0 accepted
+    try testing.expect((inf_mask & (@as(u32, 1) << 26)) != 0); // -inf accepted
+}
+
+test "vector slab helpers: branchlessSelectKSoa and nthElementSoaInPlace across ties and edge sizes" {
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5E1E_C701);
+    const rand = prng.random();
+
+    const Pattern = enum { random, sorted, reversed, all_equal, heavy_ties };
+    const sizes = [_]usize{ 1, 2, 16, 17, 64, 512, 1200 };
+
+    for (sizes) |n| {
+        const ks = [_]usize{ 1, @max(@as(usize, 1), n / 2), n };
+        for ([_]Pattern{ .random, .sorted, .reversed, .all_equal, .heavy_ties }) |pat| {
+            const orig_d = try alloc.alloc(f32, n);
+            defer alloc.free(orig_d);
+            const orig_i = try alloc.alloc(u32, n);
+            defer alloc.free(orig_i);
+            const sorted_ref = try alloc.alloc(f32, n);
+            defer alloc.free(sorted_ref);
+
+            for (0..n) |i| {
+                orig_i[i] = @intCast(i);
+                orig_d[i] = switch (pat) {
+                    .random => rand.float(f32) * 100.0 - 20.0,
+                    .sorted => @floatFromInt(i),
+                    .reversed => @floatFromInt(n - 1 - i),
+                    .all_equal => 3.5,
+                    .heavy_ties => @floatFromInt(i % 4),
+                };
+            }
+            @memcpy(sorted_ref, orig_d);
+            std.mem.sort(f32, sorted_ref, {}, std.sort.asc(f32));
+
+            const work_d = try alloc.alloc(f32, n);
+            defer alloc.free(work_d);
+            const work_i = try alloc.alloc(u32, n);
+            defer alloc.free(work_i);
+
+            for (ks) |k| {
+                @memcpy(work_d, orig_d);
+                @memcpy(work_i, orig_i);
+                const thr = branchlessSelectKSoa(work_d, work_i, k, alloc);
+                try testing.expectEqual(sorted_ref[k - 1], thr);
+
+                // Every selected item must match its original distance and be <= thr, with no duplicate IDs.
+                var seen = try std.bit_set.Dynamic.initEmpty(alloc, n);
+                defer seen.deinit(alloc);
+                for (0..k) |j| {
+                    try testing.expect(work_d[j] <= thr);
+                    try testing.expectEqual(orig_d[work_i[j]], work_d[j]);
+                    try testing.expect(!seen.isSet(work_i[j]));
+                    seen.set(work_i[j]);
+                }
+
+                // Also verify in-place OOM fallback.
+                @memcpy(work_d, orig_d);
+                @memcpy(work_i, orig_i);
+                const thr_ip = nthElementSoaInPlace(work_d, work_i, k - 1);
+                try testing.expectEqual(sorted_ref[k - 1], thr_ip);
+                for (0..k) |j| {
+                    try testing.expect(work_d[j] <= thr_ip);
+                    try testing.expectEqual(orig_d[work_i[j]], work_d[j]);
+                }
+            }
+        }
+    }
+}
+
+test "namespace index: large-M RaBitQ batched select and BQ counting-bucket parity with tombstones and exclude_id" {
+    const alloc = testing.allocator;
+    const dim: usize = 32;
+    const N: usize = 1300; // > RABITQ_SEL_STACK_CAP (1024) so batched compaction fires!
+
+    var idx = NamespaceIndex.init(alloc, .{ .m = 8, .ef_construction = 32 }, .cosine);
+    defer idx.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0xB0C4_E701);
+    const rand = prng.random();
+    const corpus = try alloc.alloc(f32, N * dim);
+    defer alloc.free(corpus);
+    for (corpus) |*x| x.* = rand.floatNorm(f32);
+
+    // Make vector 1250 nearly identical to query and vector 1251 identical to vector 1250.
+    var query: [dim]f32 = undefined;
+    for (&query) |*x| x.* = rand.floatNorm(f32);
+    @memcpy(corpus[1250 * dim ..][0..dim], &query);
+    @memcpy(corpus[1251 * dim ..][0..dim], &query);
+
+    var key_buf: [32]u8 = undefined;
+    for (0..N) |i| {
+        const k = std.fmt.bufPrint(&key_buf, "vec:t:{d}", .{i}) catch unreachable;
+        _ = try idx.insertLocked(k, corpus[i * dim ..][0..dim], 1000 + i);
+    }
+
+    // 1. Legacy BQ slab without filters (fast path): rerank=true (M=200) and rerank=false (top_k=10).
+    var out10: [10]IndexScoredResult = undefined;
+    const bq_rr = (try idx.searchBqLocked(&query, null, 10, 20, .cosine, 0.0, 0, 24.0, true, &out10, alloc)).?;
+    try testing.expect(!bq_rr.needs_kv_rerank);
+    try testing.expectEqual(@as(usize, 10), bq_rr.count);
+    try testing.expect(std.mem.eql(u8, out10[0].key, "vec:t:1250") or std.mem.eql(u8, out10[0].key, "vec:t:1251"));
+    try testing.expectApproxEqAbs(@as(f32, 1.0), out10[0].score, 1e-4);
+
+    // Pure BQ (rerank=false) must be sorted descending by score (ascending Hamming) and match exact Hamming cutoff.
+    const bq_pure = (try idx.searchBqLocked(&query, null, 10, 1, .cosine, 0.0, 0, 24.0, false, &out10, alloc)).?;
+    try testing.expectEqual(@as(usize, 10), bq_pure.count);
+    for (1..bq_pure.count) |j| {
+        try testing.expect(out10[j - 1].score >= out10[j].score);
+    }
+    try testing.expectApproxEqAbs(@as(f32, 1.0), out10[0].score, 1e-6);
+
+    // 2. Legacy BQ with exclude_id=1250 and tombstone=1251: neither may appear.
+    const ex_id = idx.nodeIdFor("vec:t:1250").?;
+    try testing.expectEqual(TombstoneResult.deleted, idx.markTombstoneLocked("vec:t:1251"));
+    const bq_filt = (try idx.searchBqLocked(&query, ex_id, 10, 20, .cosine, 0.0, 0, 24.0, true, &out10, alloc)).?;
+    try testing.expectEqual(@as(usize, 10), bq_filt.count);
+    for (out10[0..bq_filt.count]) |r| {
+        try testing.expect(!std.mem.eql(u8, r.key, "vec:t:1250"));
+        try testing.expect(!std.mem.eql(u8, r.key, "vec:t:1251"));
+    }
+
+    // 3. Install RaBitQ slab and test BOTH unfiltered (AVX-512 compress path) and filtered large-M selection!
+    // Reset tombstone on a fresh index for clean unfiltered test, then tombstone for filtered test.
+    var rq_idx = NamespaceIndex.init(alloc, .{ .m = 8, .ef_construction = 32 }, .cosine);
+    defer rq_idx.deinit();
+    for (0..N) |i| {
+        const k = std.fmt.bufPrint(&key_buf, "vec:r:{d}", .{i}) catch unreachable;
+        _ = try rq_idx.insertLocked(k, corpus[i * dim ..][0..dim], 1000 + i);
+    }
+
+    const centroid = try alloc.alloc(f32, dim);
+    @memset(centroid, 0.0);
+    for (0..N) |i| {
+        const v = rq_idx.hnsw.getVector(@intCast(i));
+        for (0..dim) |d| centroid[d] += v[d];
+    }
+    for (centroid) |*c| c.* /= @as(f32, @floatFromInt(N));
+    const rot = try rabitq_mod.generateRotation(alloc, dim, 0xCAFE);
+    const params = try alloc.create(RabitqParams);
+    params.* = .{ .allocator = alloc, .centroid = centroid, .rotation = rot, .dim = dim, .seed = 0xCAFE };
+    try rq_idx.setRabitqParams(params);
+    try rq_idx.installRabitqSlabFromEncodedLocked(params, &.{});
+
+    // Unfiltered large-M rerank=true (stage1_k=200 -> triggers AVX-512 compress + compaction over N=1300).
+    const rq_rr = (try rq_idx.searchRabitqLocked(&query, null, 10, 20, .cosine, 0.0, 0, 24.0, true, &out10, alloc)).?;
+    try testing.expect(!rq_rr.needs_kv_rerank);
+    try testing.expectEqual(@as(usize, 10), rq_rr.count);
+    try testing.expect(std.mem.eql(u8, out10[0].key, "vec:r:1250") or std.mem.eql(u8, out10[0].key, "vec:r:1251"));
+    try testing.expectApproxEqAbs(@as(f32, 1.0), out10[0].score, 1e-4);
+
+    // Unfiltered large-M rerank=false (stage1_k=64 -> exercises sorted non-rerank path).
+    var out64: [64]IndexScoredResult = undefined;
+    const rq_pure64 = (try rq_idx.searchRabitqLocked(&query, null, 64, 1, .cosine, 0.0, 0, 24.0, false, &out64, alloc)).?;
+    try testing.expectEqual(@as(usize, 64), rq_pure64.count);
+    for (1..rq_pure64.count) |j| {
+        try testing.expect(out64[j - 1].score >= out64[j].score);
+    }
+
+    // Filtered large-M rerank=true (tombstone 1251 + exclude_id 1250 -> neither may appear).
+    const rq_ex = rq_idx.nodeIdFor("vec:r:1250").?;
+    try testing.expectEqual(TombstoneResult.deleted, rq_idx.markTombstoneLocked("vec:r:1251"));
+    const rq_filt = (try rq_idx.searchRabitqLocked(&query, rq_ex, 10, 20, .cosine, 0.0, 0, 24.0, true, &out10, alloc)).?;
+    try testing.expectEqual(@as(usize, 10), rq_filt.count);
+    for (out10[0..rq_filt.count]) |r| {
+        try testing.expect(!std.mem.eql(u8, r.key, "vec:r:1250"));
+        try testing.expect(!std.mem.eql(u8, r.key, "vec:r:1251"));
+    }
 }

@@ -216,7 +216,23 @@ pub const EventBus = struct {
         }
     }
 
-    /// Publish `message` to all subscribers of `channel_name`.
+    /// True if a subscription key `sub_pattern` should receive events published to `channel_name`.
+    /// Matches exact names, namespace prefixes ending in `:` (e.g. `SUB vec:` receives `vec:vis:1`),
+    /// and trailing `*` wildcards (e.g. `SUB *` or `SUB gallery:*`).
+    fn channelMatches(channel_name: []const u8, sub_pattern: []const u8) bool {
+        if (std.mem.eql(u8, channel_name, sub_pattern)) return true;
+        if (sub_pattern.len == 0) return false;
+        const last = sub_pattern[sub_pattern.len - 1];
+        if (last == ':') {
+            return std.mem.startsWith(u8, channel_name, sub_pattern);
+        }
+        if (last == '*') {
+            return std.mem.startsWith(u8, channel_name, sub_pattern[0 .. sub_pattern.len - 1]);
+        }
+        return false;
+    }
+
+    /// Publish `message` to all subscribers of `channel_name` (exact and prefix matches).
     ///
     /// Filter matching runs under `channel.mutex`. Delivery (`write_fn`) runs
     /// **after both** the bus map lock and the channel lock are released so
@@ -233,14 +249,33 @@ pub const EventBus = struct {
     /// Channel pointers remain valid for the process lifetime of the bus
     /// (channels are only destroyed in `EventBus.deinit`).
     pub fn publish(self: *EventBus, channel_name: []const u8, message: []const u8) !void {
-        const channel: *Channel = blk: {
+        var matched_stack: [16]*Channel = undefined;
+        var matched_len: usize = 0;
+        var matched_heap: std.ArrayListUnmanaged(*Channel) = .empty;
+        defer matched_heap.deinit(self.allocator);
+
+        {
             self.mutex.lockShared();
             defer self.mutex.unlockShared();
-            break :blk self.channels.get(channel_name) orelse return;
-        };
 
-        const event_msg = try std.fmt.allocPrint(self.allocator, ">EVENT {s}\r\n{s}\r\n", .{ channel_name, message });
-        defer self.allocator.free(event_msg);
+            var ch_it = self.channels.iterator();
+            while (ch_it.next()) |entry| {
+                if (!channelMatches(channel_name, entry.key_ptr.*)) continue;
+                const ch = entry.value_ptr.*;
+                if (matched_len < matched_stack.len) {
+                    matched_stack[matched_len] = ch;
+                    matched_len += 1;
+                } else {
+                    try matched_heap.append(self.allocator, ch);
+                }
+            }
+        }
+
+        // Count every publish call even when zero subscribers match.
+        self.bumpPublishCount();
+
+        const total_matched = matched_len + matched_heap.items.len;
+        if (total_matched == 0) return;
 
         var deliveries: std.ArrayListUnmanaged(Delivery) = .empty;
         defer {
@@ -252,29 +287,30 @@ pub const EventBus = struct {
             deliveries.deinit(self.allocator);
         }
 
-        {
+        var ts_computed = false;
+        var ts_ms: u64 = 0;
+
+        var ch_idx: usize = 0;
+        while (ch_idx < total_matched) : (ch_idx += 1) {
+            const channel = if (ch_idx < matched_len) matched_stack[ch_idx] else matched_heap.items[ch_idx - matched_len];
+
             channel.mutex.lock();
             defer channel.mutex.unlock();
 
             const n_subs = channel.subscribers.count();
-            if (n_subs == 0) {
-                self.bumpPublishCount();
-                return;
-            }
-            try deliveries.ensureTotalCapacity(self.allocator, n_subs);
+            if (n_subs == 0) continue;
+            try deliveries.ensureUnusedCapacity(self.allocator, n_subs);
 
-            // Only pay filter/ts cost when at least one subscriber needs it.
-            var any_filter = false;
-            {
+            if (!ts_computed) {
                 var scan = channel.subscribers.iterator();
                 while (scan.next()) |entry| {
                     if (entry.value_ptr.filter != null) {
-                        any_filter = true;
+                        ts_ms = eventTimestamp(message);
+                        ts_computed = true;
                         break;
                     }
                 }
             }
-            const ts_ms: u64 = if (any_filter) eventTimestamp(message) else 0;
 
             var iter = channel.subscribers.iterator();
             while (iter.next()) |entry| {
@@ -282,6 +318,20 @@ pub const EventBus = struct {
                 if (sub.filter) |filter| {
                     if (!filter.matches(message, ts_ms)) continue;
                 }
+
+                // When multiple prefix/exact patterns match the same publish, avoid
+                // delivering duplicate frames to the exact same subscriber target.
+                if (total_matched > 1) {
+                    var dup = false;
+                    for (deliveries.items) |existing| {
+                        if (existing.ctx == sub.ctx and existing.write_fn == sub.write_fn and existing.event_fn == sub.event_fn) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (dup) continue;
+                }
+
                 // Retain before leaving the lock so deinit cannot free ctx.
                 if (sub.retain_fn) |retain| retain(sub.ctx);
                 errdefer if (sub.release_fn) |rel| rel(sub.ctx);
@@ -293,8 +343,18 @@ pub const EventBus = struct {
                     .release_fn = sub.release_fn,
                 });
             }
+        }
 
-            self.bumpPublishCount();
+        if (deliveries.items.len == 0) return;
+
+        // Format wire text frame only when at least one subscriber uses write_fn.
+        var event_msg: ?[]u8 = null;
+        defer if (event_msg) |m| self.allocator.free(m);
+        for (deliveries.items) |d| {
+            if (d.event_fn == null) {
+                event_msg = try std.fmt.allocPrint(self.allocator, ">EVENT {s}\r\n{s}\r\n", .{ channel_name, message });
+                break;
+            }
         }
 
         // Deliver outside all bus/channel locks — head-of-line socket I/O must
@@ -307,7 +367,7 @@ pub const EventBus = struct {
             if (d.event_fn) |deliver_event| {
                 deliver_event(d.ctx, channel_name, message);
             } else {
-                d.write_fn.?(d.ctx, event_msg);
+                d.write_fn.?(d.ctx, event_msg.?);
             }
             if (d.release_fn) |rel| rel(d.ctx);
         }
@@ -598,4 +658,71 @@ test "EventBus retain/release keeps ctx alive across concurrent unsub" {
     try testing.expectEqual(@as(u32, 0), state.in_flight.load(.acquire));
     // Write either completed (1) or saw closed (0) — never UAF crash.
     try testing.expect(state.writes.load(.acquire) <= 1);
+}
+
+test "EventBus prefix subscribe receives matching sub-channels and bumps publishCount" {
+    const testing = std.testing;
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    const Counter = struct {
+        count: usize = 0,
+        last_len: usize = 0,
+        last_buf: [256]u8 = undefined,
+
+        fn write(ctx: *anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+            const n = @min(data.len, self.last_buf.len);
+            @memcpy(self.last_buf[0..n], data[0..n]);
+            self.last_len = n;
+        }
+    };
+
+    var prefix_sub = Counter{};
+    var exact_sub = Counter{};
+    var unrelated_sub = Counter{};
+
+    const s1 = try bus.subscribe("gallery:", Counter.write, @ptrCast(&prefix_sub));
+    defer bus.unsubscribe("gallery:", s1);
+    const s2 = try bus.subscribe("gallery:progress", Counter.write, @ptrCast(&exact_sub));
+    defer bus.unsubscribe("gallery:progress", s2);
+    // "gal" does not end in ':' or '*' so it must NOT match "gallery:*"
+    const s3 = try bus.subscribe("gal", Counter.write, @ptrCast(&unrelated_sub));
+    defer bus.unsubscribe("gal", s3);
+
+    try bus.publish("gallery:progress", "{\"done\":1}");
+    try bus.publish("gallery:clusters", "{\"count\":4}");
+    try bus.publish("unsubscribed:channel", "noop");
+
+    try testing.expectEqual(@as(usize, 2), prefix_sub.count);
+    try testing.expectEqual(@as(usize, 1), exact_sub.count);
+    try testing.expectEqual(@as(usize, 0), unrelated_sub.count);
+    try testing.expectEqual(@as(u64, 3), bus.publishCount());
+    try testing.expect(std.mem.containsAtLeast(u8, prefix_sub.last_buf[0..prefix_sub.last_len], 1, "gallery:clusters"));
+}
+
+test "EventBus overlapping prefix and exact subscriptions on same target deduplicate delivery" {
+    const testing = std.testing;
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    const Counter = struct {
+        count: usize = 0,
+        fn write(ctx: *anyopaque, _: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+        }
+    };
+
+    var shared = Counter{};
+    const s1 = try bus.subscribe("vec:", Counter.write, @ptrCast(&shared));
+    defer bus.unsubscribe("vec:", s1);
+    const s2 = try bus.subscribe("vec:vis:1", Counter.write, @ptrCast(&shared));
+    defer bus.unsubscribe("vec:vis:1", s2);
+
+    try bus.publish("vec:vis:1", "payload");
+    try testing.expectEqual(@as(usize, 1), shared.count);
 }

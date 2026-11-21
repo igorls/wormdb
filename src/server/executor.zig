@@ -288,6 +288,7 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
             ) catch |err| {
                 break :blk switch (err) {
                     error.InvalidVectorBytes => Response{ .err = try ctx.allocator.dupe(u8, "vinsert: invalid vector bytes (must be non-empty, len % 4 == 0)") },
+                    error.KeyMissingNamespace => Response{ .err = try ctx.allocator.dupe(u8, "vinsert: key outside its declared namespace") },
                     error.WormViolation => Response{ .err = try ctx.allocator.dupe(u8, "WORM violation: vector key is immutable") },
                     else => Response{ .err = try ctx.allocator.dupe(u8, @errorName(err)) },
                 };

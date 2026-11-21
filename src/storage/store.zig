@@ -337,12 +337,21 @@ pub const Store = struct {
         if (config.persistence != .none) {
             try store.loadSnapshot();
         }
+
+        // Snapshot v2 (WDBHNSW2) already restored HNSW graphs + RaBitQ params for
+        // namespaces present in `vector_registry`. Track any WAL mutations to those
+        // namespaces so we can preserve restored graphs (0-cost on clean restart,
+        // incremental delta on small WAL recovery) instead of unconditionally wiping
+        // and rebuilding every namespace from scratch.
+        var wal_vec_tracker = try WalVectorTracker.initFromRegistry(allocator, store.vector_registry);
+        defer wal_vec_tracker.deinit();
+
         // Only replay WAL in full mode
         if (config.persistence == .full) {
-            try store.replayWal();
+            try store.replayWal(&wal_vec_tracker);
         }
         if (config.persistence != .none) {
-            try store.rebuildVectorIndexesFromKv();
+            try store.reconcileVectorIndexes(&wal_vec_tracker);
         }
 
         return store;
@@ -940,7 +949,20 @@ pub const Store = struct {
         limit: usize,
         alloc: std.mem.Allocator,
     ) ![]ScanResult {
-        return self.scanPrefixCut(prefix, limit, alloc, .first);
+        return self.scanPrefixCutWithCursor(prefix, limit, alloc, .first, null);
+    }
+
+    /// Cursor-paginated prefix scan: returns entries matching `prefix` with
+    /// key strictly greater than `after` (when non-null).
+    pub fn scanPrefixAfter(
+        self: *Store,
+        prefix: []const u8,
+        after: ?[]const u8,
+        limit: usize,
+        alloc: std.mem.Allocator,
+        cut: ScanCut,
+    ) ![]ScanResult {
+        return self.scanPrefixCutWithCursor(prefix, limit, alloc, cut, after);
     }
 
     fn scanHeapWorse(cut: ScanCut, a: ScanResult, b: ScanResult) bool {
@@ -1040,6 +1062,17 @@ pub const Store = struct {
         alloc: std.mem.Allocator,
         cut: ScanCut,
     ) ![]ScanResult {
+        return self.scanPrefixCutWithCursor(prefix, limit, alloc, cut, null);
+    }
+
+    fn scanPrefixCutWithCursor(
+        self: *Store,
+        prefix: []const u8,
+        limit: usize,
+        alloc: std.mem.Allocator,
+        cut: ScanCut,
+        after: ?[]const u8,
+    ) ![]ScanResult {
         var results: std.ArrayListUnmanaged(ScanResult) = .empty;
         errdefer {
             for (results.items) |r| {
@@ -1060,7 +1093,16 @@ pub const Store = struct {
             shard.mutex.lock();
             defer shard.mutex.unlock();
 
-            const range = prefixRange(shard.sorted.items, prefix);
+            var range = prefixRange(shard.sorted.items, prefix);
+            if (after) |cursor| {
+                if (range.lo < range.hi) {
+                    var lo = lowerBoundKey(shard.sorted.items[range.lo..range.hi], cursor) + range.lo;
+                    if (lo < range.hi and std.mem.eql(u8, shard.sorted.items[lo].key, cursor)) {
+                        lo += 1;
+                    }
+                    range.lo = lo;
+                }
+            }
             if (range.lo == range.hi) continue;
 
             if (limit > 0 and cut == .last) {
@@ -1091,7 +1133,14 @@ pub const Store = struct {
         // No shard lock is held here, so the containsLive probe cannot deadlock.
         const live_may_shadow = self.sst_count > 0 and self.livePrefixNonEmpty(prefix);
         for (self.ssts_buf[0..self.sst_count]) |sst| {
-            const range = sst.prefixRange(prefix);
+            var range = sst.prefixRange(prefix);
+            if (after) |cursor| {
+                while (range.lo < range.hi) {
+                    const hit = sst.hitAt(range.lo);
+                    if (std.mem.order(u8, hit.key, cursor) == .gt) break;
+                    range.lo += 1;
+                }
+            }
             if (range.lo == range.hi) continue;
 
             if (limit > 0 and cut == .last) {
@@ -1212,12 +1261,94 @@ pub const Store = struct {
     }
 
     /// Manually save current state as snapshot. Available in full and snapshot modes.
+    /// In direct WAL mode (`!writer_started`), also truncates the WAL atomically under
+    /// `wal_enqueue_mutex` so `wormdb.wal` does not grow unboundedly across `SAVE` calls.
     pub fn save(self: *Store) !void {
         if (self.config.persistence == .none) return;
+        if (self.wal) |*w| {
+            if (!w.writer_started) {
+                self.wal_enqueue_mutex.lock();
+                defer self.wal_enqueue_mutex.unlock();
+                try self.writeSnapshot();
+                try w.truncate();
+                return;
+            }
+        }
         try self.writeSnapshot();
     }
 
-    fn replayWal(self: *Store) !void {
+    const MAX_INCREMENTAL_WAL_KEYS: usize = 4096;
+
+    const WalVectorTracker = struct {
+        allocator: std.mem.Allocator,
+        entries: std.ArrayListUnmanaged(NsDelta) = .empty,
+
+        const NsDelta = struct {
+            namespace: []u8,
+            dirty_keys: std.StringHashMapUnmanaged(void) = .empty,
+            needs_full_rebuild: bool = false,
+            reconciled: bool = false,
+        };
+
+        fn initFromRegistry(allocator: std.mem.Allocator, maybe_reg: ?*NamespaceRegistry) !WalVectorTracker {
+            var self = WalVectorTracker{ .allocator = allocator };
+            errdefer self.deinit();
+            const reg = maybe_reg orelse return self;
+            reg.lock.lockShared();
+            defer reg.lock.unlockShared();
+
+            var it = reg.map.iterator();
+            while (it.next()) |kv| {
+                const ns_copy = try allocator.dupe(u8, kv.key_ptr.*);
+                errdefer allocator.free(ns_copy);
+                try self.entries.append(allocator, .{ .namespace = ns_copy });
+            }
+            return self;
+        }
+
+        fn deinit(self: *WalVectorTracker) void {
+            for (self.entries.items) |*e| {
+                var kit = e.dirty_keys.keyIterator();
+                while (kit.next()) |k| self.allocator.free(k.*);
+                e.dirty_keys.deinit(self.allocator);
+                self.allocator.free(e.namespace);
+            }
+            self.entries.deinit(self.allocator);
+        }
+
+        fn noteKey(self: *WalVectorTracker, key: []const u8) !void {
+            if (self.entries.items.len == 0) return;
+            if (std.mem.startsWith(u8, key, "bq:") or std.mem.startsWith(u8, key, "__meta:")) return;
+            for (self.entries.items) |*e| {
+                if (!std.mem.startsWith(u8, key, e.namespace)) continue;
+                if (e.needs_full_rebuild) continue;
+                if (e.dirty_keys.contains(key)) continue;
+                if (e.dirty_keys.count() >= MAX_INCREMENTAL_WAL_KEYS) {
+                    e.needs_full_rebuild = true;
+                    continue;
+                }
+                const k_copy = try self.allocator.dupe(u8, key);
+                errdefer self.allocator.free(k_copy);
+                try e.dirty_keys.put(self.allocator, k_copy, {});
+            }
+        }
+
+        fn isRestored(self: *const WalVectorTracker, namespace: []const u8) bool {
+            for (self.entries.items) |e| {
+                if (std.mem.eql(u8, e.namespace, namespace)) return true;
+            }
+            return false;
+        }
+
+        fn isReconciled(self: *const WalVectorTracker, namespace: []const u8) bool {
+            for (self.entries.items) |e| {
+                if (std.mem.eql(u8, e.namespace, namespace)) return e.reconciled;
+            }
+            return false;
+        }
+    };
+
+    fn replayWal(self: *Store, tracker: *WalVectorTracker) !void {
         var iter = self.wal.?.iterator();
 
         const wal_size = self.wal.?.size() catch 0;
@@ -1244,6 +1375,8 @@ pub const Store = struct {
                         }
                     }
 
+                    try tracker.noteKey(set_rec.key);
+
                     const entry = self.allocator.create(Entry) catch |err| {
                         self.allocator.free(set_rec.key);
                         self.allocator.free(set_rec.value);
@@ -1267,6 +1400,7 @@ pub const Store = struct {
                     // ordered index in sync for the non-WORM path.
                     if (shard.data.get(key)) |existing| {
                         if (!existing.flags.is_worm) {
+                            try tracker.noteKey(key);
                             if (shardRemoveLocked(self, shard, key)) |removed| {
                                 self.destroyEntry(removed);
                             }
@@ -1275,12 +1409,12 @@ pub const Store = struct {
                     self.allocator.free(key);
                 },
                 .vinsert => |vinsert| {
-                    // Configured indexes are rebuilt from final live `vec:*`
-                    // KV state after replay. Replaying all of their historical
-                    // HNSW mutations first is redundant and very expensive.
-                    // Unconfigured vector namespaces still depend on WAL
-                    // metadata for their metric, so preserve that legacy path.
-                    if (!self.vectorNamespaceHasConfig(vinsert.namespace)) {
+                    try tracker.noteKey(vinsert.key);
+                    // Restored v2 snapshot namespaces are reconciled after WAL replay
+                    // from final live KV state. Configured indexes are also handled
+                    // after replay; only unconfigured non-restored namespaces need
+                    // per-record replay for their metric metadata.
+                    if (!tracker.isRestored(vinsert.namespace) and !self.vectorNamespaceHasConfig(vinsert.namespace)) {
                         self.replayVectorInsert(vinsert) catch |err| {
                             std.log.warn("WAL vector insert replay skipped '{s}': {s}", .{ vinsert.key, @errorName(err) });
                         };
@@ -1290,7 +1424,8 @@ pub const Store = struct {
                     self.allocator.free(vinsert.metric);
                 },
                 .vdelete => |vdelete| {
-                    if (!self.vectorNamespaceHasConfig(vdelete.namespace)) {
+                    try tracker.noteKey(vdelete.key);
+                    if (!tracker.isRestored(vdelete.namespace) and !self.vectorNamespaceHasConfig(vdelete.namespace)) {
                         self.replayVectorDelete(vdelete) catch |err| {
                             std.log.warn("WAL vector delete replay skipped '{s}': {s}", .{ vdelete.key, @errorName(err) });
                         };
@@ -1409,12 +1544,67 @@ pub const Store = struct {
         }
     }
 
-    fn rebuildVectorIndexesFromKv(self: *Store) !void {
-        try self.rebuildConfiguredVectorIndexesFromKv();
-        try self.rebuildMemoryVectorIndexesFromKv();
+    fn reconcileVectorIndexes(self: *Store, tracker: *WalVectorTracker) !void {
+        if (self.vector_registry) |reg| {
+            for (tracker.entries.items) |*delta| {
+                const ns_idx = reg.get(delta.namespace) orelse continue;
+                if (!delta.needs_full_rebuild) {
+                    if (delta.dirty_keys.count() == 0) {
+                        delta.reconciled = true;
+                        std.log.info("startup vector restore: {s} preserved={d} from snapshot", .{
+                            delta.namespace,
+                            ns_idx.liveCount(),
+                        });
+                        continue;
+                    }
+                    var applied: usize = 0;
+                    var tombstoned: usize = 0;
+                    var kit = delta.dirty_keys.keyIterator();
+                    while (kit.next()) |k_ptr| {
+                        const key = k_ptr.*;
+                        if (self.getUnsafe(key)) |entry| {
+                            if (distance.bytesToF32(entry.value)) |vec| {
+                                ns_idx.lock.lock();
+                                defer ns_idx.lock.unlock();
+                                if (ns_idx.dim == null or vec.len == ns_idx.dim.?) {
+                                    _ = try ns_idx.insertLocked(key, vec, entry.timestamp);
+                                    applied += 1;
+                                } else {
+                                    _ = ns_idx.markTombstoneLocked(key);
+                                    tombstoned += 1;
+                                }
+                            } else {
+                                ns_idx.lock.lock();
+                                defer ns_idx.lock.unlock();
+                                _ = ns_idx.markTombstoneLocked(key);
+                                tombstoned += 1;
+                            }
+                        } else {
+                            ns_idx.lock.lock();
+                            defer ns_idx.lock.unlock();
+                            _ = ns_idx.markTombstoneLocked(key);
+                            tombstoned += 1;
+                        }
+                    }
+                    delta.reconciled = true;
+                    std.log.info("startup vector restore: {s} preserved={d} wal_applied={d} wal_tombstoned={d}", .{
+                        delta.namespace,
+                        ns_idx.liveCount(),
+                        applied,
+                        tombstoned,
+                    });
+                } else {
+                    try self.rebuildVectorNamespaceFromKv(delta.namespace, ns_idx.metric);
+                    delta.reconciled = true;
+                }
+            }
+        }
+
+        try self.rebuildConfiguredVectorIndexesFromKv(tracker);
+        try self.rebuildMemoryVectorIndexesFromKv(tracker);
     }
 
-    fn rebuildConfiguredVectorIndexesFromKv(self: *Store) !void {
+    fn rebuildConfiguredVectorIndexesFromKv(self: *Store, tracker: *const WalVectorTracker) !void {
         const configs = try self.scanPrefix("__meta:vecns:", 0, self.allocator);
         defer {
             for (configs) |cfg| {
@@ -1426,13 +1616,14 @@ pub const Store = struct {
 
         for (configs) |cfg| {
             const namespace = vectorNamespaceFromConfigKey(cfg.key) orelse continue;
+            if (tracker.isReconciled(namespace)) continue;
             const metric_name = extractJsonField(cfg.value, "metric") orelse "cosine";
             const metric = Metric.fromStr(metric_name) orelse .cosine;
             try self.rebuildVectorNamespaceFromKv(namespace, metric);
         }
     }
 
-    fn rebuildMemoryVectorIndexesFromKv(self: *Store) !void {
+    fn rebuildMemoryVectorIndexesFromKv(self: *Store, tracker: *const WalVectorTracker) !void {
         const configs = try self.scanPrefix("__meta:mem:", 0, self.allocator);
         defer {
             for (configs) |cfg| {
@@ -1448,6 +1639,7 @@ pub const Store = struct {
             const metric = Metric.fromStr(metric_name) orelse .cosine;
             const vec_namespace = try std.fmt.allocPrint(self.allocator, "vec:mem:{s}:", .{ns});
             defer self.allocator.free(vec_namespace);
+            if (tracker.isReconciled(vec_namespace)) continue;
 
             // Normal memory ingest also creates a generic vector-namespace
             // config. `rebuildConfiguredVectorIndexesFromKv` has already
@@ -3022,4 +3214,149 @@ test "background WAL writer: concurrent SET, DELETE, and save preserve lock orde
     t3.join();
 
     try testing.expect(store.count() >= 16);
+}
+
+test "Store.save truncates WAL in direct mode" {
+    const testing = std.testing;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/save_trunc.wal", .{tmp_path});
+    defer testing.allocator.free(wal_path);
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/save_trunc.snapshot", .{tmp_path});
+    defer testing.allocator.free(snapshot_path);
+
+    var store = try Store.init(testing.allocator, .{
+        .wal_path = wal_path,
+        .snapshot_path = snapshot_path,
+        .persistence = .full,
+        .sync_writes = false,
+    });
+    defer store.deinit();
+
+    try store.set("a", "one", false);
+    try store.set("b", "two", false);
+    try testing.expect((try store.walSize()) > 0);
+
+    try store.save();
+    try testing.expectEqual(@as(usize, 0), try store.walSize());
+
+    // Reload from compacted snapshot + empty WAL and confirm data survives.
+    var reopened = try Store.init(testing.allocator, .{
+        .wal_path = wal_path,
+        .snapshot_path = snapshot_path,
+        .persistence = .full,
+        .sync_writes = false,
+    });
+    defer reopened.deinit();
+    try testing.expectEqual(@as(usize, 2), reopened.count());
+    try testing.expectEqualStrings("two", reopened.get("b").?.value);
+}
+
+test "Store.initWithRegistry preserves v2 HNSW snapshot and applies incremental WAL delta" {
+    const testing = std.testing;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/hnsw_preserve.wal", .{tmp_path});
+    defer testing.allocator.free(wal_path);
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/hnsw_preserve.snapshot", .{tmp_path});
+    defer testing.allocator.free(snapshot_path);
+
+    const v1 = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+    const v2 = [_]f32{ 0.0, 1.0, 0.0, 0.0 };
+    const v3 = [_]f32{ 0.0, 0.0, 1.0, 0.0 };
+
+    {
+        var reg = NamespaceRegistry.init(testing.allocator, .{});
+        defer reg.deinit();
+        var store = try Store.initWithRegistry(testing.allocator, .{
+            .wal_path = wal_path,
+            .snapshot_path = snapshot_path,
+            .persistence = .full,
+            .sync_writes = false,
+        }, &reg);
+        defer store.deinit();
+
+        try store.set("__meta:vecns:vec:demo:", "{\"metric\":\"cosine\"}", false);
+        try store.set("vec:demo:1", std.mem.sliceAsBytes(&v1), false);
+        try store.set("vec:demo:2", std.mem.sliceAsBytes(&v2), false);
+        const ns_idx = try reg.getOrCreate("vec:demo:", .cosine);
+        ns_idx.lock.lock();
+        _ = try ns_idx.insertLocked("vec:demo:1", &v1, 100);
+        _ = try ns_idx.insertLocked("vec:demo:2", &v2, 200);
+        ns_idx.lock.unlock();
+
+        try store.save();
+
+        // Append a post-snapshot vector only to WAL (no second save).
+        try store.set("vec:demo:3", std.mem.sliceAsBytes(&v3), false);
+        try store.appendVectorInsertWal("vec:demo:3", "vec:demo:", "cosine", false, false, 300);
+    }
+
+    // Reopen: v1 & v2 come from WDBHNSW2, v3 is applied incrementally from WAL.
+    var reg2 = NamespaceRegistry.init(testing.allocator, .{});
+    defer reg2.deinit();
+    var store2 = try Store.initWithRegistry(testing.allocator, .{
+        .wal_path = wal_path,
+        .snapshot_path = snapshot_path,
+        .persistence = .full,
+        .sync_writes = false,
+    }, &reg2);
+    defer store2.deinit();
+
+    const idx2 = reg2.get("vec:demo:").?;
+    try testing.expectEqual(@as(usize, 3), idx2.liveCount());
+    try testing.expectEqual(@as(?usize, 4), idx2.expectedDim());
+}
+
+test "Store.scanPrefixAfter paginates across shards" {
+    const testing = std.testing;
+    var store = try Store.init(testing.allocator, .{ .persistence = .none });
+    defer store.deinit();
+
+    try store.set("p:01", "a", false);
+    try store.set("p:02", "b", false);
+    try store.set("p:03", "c", false);
+    try store.set("p:04", "d", false);
+    try store.set("p:05", "e", false);
+
+    const page1 = try store.scanPrefixAfter("p:", null, 2, testing.allocator, .first);
+    defer {
+        for (page1) |r| {
+            testing.allocator.free(r.key);
+            testing.allocator.free(r.value);
+        }
+        testing.allocator.free(page1);
+    }
+    try testing.expectEqual(@as(usize, 2), page1.len);
+    try testing.expectEqualStrings("p:01", page1[0].key);
+    try testing.expectEqualStrings("p:02", page1[1].key);
+
+    const page2 = try store.scanPrefixAfter("p:", page1[1].key, 2, testing.allocator, .first);
+    defer {
+        for (page2) |r| {
+            testing.allocator.free(r.key);
+            testing.allocator.free(r.value);
+        }
+        testing.allocator.free(page2);
+    }
+    try testing.expectEqual(@as(usize, 2), page2.len);
+    try testing.expectEqualStrings("p:03", page2[0].key);
+    try testing.expectEqualStrings("p:04", page2[1].key);
+
+    const page3 = try store.scanPrefixAfter("p:", page2[1].key, 2, testing.allocator, .first);
+    defer {
+        for (page3) |r| {
+            testing.allocator.free(r.key);
+            testing.allocator.free(r.value);
+        }
+        testing.allocator.free(page3);
+    }
+    try testing.expectEqual(@as(usize, 1), page3.len);
+    try testing.expectEqualStrings("p:05", page3[0].key);
 }

@@ -60,32 +60,43 @@ const Delivery = struct {
 };
 
 pub const Channel = struct {
+    allocator: std.mem.Allocator,
     name: []const u8,
-    subscribers: std.AutoHashMap(u64, Subscriber),
+    subscribers: std.AutoArrayHashMapUnmanaged(u64, Subscriber),
     mutex: compat.Mutex,
     next_sub_id: compat.AtomicU64,
+    /// Number of subscribers on this channel with an active predicate filter (under `mutex`).
+    filtered_count: usize = 0,
+    /// Number of subscribers on this channel using legacy text `write_fn` (under `mutex`).
+    text_sub_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, name: []const u8) Channel {
         return .{
+            .allocator = allocator,
             .name = name,
-            .subscribers = std.AutoHashMap(u64, Subscriber).init(allocator),
+            .subscribers = .empty,
             .mutex = .{},
             .next_sub_id = compat.AtomicU64.init(1),
+            .filtered_count = 0,
+            .text_sub_count = 0,
         };
     }
 
     pub fn deinit(self: *Channel) void {
-        var iter = self.subscribers.iterator();
-        while (iter.next()) |entry| {
-            entry.value_ptr.deinit();
+        for (self.subscribers.values()) |*sub| {
+            sub.deinit();
         }
-        self.subscribers.deinit();
+        self.subscribers.deinit(self.allocator);
     }
 };
 
 pub const EventBus = struct {
     allocator: std.mem.Allocator,
     channels: std.StringHashMap(*Channel),
+    /// Subset of `channels` whose names end in `:` or `*` (prefix/wildcard patterns).
+    /// Borrowed pointers owned by `channels`; guarded by `mutex`. Keeping these separate
+    /// lets `publish()` do an O(1) exact hash lookup in the common no-wildcard case.
+    prefix_channels: std.ArrayListUnmanaged(*Channel) = .empty,
     mutex: compat.RwLock,
     stats: Stats,
 
@@ -105,6 +116,7 @@ pub const EventBus = struct {
         return .{
             .allocator = allocator,
             .channels = std.StringHashMap(*Channel).init(allocator),
+            .prefix_channels = .empty,
             .mutex = .{},
             .stats = .{
                 .publish_count = if (build_options.single_threaded) @as(u64, 0) else compat.AtomicU64.init(0),
@@ -123,6 +135,7 @@ pub const EventBus = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.channels.deinit();
+        self.prefix_channels.deinit(self.allocator);
     }
 
     pub fn subscribe(
@@ -142,6 +155,22 @@ pub const EventBus = struct {
         ctx: *anyopaque,
     ) !u64 {
         return self.subscribeFilteredHooks(channel_name, filter_raw, write_fn, ctx, .{});
+    }
+
+    fn isPrefixPattern(name: []const u8) bool {
+        if (name.len == 0) return false;
+        const last = name[name.len - 1];
+        return last == ':' or last == '*';
+    }
+
+    /// True if prefix/wildcard pattern `sub_pattern` (guaranteed to end in `:` or `*`)
+    /// matches `channel_name`.
+    fn prefixMatches(channel_name: []const u8, sub_pattern: []const u8) bool {
+        const last = sub_pattern[sub_pattern.len - 1];
+        if (last == ':') {
+            return std.mem.startsWith(u8, channel_name, sub_pattern);
+        }
+        return std.mem.startsWith(u8, channel_name, sub_pattern[0 .. sub_pattern.len - 1]);
     }
 
     pub fn subscribeFilteredHooks(
@@ -168,13 +197,23 @@ pub const EventBus = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        const is_prefix = isPrefixPattern(channel_name);
+        if (is_prefix) {
+            try self.prefix_channels.ensureUnusedCapacity(self.allocator, 1);
+        }
+
         const gop = try self.channels.getOrPut(channel_name);
         if (!gop.found_existing) {
+            errdefer _ = self.channels.remove(channel_name);
             const name_copy = try self.allocator.dupe(u8, channel_name);
+            errdefer self.allocator.free(name_copy);
             const channel = try self.allocator.create(Channel);
             channel.* = Channel.init(self.allocator, name_copy);
             gop.key_ptr.* = name_copy;
             gop.value_ptr.* = channel;
+            if (is_prefix) {
+                self.prefix_channels.appendAssumeCapacity(channel);
+            }
         }
 
         const channel = gop.value_ptr.*;
@@ -182,7 +221,9 @@ pub const EventBus = struct {
         defer channel.mutex.unlock();
 
         const sub_id = channel.next_sub_id.fetchAdd(1, .monotonic);
-        try channel.subscribers.put(sub_id, .{
+        const has_filter = parsed_filter != null;
+        const is_text = hooks.event_fn == null;
+        try channel.subscribers.put(self.allocator, sub_id, .{
             .id = sub_id,
             .write_fn = write_fn,
             .event_fn = hooks.event_fn,
@@ -195,6 +236,8 @@ pub const EventBus = struct {
         });
         parsed_filter = null;
         filter_src = null;
+        if (has_filter) channel.filtered_count += 1;
+        if (is_text) channel.text_sub_count += 1;
 
         _ = self.stats.subscriber_count.fetchAdd(1, .monotonic);
         return sub_id;
@@ -208,28 +251,14 @@ pub const EventBus = struct {
             channel.mutex.lock();
             defer channel.mutex.unlock();
 
-            if (channel.subscribers.fetchRemove(sub_id)) |removed| {
+            if (channel.subscribers.fetchSwapRemove(sub_id)) |removed| {
                 var sub = removed.value;
+                if (sub.filter != null) channel.filtered_count -= 1;
+                if (sub.event_fn == null) channel.text_sub_count -= 1;
                 sub.deinit();
                 _ = self.stats.subscriber_count.fetchSub(1, .monotonic);
             }
         }
-    }
-
-    /// True if a subscription key `sub_pattern` should receive events published to `channel_name`.
-    /// Matches exact names, namespace prefixes ending in `:` (e.g. `SUB vec:` receives `vec:vis:1`),
-    /// and trailing `*` wildcards (e.g. `SUB *` or `SUB gallery:*`).
-    fn channelMatches(channel_name: []const u8, sub_pattern: []const u8) bool {
-        if (std.mem.eql(u8, channel_name, sub_pattern)) return true;
-        if (sub_pattern.len == 0) return false;
-        const last = sub_pattern[sub_pattern.len - 1];
-        if (last == ':') {
-            return std.mem.startsWith(u8, channel_name, sub_pattern);
-        }
-        if (last == '*') {
-            return std.mem.startsWith(u8, channel_name, sub_pattern[0 .. sub_pattern.len - 1]);
-        }
-        return false;
     }
 
     /// Publish `message` to all subscribers of `channel_name` (exact and prefix matches).
@@ -241,10 +270,11 @@ pub const EventBus = struct {
     /// on disconnect must provide retain/release hooks.
     ///
     /// Throughput notes:
-    /// - Full JSON parse for `ts` is skipped when no subscriber has a filter
-    ///   (the common game-feed path). When filters exist, a cheap scan for
-    ///   `"ts":` is used instead of `std.json` tree allocation.
-    /// - Delivery list is pre-sized to subscriber count to avoid realloc churn.
+    /// - Exact channel lookup is O(1); prefix/wildcard matching only iterates
+    ///   `prefix_channels` (empty in the common no-wildcard case).
+    /// - Stack buffers cover up to 32 deliveries and 1 KiB text frames with zero
+    ///   heap allocation; larger fanouts/messages fall back cleanly to the heap.
+    /// - Full JSON parse for `ts` is skipped when `channel.filtered_count == 0`.
     ///
     /// Channel pointers remain valid for the process lifetime of the bus
     /// (channels are only destroyed in `EventBus.deinit`).
@@ -258,15 +288,22 @@ pub const EventBus = struct {
             self.mutex.lockShared();
             defer self.mutex.unlockShared();
 
-            var ch_it = self.channels.iterator();
-            while (ch_it.next()) |entry| {
-                if (!channelMatches(channel_name, entry.key_ptr.*)) continue;
-                const ch = entry.value_ptr.*;
-                if (matched_len < matched_stack.len) {
-                    matched_stack[matched_len] = ch;
-                    matched_len += 1;
-                } else {
-                    try matched_heap.append(self.allocator, ch);
+            const exact_ch = self.channels.get(channel_name);
+            if (exact_ch) |ch| {
+                matched_stack[0] = ch;
+                matched_len = 1;
+            }
+
+            if (self.prefix_channels.items.len > 0) {
+                for (self.prefix_channels.items) |ch| {
+                    if (exact_ch != null and ch == exact_ch.?) continue;
+                    if (!prefixMatches(channel_name, ch.name)) continue;
+                    if (matched_len < matched_stack.len) {
+                        matched_stack[matched_len] = ch;
+                        matched_len += 1;
+                    } else {
+                        try matched_heap.append(self.allocator, ch);
+                    }
                 }
             }
         }
@@ -277,18 +314,28 @@ pub const EventBus = struct {
         const total_matched = matched_len + matched_heap.items.len;
         if (total_matched == 0) return;
 
-        var deliveries: std.ArrayListUnmanaged(Delivery) = .empty;
+        var deliveries_stack: [32]Delivery = undefined;
+        var deliveries_stack_len: usize = 0;
+        var deliveries_heap: std.ArrayListUnmanaged(Delivery) = .empty;
+        var delivered_count: usize = 0;
         defer {
-            // Only runs if we abort before the deliver loop takes ownership;
-            // after successful assembly the loop clears via release_fn.
-            for (deliveries.items) |d| {
+            // Releases any retained deliveries that were not yet handed off to the
+            // delivery loop (e.g., on OOM while growing overflow/frame buffers).
+            const total_del = deliveries_stack_len + deliveries_heap.items.len;
+            var rem = delivered_count;
+            while (rem < total_del) : (rem += 1) {
+                const d = if (rem < deliveries_stack_len)
+                    deliveries_stack[rem]
+                else
+                    deliveries_heap.items[rem - deliveries_stack_len];
                 if (d.release_fn) |rel| rel(d.ctx);
             }
-            deliveries.deinit(self.allocator);
+            deliveries_heap.deinit(self.allocator);
         }
 
         var ts_computed = false;
         var ts_ms: u64 = 0;
+        var need_text_frame = false;
 
         var ch_idx: usize = 0;
         while (ch_idx < total_matched) : (ch_idx += 1) {
@@ -297,81 +344,143 @@ pub const EventBus = struct {
             channel.mutex.lock();
             defer channel.mutex.unlock();
 
-            const n_subs = channel.subscribers.count();
-            if (n_subs == 0) continue;
-            try deliveries.ensureUnusedCapacity(self.allocator, n_subs);
+            const subs = channel.subscribers.values();
+            if (subs.len == 0) continue;
 
-            if (!ts_computed) {
-                var scan = channel.subscribers.iterator();
-                while (scan.next()) |entry| {
-                    if (entry.value_ptr.filter != null) {
-                        ts_ms = eventTimestamp(message);
-                        ts_computed = true;
-                        break;
-                    }
-                }
+            // Pre-reserve heap overflow capacity once per channel if this channel
+            // could spill past the 32-slot stack buffer.
+            const current_total = deliveries_stack_len + deliveries_heap.items.len;
+            if (current_total + subs.len > deliveries_stack.len) {
+                const needed_heap = (current_total + subs.len) - deliveries_stack.len;
+                try deliveries_heap.ensureTotalCapacity(self.allocator, needed_heap);
             }
 
-            var iter = channel.subscribers.iterator();
-            while (iter.next()) |entry| {
-                const sub = entry.value_ptr.*;
-                if (sub.filter) |filter| {
-                    if (!filter.matches(message, ts_ms)) continue;
+            const has_filters = channel.filtered_count > 0;
+            if (has_filters and !ts_computed) {
+                ts_ms = eventTimestamp(message);
+                ts_computed = true;
+            }
+
+            if (!has_filters and total_matched == 1) {
+                // Fast path: single channel, no predicate filters, no dedup needed.
+                if (channel.text_sub_count > 0) need_text_frame = true;
+                for (subs) |sub| {
+                    if (sub.retain_fn) |retain| retain(sub.ctx);
+                    const d = Delivery{
+                        .write_fn = sub.write_fn,
+                        .event_fn = sub.event_fn,
+                        .ctx = sub.ctx,
+                        .release_fn = sub.release_fn,
+                    };
+                    if (deliveries_stack_len < deliveries_stack.len) {
+                        deliveries_stack[deliveries_stack_len] = d;
+                        deliveries_stack_len += 1;
+                    } else {
+                        deliveries_heap.appendAssumeCapacity(d);
+                    }
+                }
+                continue;
+            }
+
+            for (subs) |sub| {
+                if (has_filters) {
+                    if (sub.filter) |filter| {
+                        if (!filter.matches(message, ts_ms)) continue;
+                    }
                 }
 
                 // When multiple prefix/exact patterns match the same publish, avoid
                 // delivering duplicate frames to the exact same subscriber target.
                 if (total_matched > 1) {
                     var dup = false;
-                    for (deliveries.items) |existing| {
+                    for (deliveries_stack[0..deliveries_stack_len]) |existing| {
                         if (existing.ctx == sub.ctx and existing.write_fn == sub.write_fn and existing.event_fn == sub.event_fn) {
                             dup = true;
                             break;
                         }
                     }
+                    if (!dup) {
+                        for (deliveries_heap.items) |existing| {
+                            if (existing.ctx == sub.ctx and existing.write_fn == sub.write_fn and existing.event_fn == sub.event_fn) {
+                                dup = true;
+                                break;
+                            }
+                        }
+                    }
                     if (dup) continue;
                 }
 
+                if (sub.event_fn == null) need_text_frame = true;
                 // Retain before leaving the lock so deinit cannot free ctx.
                 if (sub.retain_fn) |retain| retain(sub.ctx);
-                errdefer if (sub.release_fn) |rel| rel(sub.ctx);
 
-                deliveries.appendAssumeCapacity(.{
+                const d = Delivery{
                     .write_fn = sub.write_fn,
                     .event_fn = sub.event_fn,
                     .ctx = sub.ctx,
                     .release_fn = sub.release_fn,
-                });
+                };
+                if (deliveries_stack_len < deliveries_stack.len) {
+                    deliveries_stack[deliveries_stack_len] = d;
+                    deliveries_stack_len += 1;
+                } else {
+                    deliveries_heap.appendAssumeCapacity(d);
+                }
             }
         }
 
-        if (deliveries.items.len == 0) return;
+        const total_deliveries = deliveries_stack_len + deliveries_heap.items.len;
+        if (total_deliveries == 0) return;
 
         // Format wire text frame only when at least one subscriber uses write_fn.
-        var event_msg: ?[]u8 = null;
-        defer if (event_msg) |m| self.allocator.free(m);
-        for (deliveries.items) |d| {
-            if (d.event_fn == null) {
-                event_msg = try std.fmt.allocPrint(self.allocator, ">EVENT {s}\r\n{s}\r\n", .{ channel_name, message });
-                break;
-            }
+        // Stack buffer avoids heap allocation and std.fmt overhead for typical frames.
+        var event_stack: [1024]u8 = undefined;
+        var event_heap: ?[]u8 = null;
+        defer if (event_heap) |m| self.allocator.free(m);
+        var event_msg: []const u8 = "";
+        if (need_text_frame) {
+            const prefix = ">EVENT ";
+            const frame_len = prefix.len + channel_name.len + 2 + message.len + 2;
+            const dst: []u8 = if (frame_len <= event_stack.len)
+                event_stack[0..frame_len]
+            else blk: {
+                const buf = try self.allocator.alloc(u8, frame_len);
+                event_heap = buf;
+                break :blk buf;
+            };
+            var pos: usize = 0;
+            @memcpy(dst[pos..][0..prefix.len], prefix);
+            pos += prefix.len;
+            @memcpy(dst[pos..][0..channel_name.len], channel_name);
+            pos += channel_name.len;
+            dst[pos] = '\r';
+            dst[pos + 1] = '\n';
+            pos += 2;
+            @memcpy(dst[pos..][0..message.len], message);
+            pos += message.len;
+            dst[pos] = '\r';
+            dst[pos + 1] = '\n';
+            event_msg = dst;
         }
 
         // Deliver outside all bus/channel locks — head-of-line socket I/O must
         // not serialize all publishers or block subscribe/unsubscribe.
         var i: usize = 0;
-        while (i < deliveries.items.len) : (i += 1) {
-            const d = deliveries.items[i];
-            // Clear release from the defer list by nulling so defer doesn't double-release.
-            deliveries.items[i].release_fn = null;
+        while (i < total_deliveries) : (i += 1) {
+            const d = if (i < deliveries_stack_len)
+                deliveries_stack[i]
+            else
+                deliveries_heap.items[i - deliveries_stack_len];
+            // Mark ownership transferred before invoking callback; defer only cleans up
+            // items at index >= delivered_count.
+            delivered_count = i + 1;
             if (d.event_fn) |deliver_event| {
                 deliver_event(d.ctx, channel_name, message);
             } else {
-                d.write_fn.?(d.ctx, event_msg.?);
+                d.write_fn.?(d.ctx, event_msg);
             }
             if (d.release_fn) |rel| rel(d.ctx);
         }
-        deliveries.clearRetainingCapacity();
     }
 
     pub fn channelCount(self: *EventBus) usize {
@@ -725,4 +834,36 @@ test "EventBus overlapping prefix and exact subscriptions on same target dedupli
 
     try bus.publish("vec:vis:1", "payload");
     try testing.expectEqual(@as(usize, 1), shared.count);
+}
+
+test "EventBus heap fallback handles >32 subscribers and >1024B frames" {
+    const testing = std.testing;
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    const Counter = struct {
+        count: usize = 0,
+        last_len: usize = 0,
+        fn write(ctx: *anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+            self.last_len = data.len;
+        }
+    };
+
+    var counters: [48]Counter = @splat(.{});
+    var sub_ids: [48]u64 = undefined;
+    for (0..48) |i| {
+        sub_ids[i] = try bus.subscribe("big:fanout", Counter.write, @ptrCast(&counters[i]));
+    }
+    defer for (sub_ids) |id| bus.unsubscribe("big:fanout", id);
+
+    const big_payload = &@as([1500]u8, @splat('Z'));
+    try bus.publish("big:fanout", big_payload);
+
+    for (counters) |c| {
+        try testing.expectEqual(@as(usize, 1), c.count);
+        try testing.expectEqual(@as(usize, ">EVENT big:fanout\r\n".len + big_payload.len + 2), c.last_len);
+    }
 }

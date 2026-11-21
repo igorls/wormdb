@@ -323,19 +323,26 @@ pub fn close(fd: std.posix.fd_t) void {
 /// Disable Nagle's algorithm (TCP_NODELAY) on a connected socket — critical
 /// for low-latency request/response. Best-effort: failures are ignored.
 ///
-/// `std.posix.setsockopt` is a hard `@compileError` on Windows, so the Windows
-/// path calls Winsock's `setsockopt` directly. The Io.net socket handle is a
-/// `HANDLE` wrapping the underlying `SOCKET`, recovered here via `@intFromPtr`.
+/// Windows sockets created by Zig 0.17 `std.Io.net` are raw `\Device\Afd\Endpoint`
+/// kernel handles, NOT Winsock `SOCKET`s (calling `ws2_32.setsockopt` fails silently
+/// with `WSAENOTSOCK`, leaving Nagle enabled and causing 15.6ms delayed-ACK stalls).
+/// Issue `IOCTL.AFD.SOCKOPT` directly via `std.Io.Operation.device_io_control`.
 pub fn setNoDelay(handle: std.posix.fd_t) void {
     if (builtin.os.tag == .windows) {
-        const setsockopt = @extern(
-            *const fn (usize, c_int, c_int, [*]const u8, c_int) callconv(.c) c_int,
-            .{ .name = "setsockopt", .library_name = "ws2_32" },
-        );
-        const IPPROTO_TCP: c_int = 6;
-        const TCP_NODELAY: c_int = 1;
-        const one: c_int = 1;
-        _ = setsockopt(@intFromPtr(handle), IPPROTO_TCP, TCP_NODELAY, @ptrCast(&one), @sizeOf(c_int));
+        const win = std.os.windows;
+        var one: u32 = 1;
+        const info = win.AFD.SOCKOPT_INFO{
+            .mode = .set,
+            .level = win.ws2_32.IPPROTO.TCP,
+            .optname = win.ws2_32.TCP.NODELAY,
+            .optval = @ptrCast(&one),
+            .optlen = @sizeOf(u32),
+        };
+        _ = io().operate(.{ .device_io_control = .{
+            .file = .{ .handle = handle, .flags = .{ .nonblocking = true } },
+            .code = win.IOCTL.AFD.SOCKOPT,
+            .in = std.mem.asBytes(&info),
+        } }) catch {};
     } else {
         std.posix.setsockopt(
             handle,
@@ -343,6 +350,38 @@ pub fn setNoDelay(handle: std.posix.fd_t) void {
             std.posix.TCP.NODELAY,
             &std.mem.toBytes(@as(c_int, 1)),
         ) catch {};
+    }
+}
+
+/// Read TCP_NODELAY state for a socket (used by tests to verify `setNoDelay`).
+fn getNoDelay(handle: std.posix.fd_t) !bool {
+    if (builtin.os.tag == .windows) {
+        const win = std.os.windows;
+        var val: u32 = 0;
+        const info = win.AFD.SOCKOPT_INFO{
+            .mode = .get,
+            .level = win.ws2_32.IPPROTO.TCP,
+            .optname = win.ws2_32.TCP.NODELAY,
+            .optval = @ptrCast(&val),
+            .optlen = @sizeOf(u32),
+        };
+        const res = try io().operate(.{ .device_io_control = .{
+            .file = .{ .handle = handle, .flags = .{ .nonblocking = true } },
+            .code = win.IOCTL.AFD.SOCKOPT,
+            .in = std.mem.asBytes(&info),
+            .out = std.mem.asBytes(&val),
+        } });
+        if (res.device_io_control.u.Status != .SUCCESS) return error.SocketOptionFailed;
+        return val != 0;
+    } else {
+        var val: c_int = 0;
+        try std.posix.getsockopt(
+            handle,
+            std.posix.IPPROTO.TCP,
+            std.posix.TCP.NODELAY,
+            std.mem.asBytes(&val),
+        );
+        return val != 0;
     }
 }
 
@@ -373,6 +412,60 @@ pub fn setSendTimeoutMs(handle: std.posix.fd_t, timeout_ms: u32) void {
             std.mem.asBytes(&timeval),
         ) catch {};
     }
+}
+
+/// Windows AFD write with lazy deadline computation: skips `nowNs()` completely
+/// on the common synchronous `.SUCCESS` completion path, while still enforcing
+/// `timeout_ms` across `.PENDING` waits and multi-chunk partial writes.
+fn socketWindowsWriteWithTimeout(
+    event_slot: *?std.os.windows.HANDLE,
+    handle: std.posix.fd_t,
+    buf: []const u8,
+    timeout_ms: usize,
+    deadline_opt: *?i128,
+) !usize {
+    const win = std.os.windows;
+    if (deadline_opt.*) |d| {
+        if (d <= nowNs()) return error.Timeout;
+    }
+    const event = event_slot.* orelse blk: {
+        var ev: win.HANDLE = undefined;
+        const event_all_access: win.ACCESS_MASK = @bitCast(@as(u32, 0x001f0003));
+        if (win.ntdll.NtCreateEvent(&ev, event_all_access, null, .Notification, .FALSE) != .SUCCESS) return error.SystemResources;
+        event_slot.* = ev;
+        break :blk ev;
+    };
+    var iovec = win.AFD.WSABUF(.@"const"){ .len = @intCast(@min(buf.len, std.math.maxInt(u32))), .buf = buf.ptr };
+    const request: win.AFD.SEND_INFO = .{
+        .BufferArray = @ptrCast(&iovec),
+        .BufferCount = 1,
+        .AfdFlags = .{ .NO_FAST_IO = true, .OVERLAPPED = true },
+        .TdiFlags = .{},
+    };
+    var iosb: win.IO_STATUS_BLOCK = undefined;
+    const status = win.ntdll.NtDeviceIoControlFile(handle, event, null, null, &iosb, win.IOCTL.AFD.SEND, &request, @sizeOf(@TypeOf(request)), null, 0);
+    switch (status) {
+        .SUCCESS => {},
+        .PENDING => {
+            const d = deadline_opt.* orelse blk: {
+                const computed = nowNs() + @as(i128, timeout_ms) * 1_000_000;
+                deadline_opt.* = computed;
+                break :blk computed;
+            };
+            const remaining = @max(d - nowNs(), 0);
+            const timeout: i64 = -@as(i64, @intCast(@min(@divTrunc(remaining + 99, 100), std.math.maxInt(i64))));
+            const waited = win.ntdll.NtWaitForSingleObject(event, .FALSE, &timeout);
+            if (waited != .SUCCESS) {
+                var cancel_iosb: win.IO_STATUS_BLOCK = undefined;
+                _ = win.ntdll.NtCancelIoFileEx(handle, &iosb, &cancel_iosb);
+                _ = win.ntdll.NtWaitForSingleObject(event, .FALSE, null);
+                return if (waited == .TIMEOUT) error.Timeout else error.SocketIoFailed;
+            }
+        },
+        else => return error.SocketIoFailed,
+    }
+    if (iosb.u.Status != .SUCCESS) return error.SocketIoFailed;
+    return iosb.Information;
 }
 
 /// Windows sockets created by Zig use AFD directly and are not Winsock socket
@@ -611,7 +704,6 @@ pub const net = if (wasm_target) struct {} else struct {
 
         pub fn writeAll(self: *Stream, data: []const u8) !void {
             const handle = self.inner.socket.handle;
-            const deadline: ?i128 = if (self.write_timeout_ms > 0) nowNs() + @as(i128, self.write_timeout_ms) * 1_000_000 else null;
             if (builtin.os.tag == .windows) {
                 // AFD send; use a cancellable request when a deadline is set.
                 // netWrite treats `data[data.len-1]` as the splat pattern, so
@@ -620,11 +712,12 @@ pub const net = if (wasm_target) struct {} else struct {
                 // slice underflows `data.len - 1` inside the vtable).
                 const zio = io();
                 const empty_header: []const u8 = "";
+                var deadline_opt: ?i128 = null;
                 var written: usize = 0;
                 while (written < data.len) {
                     const chunk = [_][]const u8{data[written..]};
-                    const n = if (deadline) |d|
-                        try socketWindowsBefore(false, &self.afd_write_event, handle, data[written..], d)
+                    const n = if (self.write_timeout_ms > 0)
+                        try socketWindowsWriteWithTimeout(&self.afd_write_event, handle, data[written..], self.write_timeout_ms, &deadline_opt)
                     else
                         try (try zio.operate(.{ .net_write = .{
                             .socket_handle = handle,
@@ -634,9 +727,15 @@ pub const net = if (wasm_target) struct {} else struct {
                         } })).net_write;
                     if (n == 0) return error.BrokenPipe;
                     written += n;
+                    // If a partial write occurred with a timeout configured, anchor the deadline
+                    // now so remaining chunks are bounded by the total write budget.
+                    if (written < data.len and self.write_timeout_ms > 0 and deadline_opt == null) {
+                        deadline_opt = nowNs() + @as(i128, self.write_timeout_ms) * 1_000_000;
+                    }
                 }
                 return;
             }
+            const deadline: ?i128 = if (self.write_timeout_ms > 0) nowNs() + @as(i128, self.write_timeout_ms) * 1_000_000 else null;
             var written: usize = 0;
             while (written < data.len) {
                 if (deadline) |d| if (nowNs() >= d) return error.Timeout;
@@ -869,4 +968,34 @@ test "Stream.shutdown from another thread wakes a blocked reader" {
     const elapsed_ms = @divTrunc(nowNs() - started, 1_000_000);
     if (result) |n| try testing.expectEqual(@as(usize, 0), n) else |_| {}
     try testing.expect(elapsed_ms < 4_000);
+}
+
+test "setNoDelay actually enables TCP_NODELAY in the kernel" {
+    if (comptime wasm_target) return error.SkipZigTest;
+    const testing = std.testing;
+
+    const listen_addr = try net.Address.parseIp("127.0.0.1", 0);
+    var listener = try listen_addr.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+    const bound_port = listener.inner.socket.address.getPort();
+
+    const Client = struct {
+        port: u16,
+        fn run(c: @This()) void {
+            var s = net.tcpConnectToAddress(net.Address.initIp4(.{ 127, 0, 0, 1 }, c.port)) catch return;
+            defer s.close();
+            setNoDelay(s.getHandle());
+            var b: [1]u8 = undefined;
+            _ = s.read(&b) catch {};
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Client.run, .{Client{ .port = bound_port }});
+    defer th.join();
+
+    var conn = try listener.accept();
+    defer conn.stream.close();
+
+    try testing.expect(!(try getNoDelay(conn.stream.getHandle())));
+    setNoDelay(conn.stream.getHandle());
+    try testing.expect(try getNoDelay(conn.stream.getHandle()));
 }

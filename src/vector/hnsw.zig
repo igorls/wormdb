@@ -31,28 +31,12 @@ const topk_mod = @import("topk.zig");
 
 pub const DistFn = metric_mod.DistFn;
 
-/// Self-contained narrow-atomics check matching `src/core/compat.zig` so
-/// `zig test src/vector/hnsw.zig` remains standalone-buildable with no parent
-/// directory imports AND compiles cleanly for `wasm32-wasi`.
+/// Self-contained narrow-atomics / single-threaded check matching
+/// `src/core/compat.zig` so `zig test src/vector/hnsw.zig` remains
+/// standalone-buildable with no parent directory imports AND compiles cleanly
+/// for `wasm32-wasi`.
 const narrow_atomics = builtin.cpu.arch.isWasm() and !builtin.cpu.has(.wasm, .atomics);
-
-const PoolMutex = struct {
-    inner: if (narrow_atomics) struct {} else std.Io.Mutex = if (narrow_atomics) .{} else .init,
-
-    inline fn io() std.Io {
-        return std.Io.Threaded.global_single_threaded.io();
-    }
-
-    inline fn lock(self: *PoolMutex) void {
-        if (comptime narrow_atomics) return;
-        self.inner.lockUncancelable(io());
-    }
-
-    inline fn unlock(self: *PoolMutex) void {
-        if (comptime narrow_atomics) return;
-        self.inner.unlock(io());
-    }
-};
+const no_sync = narrow_atomics or builtin.single_threaded;
 
 pub const HnswError = error{
     DimensionMismatch,
@@ -243,48 +227,87 @@ const MinHeap = struct {
     }
 };
 
-/// Cache-dense bitset (`N/8` bytes) with O(visited_words) sparse dirty-word
-/// reset. Invariant: `words` is always all-zero outside an active `searchLayer`.
+/// Hybrid visited tracker:
+///   - `node_count <= TAG_VISITED_MAX_NODES` (16,384 nodes = <=16 KiB, L1D
+///     resident): `u8` generation counter table — 64 nodes per cache line,
+///     O(1) mark/check, zero dirty-word pushes, zero `reset()` work (wraps and
+///     clears once every 255 searches, <1 ns/query amortized).
+///   - `node_count > TAG_VISITED_MAX_NODES`: cache-dense `u64` bitset (`N/8`
+///     bytes) with pre-reserved dirty-word list (`touched`) for infallible
+///     O(visited_words) sparse reset.
+const TAG_VISITED_MAX_NODES: usize = 16_384;
+
 const VisitedSet = struct {
+    tags: std.ArrayListUnmanaged(u8) = .empty,
+    gen: u8 = 0,
+    use_tags: bool = true,
     words: std.ArrayListUnmanaged(u64) = .empty,
     touched: std.ArrayListUnmanaged(u32) = .empty,
 
     fn deinit(self: *VisitedSet, allocator: std.mem.Allocator) void {
+        self.tags.deinit(allocator);
         self.words.deinit(allocator);
         self.touched.deinit(allocator);
     }
 
     fn prepare(self: *VisitedSet, allocator: std.mem.Allocator, node_count: usize) !void {
+        if (node_count <= TAG_VISITED_MAX_NODES) {
+            self.use_tags = true;
+            if (node_count > self.tags.items.len) {
+                const old_len = self.tags.items.len;
+                try self.tags.resize(allocator, node_count);
+                @memset(self.tags.items[old_len..node_count], 0);
+            }
+            self.gen +%= 1;
+            if (self.gen == 0) {
+                @memset(self.tags.items, 0);
+                self.gen = 1;
+            }
+            return;
+        }
+
         const needed_words = (node_count + 63) / 64;
         if (needed_words > self.words.items.len) {
             const old_len = self.words.items.len;
             try self.words.resize(allocator, needed_words);
             @memset(self.words.items[old_len..needed_words], 0);
         }
-        const target_touched_cap = @min(needed_words, 512);
-        if (self.touched.capacity < target_touched_cap) {
-            try self.touched.ensureTotalCapacity(allocator, target_touched_cap);
+        if (self.touched.capacity < needed_words) {
+            try self.touched.ensureTotalCapacity(allocator, needed_words);
         }
+        if (self.tags.capacity > 0) {
+            self.tags.deinit(allocator);
+            self.tags = .empty;
+            self.gen = 0;
+        }
+        self.use_tags = false;
     }
 
-    inline fn testAndSet(self: *VisitedSet, allocator: std.mem.Allocator, id: u32) !bool {
+    inline fn testAndSetBitset(self: *VisitedSet, id: u32) bool {
         const w_idx: usize = @as(usize, id) >> 6;
         const bit: u64 = @as(u64, 1) << @as(u6, @truncate(id));
         const slot = &self.words.items[w_idx];
         const prev = slot.*;
         if ((prev & bit) != 0) return true;
         if (prev == 0) {
-            if (self.touched.items.len < self.touched.capacity) {
-                self.touched.appendAssumeCapacity(@intCast(w_idx));
-            } else {
-                try self.touched.append(allocator, @intCast(w_idx));
-            }
+            self.touched.appendAssumeCapacity(@intCast(w_idx));
         }
         slot.* = prev | bit;
         return false;
     }
 
+    inline fn testAndSet(self: *VisitedSet, id: u32) bool {
+        if (self.use_tags) {
+            const slot = &self.tags.items[id];
+            if (slot.* == self.gen) return true;
+            slot.* = self.gen;
+            return false;
+        }
+        return self.testAndSetBitset(id);
+    }
+
     inline fn reset(self: *VisitedSet) void {
+        if (self.use_tags) return;
         const w = self.words.items;
         for (self.touched.items) |idx| {
             w[idx] = 0;
@@ -333,54 +356,117 @@ pub const SearchScratch = struct {
     }
 };
 
-/// Bounded thread-safe pool of `SearchScratch` instances owned by `Hnsw`.
-/// Enables concurrent `search()` calls under a shared reader lock with zero
-/// steady-state heap allocations and clean teardown on `Hnsw.deinit()`.
-const MAX_POOLED_SCRATCHES: usize = 64;
+/// Lock-free sharded pool of `SearchScratch` instances owned by `Hnsw`.
+///
+/// Each thread claims a thread-local preferred slot (`tls_slot & 31`) in a
+/// 32-slot cache-line-padded (`align(64)`) atomic checkout array, eliminating
+/// cross-CCD lock contention under 16–32T concurrent `search()` workloads.
+/// Oversubscribed callers (>32 concurrent searchers) gracefully fall back to a
+/// temporary heap `SearchScratch` freed on release (never blocks or deadlocks).
+///
+/// Uses only 32-bit atomics (`u32`) and compiles to a single zero-atomic slot
+/// when `no_sync` (`narrow_atomics` or `builtin.single_threaded`, e.g. `wasm32-wasi`).
+const SCRATCH_POOL_SLOTS: usize = 32;
+const SLOT_EMPTY: u32 = 0;
+const SLOT_AVAIL: u32 = 1;
+const SLOT_BUSY: u32 = 2;
+const FALLBACK_SLOT: u32 = std.math.maxInt(u32);
+
+const PoolSlot = struct {
+    state: std.atomic.Value(u32) align(64) = .init(SLOT_EMPTY),
+    scratch: SearchScratch = .{},
+};
 
 const SearchScratchPool = struct {
-    mutex: PoolMutex = .{},
-    slots: [MAX_POOLED_SCRATCHES]*SearchScratch = undefined,
-    count: usize = 0,
+    const Checkout = struct {
+        scratch: *SearchScratch,
+        slot_idx: u32,
+    };
 
-    fn acquire(self: *SearchScratchPool, allocator: std.mem.Allocator) !*SearchScratch {
-        self.mutex.lock();
-        if (self.count > 0) {
-            self.count -= 1;
-            const s = self.slots[self.count];
-            self.mutex.unlock();
-            return s;
+    const MultiInner = struct {
+        slots: [SCRATCH_POOL_SLOTS]PoolSlot = @splat(.{}),
+    };
+
+    const SingleInner = struct {
+        slot: SearchScratch = .{},
+        in_use: bool = false,
+    };
+
+    const SlotAssign = struct {
+        var next_slot: std.atomic.Value(u32) = .init(0);
+        threadlocal var tls_slot_plus_one: u32 = 0;
+
+        inline fn current() usize {
+            const cached = tls_slot_plus_one;
+            if (cached != 0) return @intCast(cached - 1);
+            const assigned: u32 = next_slot.fetchAdd(1, .monotonic) & @as(u32, @intCast(SCRATCH_POOL_SLOTS - 1));
+            tls_slot_plus_one = assigned + 1;
+            return @intCast(assigned);
         }
-        self.mutex.unlock();
+    };
 
-        const fresh = try allocator.create(SearchScratch);
-        fresh.* = SearchScratch.init();
-        return fresh;
+    inner: if (no_sync) SingleInner else MultiInner = .{},
+
+    fn acquire(self: *SearchScratchPool, allocator: std.mem.Allocator) !Checkout {
+        if (comptime no_sync) {
+            if (!self.inner.in_use) {
+                self.inner.in_use = true;
+                return .{ .scratch = &self.inner.slot, .slot_idx = 0 };
+            }
+            const fresh = try allocator.create(SearchScratch);
+            fresh.* = SearchScratch.init();
+            return .{ .scratch = fresh, .slot_idx = FALLBACK_SLOT };
+        } else {
+            const start = SlotAssign.current();
+            for (0..SCRATCH_POOL_SLOTS) |offset| {
+                const idx = (start + offset) & (SCRATCH_POOL_SLOTS - 1);
+                const slot = &self.inner.slots[idx];
+                // Avoid RFO cache-line bounce when probing past our preferred slot.
+                if (offset > 0 and slot.state.load(.monotonic) == SLOT_BUSY) continue;
+
+                if (slot.state.cmpxchgStrong(SLOT_AVAIL, SLOT_BUSY, .acquire, .monotonic)) |prev| {
+                    if (prev == SLOT_EMPTY) {
+                        if (slot.state.cmpxchgStrong(SLOT_EMPTY, SLOT_BUSY, .acquire, .monotonic) == null) {
+                            slot.scratch = SearchScratch.init();
+                            return .{ .scratch = &slot.scratch, .slot_idx = @intCast(idx) };
+                        }
+                    }
+                } else {
+                    return .{ .scratch = &slot.scratch, .slot_idx = @intCast(idx) };
+                }
+            }
+
+            const fresh = try allocator.create(SearchScratch);
+            fresh.* = SearchScratch.init();
+            return .{ .scratch = fresh, .slot_idx = FALLBACK_SLOT };
+        }
     }
 
-    fn release(self: *SearchScratchPool, allocator: std.mem.Allocator, scratch: *SearchScratch) void {
-        self.mutex.lock();
-        if (self.count < MAX_POOLED_SCRATCHES) {
-            self.slots[self.count] = scratch;
-            self.count += 1;
-            self.mutex.unlock();
+    inline fn release(self: *SearchScratchPool, allocator: std.mem.Allocator, checkout: Checkout) void {
+        if (checkout.slot_idx == FALLBACK_SLOT) {
+            checkout.scratch.deinit(allocator);
+            allocator.destroy(checkout.scratch);
             return;
         }
-        self.mutex.unlock();
-
-        scratch.deinit(allocator);
-        allocator.destroy(scratch);
+        if (comptime no_sync) {
+            self.inner.in_use = false;
+        } else {
+            self.inner.slots[checkout.slot_idx].state.store(SLOT_AVAIL, .release);
+        }
     }
 
     fn deinit(self: *SearchScratchPool, allocator: std.mem.Allocator) void {
-        self.mutex.lock();
-        const n = self.count;
-        self.count = 0;
-        self.mutex.unlock();
-
-        for (0..n) |i| {
-            self.slots[i].deinit(allocator);
-            allocator.destroy(self.slots[i]);
+        if (comptime no_sync) {
+            self.inner.slot.deinit(allocator);
+            self.inner.in_use = false;
+        } else {
+            for (&self.inner.slots) |*slot| {
+                const st = slot.state.load(.acquire);
+                if (st != SLOT_EMPTY) {
+                    slot.scratch.deinit(allocator);
+                    slot.state.store(SLOT_EMPTY, .release);
+                }
+            }
         }
     }
 };
@@ -418,18 +504,21 @@ fn sortPQItemsAsc(items: []PQItem) void {
     }
 }
 
-/// Growth schedule balancing low realloc count with tight memory overhead
-/// (~5–6% slack at N=10k/50k vs ~64% with naive 2× doubling).
+/// Growth schedule balancing low realloc count (O(N) amortized copies) with
+/// tight memory slack (<=6.25% above 8192 nodes, ~3% average vs ~64% with
+/// naive 2× doubling).
 fn nextNodeCapacity(current: usize, needed: usize) usize {
     if (current == 0) return @max(needed, 64);
     var cap = current;
     while (cap < needed) {
-        const step = if (cap < 1024)
+        const step = if (cap < 512)
             cap
-        else if (cap < 4096)
+        else if (cap < 2048)
             cap / 4
+        else if (cap < 8192)
+            cap / 8
         else
-            @max(@as(usize, 256), cap / 8);
+            @max(@as(usize, 256), cap / 16);
         cap = std.mem.alignForward(usize, cap + step, 64);
     }
     return cap;
@@ -939,9 +1028,14 @@ pub const Hnsw = struct {
         if (vec_bytes > 192) @prefetch(ptr + 192, .{ .locality = 2 });
     }
 
-    inline fn distPreparedSingle(self: *const Hnsw, q_ptr: [*]align(32) const f32, node_id: u32) f32 {
+    inline fn distPreparedSingleKind(
+        self: *const Hnsw,
+        comptime kind: MetricKind,
+        q_ptr: [*]align(32) const f32,
+        node_id: u32,
+    ) f32 {
         const v_ptr = self.vecPtr(node_id);
-        return switch (self.metric_kind) {
+        return switch (kind) {
             .cosine_unit => clampCosineDist(distance.dotAligned(q_ptr, v_ptr, self.vec_stride)),
             .dot => -distance.dotAligned(q_ptr, v_ptr, self.vec_stride),
             .l2 => distance.l2SquaredAligned(q_ptr, v_ptr, self.vec_stride),
@@ -949,14 +1043,28 @@ pub const Hnsw = struct {
         };
     }
 
-    inline fn distPreparedBatch4(self: *const Hnsw, q_ptr: [*]align(32) const f32, ids: [4]u32) [4]f32 {
+    inline fn distPreparedSingle(self: *const Hnsw, q_ptr: [*]align(32) const f32, node_id: u32) f32 {
+        return switch (self.metric_kind) {
+            .cosine_unit => self.distPreparedSingleKind(.cosine_unit, q_ptr, node_id),
+            .dot => self.distPreparedSingleKind(.dot, q_ptr, node_id),
+            .l2 => self.distPreparedSingleKind(.l2, q_ptr, node_id),
+            .custom => self.distPreparedSingleKind(.custom, q_ptr, node_id),
+        };
+    }
+
+    inline fn distPreparedBatch4Kind(
+        self: *const Hnsw,
+        comptime kind: MetricKind,
+        q_ptr: [*]align(32) const f32,
+        ids: [4]u32,
+    ) [4]f32 {
         const ptrs: [4][*]align(32) const f32 = .{
             self.vecPtr(ids[0]),
             self.vecPtr(ids[1]),
             self.vecPtr(ids[2]),
             self.vecPtr(ids[3]),
         };
-        return switch (self.metric_kind) {
+        return switch (kind) {
             .cosine_unit => blk: {
                 const dots = distance.dotBatch4Aligned(q_ptr, ptrs, self.vec_stride);
                 break :blk .{
@@ -977,6 +1085,15 @@ pub const Hnsw = struct {
                 self.params.dist_fn(q_ptr[0..self.dim], ptrs[2][0..self.dim]),
                 self.params.dist_fn(q_ptr[0..self.dim], ptrs[3][0..self.dim]),
             },
+        };
+    }
+
+    inline fn distPreparedBatch4(self: *const Hnsw, q_ptr: [*]align(32) const f32, ids: [4]u32) [4]f32 {
+        return switch (self.metric_kind) {
+            .cosine_unit => self.distPreparedBatch4Kind(.cosine_unit, q_ptr, ids),
+            .dot => self.distPreparedBatch4Kind(.dot, q_ptr, ids),
+            .l2 => self.distPreparedBatch4Kind(.l2, q_ptr, ids),
+            .custom => self.distPreparedBatch4Kind(.custom, q_ptr, ids),
         };
     }
 
@@ -1024,6 +1141,23 @@ pub const Hnsw = struct {
         from_level: u8,
         to_level_exclusive: u8,
     ) PQItem {
+        return switch (self.metric_kind) {
+            .cosine_unit => self.greedyDescendKind(.cosine_unit, q_ptr, start_id, start_dist, from_level, to_level_exclusive),
+            .dot => self.greedyDescendKind(.dot, q_ptr, start_id, start_dist, from_level, to_level_exclusive),
+            .l2 => self.greedyDescendKind(.l2, q_ptr, start_id, start_dist, from_level, to_level_exclusive),
+            .custom => self.greedyDescendKind(.custom, q_ptr, start_id, start_dist, from_level, to_level_exclusive),
+        };
+    }
+
+    fn greedyDescendKind(
+        self: *const Hnsw,
+        comptime kind: MetricKind,
+        q_ptr: [*]align(32) const f32,
+        start_id: u32,
+        start_dist: f32,
+        from_level: u8,
+        to_level_exclusive: u8,
+    ) PQItem {
         var curr_id = start_id;
         var curr_dist = start_dist;
         var lc: i32 = from_level;
@@ -1047,7 +1181,7 @@ pub const Hnsw = struct {
                         if (nbrs[pf] < self.node_count) self.prefetchVector(nbrs[pf]);
                     }
                     const batch_ids: [4]u32 = .{ nbrs[j], nbrs[j + 1], nbrs[j + 2], nbrs[j + 3] };
-                    const ds = self.distPreparedBatch4(q_ptr, batch_ids);
+                    const ds = self.distPreparedBatch4Kind(kind, q_ptr, batch_ids);
                     inline for (0..4) |lane| {
                         if (ds[lane] < curr_dist) {
                             curr_dist = ds[lane];
@@ -1058,7 +1192,7 @@ pub const Hnsw = struct {
                 }
                 while (j < nbrs.len) : (j += 1) {
                     const nb_id = nbrs[j];
-                    const d = self.distPreparedSingle(q_ptr, nb_id);
+                    const d = self.distPreparedSingleKind(kind, q_ptr, nb_id);
                     if (d < curr_dist) {
                         curr_dist = d;
                         curr_id = nb_id;
@@ -1089,10 +1223,34 @@ pub const Hnsw = struct {
         exclude_id: ?u32,
         scratch: *SearchScratch,
     ) !BoundedResultHeap {
+        return switch (self.metric_kind) {
+            .cosine_unit => self.searchLayerKind(.cosine_unit, allocator, q_ptr, entry_points, ef, lc, skip, exclude_id, scratch),
+            .dot => self.searchLayerKind(.dot, allocator, q_ptr, entry_points, ef, lc, skip, exclude_id, scratch),
+            .l2 => self.searchLayerKind(.l2, allocator, q_ptr, entry_points, ef, lc, skip, exclude_id, scratch),
+            .custom => self.searchLayerKind(.custom, allocator, q_ptr, entry_points, ef, lc, skip, exclude_id, scratch),
+        };
+    }
+
+    fn searchLayerKind(
+        self: *const Hnsw,
+        comptime kind: MetricKind,
+        allocator: std.mem.Allocator,
+        q_ptr: [*]align(32) const f32,
+        entry_points: []const PQItem,
+        ef: usize,
+        lc: u8,
+        skip: ?*const std.bit_set.Dynamic,
+        exclude_id: ?u32,
+        scratch: *SearchScratch,
+    ) !BoundedResultHeap {
         try scratch.visited.prepare(allocator, self.node_count);
         defer scratch.visited.reset();
 
         scratch.candidates.clearRetainingCapacity();
+        const min_cand_cap = @max(ef * 2, 128);
+        if (scratch.candidates.items.capacity < min_cand_cap) {
+            try scratch.candidates.items.ensureTotalCapacity(allocator, min_cand_cap);
+        }
         if (scratch.results_buf.items.len < ef) {
             try scratch.results_buf.resize(allocator, ef);
         }
@@ -1103,7 +1261,7 @@ pub const Hnsw = struct {
         // still enter `candidates` (we traverse through them) but not `w`.
         for (entry_points) |ep| {
             if (ep.id >= self.node_count) continue;
-            if (try scratch.visited.testAndSet(allocator, ep.id)) continue;
+            if (scratch.visited.testAndSet(ep.id)) continue;
             try scratch.candidates.push(allocator, ep);
             if (!has_filter or !isExcluded(skip, exclude_id, ep.id)) {
                 w.pushOrReplace(ep);
@@ -1112,14 +1270,17 @@ pub const Hnsw = struct {
 
         // Register-cached cutoff: +inf while w.len() < ef, else w.peek().dist.
         var worst_dist: f32 = w.worstDist();
+        const use_tags = scratch.visited.use_tags;
+        const is_l0 = (lc == 0);
+        const node_count = self.node_count;
 
         while (scratch.candidates.pop()) |c| {
             if (c.dist > worst_dist) break;
 
             // Hide L0 adjacency miss for the next candidate while expanding `c`.
-            if (lc == 0) {
+            if (is_l0) {
                 if (scratch.candidates.peek()) |next_c| {
-                    if (next_c.id < self.node_count) {
+                    if (next_c.id < node_count) {
                         @prefetch(&self.headers[next_c.id], .{ .locality = 3 });
                         if (self.l0_stride > 0) {
                             @prefetch(&self.l0_links[@as(usize, next_c.id) * self.l0_stride], .{ .locality = 3 });
@@ -1128,7 +1289,11 @@ pub const Hnsw = struct {
                 }
             }
 
-            const nbrs = self.nodeNeighbors(c.id, lc);
+            const nbrs = if (is_l0) blk: {
+                if (self.l0_stride == 0) break :blk &[_]u32{};
+                const cnt = self.headers[c.id].l0_count;
+                break :blk self.l0_links[@as(usize, c.id) * self.l0_stride ..][0..cnt];
+            } else self.nodeNeighbors(c.id, lc);
             if (nbrs.len == 0) continue;
 
             // Two-phase neighbor expansion:
@@ -1139,13 +1304,28 @@ pub const Hnsw = struct {
             while (pos < nbrs.len) {
                 var unvisited: [64]u32 = undefined;
                 var u_count: usize = 0;
-                while (pos < nbrs.len and u_count < unvisited.len) : (pos += 1) {
-                    const nb_id = nbrs[pos];
-                    if (nb_id >= self.node_count) continue;
-                    if (!try scratch.visited.testAndSet(allocator, nb_id)) {
-                        unvisited[u_count] = nb_id;
-                        if (u_count < 4) self.prefetchVector(nb_id);
-                        u_count += 1;
+                if (use_tags) {
+                    const tags = scratch.visited.tags.items;
+                    const gen = scratch.visited.gen;
+                    while (pos < nbrs.len and u_count < unvisited.len) : (pos += 1) {
+                        const nb_id = nbrs[pos];
+                        if (nb_id >= node_count) continue;
+                        if (tags[nb_id] != gen) {
+                            tags[nb_id] = gen;
+                            unvisited[u_count] = nb_id;
+                            if (u_count < 4) self.prefetchVector(nb_id);
+                            u_count += 1;
+                        }
+                    }
+                } else {
+                    while (pos < nbrs.len and u_count < unvisited.len) : (pos += 1) {
+                        const nb_id = nbrs[pos];
+                        if (nb_id >= node_count) continue;
+                        if (!scratch.visited.testAndSetBitset(nb_id)) {
+                            unvisited[u_count] = nb_id;
+                            if (u_count < 4) self.prefetchVector(nb_id);
+                            u_count += 1;
+                        }
                     }
                 }
 
@@ -1163,7 +1343,7 @@ pub const Hnsw = struct {
                         unvisited[j + 2],
                         unvisited[j + 3],
                     };
-                    const ds = self.distPreparedBatch4(q_ptr, batch_ids);
+                    const ds = self.distPreparedBatch4Kind(kind, q_ptr, batch_ids);
                     inline for (0..4) |lane| {
                         const d = ds[lane];
                         if (d < worst_dist) {
@@ -1179,7 +1359,7 @@ pub const Hnsw = struct {
 
                 while (j < u_count) : (j += 1) {
                     const nb_id = unvisited[j];
-                    const d = self.distPreparedSingle(q_ptr, nb_id);
+                    const d = self.distPreparedSingleKind(kind, q_ptr, nb_id);
                     if (d < worst_dist) {
                         try scratch.candidates.push(allocator, .{ .id = nb_id, .dist = d });
                         if (!has_filter or !isExcluded(skip, exclude_id, nb_id)) {
@@ -1518,10 +1698,10 @@ pub const Hnsw = struct {
         if (k == 0 or out.len == 0) return 0;
         if (self.dim != 0 and query.len != self.dim) return error.DimensionMismatch;
 
-        const scratch = try self.scratch_pool.acquire(self.allocator);
-        defer self.scratch_pool.release(self.allocator, scratch);
+        const checkout = try self.scratch_pool.acquire(self.allocator);
+        defer self.scratch_pool.release(self.allocator, checkout);
 
-        return self.searchWithScratch(self.allocator, query, k, ef, out, skip, exclude_id, scratch);
+        return self.searchWithScratch(self.allocator, query, k, ef, out, skip, exclude_id, checkout.scratch);
     }
 
     /// Pure `*const Hnsw` k-NN search using a caller-owned `SearchScratch`.
@@ -1573,6 +1753,26 @@ pub const Hnsw = struct {
             exclude_id,
             scratch,
         );
+
+        // Fast partial top-K extraction when `limit << w.len()` avoids full
+        // O(ef log ef) heapsort of all `ef` beam candidates.
+        const w_items = w.items();
+        if (limit <= 32 and limit * 2 < w_items.len) {
+            var top_buf: [32]PQItem = undefined;
+            var top = BoundedResultHeap.init(top_buf[0..limit]);
+            var cut: f32 = std.math.inf(f32);
+            for (w_items) |item| {
+                if (item.dist < cut) {
+                    top.pushOrReplace(item);
+                    cut = top.worstDist();
+                }
+            }
+            const sorted = top.sortedAsc();
+            for (0..sorted.len) |i| {
+                out[i] = .{ .id = sorted[i].id, .dist = sorted[i].dist };
+            }
+            return sorted.len;
+        }
 
         const sorted = w.sortedAsc();
         const n = @min(limit, sorted.len);
@@ -2111,6 +2311,162 @@ test "hnsw: concurrent read-only search across 4 threads" {
     for (threads) |t| t.join();
 
     try testing.expectEqual(@as(u32, 0), wctx.failed.load(.acquire));
+}
+
+test "hnsw: concurrent 40-thread oversubscription exercises sharded slots and fallback leak-free" {
+    if (comptime builtin.single_threaded) return;
+
+    const alloc = testing.allocator;
+    var h = Hnsw.init(alloc, .{ .m = 16, .m_max0 = 32, .ef_construction = 80 });
+    defer h.deinit();
+
+    const dim: usize = 32;
+    const n: usize = 200;
+    const n_queries: usize = 16;
+
+    var prng = std.Random.DefaultPrng.init(0xC0AC_0040);
+    const rand = prng.random();
+    const corpus = try alloc.alloc(f32, n * dim);
+    defer alloc.free(corpus);
+    for (corpus) |*x| x.* = rand.floatNorm(f32);
+    for (0..n) |i| _ = try h.insert(corpus[i * dim ..][0..dim]);
+
+    const queries = try alloc.alloc(f32, n_queries * dim);
+    defer alloc.free(queries);
+    for (queries) |*x| x.* = rand.floatNorm(f32);
+
+    const ref_ids = try alloc.alloc([5]u32, n_queries);
+    defer alloc.free(ref_ids);
+    for (0..n_queries) |qi| {
+        var out: [5]SearchResult = undefined;
+        const got = try h.search(queries[qi * dim ..][0..dim], 5, 48, &out, null);
+        try testing.expectEqual(@as(usize, 5), got);
+        for (0..5) |j| ref_ids[qi][j] = out[j].id;
+    }
+
+    const num_threads: usize = 40; // > SCRATCH_POOL_SLOTS (32) to force overflow fallback
+    const WorkerCtx = struct {
+        hnsw: *Hnsw,
+        queries: []const f32,
+        ref_ids: []const [5]u32,
+        dim: usize,
+        n_queries: usize,
+        ready: std.atomic.Value(u32) = .init(0),
+        go: std.atomic.Value(u32) = .init(0),
+        failed: std.atomic.Value(u32) = .init(0),
+
+        fn run(ctx: *@This()) void {
+            _ = ctx.ready.fetchAdd(1, .release);
+            while (ctx.go.load(.acquire) == 0) std.atomic.spinLoopHint();
+
+            var out: [5]SearchResult = undefined;
+            for (0..4) |_| {
+                for (0..ctx.n_queries) |qi| {
+                    const got = ctx.hnsw.search(ctx.queries[qi * ctx.dim ..][0..ctx.dim], 5, 48, &out, null) catch {
+                        _ = ctx.failed.fetchAdd(1, .monotonic);
+                        return;
+                    };
+                    if (got != 5) {
+                        _ = ctx.failed.fetchAdd(1, .monotonic);
+                        return;
+                    }
+                    for (0..5) |j| {
+                        if (out[j].id != ctx.ref_ids[qi][j]) {
+                            _ = ctx.failed.fetchAdd(1, .monotonic);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    var wctx = WorkerCtx{
+        .hnsw = &h,
+        .queries = queries,
+        .ref_ids = ref_ids,
+        .dim = dim,
+        .n_queries = n_queries,
+    };
+
+    var threads: [num_threads]std.Thread = undefined;
+    for (&threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, WorkerCtx.run, .{&wctx});
+    }
+    while (wctx.ready.load(.acquire) < num_threads) std.atomic.spinLoopHint();
+    wctx.go.store(1, .release);
+    for (threads) |t| t.join();
+
+    try testing.expectEqual(@as(u32, 0), wctx.failed.load(.acquire));
+}
+
+test "hnsw: visited generation wraparound and tag-to-bitset transition" {
+    const alloc = testing.allocator;
+
+    // 1. Direct VisitedSet wraparound across u8 generation boundary (>260 prepares)
+    //    and clean transition from tag mode (<=16384) to bitset mode (>16384).
+    {
+        var v = VisitedSet{};
+        defer v.deinit(alloc);
+
+        for (0..270) |iter| {
+            try v.prepare(alloc, 128);
+            try testing.expect(v.use_tags);
+            const probe: u32 = @intCast(iter % 128);
+            try testing.expect(!v.testAndSet(probe));
+            try testing.expect(v.testAndSet(probe));
+            v.reset();
+        }
+
+        // Cross threshold into bitset mode: tags released, bitset clean & resettable
+        try v.prepare(alloc, TAG_VISITED_MAX_NODES + 128);
+        try testing.expect(!v.use_tags);
+        try testing.expectEqual(@as(usize, 0), v.tags.capacity);
+        try testing.expect(!v.testAndSet(0));
+        try testing.expect(v.testAndSet(0));
+        try testing.expect(!v.testAndSet(TAG_VISITED_MAX_NODES + 100));
+        try testing.expect(v.testAndSet(TAG_VISITED_MAX_NODES + 100));
+        v.reset();
+
+        // After reset, same IDs must register as unvisited again
+        try v.prepare(alloc, TAG_VISITED_MAX_NODES + 128);
+        try testing.expect(!v.testAndSet(0));
+        try testing.expect(!v.testAndSet(TAG_VISITED_MAX_NODES + 100));
+        v.reset();
+    }
+
+    // 2. End-to-end HNSW search >260 iterations on one SearchScratch stays deterministic
+    var h = Hnsw.init(alloc, .{ .m = 8, .m_max0 = 16, .ef_construction = 40 });
+    defer h.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0x270_FA57);
+    const rand = prng.random();
+    const dim: usize = 16;
+    for (0..64) |_| {
+        var vec: [dim]f32 = undefined;
+        for (&vec) |*x| x.* = rand.floatNorm(f32);
+        _ = try h.insert(&vec);
+    }
+
+    var q: [dim]f32 = undefined;
+    for (&q) |*x| x.* = rand.floatNorm(f32);
+
+    var scratch = SearchScratch.init();
+    defer scratch.deinit(alloc);
+
+    var ref: [5]SearchResult = undefined;
+    const ref_n = try h.searchWithScratch(alloc, &q, 5, 32, &ref, null, null, &scratch);
+    try testing.expectEqual(@as(usize, 5), ref_n);
+
+    for (0..270) |_| {
+        var out: [5]SearchResult = undefined;
+        const got = try h.searchWithScratch(alloc, &q, 5, 32, &out, null, null, &scratch);
+        try testing.expectEqual(ref_n, got);
+        for (0..ref_n) |i| {
+            try testing.expectEqual(ref[i].id, out[i].id);
+            try testing.expectApproxEqAbs(ref[i].dist, out[i].dist, 1e-6);
+        }
+    }
 }
 
 test "hnsw: custom DistFn works end-to-end" {

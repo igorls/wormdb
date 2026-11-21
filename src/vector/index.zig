@@ -893,14 +893,42 @@ pub const NamespaceRegistry = struct {
     /// Lock-free count of active namespaces so non-vector KV workloads skip
     /// `syncRawSet` / `syncRawDelete` without acquiring `lock`.
     active_namespaces: std.atomic.Value(usize) = .init(0),
+    /// 256-bit lock-free first-byte bitmap (32 bytes = half a cache line, 32-bit atomics
+    /// for wasm32 compatibility). Checked inline on every KV write before calling into
+    /// `syncVectorSetWithRegistry` so non-matching keys stay in 1 hot L1 cache line.
+    first_byte_mask: [8]std.atomic.Value(u32) align(64) = initFirstByteMask(),
     /// Lock-free first-byte refcount table of registered namespaces, indexed by
-    /// `namespace[0]`. Rejects non-matching keys before taking `lock`.
+    /// `namespace[0]`. Keeps bit-clear on `remove` exact when multiple namespaces share byte 0.
     first_byte_counts: [256]std.atomic.Value(u32) align(64) = initFirstByteCounts(),
+
+    fn initFirstByteMask() [8]std.atomic.Value(u32) {
+        var table: [8]std.atomic.Value(u32) = undefined;
+        for (&table) |*slot| slot.* = .init(0);
+        return table;
+    }
 
     fn initFirstByteCounts() [256]std.atomic.Value(u32) {
         var table: [256]std.atomic.Value(u32) = undefined;
         for (&table) |*slot| slot.* = .init(0);
         return table;
+    }
+
+    fn addFirstByteLocked(self: *NamespaceRegistry, b: u8) void {
+        const prev = self.first_byte_counts[b].fetchAdd(1, .release);
+        if (prev == 0) {
+            const word_idx: usize = b >> 5;
+            const bit: u32 = @as(u32, 1) << @as(u5, @truncate(b));
+            _ = self.first_byte_mask[word_idx].fetchOr(bit, .release);
+        }
+    }
+
+    fn removeFirstByteLocked(self: *NamespaceRegistry, b: u8) void {
+        const prev = self.first_byte_counts[b].fetchSub(1, .release);
+        if (prev == 1) {
+            const word_idx: usize = b >> 5;
+            const bit: u32 = @as(u32, 1) << @as(u5, @truncate(b));
+            _ = self.first_byte_mask[word_idx].fetchAnd(~bit, .release);
+        }
     }
 
     pub fn init(allocator: std.mem.Allocator, default_params: HnswParams) NamespaceRegistry {
@@ -910,6 +938,7 @@ pub const NamespaceRegistry = struct {
             .lock = .{},
             .default_params = default_params,
             .active_namespaces = .init(0),
+            .first_byte_mask = initFirstByteMask(),
             .first_byte_counts = initFirstByteCounts(),
         };
     }
@@ -924,6 +953,7 @@ pub const NamespaceRegistry = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.map.deinit(self.allocator);
+        for (&self.first_byte_mask) |*slot| slot.store(0, .monotonic);
         for (&self.first_byte_counts) |*slot| slot.store(0, .monotonic);
         self.active_namespaces.store(0, .monotonic);
     }
@@ -974,7 +1004,7 @@ pub const NamespaceRegistry = struct {
 
         try self.map.put(self.allocator, ns_copy, idx);
         if (ns_copy.len > 0) {
-            _ = self.first_byte_counts[ns_copy[0]].fetchAdd(1, .release);
+            self.addFirstByteLocked(ns_copy[0]);
         }
         _ = self.active_namespaces.fetchAdd(1, .release);
         return idx;
@@ -987,7 +1017,7 @@ pub const NamespaceRegistry = struct {
         defer self.lock.unlock();
         if (self.map.fetchRemove(namespace)) |kv| {
             if (kv.key.len > 0) {
-                _ = self.first_byte_counts[kv.key[0]].fetchSub(1, .release);
+                self.removeFirstByteLocked(kv.key[0]);
             }
             _ = self.active_namespaces.fetchSub(1, .release);
             self.allocator.free(kv.key);
@@ -996,9 +1026,17 @@ pub const NamespaceRegistry = struct {
         }
     }
 
-    inline fn mayMatchRegisteredNamespace(self: *const NamespaceRegistry, key: []const u8) bool {
+    /// Single-atomic-load fast check suitable for inlining at the Store write/delete hot path.
+    /// Returns false whenever no registered namespace starts with `key[0]`.
+    pub inline fn mayMatchFast(self: *const NamespaceRegistry, key: []const u8) bool {
         if (key.len == 0) return false;
-        if (self.first_byte_counts[key[0]].load(.acquire) == 0) return false;
+        const b = key[0];
+        const word = self.first_byte_mask[b >> 5].load(.acquire);
+        return (word & (@as(u32, 1) << @as(u5, @truncate(b)))) != 0;
+    }
+
+    inline fn mayMatchRegisteredNamespace(self: *const NamespaceRegistry, key: []const u8) bool {
+        if (!self.mayMatchFast(key)) return false;
         if (self.active_namespaces.load(.acquire) == 0) return false;
         if (std.mem.startsWith(u8, key, "bq:") or std.mem.startsWith(u8, key, "__meta:")) return false;
         return true;
@@ -1230,7 +1268,7 @@ pub const NamespaceRegistry = struct {
 
             try self.map.put(self.allocator, ns_copy, idx_ptr);
             if (ns_copy.len > 0) {
-                _ = self.first_byte_counts[ns_copy[0]].fetchAdd(1, .release);
+                self.addFirstByteLocked(ns_copy[0]);
             }
             _ = self.active_namespaces.fetchAdd(1, .release);
         }
@@ -1257,6 +1295,16 @@ test "registry: getOrCreate is idempotent" {
     reg.remove("vec:");
     try testing.expectEqual(@as(u32, 0), reg.first_byte_counts['v'].load(.acquire));
     try testing.expect(!reg.mayMatchRegisteredNamespace("vec:1"));
+    try testing.expect(!reg.mayMatchFast("vec:1"));
+
+    // Multiple namespaces sharing byte 0 keep the bitmap bit set until the last is removed.
+    _ = try reg.getOrCreate("vec:a:", .cosine);
+    _ = try reg.getOrCreate("vec:b:", .cosine);
+    try testing.expect(reg.mayMatchFast("vec:anything"));
+    reg.remove("vec:a:");
+    try testing.expect(reg.mayMatchFast("vec:anything"));
+    reg.remove("vec:b:");
+    try testing.expect(!reg.mayMatchFast("vec:anything"));
 }
 
 test "registry: distinct namespaces get distinct indexes" {

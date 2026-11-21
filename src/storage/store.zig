@@ -45,8 +45,11 @@ pub fn shardIndex(key: []const u8) usize {
 }
 
 const Shard = struct {
-    mutex: core.compat.Mutex,
-    data: std.StringHashMap(*Entry),
+    /// Align each shard to a single 64-byte cache line (mutex 8B + unmanaged map 16B
+    /// + sorted slice 24B = 48B padded to 64B). Zero cross-core false sharing AND
+    /// the entire `[256]Shard` table fits in 16 KiB (half of L1D).
+    mutex: core.compat.Mutex align(64),
+    data: std.StringHashMapUnmanaged(*Entry),
     /// The shard's entries sorted by key ascending — the same `*Entry` objects
     /// as `data`, never owned separately. Maintained by `shardPutLocked` /
     /// `shardRemoveLocked` on every mutation, it turns prefix scans and counts
@@ -57,6 +60,9 @@ const Shard = struct {
     /// WAL write they accompany).
     sorted: std.ArrayListUnmanaged(*Entry),
 };
+comptime {
+    std.debug.assert(@sizeOf(Shard) <= 64);
+}
 
 /// Three-way comparison of a key against a prefix *range*:
 ///   .lt — key sorts before every key carrying `prefix`
@@ -86,8 +92,12 @@ fn lowerBoundKey(items: []const *Entry, key: []const u8) usize {
 const PrefixRange = struct { lo: usize, hi: usize };
 
 /// Half-open index range [lo, hi) of keys carrying `prefix` in a sorted shard
-/// index — two binary searches over `prefixCompare`.
+/// index — lower-bound binary search, fast empty-match exit, and equality-only
+/// `startsWith` upper-bound search (every key >= start is either matching or .gt).
 fn prefixRange(items: []const *Entry, prefix: []const u8) PrefixRange {
+    if (items.len == 0) return .{ .lo = 0, .hi = 0 };
+    if (prefix.len == 0) return .{ .lo = 0, .hi = items.len };
+
     var lo: usize = 0;
     var hi: usize = items.len;
     while (lo < hi) { // lower bound: first key not .lt the range
@@ -95,10 +105,15 @@ fn prefixRange(items: []const *Entry, prefix: []const u8) PrefixRange {
         if (prefixCompare(items[mid].key, prefix) == .lt) lo = mid + 1 else hi = mid;
     }
     const start = lo;
+    if (start == items.len or !std.mem.startsWith(u8, items[start].key, prefix)) {
+        return .{ .lo = start, .hi = start };
+    }
+
+    lo = start + 1;
     hi = items.len;
-    while (lo < hi) { // upper bound: first key .gt the range
+    while (lo < hi) { // upper bound: first key >= start that does not start with prefix
         const mid = lo + (hi - lo) / 2;
-        if (prefixCompare(items[mid].key, prefix) == .gt) hi = mid else lo = mid + 1;
+        if (!std.mem.startsWith(u8, items[mid].key, prefix)) hi = mid else lo = mid + 1;
     }
     return .{ .lo = start, .hi = lo };
 }
@@ -318,7 +333,7 @@ pub const Store = struct {
         for (&shards) |*shard| {
             shard.* = .{
                 .mutex = .{},
-                .data = std.StringHashMap(*Entry).init(allocator),
+                .data = .empty,
                 .sorted = .empty,
             };
         }
@@ -378,7 +393,7 @@ pub const Store = struct {
             while (iter.next()) |entry| {
                 self.destroyEntry(entry.value_ptr.*);
             }
-            shard.data.deinit();
+            shard.data.deinit(self.allocator);
             shard.sorted.deinit(self.allocator);
         }
         self.snapshot_arena.deinit();
@@ -404,18 +419,24 @@ pub const Store = struct {
         self.shardPutAssumeCapacityLocked(shard, entry);
     }
 
-    fn shardReservePutLocked(self: *Store, shard: *Shard, key: []const u8) StoreError!void {
+    fn shardReservePutLocked(self: *Store, shard: *Shard, _: []const u8) StoreError!void {
         if (@import("builtin").is_test and self.fail_put_reserve_for_test) return error.OutOfMemory;
-        const idx = lowerBoundKey(shard.sorted.items, key);
-        const replacing = idx < shard.sorted.items.len and std.mem.eql(u8, shard.sorted.items[idx].key, key);
-        shard.data.ensureUnusedCapacity(1) catch return error.OutOfMemory;
-        if (!replacing) shard.sorted.ensureUnusedCapacity(self.allocator, 1) catch return error.OutOfMemory;
+        shard.data.ensureUnusedCapacity(self.allocator, 1) catch return error.OutOfMemory;
+        shard.sorted.ensureUnusedCapacity(self.allocator, 1) catch return error.OutOfMemory;
     }
 
     fn shardPutAssumeCapacityLocked(self: *Store, shard: *Shard, entry: *Entry) void {
-        const idx = lowerBoundKey(shard.sorted.items, entry.key);
-        const replacing = idx < shard.sorted.items.len and
-            std.mem.eql(u8, shard.sorted.items[idx].key, entry.key);
+        const items = shard.sorted.items;
+        // O(1) tail-append fast path for sequential / timestamp-keyed / snapshot inserts.
+        if (items.len == 0 or std.mem.order(u8, items[items.len - 1].key, entry.key) == .lt) {
+            shard.data.putAssumeCapacity(entry.key, entry);
+            shard.sorted.appendAssumeCapacity(entry);
+            _ = self.live_keys.fetchAdd(1, .monotonic);
+            return;
+        }
+
+        const idx = lowerBoundKey(items, entry.key);
+        const replacing = idx < items.len and std.mem.eql(u8, items[idx].key, entry.key);
 
         if (replacing) {
             // Same key ⇒ same ordered position: swap the pointer in place. The
@@ -520,7 +541,9 @@ pub const Store = struct {
     pub fn setWithTimestamp(self: *Store, key: []const u8, value: []const u8, is_worm: bool, timestamp: u64) StoreError!void {
         try self.setWithTimestampNoVectorSync(key, value, is_worm, timestamp);
         if (self.vector_registry) |reg| {
-            self.syncVectorSetWithRegistry(reg, key, value, is_worm, timestamp);
+            if (reg.mayMatchFast(key)) {
+                self.syncVectorSetWithRegistry(reg, key, value, is_worm, timestamp);
+            }
         }
     }
 
@@ -865,7 +888,9 @@ pub const Store = struct {
         }
         if (did_exist) {
             if (self.vector_registry) |reg| {
-                self.syncVectorDeleteWithRegistry(reg, key);
+                if (reg.mayMatchFast(key)) {
+                    self.syncVectorDeleteWithRegistry(reg, key);
+                }
             }
         }
         // Snapshot takes every shard; never enter it with one already held.
@@ -965,28 +990,45 @@ pub const Store = struct {
         return self.scanPrefixCutWithCursor(prefix, limit, alloc, cut, after);
     }
 
-    fn scanHeapWorse(cut: ScanCut, a: ScanResult, b: ScanResult) bool {
+    inline fn keySuffix(key: []const u8, prefix_len: usize) []const u8 {
+        return if (prefix_len <= key.len) key[prefix_len..] else key;
+    }
+
+    inline fn loadPrefix8(key: []const u8, offset: usize) u64 {
+        const tail = if (offset < key.len) key[offset..] else "";
+        if (tail.len >= 8) {
+            return std.mem.readInt(u64, tail[0..8], .big);
+        }
+        var buf: [8]u8 = @splat(0);
+        @memcpy(buf[0..tail.len], tail);
+        return std.mem.readInt(u64, &buf, .big);
+    }
+
+    fn scanHeapWorse(cut: ScanCut, prefix_len: usize, a: ScanResult, b: ScanResult) bool {
         // Returns true if `a` is closer to eviction than `b` (so `a` sits higher in the heap):
         // - For `.first` (keep smallest): max-heap root is the LARGEST key (`a.key > b.key`).
         // - For `.last` (keep largest): min-heap root is the SMALLEST key (`a.key < b.key`).
+        // All keys share `prefix`, so comparing suffixes skips redundant prefix bytes.
+        const a_tail = keySuffix(a.key, prefix_len);
+        const b_tail = keySuffix(b.key, prefix_len);
         return switch (cut) {
-            .first => std.mem.order(u8, a.key, b.key) == .gt,
-            .last => std.mem.order(u8, a.key, b.key) == .lt,
+            .first => std.mem.order(u8, a_tail, b_tail) == .gt,
+            .last => std.mem.order(u8, a_tail, b_tail) == .lt,
         };
     }
 
-    fn scanHeapSiftUp(items: []ScanResult, cut: ScanCut, start_idx: usize) void {
+    fn scanHeapSiftUp(items: []ScanResult, cut: ScanCut, prefix_len: usize, start_idx: usize) void {
         var idx = start_idx;
         while (idx > 0) {
             const parent = (idx - 1) / 2;
-            if (scanHeapWorse(cut, items[idx], items[parent])) {
+            if (scanHeapWorse(cut, prefix_len, items[idx], items[parent])) {
                 std.mem.swap(ScanResult, &items[idx], &items[parent]);
                 idx = parent;
             } else break;
         }
     }
 
-    fn scanHeapSiftDown(items: []ScanResult, cut: ScanCut, start_idx: usize) void {
+    fn scanHeapSiftDown(items: []ScanResult, cut: ScanCut, prefix_len: usize, start_idx: usize) void {
         var idx = start_idx;
         const len = items.len;
         while (true) {
@@ -994,10 +1036,10 @@ pub const Store = struct {
             if (left >= len) break;
             var best = left;
             const right = left + 1;
-            if (right < len and scanHeapWorse(cut, items[right], items[left])) {
+            if (right < len and scanHeapWorse(cut, prefix_len, items[right], items[left])) {
                 best = right;
             }
-            if (scanHeapWorse(cut, items[best], items[idx])) {
+            if (scanHeapWorse(cut, prefix_len, items[best], items[idx])) {
                 std.mem.swap(ScanResult, &items[idx], &items[best]);
                 idx = best;
             } else break;
@@ -1009,6 +1051,7 @@ pub const Store = struct {
         alloc: std.mem.Allocator,
         limit: usize,
         cut: ScanCut,
+        prefix_len: usize,
         key: []const u8,
         value: []const u8,
         timestamp: u64,
@@ -1016,9 +1059,11 @@ pub const Store = struct {
     ) !bool {
         if (limit > 0 and results.items.len == limit) {
             // Check against the eviction root before duping any memory:
+            const k_tail = keySuffix(key, prefix_len);
+            const r_tail = keySuffix(results.items[0].key, prefix_len);
             const better = switch (cut) {
-                .first => std.mem.order(u8, key, results.items[0].key) == .lt,
-                .last => std.mem.order(u8, key, results.items[0].key) == .gt,
+                .first => std.mem.order(u8, k_tail, r_tail) == .lt,
+                .last => std.mem.order(u8, k_tail, r_tail) == .gt,
             };
             if (!better) return false;
 
@@ -1034,7 +1079,7 @@ pub const Store = struct {
                 .timestamp = timestamp,
                 .is_worm = is_worm,
             };
-            scanHeapSiftDown(results.items, cut, 0);
+            scanHeapSiftDown(results.items, cut, prefix_len, 0);
             return true;
         }
 
@@ -1050,7 +1095,7 @@ pub const Store = struct {
             .is_worm = is_worm,
         });
         if (limit > 0) {
-            scanHeapSiftUp(results.items, cut, results.items.len - 1);
+            scanHeapSiftUp(results.items, cut, prefix_len, results.items.len - 1);
         }
         return true;
     }
@@ -1085,6 +1130,8 @@ pub const Store = struct {
             try results.ensureTotalCapacity(alloc, @min(limit, 1024));
         }
 
+        const prefix_len = prefix.len;
+
         // Collect each shard's match range. With a bounded heap of size `limit`
         // and sorted shard ranges, we stop iterating a shard as soon as the
         // first candidate fails to beat the heap's eviction root — zero extra
@@ -1105,21 +1152,36 @@ pub const Store = struct {
             }
             if (range.lo == range.hi) continue;
 
-            if (limit > 0 and cut == .last) {
+            if (limit == 0) {
+                // Unbounded scan fast path: pre-reserve this shard's matches and
+                // append directly without bounded-heap checks.
+                try results.ensureUnusedCapacity(alloc, range.hi - range.lo);
+                for (shard.sorted.items[range.lo..range.hi]) |e| {
+                    const key_copy = try alloc.dupe(u8, e.key);
+                    errdefer alloc.free(key_copy);
+                    const val_copy = try alloc.dupe(u8, e.value);
+                    results.appendAssumeCapacity(.{
+                        .key = key_copy,
+                        .value = val_copy,
+                        .timestamp = e.timestamp,
+                        .is_worm = e.flags.is_worm,
+                    });
+                }
+            } else if (cut == .last) {
                 const start = if (range.hi - range.lo > limit) range.hi - limit else range.lo;
                 var idx = range.hi;
                 while (idx > start) {
                     idx -= 1;
                     const e = shard.sorted.items[idx];
-                    if (!try scanHeapOffer(&results, alloc, limit, cut, e.key, e.value, e.timestamp, e.flags.is_worm)) {
+                    if (!try scanHeapOffer(&results, alloc, limit, cut, prefix_len, e.key, e.value, e.timestamp, e.flags.is_worm)) {
                         // Descending traversal: all earlier keys in this shard are even smaller.
                         break;
                     }
                 }
             } else {
-                const end = if (limit > 0 and range.hi - range.lo > limit) range.lo + limit else range.hi;
+                const end = if (range.hi - range.lo > limit) range.lo + limit else range.hi;
                 for (shard.sorted.items[range.lo..end]) |e| {
-                    if (!try scanHeapOffer(&results, alloc, limit, cut, e.key, e.value, e.timestamp, e.flags.is_worm)) {
+                    if (!try scanHeapOffer(&results, alloc, limit, cut, prefix_len, e.key, e.value, e.timestamp, e.flags.is_worm)) {
                         // Ascending traversal: all subsequent keys in this shard are even larger.
                         break;
                     }
@@ -1150,7 +1212,7 @@ pub const Store = struct {
                     idx -= 1;
                     const hit = sst.hitAt(idx);
                     if (live_may_shadow and self.containsLive(hit.key)) continue;
-                    if (!try scanHeapOffer(&results, alloc, limit, cut, hit.key, hit.value, hit.timestamp, hit.is_worm)) {
+                    if (!try scanHeapOffer(&results, alloc, limit, cut, prefix_len, hit.key, hit.value, hit.timestamp, hit.is_worm)) {
                         break;
                     }
                 }
@@ -1160,21 +1222,74 @@ pub const Store = struct {
                 while (i < end) : (i += 1) {
                     const hit = sst.hitAt(i);
                     if (live_may_shadow and self.containsLive(hit.key)) continue;
-                    if (!try scanHeapOffer(&results, alloc, limit, cut, hit.key, hit.value, hit.timestamp, hit.is_worm)) {
+                    if (!try scanHeapOffer(&results, alloc, limit, cut, prefix_len, hit.key, hit.value, hit.timestamp, hit.is_worm)) {
                         break;
                     }
                 }
             }
         }
 
-        // Sort surviving items by key ascending (lexicographic = chronological for timestamp-keyed data)
-        std.sort.heap(ScanResult, results.items, {}, struct {
-            fn lessThan(_: void, a: ScanResult, b: ScanResult) bool {
-                return std.mem.lessThan(u8, a.key, b.key);
-            }
-        }.lessThan);
+        // Sort surviving items by key ascending (lexicographic = chronological for timestamp-keyed data).
+        const n = results.items.len;
+        if (n <= 1) {
+            return try results.toOwnedSlice(alloc);
+        }
 
-        return try results.toOwnedSlice(alloc);
+        if (n <= 32) {
+            std.sort.pdq(ScanResult, results.items, prefix_len, struct {
+                fn lessThan(p_len: usize, a: ScanResult, b: ScanResult) bool {
+                    return std.mem.lessThan(u8, keySuffix(a.key, p_len), keySuffix(b.key, p_len));
+                }
+            }.lessThan);
+            return try results.toOwnedSlice(alloc);
+        }
+
+        // For larger result sets, pack the first 8 suffix bytes inline into a 16-byte
+        // SortSlot so pdqsort compares registers with minimal pointer chasing and
+        // avoids swapping 48-byte ScanResult structs during partitioning.
+        const SortSlot = struct {
+            prefix8: u64,
+            idx: u32,
+        };
+        const SortCtx = struct {
+            items: []const ScanResult,
+            p_len: usize,
+            fn lessThan(ctx: @This(), a: SortSlot, b: SortSlot) bool {
+                if (a.prefix8 != b.prefix8) return a.prefix8 < b.prefix8;
+                return std.mem.lessThan(
+                    u8,
+                    keySuffix(ctx.items[a.idx].key, ctx.p_len),
+                    keySuffix(ctx.items[b.idx].key, ctx.p_len),
+                );
+            }
+        };
+
+        var stack_slots: [256]SortSlot = undefined;
+        var heap_slots: ?[]SortSlot = null;
+        defer if (heap_slots) |hs| alloc.free(hs);
+        const slots: []SortSlot = if (n <= stack_slots.len)
+            stack_slots[0..n]
+        else blk: {
+            const buf = try alloc.alloc(SortSlot, n);
+            heap_slots = buf;
+            break :blk buf;
+        };
+
+        for (results.items, 0..) |r, i| {
+            slots[i] = .{
+                .prefix8 = loadPrefix8(r.key, prefix_len),
+                .idx = @intCast(i),
+            };
+        }
+
+        std.sort.pdq(SortSlot, slots, SortCtx{ .items = results.items, .p_len = prefix_len }, SortCtx.lessThan);
+
+        const out = try alloc.alloc(ScanResult, n);
+        for (slots, 0..) |s, i| {
+            out[i] = results.items[s.idx];
+        }
+        results.deinit(alloc);
+        return out;
     }
 
     /// Control flow return from a scan callback.
@@ -2009,7 +2124,7 @@ pub const Store = struct {
         // +1/8 headroom) so the load never rehashes or regrows mid-stream.
         const per_shard: u32 = @intCast(entry_count / SHARD_COUNT + entry_count / SHARD_COUNT / 8 + 16);
         for (&self.shards) |*shard| {
-            try shard.data.ensureTotalCapacity(per_shard);
+            try shard.data.ensureTotalCapacity(self.allocator, per_shard);
             try shard.sorted.ensureTotalCapacity(self.allocator, per_shard);
         }
 
@@ -3359,4 +3474,41 @@ test "Store.scanPrefixAfter paginates across shards" {
     }
     try testing.expectEqual(@as(usize, 1), page3.len);
     try testing.expectEqualStrings("p:05", page3[0].key);
+}
+
+test "Store.scanPrefix sorts >256 keys with shared 8-byte suffix ties and NUL bytes" {
+    const testing = std.testing;
+    var store = try Store.init(testing.allocator, .{ .persistence = .none });
+    defer store.deinit();
+
+    // 320 keys sharing the same first 10 suffix bytes ("shared_tie") to exercise both
+    // heap_slots (>256) and prefix8 tie-breaking fallback.
+    var kbuf: [64]u8 = undefined;
+    var i: usize = 320;
+    while (i > 0) {
+        i -= 1;
+        const k = try std.fmt.bufPrint(&kbuf, "t:shared_tie_{d:0>4}", .{i});
+        try store.set(k, "v", false);
+    }
+    // Also check NUL-byte suffix ordering ("t:a" < "t:a\x00" < "t:a\x01")
+    try store.set("t:a\x01", "3", false);
+    try store.set("t:a\x00", "2", false);
+    try store.set("t:a", "1", false);
+
+    const res = try store.scanPrefix("t:", 0, testing.allocator);
+    defer {
+        for (res) |r| {
+            testing.allocator.free(r.key);
+            testing.allocator.free(r.value);
+        }
+        testing.allocator.free(res);
+    }
+
+    try testing.expectEqual(@as(usize, 323), res.len);
+    try testing.expectEqualStrings("t:a", res[0].key);
+    try testing.expectEqualStrings("t:a\x00", res[1].key);
+    try testing.expectEqualStrings("t:a\x01", res[2].key);
+    for (1..res.len) |idx| {
+        try testing.expect(std.mem.lessThan(u8, res[idx - 1].key, res[idx].key));
+    }
 }

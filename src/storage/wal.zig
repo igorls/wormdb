@@ -22,30 +22,61 @@ pub const Wal = struct {
     path: []const u8,
     sync_writes: bool,
     write_count: usize,
+    /// Bytes written directly (before startBackground or in direct mode) plus initial file size.
+    /// Background mode tracks per-lane enqueued bytes in `lanes[i].bytes_enqueued` to avoid
+    /// global cache-line bouncing on hot multi-threaded writes.
     wal_bytes: std.atomic.Value(usize),
-    queue: []?[]u8,
-    queue_head: std.atomic.Value(usize) align(64),
-    queue_tail: std.atomic.Value(usize) align(64),
-    /// Leaf mutex serializing multi-producer ring-buffer slot reservation.
-    /// Lock order: Store.wal_enqueue_mutex -> Store.snapshot_mutex -> Shard.mutex -> Wal.queue_mutex.
-    queue_mutex: compat.Mutex = .{},
+    /// 32 independent cache-line-isolated byte-ring lanes indexed by `shardIndex(key) & WAL_LANE_MASK`.
+    /// Deterministic key -> lane routing preserves strict per-key FIFO order on disk while
+    /// eliminating global queue_mutex contention and cross-thread per-record malloc/free churn.
+    lanes: [WAL_LANES]WalLane,
+    /// Consumer staging buffer (WRITER_STAGE_CAP bytes), lazily allocated in `startBackground()`.
+    writer_stage: []u8,
     writer_thread: ?std.Thread,
     writer_running: std.atomic.Value(bool),
     writer_started: bool,
     sync_requested: std.atomic.Value(bool),
-    wake_futex: std.atomic.Value(u32) align(64),
-    consumer_parked: std.atomic.Value(bool),
-    producer_futex: std.atomic.Value(u32) align(64),
-    producer_parked: std.atomic.Value(bool),
+    /// Consumer parking state isolated on its own cache line so busy producers read
+    /// `consumer_parked == false` from Shared L1D with zero coherence traffic.
+    consumer_parked: std.atomic.Value(bool) align(64),
+    wake_futex: std.atomic.Value(u32),
     /// Direct synchronous I/O failures have an uncertain commit outcome. Do
     /// not acknowledge later writes against a live view that may differ from
     /// replay. Store serializes these fields with wal_enqueue_mutex.
     sync_failed: bool = false,
     fail_sync_for_test: if (@import("builtin").is_test) bool else void = if (@import("builtin").is_test) false else {},
 
-    // Power-of-two ring capacity for mask indexing.
-    const WAL_QUEUE_CAP: usize = 1 << 16;
-    const WAL_QUEUE_MASK: usize = WAL_QUEUE_CAP - 1;
+    /// Number of independent WAL byte-ring lanes (power of two).
+    pub const WAL_LANES: usize = 32;
+    pub const WAL_LANE_MASK: usize = WAL_LANES - 1;
+    /// Per-lane byte-ring capacity (power of two): 256 KiB * 32 = 8 MiB total, allocated lazily
+    /// only when `startBackground()` starts the writer thread.
+    pub const LANE_RING_CAP: usize = 256 * 1024;
+    const LANE_RING_MASK: usize = LANE_RING_CAP - 1;
+    /// Records up to 64 KiB copy directly into the lane byte-ring with zero heap allocation.
+    /// Rare larger records (up to 16 MiB) drain the lane ring first and hand off via `large_pending`
+    /// to preserve strict per-lane FIFO ordering.
+    pub const LANE_MAX_INLINE: usize = 64 * 1024;
+    const WRITER_STAGE_CAP: usize = 256 * 1024;
+
+    const WalLane = struct {
+        /// Leaf mutex serializing multi-producer writes onto this lane.
+        /// Lock order: Store.wal_enqueue_mutex -> Store.snapshot_mutex -> Shard.mutex -> Wal.lanes[i].mutex.
+        mutex: compat.Mutex align(64) = .{},
+        ring: []u8 = &.{},
+        tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        cached_head: usize = 0,
+        bytes_enqueued: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        /// Pointer to an oversized (>LANE_MAX_INLINE) heap-owned record waiting for the consumer.
+        /// Uses 32-bit pointer atomics on wasm32 (narrow-atomics safe).
+        large_pending: std.atomic.Value(?[*]u8) = std.atomic.Value(?[*]u8).init(null),
+        large_pending_len: usize = 0,
+
+        // Consumer-updated cache line (rarely touched by producers thanks to `cached_head`).
+        head: std.atomic.Value(usize) align(64) = std.atomic.Value(usize).init(0),
+        producer_parked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        producer_futex: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    };
 
     const RecordHeader = extern struct {
         crc: u32 align(1),
@@ -64,9 +95,8 @@ pub const Wal = struct {
         const s = try compat.File.stat(file);
         try compat.File.seekTo(file, s.size);
 
-        const queue = try allocator.alloc(?[]u8, WAL_QUEUE_CAP);
-        errdefer allocator.free(queue);
-        @memset(queue, null);
+        var lanes: [WAL_LANES]WalLane = undefined;
+        for (&lanes) |*lane| lane.* = .{};
 
         return .{
             .allocator = allocator,
@@ -75,18 +105,14 @@ pub const Wal = struct {
             .sync_writes = sync_writes,
             .write_count = 0,
             .wal_bytes = std.atomic.Value(usize).init(@intCast(s.size)),
-            .queue = queue,
-            .queue_head = std.atomic.Value(usize).init(0),
-            .queue_tail = std.atomic.Value(usize).init(0),
-            .queue_mutex = .{},
+            .lanes = lanes,
+            .writer_stage = &.{},
             .writer_thread = null,
             .writer_running = std.atomic.Value(bool).init(false),
             .writer_started = false,
             .sync_requested = std.atomic.Value(bool).init(false),
-            .wake_futex = std.atomic.Value(u32).init(0),
             .consumer_parked = std.atomic.Value(bool).init(false),
-            .producer_futex = std.atomic.Value(u32).init(0),
-            .producer_parked = std.atomic.Value(bool).init(false),
+            .wake_futex = std.atomic.Value(u32).init(0),
         };
     }
 
@@ -107,7 +133,44 @@ pub const Wal = struct {
         // fails so later writes are fenced (a46f517). A queued single-threaded drain would
         // batch and swallow those failures instead, so the queue is not used at all here.
         if (!use_background_writer) return;
+
+        // Lazily allocate the staging buffer and 32 lane byte-rings only when bg mode starts.
+        if (self.writer_stage.len == 0) {
+            self.writer_stage = try self.allocator.alloc(u8, WRITER_STAGE_CAP);
+            // Pre-fault OS pages once at startup so the first client writes don't pay page-fault stalls.
+            var p: usize = 0;
+            while (p < self.writer_stage.len) : (p += 4096) self.writer_stage[p] = 0;
+        }
+        errdefer {
+            for (&self.lanes) |*lane| {
+                if (lane.ring.len != 0) {
+                    self.allocator.free(lane.ring);
+                    lane.ring = &.{};
+                }
+            }
+            if (self.writer_stage.len != 0) {
+                self.allocator.free(self.writer_stage);
+                self.writer_stage = &.{};
+            }
+        }
+
+        for (&self.lanes) |*lane| {
+            if (lane.ring.len == 0) {
+                lane.ring = try self.allocator.alloc(u8, LANE_RING_CAP);
+                var p: usize = 0;
+                while (p < lane.ring.len) : (p += 4096) lane.ring[p] = 0;
+            }
+            lane.head.store(0, .monotonic);
+            lane.tail.store(0, .monotonic);
+            lane.cached_head = 0;
+            lane.large_pending.store(null, .monotonic);
+            lane.large_pending_len = 0;
+            lane.producer_parked.store(false, .monotonic);
+            lane.producer_futex.store(0, .monotonic);
+        }
+
         self.writer_running.store(true, .seq_cst);
+        errdefer self.writer_running.store(false, .seq_cst);
         self.writer_thread = try std.Thread.spawn(.{}, writerLoop, .{self});
         self.writer_started = true;
     }
@@ -125,12 +188,21 @@ pub const Wal = struct {
             self.writer_started = false;
         }
 
-        // Free any residual queued buffers (should be empty after join, but safe).
-        while (self.tryDequeueRecord()) |record| {
-            self.allocator.free(record);
+        for (&self.lanes) |*lane| {
+            if (lane.large_pending.swap(null, .acq_rel)) |ptr| {
+                self.allocator.free(ptr[0..lane.large_pending_len]);
+                lane.large_pending_len = 0;
+            }
+            if (lane.ring.len != 0) {
+                self.allocator.free(lane.ring);
+                lane.ring = &.{};
+            }
+        }
+        if (self.writer_stage.len != 0) {
+            self.allocator.free(self.writer_stage);
+            self.writer_stage = &.{};
         }
 
-        self.allocator.free(self.queue);
         compat.File.close(self.file);
     }
 
@@ -139,23 +211,52 @@ pub const Wal = struct {
         if (self.sync_failed) return error.WalNeedsRecovery;
         if (self.writer_started) {
             self.sync_requested.store(true, .seq_cst);
-            if (self.consumer_parked.load(.seq_cst)) {
-                self.consumer_parked.store(false, .release);
-                _ = self.wake_futex.fetchAdd(1, .release);
-                compat.Futex.wake(&self.wake_futex, 1);
-            }
+            self.wakeConsumerIfParked();
             return;
         }
         try compat.File.sync(self.file);
     }
 
-    /// Commit a pre-serialized WAL record buffer. Takes ownership of `record` on success;
-    /// on error, caller still owns `record` and must free it.
-    pub fn commitSerializedRecord(self: *Wal, record: []u8) !void {
-        const rec_len = record.len;
+    inline fn wakeConsumerIfParked(self: *Wal) void {
+        if (self.consumer_parked.load(.seq_cst)) {
+            if (self.consumer_parked.swap(false, .acq_rel)) {
+                _ = self.wake_futex.fetchAdd(1, .release);
+                compat.Futex.wake(&self.wake_futex, 1);
+            }
+        }
+    }
+
+    /// Zero-malloc commit path: commits already-encoded record bytes to the lane derived from
+    /// `lane_key` (typically `Store.shardIndex(key)`).
+    /// - In background mode: copies `<= LANE_MAX_INLINE` records straight into the lane's byte-ring
+    ///   with zero heap allocation, or hands off oversized records in strict per-lane FIFO order.
+    /// - In direct mode: writes directly to `self.file` with zero heap allocation.
+    pub fn commitRecordBytesForLane(self: *Wal, lane_key: usize, record: []const u8) !void {
         if (self.writer_started) {
-            self.enqueueRecordBlocking(record);
-            _ = self.wal_bytes.fetchAdd(rec_len, .monotonic);
+            const lane = &self.lanes[lane_key & WAL_LANE_MASK];
+            if (record.len <= LANE_MAX_INLINE) {
+                self.enqueueInlineBlocking(lane, record);
+            } else {
+                const owned = try self.allocator.dupe(u8, record);
+                self.enqueueLargeBlocking(lane, owned);
+            }
+        } else {
+            try self.writeDirect(record);
+        }
+    }
+
+    /// Commit a pre-serialized WAL record buffer (legacy ownership API, routes to lane 0).
+    /// Takes ownership of `record` on success; on error, caller still owns `record` and must free it.
+    pub fn commitSerializedRecord(self: *Wal, record: []u8) !void {
+        if (self.writer_started) {
+            const lane = &self.lanes[0];
+            if (record.len <= LANE_MAX_INLINE) {
+                self.enqueueInlineBlocking(lane, record);
+                self.allocator.free(record);
+            } else {
+                // Hand ownership straight to consumer without a redundant copy.
+                self.enqueueLargeBlocking(lane, record);
+            }
         } else {
             try self.writeDirect(record);
             self.allocator.free(record);
@@ -170,8 +271,11 @@ pub const Wal = struct {
     /// Returns a heap-allocated `Entry` that owns duplicated key/value memory.
     /// Caller owns the returned entry and must call `entry.deinit(allocator)` + `allocator.destroy(entry)`.
     pub fn appendSet(self: *Wal, key: []const u8, value: []const u8, flags: EntryFlags, timestamp: Timestamp) !*Entry {
-        const record = try self.serializeSetRecord(key, value, flags, timestamp);
-        errdefer self.allocator.free(record);
+        const total_len = setRecordSize(key.len, value.len);
+        var stack_buf: [4096]u8 = undefined;
+        const heap_buf: ?[]u8 = if (total_len > stack_buf.len) try self.allocator.alloc(u8, total_len) else null;
+        defer if (heap_buf) |hb| self.allocator.free(hb);
+        const rec_slice = encodeSetRecord(if (heap_buf) |hb| hb else stack_buf[0..total_len], key, value, flags, timestamp);
 
         // Finish every fallible live-entry allocation before publishing the
         // durable record. Once the append succeeds, returning the Entry cannot
@@ -189,14 +293,21 @@ pub const Wal = struct {
             .flags = flags,
         };
 
-        try self.commitSerializedRecord(record);
+        try self.commitRecordBytesForLane(0, rec_slice);
         return entry;
     }
 
     pub fn appendDelete(self: *Wal, key: []const u8) !void {
-        const record = try self.serializeDeleteRecord(key);
-        errdefer self.allocator.free(record);
-        try self.commitSerializedRecord(record);
+        try self.appendDeleteForLane(0, key);
+    }
+
+    pub fn appendDeleteForLane(self: *Wal, lane_key: usize, key: []const u8) !void {
+        const total_len = deleteRecordSize(key.len);
+        var stack_buf: [512]u8 = undefined;
+        const heap_buf: ?[]u8 = if (total_len > stack_buf.len) try self.allocator.alloc(u8, total_len) else null;
+        defer if (heap_buf) |hb| self.allocator.free(hb);
+        const rec_slice = encodeDeleteRecord(if (heap_buf) |hb| hb else stack_buf[0..total_len], key);
+        try self.commitRecordBytesForLane(lane_key, rec_slice);
     }
 
     pub fn appendVinsert(
@@ -207,15 +318,37 @@ pub const Wal = struct {
         flags: u8,
         timestamp: Timestamp,
     ) !void {
-        const record = try self.serializeVinsertRecord(key, namespace, metric, flags, timestamp);
-        errdefer self.allocator.free(record);
-        try self.commitSerializedRecord(record);
+        try self.appendVinsertForLane(0, key, namespace, metric, flags, timestamp);
+    }
+
+    pub fn appendVinsertForLane(
+        self: *Wal,
+        lane_key: usize,
+        key: []const u8,
+        namespace: []const u8,
+        metric: []const u8,
+        flags: u8,
+        timestamp: Timestamp,
+    ) !void {
+        const total_len = vinsertRecordSize(key.len, namespace.len, metric.len);
+        var stack_buf: [1024]u8 = undefined;
+        const heap_buf: ?[]u8 = if (total_len > stack_buf.len) try self.allocator.alloc(u8, total_len) else null;
+        defer if (heap_buf) |hb| self.allocator.free(hb);
+        const rec_slice = encodeVinsertRecord(if (heap_buf) |hb| hb else stack_buf[0..total_len], key, namespace, metric, flags, timestamp);
+        try self.commitRecordBytesForLane(lane_key, rec_slice);
     }
 
     pub fn appendVdelete(self: *Wal, key: []const u8, namespace: []const u8) !void {
-        const record = try self.serializeVdeleteRecord(key, namespace);
-        errdefer self.allocator.free(record);
-        try self.commitSerializedRecord(record);
+        try self.appendVdeleteForLane(0, key, namespace);
+    }
+
+    pub fn appendVdeleteForLane(self: *Wal, lane_key: usize, key: []const u8, namespace: []const u8) !void {
+        const total_len = vdeleteRecordSize(key.len, namespace.len);
+        var stack_buf: [1024]u8 = undefined;
+        const heap_buf: ?[]u8 = if (total_len > stack_buf.len) try self.allocator.alloc(u8, total_len) else null;
+        defer if (heap_buf) |hb| self.allocator.free(hb);
+        const rec_slice = encodeVdeleteRecord(if (heap_buf) |hb| hb else stack_buf[0..total_len], key, namespace);
+        try self.commitRecordBytesForLane(lane_key, rec_slice);
     }
 
     fn writeDirect(self: *Wal, record: []const u8) !void {
@@ -234,10 +367,14 @@ pub const Wal = struct {
         _ = self.wal_bytes.fetchAdd(record.len, .monotonic);
     }
 
-    pub fn serializeSetRecord(self: *Wal, key: []const u8, value: []const u8, flags: EntryFlags, timestamp: Timestamp) ![]u8 {
+    pub inline fn setRecordSize(key_len: usize, value_len: usize) usize {
+        return @sizeOf(RecordHeader) + SET_PAYLOAD_OVERHEAD + key_len + value_len;
+    }
+
+    pub fn encodeSetRecord(dst: []u8, key: []const u8, value: []const u8, flags: EntryFlags, timestamp: Timestamp) []const u8 {
         const payload_len = SET_PAYLOAD_OVERHEAD + key.len + value.len;
         const total_len = @sizeOf(RecordHeader) + payload_len;
-        const buf = try self.allocator.alloc(u8, total_len);
+        const buf = dst[0..total_len];
 
         var pos: usize = @sizeOf(RecordHeader);
         std.mem.writeInt(u16, buf[pos..][0..2], @intCast(key.len), .little);
@@ -262,10 +399,21 @@ pub const Wal = struct {
         return buf;
     }
 
-    pub fn serializeDeleteRecord(self: *Wal, key: []const u8) ![]u8 {
+    pub fn serializeSetRecord(self: *Wal, key: []const u8, value: []const u8, flags: EntryFlags, timestamp: Timestamp) ![]u8 {
+        const total_len = setRecordSize(key.len, value.len);
+        const buf = try self.allocator.alloc(u8, total_len);
+        _ = encodeSetRecord(buf, key, value, flags, timestamp);
+        return buf;
+    }
+
+    pub inline fn deleteRecordSize(key_len: usize) usize {
+        return @sizeOf(RecordHeader) + DEL_PAYLOAD_OVERHEAD + key_len;
+    }
+
+    pub fn encodeDeleteRecord(dst: []u8, key: []const u8) []const u8 {
         const payload_len = DEL_PAYLOAD_OVERHEAD + key.len;
         const total_len = @sizeOf(RecordHeader) + payload_len;
-        const buf = try self.allocator.alloc(u8, total_len);
+        const buf = dst[0..total_len];
 
         var pos: usize = @sizeOf(RecordHeader);
         std.mem.writeInt(u16, buf[pos..][0..2], @intCast(key.len), .little);
@@ -282,17 +430,28 @@ pub const Wal = struct {
         return buf;
     }
 
-    pub fn serializeVinsertRecord(
-        self: *Wal,
+    pub fn serializeDeleteRecord(self: *Wal, key: []const u8) ![]u8 {
+        const total_len = deleteRecordSize(key.len);
+        const buf = try self.allocator.alloc(u8, total_len);
+        _ = encodeDeleteRecord(buf, key);
+        return buf;
+    }
+
+    pub inline fn vinsertRecordSize(key_len: usize, namespace_len: usize, metric_len: usize) usize {
+        return @sizeOf(RecordHeader) + VINSERT_PAYLOAD_OVERHEAD + key_len + namespace_len + metric_len;
+    }
+
+    pub fn encodeVinsertRecord(
+        dst: []u8,
         key: []const u8,
         namespace: []const u8,
         metric: []const u8,
         flags: u8,
         timestamp: Timestamp,
-    ) ![]u8 {
+    ) []const u8 {
         const payload_len = VINSERT_PAYLOAD_OVERHEAD + key.len + namespace.len + metric.len;
         const total_len = @sizeOf(RecordHeader) + payload_len;
-        const buf = try self.allocator.alloc(u8, total_len);
+        const buf = dst[0..total_len];
 
         var pos: usize = @sizeOf(RecordHeader);
         std.mem.writeInt(u16, buf[pos..][0..2], @intCast(key.len), .little);
@@ -321,10 +480,28 @@ pub const Wal = struct {
         return buf;
     }
 
-    pub fn serializeVdeleteRecord(self: *Wal, key: []const u8, namespace: []const u8) ![]u8 {
+    pub fn serializeVinsertRecord(
+        self: *Wal,
+        key: []const u8,
+        namespace: []const u8,
+        metric: []const u8,
+        flags: u8,
+        timestamp: Timestamp,
+    ) ![]u8 {
+        const total_len = vinsertRecordSize(key.len, namespace.len, metric.len);
+        const buf = try self.allocator.alloc(u8, total_len);
+        _ = encodeVinsertRecord(buf, key, namespace, metric, flags, timestamp);
+        return buf;
+    }
+
+    pub inline fn vdeleteRecordSize(key_len: usize, namespace_len: usize) usize {
+        return @sizeOf(RecordHeader) + VDELETE_PAYLOAD_OVERHEAD + key_len + namespace_len;
+    }
+
+    pub fn encodeVdeleteRecord(dst: []u8, key: []const u8, namespace: []const u8) []const u8 {
         const payload_len = VDELETE_PAYLOAD_OVERHEAD + key.len + namespace.len;
         const total_len = @sizeOf(RecordHeader) + payload_len;
-        const buf = try self.allocator.alloc(u8, total_len);
+        const buf = dst[0..total_len];
 
         var pos: usize = @sizeOf(RecordHeader);
         std.mem.writeInt(u16, buf[pos..][0..2], @intCast(key.len), .little);
@@ -345,99 +522,176 @@ pub const Wal = struct {
         return buf;
     }
 
-    /// Producer enqueue protected by leaf `queue_mutex` (always innermost in lock order).
-    fn enqueueRecordBlocking(self: *Wal, record: []u8) void {
-        self.queue_mutex.lock();
-        defer self.queue_mutex.unlock();
+    pub fn serializeVdeleteRecord(self: *Wal, key: []const u8, namespace: []const u8) ![]u8 {
+        const total_len = vdeleteRecordSize(key.len, namespace.len);
+        const buf = try self.allocator.alloc(u8, total_len);
+        _ = encodeVdeleteRecord(buf, key, namespace);
+        return buf;
+    }
 
-        while (!self.tryEnqueueRecord(record)) {
-            self.producer_parked.store(true, .seq_cst);
-            if (self.tryEnqueueRecord(record)) {
-                self.producer_parked.store(false, .release);
-                break;
+    /// Producer enqueue for inline (`<= LANE_MAX_INLINE`) records into a sharded byte-ring.
+    /// Releases `lane.mutex` before parking on full ring / pending oversized record.
+    fn enqueueInlineBlocking(self: *Wal, lane: *WalLane, record: []const u8) void {
+        lane.mutex.lock();
+        while (true) {
+            if (lane.large_pending.load(.acquire) == null) {
+                const tail = lane.tail.load(.monotonic);
+                var free_space = LANE_RING_CAP - (tail -% lane.cached_head);
+                if (free_space < record.len) {
+                    lane.cached_head = lane.head.load(.acquire);
+                    free_space = LANE_RING_CAP - (tail -% lane.cached_head);
+                }
+                if (free_space >= record.len) {
+                    const pos = tail & LANE_RING_MASK;
+                    const first = @min(record.len, LANE_RING_CAP - pos);
+                    @memcpy(lane.ring[pos .. pos + first], record[0..first]);
+                    if (first < record.len) {
+                        @memcpy(lane.ring[0 .. record.len - first], record[first..]);
+                    }
+                    // Plain monotonic update under lane.mutex (zero global lock xadd).
+                    lane.bytes_enqueued.store(lane.bytes_enqueued.load(.monotonic) + record.len, .monotonic);
+                    // .seq_cst store pairs with consumer_parked.load(.seq_cst) below and
+                    // consumer_parked.store(true, .seq_cst) -> hasPendingRecords() in writerLoop.
+                    lane.tail.store(tail +% record.len, .seq_cst);
+                    lane.mutex.unlock();
+                    self.wakeConsumerIfParked();
+                    return;
+                }
             }
-            // Wait on futex instead of spinning — wake when consumer drains
-            compat.Futex.timedWait(&self.producer_futex, self.producer_futex.load(.acquire), 50_000);
-        }
-        // Dekker pair with consumer_parked: tryEnqueueRecord published queue_tail
-        // with .seq_cst before this .seq_cst load, preventing lost wake-ups.
-        if (self.consumer_parked.load(.seq_cst)) {
-            self.consumer_parked.store(false, .release);
-            _ = self.wake_futex.fetchAdd(1, .release);
-            compat.Futex.wake(&self.wake_futex, 1);
+
+            // Lane ring is temporarily full (or an oversized record is ahead in FIFO order).
+            const futex_val = lane.producer_futex.load(.acquire);
+            lane.producer_parked.store(true, .seq_cst);
+            // Re-check after publishing producer_parked=true (Dekker handshake with consumer).
+            if (lane.large_pending.load(.acquire) == null) {
+                const tail = lane.tail.load(.monotonic);
+                lane.cached_head = lane.head.load(.acquire);
+                if (LANE_RING_CAP - (tail -% lane.cached_head) >= record.len) {
+                    continue;
+                }
+            }
+            lane.mutex.unlock();
+            self.wakeConsumerIfParked();
+            compat.Futex.timedWait(&lane.producer_futex, futex_val, 50_000);
+            lane.mutex.lock();
         }
     }
 
-    fn tryEnqueueRecord(self: *Wal, record: []u8) bool {
-        const head = self.queue_head.load(.seq_cst);
-        const tail = self.queue_tail.load(.monotonic);
-        if (tail - head >= self.queue.len) return false;
+    /// Producer enqueue for rare oversized (`> LANE_MAX_INLINE`) records.
+    /// Waits until the lane's byte-ring is drained (`head == tail`) and no prior `large_pending`
+    /// exists, guaranteeing strict per-lane FIFO ordering on disk. Takes ownership of `owned`.
+    fn enqueueLargeBlocking(self: *Wal, lane: *WalLane, owned: []u8) void {
+        lane.mutex.lock();
+        while (true) {
+            const tail = lane.tail.load(.monotonic);
+            const head = lane.head.load(.acquire);
+            lane.cached_head = head;
+            if (head == tail and lane.large_pending.load(.acquire) == null) {
+                lane.large_pending_len = owned.len;
+                lane.bytes_enqueued.store(lane.bytes_enqueued.load(.monotonic) + owned.len, .monotonic);
+                lane.large_pending.store(owned.ptr, .seq_cst);
+                lane.mutex.unlock();
+                self.wakeConsumerIfParked();
+                return;
+            }
 
-        const idx = tail & WAL_QUEUE_MASK;
-        self.queue[idx] = record;
-        // .seq_cst store forms a Dekker pair with consumer_parked.load(.seq_cst)
-        // in enqueueRecordBlocking and consumer_parked.store(true, .seq_cst) ->
-        // hasPendingRecords() in writerLoop.
-        self.queue_tail.store(tail + 1, .seq_cst);
-        return true;
-    }
-
-    fn tryDequeueRecord(self: *Wal) ?[]u8 {
-        const head = self.queue_head.load(.monotonic);
-        const tail = self.queue_tail.load(.acquire);
-        if (head == tail) return null;
-
-        const idx = head & WAL_QUEUE_MASK;
-        const record = self.queue[idx] orelse return null;
-        self.queue[idx] = null;
-        self.queue_head.store(head + 1, .seq_cst);
-        return record;
+            const futex_val = lane.producer_futex.load(.acquire);
+            lane.producer_parked.store(true, .seq_cst);
+            const tail2 = lane.tail.load(.monotonic);
+            const head2 = lane.head.load(.acquire);
+            lane.cached_head = head2;
+            if (head2 == tail2 and lane.large_pending.load(.acquire) == null) {
+                continue;
+            }
+            lane.mutex.unlock();
+            self.wakeConsumerIfParked();
+            compat.Futex.timedWait(&lane.producer_futex, futex_val, 50_000);
+            lane.mutex.lock();
+        }
     }
 
     fn hasPendingRecords(self: *Wal) bool {
-        return self.queue_head.load(.seq_cst) != self.queue_tail.load(.seq_cst);
+        for (&self.lanes) |*lane| {
+            if (lane.head.load(.acquire) != lane.tail.load(.acquire)) return true;
+            if (lane.large_pending.load(.acquire) != null) return true;
+        }
+        return false;
+    }
+
+    inline fn wakeLaneProducers(lane: *WalLane) void {
+        if (lane.producer_parked.load(.seq_cst)) {
+            lane.producer_parked.store(false, .release);
+            _ = lane.producer_futex.fetchAdd(1, .release);
+            compat.Futex.wake(&lane.producer_futex, std.math.maxInt(u32));
+        }
+    }
+
+    fn stageAppend(self: *Wal, stage_pos: *usize, data: []const u8) void {
+        const stage = self.writer_stage;
+        if (data.len >= stage.len) {
+            if (stage_pos.* > 0) {
+                compat.File.writeAll(self.file, stage[0..stage_pos.*]) catch {};
+                stage_pos.* = 0;
+            }
+            compat.File.writeAll(self.file, data) catch {};
+            return;
+        }
+        if (stage_pos.* + data.len > stage.len) {
+            compat.File.writeAll(self.file, stage[0..stage_pos.*]) catch {};
+            stage_pos.* = 0;
+        }
+        @memcpy(stage[stage_pos.* .. stage_pos.* + data.len], data);
+        stage_pos.* += data.len;
     }
 
     fn writerLoop(self: *Wal) void {
-        var write_buf: [65536]u8 = undefined;
+        const stage = self.writer_stage;
         while (self.writer_running.load(.acquire) or self.hasPendingRecords()) {
-            // Drain phase: coalesce pending records into a single 64 KiB write buffer
-            var batch_count: usize = 0;
-            var write_pos: usize = 0;
-            while (batch_count < 256) {
-                if (self.tryDequeueRecord()) |record| {
-                    if (record.len > write_buf.len) {
-                        if (write_pos > 0) {
-                            compat.File.writeAll(self.file, write_buf[0..write_pos]) catch {};
-                            write_pos = 0;
-                        }
-                        compat.File.writeAll(self.file, record) catch {};
-                    } else {
-                        if (write_pos + record.len > write_buf.len) {
-                            compat.File.writeAll(self.file, write_buf[0..write_pos]) catch {};
-                            write_pos = 0;
-                        }
-                        @memcpy(write_buf[write_pos..][0..record.len], record);
-                        write_pos += record.len;
+            var stage_pos: usize = 0;
+            var drained_bytes: usize = 0;
+
+            // Sweep all 32 lanes, draining complete record-bounded snapshots from each lane
+            // before moving to the next so records from different lanes never interleave mid-frame.
+            for (&self.lanes) |*lane| {
+                const head = lane.head.load(.monotonic);
+                const tail = lane.tail.load(.acquire);
+                const avail = tail -% head;
+                if (avail > 0) {
+                    const pos = head & LANE_RING_MASK;
+                    const first = @min(avail, LANE_RING_CAP - pos);
+                    self.stageAppend(&stage_pos, lane.ring[pos .. pos + first]);
+                    if (first < avail) {
+                        self.stageAppend(&stage_pos, lane.ring[0 .. avail - first]);
                     }
-                    self.allocator.free(record);
-                    self.write_count += 1;
-                    batch_count += 1;
-                } else break;
+                    lane.head.store(head +% avail, .seq_cst);
+                    wakeLaneProducers(lane);
+                    drained_bytes += avail;
+                }
+
+                if (lane.large_pending.load(.acquire)) |ptr| {
+                    // Flush staged bytes first so any earlier ring records from this lane hit disk first.
+                    if (stage_pos > 0) {
+                        compat.File.writeAll(self.file, stage[0..stage_pos]) catch {};
+                        stage_pos = 0;
+                    }
+                    const len = lane.large_pending_len;
+                    compat.File.writeAll(self.file, ptr[0..len]) catch {};
+                    self.allocator.free(ptr[0..len]);
+                    lane.large_pending_len = 0;
+                    lane.large_pending.store(null, .seq_cst);
+                    wakeLaneProducers(lane);
+                    drained_bytes += len;
+                }
             }
 
-            if (batch_count > 0) {
-                if (write_pos > 0) {
-                    compat.File.writeAll(self.file, write_buf[0..write_pos]) catch {};
+            if (drained_bytes > 0) {
+                if (stage_pos > 0) {
+                    compat.File.writeAll(self.file, stage[0..stage_pos]) catch {};
                 }
-                // Single fsync for entire batch — key performance win
+                self.write_count += 1;
+                // Single fsync for the entire multi-lane batch — group commit durability.
                 if (self.sync_writes) {
                     compat.File.sync(self.file) catch {};
-                }
-                // Wake producer ONLY if it was blocked on a full queue
-                if (self.producer_parked.swap(false, .seq_cst)) {
-                    _ = self.producer_futex.fetchAdd(1, .release);
-                    compat.Futex.wake(&self.producer_futex, 1);
                 }
                 continue;
             }
@@ -448,7 +702,7 @@ pub const Wal = struct {
             }
 
             // Park consumer and wait for producer to enqueue — Dekker handshake
-            // with producer's queue_tail.store(.seq_cst) + consumer_parked.load(.seq_cst).
+            // with producer's lane.tail/large_pending.store(.seq_cst) + consumer_parked.load(.seq_cst).
             const futex_val = self.wake_futex.load(.acquire);
             self.consumer_parked.store(true, .seq_cst);
             if (!self.hasPendingRecords() and !self.sync_requested.load(.seq_cst) and self.writer_running.load(.seq_cst)) {
@@ -467,7 +721,11 @@ pub const Wal = struct {
     }
 
     pub fn size(self: *Wal) !usize {
-        return self.wal_bytes.load(.monotonic);
+        var total = self.wal_bytes.load(.monotonic);
+        for (&self.lanes) |*lane| {
+            total += lane.bytes_enqueued.load(.monotonic);
+        }
+        return total;
     }
 
     /// Truncate the WAL to zero bytes and reset write cursor to the beginning.
@@ -475,6 +733,9 @@ pub const Wal = struct {
         try compat.File.setLength(self.file, 0);
         try compat.File.seekTo(self.file, 0);
         self.wal_bytes.store(0, .monotonic);
+        for (&self.lanes) |*lane| {
+            lane.bytes_enqueued.store(0, .monotonic);
+        }
         if (self.sync_writes) {
             try compat.File.sync(self.file);
         }
@@ -781,4 +1042,174 @@ test "the background writer is used exactly when the build has threads" {
     // build where the two disagree would have some code taking the threaded path and some the
     // single-threaded one.
     try std.testing.expectEqual(!builtin.single_threaded, Wal.use_background_writer);
+}
+
+test "sharded bg-WAL handles multi-threaded writes, single-lane ring wrap-around, and exact replay" {
+    if (!Wal.use_background_writer) return;
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try compat.Dir.realPathAlloc(tmp.dir, allocator, ".");
+    defer allocator.free(path);
+    const file = try std.fmt.allocPrint(allocator, "{s}/sharded_mt.wal", .{path});
+    defer allocator.free(file);
+
+    const created = try compat.Dir.createFile(compat.cwd(), file, .{});
+    compat.File.close(created);
+
+    const n_threads: usize = 8;
+    const ops_per_thread: usize = 400; // Thread 0 alone writes ~400 * 1050B > 400 KiB (> 256 KiB ring) on lane 0!
+
+    {
+        var wal = try Wal.init(allocator, file, true);
+        defer wal.deinit();
+        try wal.startBackground();
+
+        const Worker = struct {
+            fn run(w: *Wal, tid: usize) void {
+                var key_buf: [32]u8 = undefined;
+                var val_buf: [1024]u8 = undefined;
+                var rec_buf: [2048]u8 = undefined;
+                const flags = EntryFlags{ .is_worm = false, .is_deleted = false };
+
+                for (0..ops_per_thread) |seq| {
+                    const key = std.fmt.bufPrint(&key_buf, "t{d}:k{d}", .{ tid, seq % 16 }) catch unreachable;
+                    const fill: u8 = @intCast('a' + ((tid + seq) % 26));
+                    @memset(&val_buf, fill);
+                    // Put seq into the first 4 bytes so we can verify strict per-key FIFO ordering!
+                    std.mem.writeInt(u32, val_buf[0..4], @intCast(seq), .little);
+                    const rec = Wal.encodeSetRecord(&rec_buf, key, &val_buf, flags, @intCast(seq));
+                    // Thread 0 hammers lane 0 exclusively to force ring wrap-around (> 256 KiB);
+                    // other threads spread across multiple lanes deterministically by key.
+                    const lane_key: usize = if (tid == 0) 0 else (tid * 3 + (seq % 16));
+                    w.commitRecordBytesForLane(lane_key, rec) catch unreachable;
+                }
+            }
+        };
+
+        var threads: [n_threads]std.Thread = undefined;
+        for (0..n_threads) |t| {
+            threads[t] = try std.Thread.spawn(.{}, Worker.run, .{ &wal, t });
+        }
+        for (&threads) |th| th.join();
+
+        try testing.expect((try wal.size()) > Wal.LANE_RING_CAP);
+    }
+
+    // Replay WAL and verify total record count, CRC integrity, and strict FIFO per-key ordering.
+    var wal_ro = try Wal.init(allocator, file, false);
+    defer wal_ro.deinit();
+    var iter = wal_ro.iterator();
+
+    var seen_total: usize = 0;
+    var last_seq: [n_threads * 16]i64 = @splat(-1);
+    while (try iter.next()) |rec| {
+        defer iter.deinitRecord(rec);
+        switch (rec) {
+            .set => |s| {
+                seen_total += 1;
+                try testing.expectEqual(@as(usize, 1024), s.value.len);
+                const seq: i64 = @intCast(std.mem.readInt(u32, s.value[0..4], .little));
+                // Parse "t<tid>:k<slot>"
+                const colon = std.mem.indexOfScalar(u8, s.key, ':').?;
+                const tid = try std.fmt.parseInt(usize, s.key[1..colon], 10);
+                const slot = try std.fmt.parseInt(usize, s.key[colon + 2 ..], 10);
+                const idx = tid * 16 + slot;
+                // Because each (tid, slot) routes deterministically to one lane and is written
+                // in ascending seq order, replay MUST observe strictly increasing seq per key!
+                try testing.expect(seq > last_seq[idx]);
+                last_seq[idx] = seq;
+            },
+            else => return error.UnexpectedRecordType,
+        }
+    }
+    try testing.expectEqual(n_threads * ops_per_thread, seen_total);
+    // Final seq for each slot `s` out of `0..ops_per_thread` is the largest `seq` with `seq % 16 == s`.
+    for (0..n_threads) |t| {
+        for (0..16) |s| {
+            const expected_last: i64 = @intCast(((ops_per_thread - 1 - s) / 16) * 16 + s);
+            try testing.expectEqual(expected_last, last_seq[t * 16 + s]);
+        }
+    }
+}
+
+test "sharded bg-WAL preserves strict FIFO ordering across inline and >64 KiB oversized records on same lane" {
+    if (!Wal.use_background_writer) return;
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try compat.Dir.realPathAlloc(tmp.dir, allocator, ".");
+    defer allocator.free(path);
+    const file = try std.fmt.allocPrint(allocator, "{s}/oversized_fifo.wal", .{path});
+    defer allocator.free(file);
+
+    const created = try compat.Dir.createFile(compat.cwd(), file, .{});
+    compat.File.close(created);
+
+    const big_len: usize = 96 * 1024; // > LANE_MAX_INLINE (64 KiB)
+    const big_val = try allocator.alloc(u8, big_len);
+    defer allocator.free(big_val);
+    @memset(big_val, 'B');
+
+    const flags = EntryFlags{ .is_worm = false, .is_deleted = false };
+    const lane_key: usize = 7;
+
+    {
+        var wal = try Wal.init(allocator, file, true);
+        defer wal.deinit();
+        try wal.startBackground();
+
+        var small_buf: [256]u8 = undefined;
+        // 1. Inline SET before oversized record
+        try wal.commitRecordBytesForLane(lane_key, Wal.encodeSetRecord(&small_buf, "same_key", "step1_inline", flags, 1));
+        // 2. Oversized 96 KiB SET on the SAME lane
+        const big_rec = try wal.serializeSetRecord("same_key", big_val, flags, 2);
+        defer allocator.free(big_rec);
+        try wal.commitRecordBytesForLane(lane_key, big_rec);
+        // 3. Inline SET after oversized record
+        try wal.commitRecordBytesForLane(lane_key, Wal.encodeSetRecord(&small_buf, "same_key", "step3_inline", flags, 3));
+        // 4. Second oversized 96 KiB SET on the SAME lane
+        @memset(big_val, 'D');
+        const big_rec2 = try wal.serializeSetRecord("same_key", big_val, flags, 4);
+        defer allocator.free(big_rec2);
+        try wal.commitRecordBytesForLane(lane_key, big_rec2);
+        // 5. Final inline DELETE on the SAME lane
+        try wal.appendDeleteForLane(lane_key, "same_key");
+    }
+
+    var wal_ro = try Wal.init(allocator, file, false);
+    defer wal_ro.deinit();
+    var iter = wal_ro.iterator();
+
+    // Verify exact 1 -> 2 -> 3 -> 4 -> 5 on-disk order!
+    const r1 = (try iter.next()).?;
+    defer iter.deinitRecord(r1);
+    try testing.expectEqualStrings("step1_inline", r1.set.value);
+    try testing.expectEqual(@as(u64, 1), r1.set.timestamp);
+
+    const r2 = (try iter.next()).?;
+    defer iter.deinitRecord(r2);
+    try testing.expectEqual(big_len, r2.set.value.len);
+    try testing.expectEqual(@as(u8, 'B'), r2.set.value[0]);
+    try testing.expectEqual(@as(u8, 'B'), r2.set.value[big_len - 1]);
+    try testing.expectEqual(@as(u64, 2), r2.set.timestamp);
+
+    const r3 = (try iter.next()).?;
+    defer iter.deinitRecord(r3);
+    try testing.expectEqualStrings("step3_inline", r3.set.value);
+    try testing.expectEqual(@as(u64, 3), r3.set.timestamp);
+
+    const r4 = (try iter.next()).?;
+    defer iter.deinitRecord(r4);
+    try testing.expectEqual(big_len, r4.set.value.len);
+    try testing.expectEqual(@as(u8, 'D'), r4.set.value[0]);
+    try testing.expectEqual(@as(u64, 4), r4.set.timestamp);
+
+    const r5 = (try iter.next()).?;
+    defer iter.deinitRecord(r5);
+    try testing.expectEqualStrings("same_key", r5.delete);
+
+    try testing.expect((try iter.next()) == null);
 }

@@ -655,40 +655,43 @@ pub const Store = struct {
         //   wal_enqueue_mutex (compaction / direct-WAL exclusion)
         //     -> snapshot_mutex
         //       -> shards[si].mutex
-        //         -> wal.queue_mutex (leaf mutex for background ring enqueue)
+        //         -> wal.lanes[si & WAL_LANE_MASK].mutex (leaf mutex for background byte-ring)
         if (self.config.persistence == .full) {
             const flags = EntryFlags{ .is_worm = is_worm, .is_deleted = false };
-            // Pre-serialize and CRC32C-hash the WAL record outside all locks so
-            // concurrent producer threads parallelize allocation and hashing.
-            const record = self.wal.?.serializeSetRecord(key, value, flags, timestamp) catch return error.OutOfMemory;
+            // Pre-serialize and CRC32C-hash into a stack buffer (heap fallback > 4 KiB)
+            // outside all locks so concurrent producers parallelize hashing with zero malloc churn.
+            const total_len = Wal.setRecordSize(key.len, value.len);
+            var stack_buf: [4096]u8 = undefined;
+            const heap_buf: ?[]u8 = if (total_len > stack_buf.len)
+                (self.allocator.alloc(u8, total_len) catch return error.OutOfMemory)
+            else
+                null;
+            defer if (heap_buf) |hb| self.allocator.free(hb);
+            const record = Wal.encodeSetRecord(
+                if (heap_buf) |hb| hb else stack_buf[0..total_len],
+                key,
+                value,
+                flags,
+                timestamp,
+            );
 
             if (self.wal.?.writer_started) {
                 // Background WAL writer mode (sync_writes=true, truncation disabled):
-                // Lock only shard.mutex -> leaf wal.queue_mutex (inside commitSerializedRecord).
+                // Lock only shard.mutex -> leaf wal.lanes[si & WAL_LANE_MASK].mutex.
                 // Never acquire wal_enqueue_mutex after shard.mutex.
                 shard.mutex.lock();
                 defer shard.mutex.unlock();
 
                 const existing = shard.data.get(key);
                 if (existing) |ex| {
-                    if (ex.flags.is_worm) {
-                        self.wal.?.freeRecord(record);
-                        return error.WormViolation;
-                    }
+                    if (ex.flags.is_worm) return error.WormViolation;
                 } else if (self.sstHit(key)) |frozen| {
-                    if (frozen.is_worm) {
-                        self.wal.?.freeRecord(record);
-                        return error.WormViolation;
-                    }
+                    if (frozen.is_worm) return error.WormViolation;
                 }
 
-                const prepared = self.prepareUpsertLocked(shard, existing, key, value, is_worm, timestamp) catch |err| {
-                    self.wal.?.freeRecord(record);
-                    return err;
-                };
-                self.wal.?.commitSerializedRecord(record) catch {
+                const prepared = try self.prepareUpsertLocked(shard, existing, key, value, is_worm, timestamp);
+                self.wal.?.commitRecordBytesForLane(si, record) catch {
                     self.abortPreparedUpsert(prepared);
-                    self.wal.?.freeRecord(record);
                     return error.IoError;
                 };
                 self.commitPreparedUpsertLocked(shard, prepared, value, is_worm, timestamp);
@@ -707,26 +710,22 @@ pub const Store = struct {
                 if (existing) |ex| {
                     if (ex.flags.is_worm) {
                         self.wal_enqueue_mutex.unlock();
-                        self.wal.?.freeRecord(record);
                         return error.WormViolation;
                     }
                 } else if (self.sstHit(key)) |frozen| {
                     if (frozen.is_worm) {
                         self.wal_enqueue_mutex.unlock();
-                        self.wal.?.freeRecord(record);
                         return error.WormViolation;
                     }
                 }
 
                 const prepared = self.prepareUpsertLocked(shard, existing, key, value, is_worm, timestamp) catch |err| {
                     self.wal_enqueue_mutex.unlock();
-                    self.wal.?.freeRecord(record);
                     return err;
                 };
-                self.wal.?.commitSerializedRecord(record) catch {
+                self.wal.?.commitRecordBytesForLane(si, record) catch {
                     self.abortPreparedUpsert(prepared);
                     self.wal_enqueue_mutex.unlock();
-                    self.wal.?.freeRecord(record);
                     return error.IoError;
                 };
                 self.commitPreparedUpsertLocked(shard, prepared, value, is_worm, timestamp);
@@ -849,12 +848,25 @@ pub const Store = struct {
         if (is_worm) flags |= 0x01;
         if (is_async) flags |= 0x02;
 
-        const record = self.wal.?.serializeVinsertRecord(key, namespace, metric, flags, timestamp) catch return error.OutOfMemory;
-        errdefer self.wal.?.freeRecord(record);
+        const total_len = Wal.vinsertRecordSize(key.len, namespace.len, metric.len);
+        var stack_buf: [1024]u8 = undefined;
+        const heap_buf: ?[]u8 = if (total_len > stack_buf.len)
+            (self.allocator.alloc(u8, total_len) catch return error.OutOfMemory)
+        else
+            null;
+        defer if (heap_buf) |hb| self.allocator.free(hb);
+        const record = Wal.encodeVinsertRecord(
+            if (heap_buf) |hb| hb else stack_buf[0..total_len],
+            key,
+            namespace,
+            metric,
+            flags,
+            timestamp,
+        );
 
         if (!self.wal.?.writer_started) self.wal_enqueue_mutex.lock();
         defer if (!self.wal.?.writer_started) self.wal_enqueue_mutex.unlock();
-        self.wal.?.commitSerializedRecord(record) catch return error.IoError;
+        self.wal.?.commitRecordBytesForLane(shardIndex(key), record) catch return error.IoError;
     }
 
     /// Append a vector-delete metadata record to the WAL. The KV deletion is
@@ -863,12 +875,22 @@ pub const Store = struct {
         if (self.config.persistence != .full) return;
         if (self.wal == null) return;
 
-        const record = self.wal.?.serializeVdeleteRecord(key, namespace) catch return error.OutOfMemory;
-        errdefer self.wal.?.freeRecord(record);
+        const total_len = Wal.vdeleteRecordSize(key.len, namespace.len);
+        var stack_buf: [1024]u8 = undefined;
+        const heap_buf: ?[]u8 = if (total_len > stack_buf.len)
+            (self.allocator.alloc(u8, total_len) catch return error.OutOfMemory)
+        else
+            null;
+        defer if (heap_buf) |hb| self.allocator.free(hb);
+        const record = Wal.encodeVdeleteRecord(
+            if (heap_buf) |hb| hb else stack_buf[0..total_len],
+            key,
+            namespace,
+        );
 
         if (!self.wal.?.writer_started) self.wal_enqueue_mutex.lock();
         defer if (!self.wal.?.writer_started) self.wal_enqueue_mutex.unlock();
-        self.wal.?.commitSerializedRecord(record) catch return error.IoError;
+        self.wal.?.commitRecordBytesForLane(shardIndex(key), record) catch return error.IoError;
     }
 
     /// Lock two keys atomically in stable shard order to avoid deadlocks.
@@ -930,7 +952,7 @@ pub const Store = struct {
         const si = shardIndex(key);
         var did_exist = false;
         {
-            // Lock order: wal_enqueue_mutex (when compaction is possible) -> shard.mutex -> wal.queue_mutex.
+            // Lock order: wal_enqueue_mutex (when compaction is possible) -> shard.mutex -> wal.lanes[si & WAL_LANE_MASK].mutex.
             const need_compaction_lock = self.config.persistence == .full and !self.wal.?.writer_started;
             if (need_compaction_lock) self.wal_enqueue_mutex.lock();
             defer if (need_compaction_lock) self.wal_enqueue_mutex.unlock();
@@ -939,7 +961,9 @@ pub const Store = struct {
             defer shard.mutex.unlock();
             const existing = shard.data.get(key) orelse return;
             if (existing.flags.is_worm) return error.WormViolation;
-            if (self.config.persistence == .full) self.wal.?.appendDelete(key) catch return error.IoError;
+            if (self.config.persistence == .full) {
+                self.wal.?.appendDeleteForLane(si, key) catch return error.IoError;
+            }
 
             if (shardRemoveLocked(self, shard, key)) |removed| {
                 self.destroyEntry(removed);

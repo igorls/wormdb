@@ -138,6 +138,139 @@ pub const RwLock = struct {
     }
 };
 
+/// Cache-line-padded sharded reader-writer lock for high-contention read-mostly paths
+/// (e.g. `NamespaceRegistry` and `NamespaceIndex`).
+///
+/// Readers increment only their thread-local 64-byte-aligned 32-bit slot, avoiding
+/// cross-core atomic RMW cache-line bouncing on multi-CCD CPUs. Writers acquire an
+/// internal `writer_mutex`, set `writer_state` to block new readers (preventing writer
+/// starvation), and drain all `NUM_SLOTS` reader slots before entering the critical section.
+///
+/// Uses only 32-bit atomics (`u32`) and compiles to an inert no-op when `narrow_atomics`
+/// or `builtin.single_threaded` is true (`wasm32-wasi` compatible).
+pub const ShardedRwLock = struct {
+    pub const NUM_SLOTS: usize = 16;
+    const no_sync = narrow_atomics or builtin.single_threaded;
+
+    const ReaderSlot = struct {
+        count: std.atomic.Value(u32) align(64) = .init(0),
+    };
+
+    const Inner = struct {
+        slots: [NUM_SLOTS]ReaderSlot = @splat(.{}),
+        /// 0 = unlocked, 1 = writer active/draining, 2 = writer active + >=1 reader parked.
+        writer_state: std.atomic.Value(u32) align(64) = .init(0),
+        writer_mutex: Mutex = .{},
+    };
+
+    inner: if (no_sync) struct {} else Inner = .{},
+
+    const SlotAssign = struct {
+        var next_slot: std.atomic.Value(u32) = .init(0);
+        threadlocal var tls_slot_plus_one: u32 = 0;
+
+        inline fn current() usize {
+            const cached = tls_slot_plus_one;
+            if (cached != 0) return @intCast(cached - 1);
+            const assigned: u32 = next_slot.fetchAdd(1, .monotonic) & @as(u32, @intCast(NUM_SLOTS - 1));
+            tls_slot_plus_one = assigned + 1;
+            return @intCast(assigned);
+        }
+    };
+
+    pub fn lockShared(self: *ShardedRwLock) void {
+        if (comptime no_sync) return else {
+            const slot = &self.inner.slots[SlotAssign.current()].count;
+            while (true) {
+                if (self.inner.writer_state.load(.acquire) != 0) {
+                    self.waitForWriter();
+                }
+
+                // Dekker publish: seq_cst RMW on this thread's private slot followed by
+                // seq_cst load of writer_state guarantees mutual exclusion with a writer's
+                // seq_cst store to writer_state followed by seq_cst drain of every slot.
+                _ = slot.fetchAdd(1, .seq_cst);
+                if (self.inner.writer_state.load(.seq_cst) == 0) {
+                    return;
+                }
+
+                // A writer raced in: back off our slot and wake it if it is draining us.
+                const prev = slot.fetchSub(1, .seq_cst);
+                if (prev == 1) {
+                    Futex.wake(slot, 1);
+                }
+                self.waitForWriter();
+            }
+        }
+    }
+
+    pub fn unlockShared(self: *ShardedRwLock) void {
+        if (comptime no_sync) return else {
+            const slot = &self.inner.slots[SlotAssign.current()].count;
+            const prev = slot.fetchSub(1, .seq_cst);
+            // Hot path: writer_state remains in Shared (S) cache state across all cores.
+            if (prev == 1 and self.inner.writer_state.load(.seq_cst) != 0) {
+                Futex.wake(slot, 1);
+            }
+        }
+    }
+
+    pub fn lock(self: *ShardedRwLock) void {
+        if (comptime no_sync) return else {
+            self.inner.writer_mutex.lock();
+            self.inner.writer_state.store(1, .seq_cst);
+
+            for (&self.inner.slots) |*slot| {
+                var spins: u32 = 0;
+                while (true) {
+                    const cur = slot.count.load(.seq_cst);
+                    if (cur == 0) break;
+                    if (spins < 64) {
+                        std.atomic.spinLoopHint();
+                        spins += 1;
+                    } else if (spins < 80) {
+                        std.Thread.yield() catch {};
+                        spins += 1;
+                    } else {
+                        Futex.timedWait(&slot.count, cur, 1_000_000);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn unlock(self: *ShardedRwLock) void {
+        if (comptime no_sync) return else {
+            const prev = self.inner.writer_state.swap(0, .seq_cst);
+            if (prev == 2) {
+                Futex.wake(&self.inner.writer_state, std.math.maxInt(i32));
+            }
+            self.inner.writer_mutex.unlock();
+        }
+    }
+
+    fn waitForWriter(self: *ShardedRwLock) void {
+        if (comptime no_sync) return else {
+            var spins: u32 = 0;
+            while (true) {
+                const ws = self.inner.writer_state.load(.acquire);
+                if (ws == 0) return;
+                if (spins < 32) {
+                    std.atomic.spinLoopHint();
+                    spins += 1;
+                    continue;
+                }
+                if (ws == 1) {
+                    _ = self.inner.writer_state.cmpxchgStrong(1, 2, .acq_rel, .acquire);
+                }
+                if (self.inner.writer_state.load(.acquire) == 2) {
+                    Futex.timedWait(&self.inner.writer_state, 2, 1_000_000);
+                }
+            }
+        }
+    }
+};
+
 /// Futex compatibility wrapper.
 /// In 0.16, std.Thread.Futex moved to std.Io.futexWait/futexWake.
 pub const Futex = struct {
@@ -998,4 +1131,96 @@ test "setNoDelay actually enables TCP_NODELAY in the kernel" {
     try testing.expect(!(try getNoDelay(conn.stream.getHandle())));
     setNoDelay(conn.stream.getHandle());
     try testing.expect(try getNoDelay(conn.stream.getHandle()));
+}
+
+test "ShardedRwLock basic single-threaded lock and unlock" {
+    var rw = ShardedRwLock{};
+    rw.lockShared();
+    rw.unlockShared();
+    rw.lock();
+    rw.unlock();
+}
+
+test "ShardedRwLock multi-threaded mutual exclusion under 8 readers + 2 writers" {
+    if (comptime wasm_target or builtin.single_threaded) return error.SkipZigTest;
+    const testing = std.testing;
+
+    const Shared = struct {
+        rw: ShardedRwLock = .{},
+        // Two fields written under exclusive lock must ALWAYS satisfy b == a * 3 + 7
+        // when observed under shared lock; a torn/racy read violates this invariant.
+        a: u64 = 0,
+        b: u64 = 7,
+        active_writers: std.atomic.Value(u32) = .init(0),
+        active_readers: std.atomic.Value(u32) = .init(0),
+        violations: std.atomic.Value(u32) = .init(0),
+        stop: std.atomic.Value(bool) = .init(false),
+        reads_completed: std.atomic.Value(u32) = .init(0),
+    };
+
+    const Reader = struct {
+        fn run(s: *Shared) void {
+            var local_reads: u32 = 0;
+            while (!s.stop.load(.acquire) or local_reads < 1_000) {
+                s.rw.lockShared();
+                _ = s.active_readers.fetchAdd(1, .acq_rel);
+                if (s.active_writers.load(.acquire) != 0) {
+                    _ = s.violations.fetchAdd(1, .monotonic);
+                }
+                const a = s.a;
+                const b = s.b;
+                if (b != a *% 3 +% 7) {
+                    _ = s.violations.fetchAdd(1, .monotonic);
+                }
+                _ = s.active_readers.fetchSub(1, .acq_rel);
+                s.rw.unlockShared();
+                local_reads += 1;
+                if (local_reads >= 20_000) break;
+            }
+            _ = s.reads_completed.fetchAdd(local_reads, .release);
+        }
+    };
+
+    const Writer = struct {
+        fn run(s: *Shared, iters: u32) void {
+            for (0..iters) |_| {
+                s.rw.lock();
+                const prev_w = s.active_writers.fetchAdd(1, .acq_rel);
+                if (prev_w != 0 or s.active_readers.load(.acquire) != 0) {
+                    _ = s.violations.fetchAdd(1, .monotonic);
+                }
+                const next_a = s.a +% 1;
+                s.a = next_a;
+                // Deliberately separate the two writes to expose any missing exclusion.
+                std.atomic.spinLoopHint();
+                s.b = next_a *% 3 +% 7;
+                _ = s.active_writers.fetchSub(1, .acq_rel);
+                s.rw.unlock();
+            }
+        }
+    };
+
+    var shared = Shared{};
+    const NUM_READERS = 8;
+    const NUM_WRITERS = 2;
+    const WRITER_ITERS: u32 = 500;
+
+    var readers: [NUM_READERS]std.Thread = undefined;
+    var writers: [NUM_WRITERS]std.Thread = undefined;
+
+    for (&readers) |*th| {
+        th.* = try std.Thread.spawn(.{}, Reader.run, .{&shared});
+    }
+    for (&writers) |*th| {
+        th.* = try std.Thread.spawn(.{}, Writer.run, .{ &shared, WRITER_ITERS });
+    }
+
+    for (&writers) |*th| th.join();
+    shared.stop.store(true, .release);
+    for (&readers) |*th| th.join();
+
+    try testing.expectEqual(@as(u32, 0), shared.violations.load(.acquire));
+    try testing.expectEqual(@as(u64, NUM_WRITERS * WRITER_ITERS), shared.a);
+    try testing.expectEqual(@as(u64, (NUM_WRITERS * WRITER_ITERS) * 3 + 7), shared.b);
+    try testing.expect(shared.reads_completed.load(.acquire) >= NUM_READERS * 1_000);
 }

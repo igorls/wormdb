@@ -290,6 +290,26 @@ pub const Ctx = struct {
         return self.store.getValueDupe(key, self.allocator);
     }
 
+    /// Zero-allocation read into a caller-owned buffer. Locks, copies, and unlocks
+    /// internally — safe to call without holding any Ctx shard locks.
+    pub fn getInto(self: *Ctx, key: []const u8, buf: []u8) Store.GetIntoResult {
+        self.assertNoHeldShardLocks("getInto");
+        return self.store.getValueInto(key, buf);
+    }
+
+    /// Zero-copy read with callback: invokes `cb(user_ctx, value)` on borrowed bytes
+    /// under the shard lock (or lock-free for SST hits). Caller must hold no Ctx shard
+    /// locks, and `cb` must not retain `value` or call back into Store/NamespaceIndex.
+    pub fn readWithCallback(
+        self: *Ctx,
+        key: []const u8,
+        user_ctx: anytype,
+        comptime cb: fn (@TypeOf(user_ctx), []const u8) void,
+    ) bool {
+        self.assertNoHeldShardLocks("readWithCallback");
+        return self.store.readWithCallback(key, user_ctx, cb);
+    }
+
     /// Get the value for a key parsed as an integer.
     /// Returns null if key doesn't exist or value is not a valid integer.
     pub fn getInt(self: *Ctx, comptime T: type, key: []const u8) ?T {
@@ -417,9 +437,16 @@ pub const Ctx = struct {
         return .{ .err = self.allocator.dupe(u8, msg) catch "internal_error" };
     }
 
-    /// Return a string value.
+    /// Return a string value (copies into `self.allocator`).
     pub fn value(self: *Ctx, data: []const u8) Result {
         return .{ .value = self.allocator.dupe(u8, data) catch null };
+    }
+
+    /// Transfer ownership of a slice already allocated with `self.allocator`
+    /// (e.g. from `ArrayListUnmanaged.toOwnedSlice(ctx.allocator)`) without
+    /// allocating and copying it a second time.
+    pub fn valueOwned(_: *const Ctx, owned: []u8) Result {
+        return .{ .value = owned };
     }
 
     /// Return an integer value as a string.
@@ -778,4 +805,52 @@ test "Ctx.requireKey/requirePrefix honor the enforce context; trusted bypasses" 
     defer trusted.deinit();
     try trusted.requireDelete("anything");
     try trusted.requirePrefix("", .delete);
+}
+
+test "Ctx.getInto, readWithCallback, and valueOwned avoid redundant copies and leak zero memory" {
+    const testing = std.testing;
+    const Config = @import("../core/config.zig").Config;
+
+    var store = try Store.init(testing.allocator, Config{ .persistence = .none });
+    defer store.deinit();
+    try store.set("k:1", "payload-1234", false);
+
+    var ctx = Ctx.init(&store, &.{}, testing.allocator, null, null, null, null);
+    defer ctx.deinit();
+
+    var small_buf: [4]u8 = undefined;
+    switch (ctx.getInto("k:1", &small_buf)) {
+        .too_small => |n| try testing.expectEqual(@as(usize, 12), n),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var ok_buf: [32]u8 = undefined;
+    switch (ctx.getInto("k:1", &ok_buf)) {
+        .hit => |slice| try testing.expectEqualStrings("payload-1234", slice),
+        else => return error.TestUnexpectedResult,
+    }
+
+    switch (ctx.getInto("k:missing", &ok_buf)) {
+        .miss => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    const Probe = struct {
+        matched: bool = false,
+        fn cb(self: *@This(), val: []const u8) void {
+            self.matched = std.mem.eql(u8, val, "payload-1234");
+        }
+    };
+    var probe = Probe{};
+    try testing.expect(ctx.readWithCallback("k:1", &probe, Probe.cb));
+    try testing.expect(probe.matched);
+    try testing.expect(!ctx.readWithCallback("k:missing", &probe, Probe.cb));
+
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    try list.appendSlice(testing.allocator, "{\"ok\":true}");
+    const owned = try list.toOwnedSlice(testing.allocator);
+    const res = ctx.valueOwned(owned);
+    defer testing.allocator.free(res.value.?);
+    try testing.expectEqual(@intFromPtr(owned.ptr), @intFromPtr(res.value.?.ptr));
+    try testing.expectEqualStrings("{\"ok\":true}", res.value.?);
 }

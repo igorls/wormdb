@@ -72,7 +72,9 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
             };
             if (ctx.store.vector_registry == null) {
                 if (ctx.vector_registry) |reg| {
-                    ctx.store.syncVectorSetWithRegistry(reg, params.key, params.value, params.worm, @intCast(core.compat.nowMs()));
+                    if (reg.mayMatchFast(params.key)) {
+                        ctx.store.syncVectorSetWithRegistry(reg, params.key, params.value, params.worm, @intCast(core.compat.nowMs()));
+                    }
                 }
             }
 
@@ -93,7 +95,9 @@ pub fn execute(ctx: ExecContext, cmd: Command) !Response {
             };
             if (ctx.store.vector_registry == null) {
                 if (ctx.vector_registry) |reg| {
-                    ctx.store.syncVectorDeleteWithRegistry(reg, key);
+                    if (reg.mayMatchFast(key)) {
+                        ctx.store.syncVectorDeleteWithRegistry(reg, key);
+                    }
                 }
             }
 

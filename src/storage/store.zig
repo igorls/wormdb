@@ -488,6 +488,66 @@ pub const Store = struct {
         return null;
     }
 
+    /// Outcome of `getValueInto`: distinguishes a missing key from a value that
+    /// does not fit in the caller-supplied buffer (carrying the exact byte length
+    /// so the caller can fall back to heap allocation without guessing).
+    pub const GetIntoResult = union(enum) {
+        hit: []const u8,
+        too_small: usize,
+        miss,
+    };
+
+    /// Zero-allocation read into a caller-owned buffer (e.g. a 16B-aligned stack
+    /// buffer for vector queries). Locks only the key's shard, copies the value
+    /// into `buf`, and unlocks. Falls through to the frozen SST overlay on a live
+    /// miss, matching `getValueDupe` semantics identically.
+    pub fn getValueInto(self: *Store, key: []const u8, buf: []u8) GetIntoResult {
+        const si = shardIndex(key);
+        self.shards[si].mutex.lock();
+        if (self.shards[si].data.get(key)) |entry| {
+            defer self.shards[si].mutex.unlock();
+            if (entry.value.len > buf.len) return .{ .too_small = entry.value.len };
+            @memcpy(buf[0..entry.value.len], entry.value);
+            return .{ .hit = buf[0..entry.value.len] };
+        }
+        self.shards[si].mutex.unlock();
+        if (self.sstHit(key)) |hit| {
+            if (hit.value.len > buf.len) return .{ .too_small = hit.value.len };
+            @memcpy(buf[0..hit.value.len], hit.value);
+            return .{ .hit = buf[0..hit.value.len] };
+        }
+        return .miss;
+    }
+
+    /// Zero-copy read with callback: locks the key's shard, invokes `cb(user_ctx, value)`
+    /// with borrowed value bytes, and unlocks. Falls through to the frozen SST overlay
+    /// on a live miss (where no shard lock is held during `cb`). Returns `true` iff the
+    /// key existed and `cb` ran.
+    ///
+    /// Contract: `cb` MUST NOT retain the borrowed `value` slice after returning, and
+    /// MUST NOT call back into `Store`, `NamespaceRegistry`, or `NamespaceIndex`
+    /// (deadlock risk against the held shard mutex and global lock order).
+    pub fn readWithCallback(
+        self: *Store,
+        key: []const u8,
+        user_ctx: anytype,
+        comptime cb: fn (@TypeOf(user_ctx), []const u8) void,
+    ) bool {
+        const si = shardIndex(key);
+        self.shards[si].mutex.lock();
+        if (self.shards[si].data.get(key)) |entry| {
+            defer self.shards[si].mutex.unlock();
+            cb(user_ctx, entry.value);
+            return true;
+        }
+        self.shards[si].mutex.unlock();
+        if (self.sstHit(key)) |hit| {
+            cb(user_ctx, hit.value);
+            return true;
+        }
+        return false;
+    }
+
     /// Stable receipt metadata for an entry, copied while the shard is locked.
     pub const EntryMetadata = struct {
         timestamp: u64,
@@ -3511,4 +3571,71 @@ test "Store.scanPrefix sorts >256 keys with shared 8-byte suffix ties and NUL by
     for (1..res.len) |idx| {
         try testing.expect(std.mem.lessThan(u8, res[idx - 1].key, res[idx].key));
     }
+}
+
+test "Store.getValueInto handles hit, exact fit, empty value, too_small, and miss" {
+    const testing = std.testing;
+    var store = try Store.init(testing.allocator, .{ .persistence = .none });
+    defer store.deinit();
+
+    try store.set("k:small", "hello", false);
+    try store.set("k:empty", "", false);
+    try store.set("k:big", "0123456789abcdef", false);
+
+    var buf: [8]u8 = undefined;
+
+    switch (store.getValueInto("k:small", &buf)) {
+        .hit => |slice| try testing.expectEqualStrings("hello", slice),
+        else => return error.TestUnexpectedResult,
+    }
+
+    switch (store.getValueInto("k:small", buf[0..5])) {
+        .hit => |slice| try testing.expectEqualStrings("hello", slice),
+        else => return error.TestUnexpectedResult,
+    }
+
+    switch (store.getValueInto("k:empty", buf[0..0])) {
+        .hit => |slice| try testing.expectEqual(@as(usize, 0), slice.len),
+        else => return error.TestUnexpectedResult,
+    }
+
+    switch (store.getValueInto("k:big", &buf)) {
+        .too_small => |needed| try testing.expectEqual(@as(usize, 16), needed),
+        else => return error.TestUnexpectedResult,
+    }
+
+    switch (store.getValueInto("k:missing", &buf)) {
+        .miss => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Store.readWithCallback borrows value without copying and reports misses" {
+    const testing = std.testing;
+    var store = try Store.init(testing.allocator, .{ .persistence = .none });
+    defer store.deinit();
+
+    const meta_json = "{\"mediaType\":\"image\",\"sharpness\":88}";
+    try store.set("meta:42", meta_json, false);
+
+    const Probe = struct {
+        called: bool = false,
+        len: usize = 0,
+        has_image: bool = false,
+        fn onVal(self: *@This(), val: []const u8) void {
+            self.called = true;
+            self.len = val.len;
+            self.has_image = std.mem.indexOf(u8, val, "\"image\"") != null;
+        }
+    };
+
+    var hit_probe = Probe{};
+    try testing.expect(store.readWithCallback("meta:42", &hit_probe, Probe.onVal));
+    try testing.expect(hit_probe.called);
+    try testing.expectEqual(meta_json.len, hit_probe.len);
+    try testing.expect(hit_probe.has_image);
+
+    var miss_probe = Probe{};
+    try testing.expect(!store.readWithCallback("meta:999", &miss_probe, Probe.onVal));
+    try testing.expect(!miss_probe.called);
 }

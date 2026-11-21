@@ -861,30 +861,28 @@ fn runHnswDispatch(
     const stage1_size = top_k * HNSW_EF_SEARCH_FACTOR;
     const raw_buf = try ctx.allocator.alloc(IndexModule.IndexSearchResult, stage1_size);
     const hnsw_scratch = try ctx.allocator.alloc(hnsw_mod.SearchResult, stage1_size);
+    const stage1_keys = try ctx.allocator.alloc([]u8, stage1_size);
+    const stage1_ts = try ctx.allocator.alloc(u64, stage1_size);
     const ef = stage1_size;
 
+    // Duplicate borrowed NamespaceIndex key slices BEFORE releasing the shared lock so a
+    // concurrent `clearLocked`/`vreindex` cannot free `ns_idx.keys` while we read them.
     const n_stage1 = blk: {
         ns_idx.lock.lockShared();
         defer ns_idx.lock.unlockShared();
         if (ns_idx.len() == 0) break :blk @as(usize, 0);
-        break :blk try ns_idx.searchLocked(query_vec, stage1_size, ef, raw_buf, hnsw_scratch);
+        const found = try ns_idx.searchLocked(query_vec, stage1_size, ef, raw_buf, hnsw_scratch);
+        for (raw_buf[0..found], 0..) |r, i| {
+            stage1_keys[i] = try ctx.allocator.dupe(u8, r.key);
+            stage1_ts[i] = r.timestamp;
+        }
+        break :blk found;
     };
 
     if (n_stage1 == 0) return false;
 
     const vec_prefix = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
     defer ctx.allocator.free(vec_prefix);
-
-    const stage1_keys = try ctx.allocator.alloc([]u8, n_stage1);
-    const stage1_ts = try ctx.allocator.alloc(u64, n_stage1);
-    {
-        ns_idx.lock.lockShared();
-        defer ns_idx.lock.unlockShared();
-        for (raw_buf[0..n_stage1], 0..) |r, i| {
-            stage1_keys[i] = try ctx.allocator.dupe(u8, r.key);
-            stage1_ts[i] = r.timestamp;
-        }
-    }
 
     for (0..n_stage1) |i| {
         if (!try candidateMatchesFilter(ctx, filter, ns, vec_prefix, stage1_keys[i], stage1_ts[i])) continue;

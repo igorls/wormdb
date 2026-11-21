@@ -223,7 +223,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
         const full_key = ns_idx.keys.items[nid];
         const suffix = if (std.mem.startsWith(u8, full_key, namespace)) full_key[namespace.len..] else full_key;
         if (excluded_map.count() > 0 and excluded_map.contains(suffix)) continue;
-        const vec = ns_idx.hnsw.nodes.items[nid].vector;
+        const vec = ns_idx.hnsw.getVector(@intCast(nid));
         if (vec.len != dim) continue;
 
         const idx: i32 = @intCast(active_nids.items.len);
@@ -248,8 +248,11 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const adj = try alloc.alloc(std.ArrayListUnmanaged(Edge), n);
     for (adj) |*list| list.* = .empty;
 
+    var hnsw_search_scratch = hnsw_mod.SearchScratch.init();
+    defer hnsw_search_scratch.deinit(alloc);
+
     for (0..n) |i| {
-        const found = try ns_idx.hnsw.search(active_vecs.items[i], k_query, ef, scratch, filter);
+        const found = try ns_idx.hnsw.searchWithScratch(alloc, active_vecs.items[i], k_query, ef, scratch, filter, null, &hnsw_search_scratch);
         for (scratch[0..found]) |hit| {
             const j_signed = nid_to_idx[hit.id];
             if (j_signed < 0) continue;

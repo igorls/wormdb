@@ -1,20 +1,13 @@
-//! Bounded top-K via fixed-capacity min-heap.
+//! Bounded top-K and fixed-capacity heap primitives for vector search.
 //!
-//! Tracks the K highest-scoring items from an unknown-length stream without
-//! allocating per-item or sorting the whole stream. Standard pattern:
-//! maintain a min-heap of size K; a new item is kept only if it beats the
-//! current minimum (root).
+//! Provides:
+//!   - `TopK(T, scoreOf)` — fixed-capacity min-heap retaining the K highest
+//!     scores from a stream (O(N log K), zero per-item allocation).
+//!   - `BoundedMaxHeap(T, distOf)` — fixed-capacity max-heap retaining the K
+//!     smallest distances (root = furthest kept element), using single-pass
+//!     `pushOrReplace` (1 siftDown vs push+pop) for HNSW beam search.
 //!
-//! For N candidates this is O(N log K) vs O(N log N) for append+sort — the
-//! difference matters when N = millions of vectors and K = 10.
-//!
-//! Usage:
-//!   var buf: [10]Candidate = undefined;
-//!   var topk = TopK(Candidate, scoreOf).init(&buf);
-//!   // stream items:
-//!   topk.push(.{ .key = k, .score = s });
-//!   // drain sorted (best first):
-//!   const results = topk.sortedDesc();
+//! Both use hole-sifting (1 element move per tree level instead of 3-move swap).
 
 const std = @import("std");
 
@@ -49,7 +42,7 @@ pub fn TopK(
         /// duping a key into the arena) for candidates that would be
         /// rejected anyway.
         pub fn thresholdScore(self: *const Self) f32 {
-            if (self.count < self.buf.len) return -std.math.inf(f32);
+            if (self.count < self.buf.len or self.buf.len == 0) return -std.math.inf(f32);
             return scoreOf(self.buf[0]);
         }
 
@@ -65,7 +58,7 @@ pub fn TopK(
                 return;
             }
 
-            // Full — replace root only if new item beats current min.
+            // Full — replace root only if new item strictly beats current min.
             if (scoreOf(item) <= scoreOf(self.buf[0])) return;
             self.buf[0] = item;
             siftDown(self.buf, 0);
@@ -76,37 +69,191 @@ pub fn TopK(
         /// at most once per fill cycle.
         pub fn sortedDesc(self: *Self) []T {
             const slice = self.buf[0..self.count];
-            std.sort.heap(T, slice, {}, struct {
-                fn greater(_: void, a: T, b: T) bool {
-                    return scoreOf(a) > scoreOf(b);
-                }
-            }.greater);
+            // `slice` is already a valid min-heap; extract minimums to the back
+            // to sort descending in-place without an extra build-heap pass.
+            var end = self.count;
+            while (end > 1) {
+                end -= 1;
+                const min_item = slice[0];
+                slice[0] = slice[end];
+                slice[end] = min_item;
+                siftDown(slice[0..end], 0);
+            }
             return slice;
         }
 
         fn siftUp(heap: []T, start: usize) void {
+            const item = heap[start];
+            const item_score = scoreOf(item);
             var i = start;
             while (i > 0) {
                 const parent = (i - 1) / 2;
-                if (scoreOf(heap[i]) >= scoreOf(heap[parent])) break;
-                std.mem.swap(T, &heap[i], &heap[parent]);
+                if (item_score >= scoreOf(heap[parent])) break;
+                heap[i] = heap[parent];
                 i = parent;
             }
+            heap[i] = item;
         }
 
         fn siftDown(heap: []T, start: usize) void {
             const n = heap.len;
+            const item = heap[start];
+            const item_score = scoreOf(item);
             var i = start;
             while (true) {
                 const l = 2 * i + 1;
-                const r = 2 * i + 2;
-                var smallest = i;
-                if (l < n and scoreOf(heap[l]) < scoreOf(heap[smallest])) smallest = l;
-                if (r < n and scoreOf(heap[r]) < scoreOf(heap[smallest])) smallest = r;
-                if (smallest == i) break;
-                std.mem.swap(T, &heap[i], &heap[smallest]);
+                if (l >= n) break;
+                const r = l + 1;
+                var smallest = l;
+                var smallest_score = scoreOf(heap[l]);
+                if (r < n) {
+                    const r_score = scoreOf(heap[r]);
+                    if (r_score < smallest_score) {
+                        smallest = r;
+                        smallest_score = r_score;
+                    }
+                }
+                if (item_score <= smallest_score) break;
+                heap[i] = heap[smallest];
                 i = smallest;
             }
+            heap[i] = item;
+        }
+    };
+}
+
+/// Fixed-capacity max-heap over items of type T, ranked by `distOf(T) -> f32`
+/// (smaller = closer). Retains up to `buf.len` closest items; root (`buf[0]`)
+/// is always the furthest kept item.
+///
+/// Designed for HNSW's result set `W`: when full, `pushOrReplace` replaces
+/// root in a single `siftDown` (half the heap work of `push` + `pop` and no
+/// capacity doubling).
+pub fn BoundedMaxHeap(
+    comptime T: type,
+    comptime distOf: fn (T) f32,
+) type {
+    return struct {
+        const Self = @This();
+
+        buf: []T,
+        count: usize,
+
+        pub fn init(buf: []T) Self {
+            return .{ .buf = buf, .count = 0 };
+        }
+
+        pub inline fn reset(self: *Self) void {
+            self.count = 0;
+        }
+
+        pub inline fn capacity(self: *const Self) usize {
+            return self.buf.len;
+        }
+
+        pub inline fn len(self: *const Self) usize {
+            return self.count;
+        }
+
+        pub inline fn isFull(self: *const Self) bool {
+            return self.count >= self.buf.len;
+        }
+
+        pub inline fn peek(self: *const Self) ?T {
+            return if (self.count > 0) self.buf[0] else null;
+        }
+
+        pub inline fn items(self: *const Self) []const T {
+            return self.buf[0..self.count];
+        }
+
+        /// Distance threshold a new item must beat (`d < worstDist()`) to improve
+        /// the heap. Returns `+inf` while not yet full so any finite distance qualifies.
+        pub inline fn worstDist(self: *const Self) f32 {
+            if (self.count < self.buf.len or self.count == 0) return std.math.inf(f32);
+            return distOf(self.buf[0]);
+        }
+
+        /// Admit `item` if the heap is not yet full, or replace the furthest
+        /// kept item if `distOf(item) < distOf(root)`. Single sift pass.
+        pub inline fn pushOrReplace(self: *Self, item: T) void {
+            if (self.buf.len == 0) return;
+
+            if (self.count < self.buf.len) {
+                self.buf[self.count] = item;
+                self.count += 1;
+                siftUpMax(self.buf[0..self.count], self.count - 1);
+                return;
+            }
+
+            if (distOf(item) >= distOf(self.buf[0])) return;
+            self.buf[0] = item;
+            siftDownMax(self.buf, 0);
+        }
+
+        /// Remove and return the furthest (maximum-distance) item.
+        pub inline fn pop(self: *Self) ?T {
+            if (self.count == 0) return null;
+            const top = self.buf[0];
+            self.count -= 1;
+            if (self.count > 0) {
+                self.buf[0] = self.buf[self.count];
+                siftDownMax(self.buf[0..self.count], 0);
+            }
+            return top;
+        }
+
+        /// Sort captured items ascending by distance (closest first) in-place
+        /// via direct max-heap extraction. Destroys heap invariant.
+        pub fn sortedAsc(self: *Self) []T {
+            const slice = self.buf[0..self.count];
+            var end = self.count;
+            while (end > 1) {
+                end -= 1;
+                const max_item = slice[0];
+                slice[0] = slice[end];
+                slice[end] = max_item;
+                siftDownMax(slice[0..end], 0);
+            }
+            return slice;
+        }
+
+        fn siftUpMax(heap: []T, start: usize) void {
+            const item = heap[start];
+            const item_dist = distOf(item);
+            var i = start;
+            while (i > 0) {
+                const parent = (i - 1) / 2;
+                if (item_dist <= distOf(heap[parent])) break;
+                heap[i] = heap[parent];
+                i = parent;
+            }
+            heap[i] = item;
+        }
+
+        fn siftDownMax(heap: []T, start: usize) void {
+            const n = heap.len;
+            const item = heap[start];
+            const item_dist = distOf(item);
+            var i = start;
+            while (true) {
+                const l = 2 * i + 1;
+                if (l >= n) break;
+                const r = l + 1;
+                var largest = l;
+                var largest_dist = distOf(heap[l]);
+                if (r < n) {
+                    const r_dist = distOf(heap[r]);
+                    if (r_dist > largest_dist) {
+                        largest = r;
+                        largest_dist = r_dist;
+                    }
+                }
+                if (item_dist >= largest_dist) break;
+                heap[i] = heap[largest];
+                i = largest;
+            }
+            heap[i] = item;
         }
     };
 }
@@ -120,6 +267,7 @@ fn scoreOfScored(s: Scored) f32 {
     return s.score;
 }
 const TopKScored = TopK(Scored, scoreOfScored);
+const BoundedDist = BoundedMaxHeap(Scored, scoreOfScored);
 
 test "top-k: fewer items than capacity" {
     var buf: [5]Scored = undefined;
@@ -154,6 +302,7 @@ test "top-k: zero capacity is a no-op" {
     tk.push(.{ .id = 1, .score = 1.0 });
     try std.testing.expectEqual(@as(usize, 0), tk.len());
     try std.testing.expectEqual(@as(usize, 0), tk.sortedDesc().len);
+    try std.testing.expect(std.math.isNegativeInf(tk.thresholdScore()));
 }
 
 test "top-k: ties preserve heap invariant" {
@@ -175,4 +324,77 @@ test "top-k: equal score does not displace (strict >)" {
     try std.testing.expectEqual(@as(usize, 2), out.len);
     // Both surviving ids come from {1, 2}; id=3 was rejected
     for (out) |r| try std.testing.expect(r.id == 1 or r.id == 2);
+}
+
+test "top-k: thresholdScore and negative scores" {
+    var buf: [3]Scored = undefined;
+    var tk = TopKScored.init(&buf);
+
+    // Unfilled heap returns -inf
+    try std.testing.expect(std.math.isNegativeInf(tk.thresholdScore()));
+    tk.push(.{ .id = 1, .score = -10.0 });
+    try std.testing.expect(std.math.isNegativeInf(tk.thresholdScore()));
+    tk.push(.{ .id = 2, .score = -2.5 });
+    try std.testing.expect(std.math.isNegativeInf(tk.thresholdScore()));
+    tk.push(.{ .id = 3, .score = -7.0 });
+
+    // Full heap exposes minimum surviving score (-10.0)
+    try std.testing.expectApproxEqAbs(@as(f32, -10.0), tk.thresholdScore(), 1e-6);
+
+    // Worse negative score is ignored; threshold unchanged
+    tk.push(.{ .id = 4, .score = -15.0 });
+    try std.testing.expectApproxEqAbs(@as(f32, -10.0), tk.thresholdScore(), 1e-6);
+
+    // Better negative score displaces -10.0; threshold rises to -7.0
+    tk.push(.{ .id = 5, .score = -1.0 });
+    try std.testing.expectApproxEqAbs(@as(f32, -7.0), tk.thresholdScore(), 1e-6);
+
+    // Another better score displaces -7.0; threshold rises to -2.5
+    tk.push(.{ .id = 6, .score = -0.25 });
+    try std.testing.expectApproxEqAbs(@as(f32, -2.5), tk.thresholdScore(), 1e-6);
+
+    const out = tk.sortedDesc();
+    try std.testing.expectEqual(@as(usize, 3), out.len);
+    try std.testing.expectEqual(@as(u32, 6), out[0].id);
+    try std.testing.expectEqual(@as(u32, 5), out[1].id);
+    try std.testing.expectEqual(@as(u32, 2), out[2].id);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.25), out[0].score, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), out[1].score, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -2.5), out[2].score, 1e-6);
+}
+
+test "bounded max-heap: retains smallest K distances and sorts ascending" {
+    var buf: [4]Scored = undefined;
+    var h = BoundedDist.init(&buf);
+
+    try std.testing.expect(std.math.isPositiveInf(h.worstDist()));
+    const vals = [_]f32{ 5.0, -1.0, 2.0, 0.5, -3.5, 4.0, 0.0, -2.0, 10.0 };
+    for (vals, 0..) |v, i| {
+        h.pushOrReplace(.{ .id = @intCast(i), .score = v });
+    }
+    try std.testing.expectEqual(@as(usize, 4), h.len());
+    // Four smallest from vals are {-3.5, -2.0, -1.0, 0.0} -> worst kept is 0.0
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), h.worstDist(), 1e-6);
+
+    // Equal or larger than worstDist does not displace
+    h.pushOrReplace(.{ .id = 99, .score = 0.0 });
+    h.pushOrReplace(.{ .id = 100, .score = 9.0 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), h.worstDist(), 1e-6);
+
+    const sorted = h.sortedAsc();
+    try std.testing.expectEqual(@as(usize, 4), sorted.len);
+    try std.testing.expectApproxEqAbs(@as(f32, -3.5), sorted[0].score, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -2.0), sorted[1].score, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), sorted[2].score, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), sorted[3].score, 1e-6);
+
+    // Also verify pop() yields descending (furthest first)
+    h.reset();
+    h.pushOrReplace(.{ .id = 1, .score = 2.0 });
+    h.pushOrReplace(.{ .id = 2, .score = -1.0 });
+    h.pushOrReplace(.{ .id = 3, .score = 0.5 });
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), h.pop().?.score, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), h.pop().?.score, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), h.pop().?.score, 1e-6);
+    try std.testing.expect(h.pop() == null);
 }

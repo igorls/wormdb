@@ -133,6 +133,10 @@ pub const NamespaceIndex = struct {
     keys: std.ArrayListUnmanaged([]u8),
     /// timestamps[node_id] — from the vec Entry when inserted.
     timestamps: std.ArrayListUnmanaged(u64),
+    /// Wyhash of each node's raw incoming vector bytes (indexed by node_id).
+    /// Preserves identical-write idempotence even when HNSW stores
+    /// unit-normalized vectors for `.cosine`.
+    vec_hashes: std.ArrayListUnmanaged(u64),
     /// Reverse lookup: vec key → node_id. Populated on every insertLocked,
     /// so DELETE-style ops can find the graph node to tombstone in O(1).
     /// The map's keys are borrowed from `self.keys` (no extra dupe).
@@ -184,6 +188,7 @@ pub const NamespaceIndex = struct {
             .hnsw = Hnsw.init(allocator, p),
             .keys = .empty,
             .timestamps = .empty,
+            .vec_hashes = .empty,
             .key_to_node = .empty,
             .tombstones = .{},
             .tombstone_count = 0,
@@ -222,6 +227,7 @@ pub const NamespaceIndex = struct {
         for (self.keys.items) |k| self.allocator.free(k);
         self.keys.deinit(self.allocator);
         self.timestamps.deinit(self.allocator);
+        self.vec_hashes.deinit(self.allocator);
         // key_to_node's keys are borrowed from self.keys — only free the map.
         self.key_to_node.deinit(self.allocator);
         self.tombstones.deinit(self.allocator);
@@ -397,13 +403,20 @@ pub const NamespaceIndex = struct {
             if (vector.len != d) return RegistryError.DimensionMismatch;
         }
 
+        const incoming_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(vector));
         if (self.key_to_node.get(key)) |old_id| {
             if (!self.tombstones.isSet(old_id)) {
                 if (timestamp < self.timestamps.items[old_id]) {
                     return old_id;
                 }
-                const old_vec = self.hnsw.nodes.items[old_id].vector;
-                if (old_vec.len == vector.len and std.mem.eql(u8, std.mem.sliceAsBytes(old_vec), std.mem.sliceAsBytes(vector))) {
+                const same_vec = if (self.hnsw.storesUnitVectors())
+                    self.vec_hashes.items[old_id] == incoming_hash and self.hnsw.dim == vector.len
+                else blk: {
+                    const old_vec = self.hnsw.getVector(old_id);
+                    break :blk old_vec.len == vector.len and
+                        std.mem.eql(u8, std.mem.sliceAsBytes(old_vec), std.mem.sliceAsBytes(vector));
+                };
+                if (same_vec) {
                     self.timestamps.items[old_id] = timestamp;
                     return old_id;
                 }
@@ -427,6 +440,10 @@ pub const NamespaceIndex = struct {
         try self.timestamps.append(self.allocator, timestamp);
         errdefer {
             _ = self.timestamps.pop();
+        }
+        try self.vec_hashes.append(self.allocator, incoming_hash);
+        errdefer {
+            _ = self.vec_hashes.pop();
         }
 
         // Grow tombstones bitset to cover the new node. resize with `false`
@@ -557,6 +574,7 @@ pub const NamespaceIndex = struct {
         for (self.keys.items) |k| self.allocator.free(k);
         self.keys.clearRetainingCapacity();
         self.timestamps.clearRetainingCapacity();
+        self.vec_hashes.clearRetainingCapacity();
         self.key_to_node.clearRetainingCapacity();
         self.tombstones.deinit(self.allocator);
         self.tombstones = .{};
@@ -667,6 +685,7 @@ pub const NamespaceIndex = struct {
     /// index is built.
     const LocalResolver = struct {
         keys: []const []const u8,
+        vec_hashes: []u64,
         outer_resolve: OuterResolveFn,
         outer_ctx: *anyopaque,
 
@@ -675,7 +694,9 @@ pub const NamespaceIndex = struct {
         fn bridge(raw_ctx: *anyopaque, node_id: u32) ?[]const u8 {
             const self: *LocalResolver = @ptrCast(@alignCast(raw_ctx));
             if (node_id >= self.keys.len) return null;
-            return self.outer_resolve(self.outer_ctx, self.keys[node_id]);
+            const bytes = self.outer_resolve(self.outer_ctx, self.keys[node_id]) orelse return null;
+            self.vec_hashes[node_id] = std.hash.Wyhash.hash(0, bytes);
+            return bytes;
         }
     };
 
@@ -761,19 +782,25 @@ pub const NamespaceIndex = struct {
         }
 
         // ── Stage 3: read graph, bridging node_id → key lookups ──
+        var vec_hashes: std.ArrayListUnmanaged(u64) = .empty;
+        errdefer vec_hashes.deinit(allocator);
+        try vec_hashes.resize(allocator, node_count);
+        @memset(vec_hashes.items, 0);
+
         var bridge_ctx = LocalResolver{
             .keys = keys.items,
+            .vec_hashes = vec_hashes.items,
             .outer_resolve = outer_resolve,
             .outer_ctx = outer_ctx,
         };
-        var hnsw = try Hnsw.readFrom(
+        var hnsw = try Hnsw.readFromWithDistFn(
             allocator,
             reader,
+            metric.distFn(),
             LocalResolver.bridge,
             @ptrCast(&bridge_ctx),
         );
         errdefer hnsw.deinit();
-        hnsw.setDistFn(metric.distFn());
 
         // ── Build the reverse map (keys must already be populated) ──
         var key_to_node: std.StringHashMapUnmanaged(u32) = .empty;
@@ -840,6 +867,7 @@ pub const NamespaceIndex = struct {
             .hnsw = hnsw,
             .keys = keys,
             .timestamps = timestamps,
+            .vec_hashes = vec_hashes,
             .key_to_node = key_to_node,
             .tombstones = tombstones,
             .tombstone_count = tombstone_count,
@@ -1760,5 +1788,36 @@ test "insertLocked ignores writes older than the stored timestamp" {
     try testing.expectEqual(@as(usize, 1), idx.liveCount());
     try testing.expectEqual(@as(usize, 0), idx.tombstone_count);
     try testing.expectEqual(@as(u64, 200), idx.timestamps.items[id_newer]);
-    try testing.expectApproxEqAbs(@as(f32, 1.0), idx.hnsw.nodes.items[id_newer].vector[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), idx.hnsw.getVector(id_newer)[0], 1e-6);
+}
+
+test "insertLocked identical-write idempotence under cosine unit-normalization" {
+    var idx = NamespaceIndex.init(testing.allocator, .{ .m = 4, .ef_construction = 20 }, .cosine);
+    defer idx.deinit();
+
+    // Non-unit vector: HNSW stores [0.6, 0.8, 0, 0] internally under `.cosine`
+    const v_raw = [_]f32{ 3.0, 4.0, 0.0, 0.0 };
+    const v_scaled = [_]f32{ 6.0, 8.0, 0.0, 0.0 };
+    const v_diff = [_]f32{ 0.0, 5.0, 0.0, 0.0 };
+
+    const id1 = try idx.insertLocked("vec:k1", &v_raw, 100);
+    // Re-inserting identical raw bytes must NOT tombstone (idempotent timestamp refresh)
+    const id2 = try idx.insertLocked("vec:k1", &v_raw, 200);
+    try testing.expectEqual(id1, id2);
+    try testing.expectEqual(@as(usize, 1), idx.len());
+    try testing.expectEqual(@as(usize, 1), idx.liveCount());
+    try testing.expectEqual(@as(usize, 0), idx.tombstone_count);
+    try testing.expectEqual(@as(u64, 200), idx.timestamps.items[id1]);
+    try testing.expectApproxEqAbs(@as(f32, 0.6), idx.hnsw.getVector(id1)[0], 1e-6);
+
+    // Different raw bytes (even same direction) still tombstone old node and append new node
+    const id3 = try idx.insertLocked("vec:k1", &v_scaled, 300);
+    try testing.expect(id3 != id1);
+    try testing.expectEqual(@as(usize, 1), idx.tombstone_count);
+    try testing.expectEqual(@as(usize, 1), idx.liveCount());
+
+    const id4 = try idx.insertLocked("vec:k1", &v_diff, 400);
+    try testing.expect(id4 != id3);
+    try testing.expectEqual(@as(usize, 2), idx.tombstone_count);
+    try testing.expectEqual(@as(usize, 1), idx.liveCount());
 }

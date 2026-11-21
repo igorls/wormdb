@@ -62,6 +62,7 @@ export class WormdbAdapter implements Adapter {
   readonly name = "wormdb";
   private client!: WormClient;
   private cfg!: AdapterConfig;
+  private ef: number | null = null;
 
   constructor(private readonly host: string, private readonly port: number) {}
 
@@ -224,17 +225,16 @@ export class WormdbAdapter implements Adapter {
     }
   }
 
-  async setEf(_ef: number): Promise<void> {
-    // HNSW ef_search is currently a build constant (see vsearch.zig); no
-    // runtime knob exists. This is a known gap to surface in the report.
-    // No-op for now so the benchmark still runs at the HNSW default.
+  async setEf(ef: number): Promise<void> {
+    this.ef = ef;
   }
 
   async query(qIdx: number, _queryVec: Float32Array, k: number): Promise<QueryResult> {
     const metric = metricStr(this.cfg.metric);
     const mode = modeArg(this.cfg.mode);
     const qkey = `${QUERY_NAMESPACE}${qIdx}`;
-    const resp = await this.client.send(`EXEC vsearch ${qkey} ${k} ${NAMESPACE} ${metric} 0 ${mode}`);
+    const efSuffix = this.ef !== null ? ` 168 ${this.ef}` : "";
+    const resp = await this.client.send(`EXEC vsearch ${qkey} ${k} ${NAMESPACE} ${metric} 0 ${mode}${efSuffix}`);
     if (resp.type !== "bulk") throw new Error(`vsearch failed: ${JSON.stringify(resp)}`);
 
     const parsed = JSON.parse(resp.value) as Array<{ k: string; s: number; ts: number }>;

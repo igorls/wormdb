@@ -196,9 +196,7 @@ fn runForDim(alloc: std.mem.Allocator, dim: usize) !void {
 }
 
 fn nowNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    return @intCast(std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake).toNanoseconds());
 }
 
 fn timeRepeated(comptime run: anytype, params: anytype) !f64 {

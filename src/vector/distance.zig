@@ -72,6 +72,86 @@ inline fn fmadd(a: F32xN, b: F32xN, c: F32xN) F32xN {
     return fmaddVec(SIMD_LANES, a, b, c);
 }
 
+/// Tree-structured horizontal sum for float vectors.
+/// Avoids LLVM's strict left-to-right serial `vaddss` chain on `@reduce(.Add, vec)`
+/// (~48 cycles -> ~12 cycles for 16-wide ZMM, and O(log N) rounding error).
+pub inline fn hsumVec(comptime N: usize, v: @Vector(N, f32)) f32 {
+    if (comptime N == 1) return v[0];
+    if (comptime N == 2) return v[0] + v[1];
+    if (comptime N == 4) {
+        const lo: @Vector(2, f32) = @shuffle(f32, v, undefined, [2]i32{ 0, 1 });
+        const hi: @Vector(2, f32) = @shuffle(f32, v, undefined, [2]i32{ 2, 3 });
+        const s = lo + hi;
+        return s[0] + s[1];
+    }
+    if (comptime N == 8) {
+        const lo: @Vector(4, f32) = @shuffle(f32, v, undefined, [4]i32{ 0, 1, 2, 3 });
+        const hi: @Vector(4, f32) = @shuffle(f32, v, undefined, [4]i32{ 4, 5, 6, 7 });
+        return hsumVec(4, lo + hi);
+    }
+    if (comptime N == 16) {
+        const lo: @Vector(8, f32) = @shuffle(f32, v, undefined, [8]i32{ 0, 1, 2, 3, 4, 5, 6, 7 });
+        const hi: @Vector(8, f32) = @shuffle(f32, v, undefined, [8]i32{ 8, 9, 10, 11, 12, 13, 14, 15 });
+        return hsumVec(8, lo + hi);
+    }
+    return @reduce(.Add, v);
+}
+
+inline fn hsum(v: F32xN) f32 {
+    return hsumVec(SIMD_LANES, v);
+}
+
+/// Simultaneous horizontal sum of 4 float vectors via pairwise folding + 4x4 transpose-add.
+pub inline fn hsum4Vec(
+    comptime N: usize,
+    v0: @Vector(N, f32),
+    v1: @Vector(N, f32),
+    v2: @Vector(N, f32),
+    v3: @Vector(N, f32),
+) [4]f32 {
+    if (comptime N == 16) {
+        const lo_m = [8]i32{ 0, 1, 2, 3, 4, 5, 6, 7 };
+        const hi_m = [8]i32{ 8, 9, 10, 11, 12, 13, 14, 15 };
+        return hsum4Vec(
+            8,
+            @shuffle(f32, v0, undefined, lo_m) + @shuffle(f32, v0, undefined, hi_m),
+            @shuffle(f32, v1, undefined, lo_m) + @shuffle(f32, v1, undefined, hi_m),
+            @shuffle(f32, v2, undefined, lo_m) + @shuffle(f32, v2, undefined, hi_m),
+            @shuffle(f32, v3, undefined, lo_m) + @shuffle(f32, v3, undefined, hi_m),
+        );
+    }
+    if (comptime N == 8) {
+        const lo_m = [4]i32{ 0, 1, 2, 3 };
+        const hi_m = [4]i32{ 4, 5, 6, 7 };
+        return hsum4Vec(
+            4,
+            @shuffle(f32, v0, undefined, lo_m) + @shuffle(f32, v0, undefined, hi_m),
+            @shuffle(f32, v1, undefined, lo_m) + @shuffle(f32, v1, undefined, hi_m),
+            @shuffle(f32, v2, undefined, lo_m) + @shuffle(f32, v2, undefined, hi_m),
+            @shuffle(f32, v3, undefined, lo_m) + @shuffle(f32, v3, undefined, hi_m),
+        );
+    }
+    if (comptime N == 4) {
+        const t0 = @shuffle(f32, v0, v1, [4]i32{ 0, ~@as(i32, 0), 2, ~@as(i32, 2) });
+        const t1 = @shuffle(f32, v0, v1, [4]i32{ 1, ~@as(i32, 1), 3, ~@as(i32, 3) });
+        const t2 = @shuffle(f32, v2, v3, [4]i32{ 0, ~@as(i32, 0), 2, ~@as(i32, 2) });
+        const t3 = @shuffle(f32, v2, v3, [4]i32{ 1, ~@as(i32, 1), 3, ~@as(i32, 3) });
+        const s01 = t0 + t1;
+        const s23 = t2 + t3;
+        const lo = @shuffle(f32, s01, s23, [4]i32{ 0, 1, ~@as(i32, 0), ~@as(i32, 1) });
+        const hi = @shuffle(f32, s01, s23, [4]i32{ 2, 3, ~@as(i32, 2), ~@as(i32, 3) });
+        return lo + hi;
+    }
+    return .{ hsumVec(N, v0), hsumVec(N, v1), hsumVec(N, v2), hsumVec(N, v3) };
+}
+
+/// Unaligned load of `N` `u64` lanes from a byte pointer.
+/// Avoids Zig 0.17's `@bitCast([N*8]u8 -> @Vector(N, u64))` scalar `i(N*64)` legalization bug.
+pub inline fn loadU64Vec(comptime N: usize, ptr: [*]const u8) @Vector(N, u64) {
+    const vp: *align(1) const @Vector(N, u64) = @ptrCast(ptr);
+    return vp.*;
+}
+
 inline fn clampUnit(v: f32) f32 {
     return @max(@as(f32, -1.0), @min(@as(f32, 1.0), v));
 }
@@ -120,20 +200,24 @@ pub fn l2Norm(v: []align(1) const f32) f32 {
         acc0 = fmadd(vx, vx, acc0);
     }
 
-    var sum_sq = @reduce(.Add, (acc0 + acc1) + (acc2 + acc3));
+    var sum_sq = hsum((acc0 + acc1) + (acc2 + acc3));
 
-    if (comptime SIMD_LANES > 4) {
-        var sub_acc: @Vector(4, f32) = @splat(0.0);
-        while (i + 4 <= len) : (i += 4) {
-            const vs: @Vector(4, f32) = v[i..][0..4].*;
-            sub_acc = fmaddVec(4, vs, vs, sub_acc);
+    if (i < len) {
+        if (comptime SIMD_LANES > 4) {
+            if (i + 4 <= len) {
+                var sub_acc: @Vector(4, f32) = @splat(0.0);
+                while (i + 4 <= len) : (i += 4) {
+                    const vs: @Vector(4, f32) = v[i..][0..4].*;
+                    sub_acc = fmaddVec(4, vs, vs, sub_acc);
+                }
+                sum_sq += hsumVec(4, sub_acc);
+            }
         }
-        sum_sq += @reduce(.Add, sub_acc);
-    }
 
-    while (i < len) : (i += 1) {
-        const x = v[i];
-        sum_sq += x * x;
+        while (i < len) : (i += 1) {
+            const x = v[i];
+            sum_sq += x * x;
+        }
     }
 
     return @sqrt(sum_sq);
@@ -223,32 +307,38 @@ pub fn cosine(a: []align(1) const f32, b: []align(1) const f32) f32 {
         nb0 = fmadd(vb, vb, nb0);
     }
 
-    var dot_sum = @reduce(.Add, dot0 + dot1);
-    var norm_a_sum = @reduce(.Add, na0 + na1);
-    var norm_b_sum = @reduce(.Add, nb0 + nb1);
+    const sums = hsum4Vec(SIMD_LANES, dot0 + dot1, na0 + na1, nb0 + nb1, ZERO);
+    var dot_sum = sums[0];
+    var norm_a_sum = sums[1];
+    var norm_b_sum = sums[2];
 
-    if (comptime SIMD_LANES > 4) {
-        var sd: @Vector(4, f32) = @splat(0.0);
-        var sna: @Vector(4, f32) = @splat(0.0);
-        var snb: @Vector(4, f32) = @splat(0.0);
-        while (i + 4 <= len) : (i += 4) {
-            const va: @Vector(4, f32) = a[i..][0..4].*;
-            const vb: @Vector(4, f32) = b[i..][0..4].*;
-            sd = fmaddVec(4, va, vb, sd);
-            sna = fmaddVec(4, va, va, sna);
-            snb = fmaddVec(4, vb, vb, snb);
+    if (i < len) {
+        if (comptime SIMD_LANES > 4) {
+            if (i + 4 <= len) {
+                var sd: @Vector(4, f32) = @splat(0.0);
+                var sna: @Vector(4, f32) = @splat(0.0);
+                var snb: @Vector(4, f32) = @splat(0.0);
+                while (i + 4 <= len) : (i += 4) {
+                    const va: @Vector(4, f32) = a[i..][0..4].*;
+                    const vb: @Vector(4, f32) = b[i..][0..4].*;
+                    sd = fmaddVec(4, va, vb, sd);
+                    sna = fmaddVec(4, va, va, sna);
+                    snb = fmaddVec(4, vb, vb, snb);
+                }
+                const sub = hsum4Vec(4, sd, sna, snb, @splat(0.0));
+                dot_sum += sub[0];
+                norm_a_sum += sub[1];
+                norm_b_sum += sub[2];
+            }
         }
-        dot_sum += @reduce(.Add, sd);
-        norm_a_sum += @reduce(.Add, sna);
-        norm_b_sum += @reduce(.Add, snb);
-    }
 
-    while (i < len) : (i += 1) {
-        const xa = a[i];
-        const xb = b[i];
-        dot_sum += xa * xb;
-        norm_a_sum += xa * xa;
-        norm_b_sum += xb * xb;
+        while (i < len) : (i += 1) {
+            const xa = a[i];
+            const xb = b[i];
+            dot_sum += xa * xb;
+            norm_a_sum += xa * xa;
+            norm_b_sum += xb * xb;
+        }
     }
 
     const denom = @sqrt(norm_a_sum) * @sqrt(norm_b_sum);
@@ -290,26 +380,30 @@ pub fn cosineWithQueryNorm(q: []align(1) const f32, inv_q_norm: f32, b: []align(
         nb0 = fmadd(vb, vb, nb0);
     }
 
-    var dot_sum = @reduce(.Add, dot0 + dot1);
-    var norm_b_sum = @reduce(.Add, nb0 + nb1);
+    var dot_sum = hsum(dot0 + dot1);
+    var norm_b_sum = hsum(nb0 + nb1);
 
-    if (comptime SIMD_LANES > 4) {
-        var sd: @Vector(4, f32) = @splat(0.0);
-        var snb: @Vector(4, f32) = @splat(0.0);
-        while (i + 4 <= len) : (i += 4) {
-            const vq: @Vector(4, f32) = q[i..][0..4].*;
-            const vb: @Vector(4, f32) = b[i..][0..4].*;
-            sd = fmaddVec(4, vq, vb, sd);
-            snb = fmaddVec(4, vb, vb, snb);
+    if (i < len) {
+        if (comptime SIMD_LANES > 4) {
+            if (i + 4 <= len) {
+                var sd: @Vector(4, f32) = @splat(0.0);
+                var snb: @Vector(4, f32) = @splat(0.0);
+                while (i + 4 <= len) : (i += 4) {
+                    const vq: @Vector(4, f32) = q[i..][0..4].*;
+                    const vb: @Vector(4, f32) = b[i..][0..4].*;
+                    sd = fmaddVec(4, vq, vb, sd);
+                    snb = fmaddVec(4, vb, vb, snb);
+                }
+                dot_sum += hsumVec(4, sd);
+                norm_b_sum += hsumVec(4, snb);
+            }
         }
-        dot_sum += @reduce(.Add, sd);
-        norm_b_sum += @reduce(.Add, snb);
-    }
 
-    while (i < len) : (i += 1) {
-        const xb = b[i];
-        dot_sum += q[i] * xb;
-        norm_b_sum += xb * xb;
+        while (i < len) : (i += 1) {
+            const xb = b[i];
+            dot_sum += q[i] * xb;
+            norm_b_sum += xb * xb;
+        }
     }
 
     const norm_b = @sqrt(norm_b_sum);
@@ -371,18 +465,8 @@ pub fn cosineWithQueryNormBatch4(
         n3 = fmadd(vb3, vb3, n3);
     }
 
-    var ds: [4]f32 = .{
-        @reduce(.Add, d0),
-        @reduce(.Add, d1),
-        @reduce(.Add, d2),
-        @reduce(.Add, d3),
-    };
-    var ns: [4]f32 = .{
-        @reduce(.Add, n0),
-        @reduce(.Add, n1),
-        @reduce(.Add, n2),
-        @reduce(.Add, n3),
-    };
+    var ds: [4]f32 = hsum4Vec(SIMD_LANES, d0, d1, d2, d3);
+    var ns: [4]f32 = hsum4Vec(SIMD_LANES, n0, n1, n2, n3);
 
     while (i < len) : (i += 1) {
         const xq = q[i];
@@ -466,20 +550,24 @@ pub fn dot(a: []align(1) const f32, b: []align(1) const f32) f32 {
         acc0 = fmadd(va, vb, acc0);
     }
 
-    var sum = @reduce(.Add, (acc0 + acc1) + (acc2 + acc3));
+    var sum = hsum((acc0 + acc1) + (acc2 + acc3));
 
-    if (comptime SIMD_LANES > 4) {
-        var sub_acc: @Vector(4, f32) = @splat(0.0);
-        while (i + 4 <= len) : (i += 4) {
-            const va: @Vector(4, f32) = a[i..][0..4].*;
-            const vb: @Vector(4, f32) = b[i..][0..4].*;
-            sub_acc = fmaddVec(4, va, vb, sub_acc);
+    if (i < len) {
+        if (comptime SIMD_LANES > 4) {
+            if (i + 4 <= len) {
+                var sub_acc: @Vector(4, f32) = @splat(0.0);
+                while (i + 4 <= len) : (i += 4) {
+                    const va: @Vector(4, f32) = a[i..][0..4].*;
+                    const vb: @Vector(4, f32) = b[i..][0..4].*;
+                    sub_acc = fmaddVec(4, va, vb, sub_acc);
+                }
+                sum += hsumVec(4, sub_acc);
+            }
         }
-        sum += @reduce(.Add, sub_acc);
-    }
 
-    while (i < len) : (i += 1) {
-        sum += a[i] * b[i];
+        while (i < len) : (i += 1) {
+            sum += a[i] * b[i];
+        }
     }
 
     return sum;
@@ -516,7 +604,7 @@ pub fn dotAligned(
         }
     }
 
-    return @reduce(.Add, (acc0 + acc1) + (acc2 + acc3));
+    return hsum((acc0 + acc1) + (acc2 + acc3));
 }
 
 /// 4-way batched dot product on 32B-aligned, 16-padded vector slabs.
@@ -571,12 +659,7 @@ pub fn dotBatch4Aligned(
         }
     }
 
-    return .{
-        @reduce(.Add, a0 + c0),
-        @reduce(.Add, a1 + c1),
-        @reduce(.Add, a2 + c2),
-        @reduce(.Add, a3 + c3),
-    };
+    return hsum4Vec(SIMD_LANES, a0 + c0, a1 + c1, a2 + c2, a3 + c3);
 }
 
 /// 4-way batched dot product for unaligned slices. Safe for mismatched lengths.
@@ -633,12 +716,7 @@ pub fn dotBatch4(q: []align(1) const f32, b: [4][]align(1) const f32) [4]f32 {
         a3 = fmadd(q0, b3[i..][0..SIMD_LANES].*, a3);
     }
 
-    var out: [4]f32 = .{
-        @reduce(.Add, a0 + c0),
-        @reduce(.Add, a1 + c1),
-        @reduce(.Add, a2 + c2),
-        @reduce(.Add, a3 + c3),
-    };
+    var out: [4]f32 = hsum4Vec(SIMD_LANES, a0 + c0, a1 + c1, a2 + c2, a3 + c3);
 
     while (i < len) : (i += 1) {
         const xq = q[i];
@@ -687,20 +765,24 @@ pub fn l2Squared(a: []align(1) const f32, b: []align(1) const f32) f32 {
         acc0 = fmadd(diff, diff, acc0);
     }
 
-    var sum = @reduce(.Add, (acc0 + acc1) + (acc2 + acc3));
+    var sum = hsum((acc0 + acc1) + (acc2 + acc3));
 
-    if (comptime SIMD_LANES > 4) {
-        var sub_acc: @Vector(4, f32) = @splat(0.0);
-        while (i + 4 <= len) : (i += 4) {
-            const ds = @as(@Vector(4, f32), a[i..][0..4].*) - @as(@Vector(4, f32), b[i..][0..4].*);
-            sub_acc = fmaddVec(4, ds, ds, sub_acc);
+    if (i < len) {
+        if (comptime SIMD_LANES > 4) {
+            if (i + 4 <= len) {
+                var sub_acc: @Vector(4, f32) = @splat(0.0);
+                while (i + 4 <= len) : (i += 4) {
+                    const ds = @as(@Vector(4, f32), a[i..][0..4].*) - @as(@Vector(4, f32), b[i..][0..4].*);
+                    sub_acc = fmaddVec(4, ds, ds, sub_acc);
+                }
+                sum += hsumVec(4, sub_acc);
+            }
         }
-        sum += @reduce(.Add, sub_acc);
-    }
 
-    while (i < len) : (i += 1) {
-        const d = a[i] - b[i];
-        sum += d * d;
+        while (i < len) : (i += 1) {
+            const d = a[i] - b[i];
+            sum += d * d;
+        }
     }
 
     return sum;
@@ -742,7 +824,7 @@ pub fn l2SquaredAligned(
         }
     }
 
-    return @reduce(.Add, (acc0 + acc1) + (acc2 + acc3));
+    return hsum((acc0 + acc1) + (acc2 + acc3));
 }
 
 /// 4-way batched squared L2 distance on 32B-aligned, 16-padded vector slabs.
@@ -808,12 +890,7 @@ pub fn l2SquaredBatch4Aligned(
         }
     }
 
-    return .{
-        @reduce(.Add, a0 + c0),
-        @reduce(.Add, a1 + c1),
-        @reduce(.Add, a2 + c2),
-        @reduce(.Add, a3 + c3),
-    };
+    return hsum4Vec(SIMD_LANES, a0 + c0, a1 + c1, a2 + c2, a3 + c3);
 }
 
 /// 4-way batched squared L2 distance for unaligned slices. Safe for mismatched lengths.
@@ -882,12 +959,7 @@ pub fn l2SquaredBatch4(q: []align(1) const f32, b: [4][]align(1) const f32) [4]f
         a3 = fmadd(d3, d3, a3);
     }
 
-    var out: [4]f32 = .{
-        @reduce(.Add, a0 + c0),
-        @reduce(.Add, a1 + c1),
-        @reduce(.Add, a2 + c2),
-        @reduce(.Add, a3 + c3),
-    };
+    var out: [4]f32 = hsum4Vec(SIMD_LANES, a0 + c0, a1 + c1, a2 + c2, a3 + c3);
 
     while (i < len) : (i += 1) {
         const xq = q[i];
@@ -922,28 +994,47 @@ pub fn hamming(a: []const u8, b: []const u8) u32 {
     var i: usize = 0;
 
     if (comptime has_avx512_vpopcntdq) {
-        if (len >= 64) {
-            var acc: @Vector(8, u64) = @splat(0);
-            const end64 = len - (len % 64);
-            while (i < end64) : (i += 64) {
-                const va: @Vector(8, u64) = @bitCast(a[i..][0..64].*);
-                const vb: @Vector(8, u64) = @bitCast(b[i..][0..64].*);
-                acc += @popCount(va ^ vb);
+        if (len < 32) {
+            // Short codes (e.g. d=128 -> 16B): direct scalar u64 hardware `popcnt`
+            // avoids ZMM/YMM setup, XMM->GPR latency, and `vzeroupper`.
+            if (len >= 16) {
+                const a0: u64 = @bitCast(a[0..8].*);
+                const b0: u64 = @bitCast(b[0..8].*);
+                const a1: u64 = @bitCast(a[8..16].*);
+                const b1: u64 = @bitCast(b[8..16].*);
+                dist = @as(u32, @popCount(a0 ^ b0)) + @as(u32, @popCount(a1 ^ b1));
+                i = 16;
+                if (len == 16) return dist;
             }
-            dist += @truncate(@reduce(.Add, acc));
-        }
-        if (comptime has_avx512vl) {
-            if (i + 32 <= len) {
-                const va: @Vector(4, u64) = @bitCast(a[i..][0..32].*);
-                const vb: @Vector(4, u64) = @bitCast(b[i..][0..32].*);
-                dist += @reduce(.Add, @as(@Vector(4, u32), @popCount(va ^ vb)));
-                i += 32;
+        } else {
+            if (len >= 64) {
+                var acc: @Vector(8, u64) = @splat(0);
+                const end64 = len - (len % 64);
+                while (i < end64) : (i += 64) {
+                    const va = loadU64Vec(8, a.ptr + i);
+                    const vb = loadU64Vec(8, b.ptr + i);
+                    acc += @popCount(va ^ vb);
+                }
+                dist += @truncate(@reduce(.Add, acc));
+                if (i == len) return dist;
+            }
+            if (comptime has_avx512vl) {
+                if (i + 32 <= len) {
+                    const va = loadU64Vec(4, a.ptr + i);
+                    const vb = loadU64Vec(4, b.ptr + i);
+                    dist += @truncate(@reduce(.Add, @as(@Vector(4, u64), @popCount(va ^ vb))));
+                    i += 32;
+                    if (i == len) return dist;
+                }
             }
             if (i + 16 <= len) {
-                const va: @Vector(2, u64) = @bitCast(a[i..][0..16].*);
-                const vb: @Vector(2, u64) = @bitCast(b[i..][0..16].*);
-                dist += @reduce(.Add, @as(@Vector(2, u32), @popCount(va ^ vb)));
+                const a0: u64 = @bitCast(a[i..][0..8].*);
+                const b0: u64 = @bitCast(b[i..][0..8].*);
+                const a1: u64 = @bitCast(a[i + 8 ..][0..8].*);
+                const b1: u64 = @bitCast(b[i + 8 ..][0..8].*);
+                dist += @as(u32, @popCount(a0 ^ b0)) + @as(u32, @popCount(a1 ^ b1));
                 i += 16;
+                if (i == len) return dist;
             }
         }
     } else if (comptime is_aarch64) {
@@ -1027,40 +1118,57 @@ pub fn hammingBatch4(q: []const u8, b: [4][]const u8) [4]u32 {
     var i: usize = 0;
 
     if (comptime has_avx512_vpopcntdq) {
-        if (len >= 64) {
-            var acc0: @Vector(8, u64) = @splat(0);
-            var acc1: @Vector(8, u64) = @splat(0);
-            var acc2: @Vector(8, u64) = @splat(0);
-            var acc3: @Vector(8, u64) = @splat(0);
-            const end64 = len - (len % 64);
-            while (i < end64) : (i += 64) {
-                const vq: @Vector(8, u64) = @bitCast(q[i..][0..64].*);
-                acc0 += @popCount(vq ^ @as(@Vector(8, u64), @bitCast(b0[i..][0..64].*)));
-                acc1 += @popCount(vq ^ @as(@Vector(8, u64), @bitCast(b1[i..][0..64].*)));
-                acc2 += @popCount(vq ^ @as(@Vector(8, u64), @bitCast(b2[i..][0..64].*)));
-                acc3 += @popCount(vq ^ @as(@Vector(8, u64), @bitCast(b3[i..][0..64].*)));
+        if (len < 32) {
+            if (len >= 16) {
+                const wq0: u64 = @bitCast(q[0..8].*);
+                const wq1: u64 = @bitCast(q[8..16].*);
+                d0 = @as(u32, @popCount(wq0 ^ @as(u64, @bitCast(b0[0..8].*)))) + @as(u32, @popCount(wq1 ^ @as(u64, @bitCast(b0[8..16].*))));
+                d1 = @as(u32, @popCount(wq0 ^ @as(u64, @bitCast(b1[0..8].*)))) + @as(u32, @popCount(wq1 ^ @as(u64, @bitCast(b1[8..16].*))));
+                d2 = @as(u32, @popCount(wq0 ^ @as(u64, @bitCast(b2[0..8].*)))) + @as(u32, @popCount(wq1 ^ @as(u64, @bitCast(b2[8..16].*))));
+                d3 = @as(u32, @popCount(wq0 ^ @as(u64, @bitCast(b3[0..8].*)))) + @as(u32, @popCount(wq1 ^ @as(u64, @bitCast(b3[8..16].*))));
+                i = 16;
+                if (len == 16) return .{ d0, d1, d2, d3 };
             }
-            d0 += @truncate(@reduce(.Add, acc0));
-            d1 += @truncate(@reduce(.Add, acc1));
-            d2 += @truncate(@reduce(.Add, acc2));
-            d3 += @truncate(@reduce(.Add, acc3));
-        }
-        if (comptime has_avx512vl) {
-            if (i + 32 <= len) {
-                const vq: @Vector(4, u64) = @bitCast(q[i..][0..32].*);
-                d0 += @reduce(.Add, @as(@Vector(4, u32), @popCount(vq ^ @as(@Vector(4, u64), @bitCast(b0[i..][0..32].*)))));
-                d1 += @reduce(.Add, @as(@Vector(4, u32), @popCount(vq ^ @as(@Vector(4, u64), @bitCast(b1[i..][0..32].*)))));
-                d2 += @reduce(.Add, @as(@Vector(4, u32), @popCount(vq ^ @as(@Vector(4, u64), @bitCast(b2[i..][0..32].*)))));
-                d3 += @reduce(.Add, @as(@Vector(4, u32), @popCount(vq ^ @as(@Vector(4, u64), @bitCast(b3[i..][0..32].*)))));
-                i += 32;
+        } else {
+            if (len >= 64) {
+                var acc0: @Vector(8, u64) = @splat(0);
+                var acc1: @Vector(8, u64) = @splat(0);
+                var acc2: @Vector(8, u64) = @splat(0);
+                var acc3: @Vector(8, u64) = @splat(0);
+                const end64 = len - (len % 64);
+                while (i < end64) : (i += 64) {
+                    const vq = loadU64Vec(8, q.ptr + i);
+                    acc0 += @popCount(vq ^ loadU64Vec(8, b0.ptr + i));
+                    acc1 += @popCount(vq ^ loadU64Vec(8, b1.ptr + i));
+                    acc2 += @popCount(vq ^ loadU64Vec(8, b2.ptr + i));
+                    acc3 += @popCount(vq ^ loadU64Vec(8, b3.ptr + i));
+                }
+                d0 += @truncate(@reduce(.Add, acc0));
+                d1 += @truncate(@reduce(.Add, acc1));
+                d2 += @truncate(@reduce(.Add, acc2));
+                d3 += @truncate(@reduce(.Add, acc3));
+                if (i == len) return .{ d0, d1, d2, d3 };
+            }
+            if (comptime has_avx512vl) {
+                if (i + 32 <= len) {
+                    const vq = loadU64Vec(4, q.ptr + i);
+                    d0 += @truncate(@reduce(.Add, @as(@Vector(4, u64), @popCount(vq ^ loadU64Vec(4, b0.ptr + i)))));
+                    d1 += @truncate(@reduce(.Add, @as(@Vector(4, u64), @popCount(vq ^ loadU64Vec(4, b1.ptr + i)))));
+                    d2 += @truncate(@reduce(.Add, @as(@Vector(4, u64), @popCount(vq ^ loadU64Vec(4, b2.ptr + i)))));
+                    d3 += @truncate(@reduce(.Add, @as(@Vector(4, u64), @popCount(vq ^ loadU64Vec(4, b3.ptr + i)))));
+                    i += 32;
+                    if (i == len) return .{ d0, d1, d2, d3 };
+                }
             }
             if (i + 16 <= len) {
-                const vq: @Vector(2, u64) = @bitCast(q[i..][0..16].*);
-                d0 += @reduce(.Add, @as(@Vector(2, u32), @popCount(vq ^ @as(@Vector(2, u64), @bitCast(b0[i..][0..16].*)))));
-                d1 += @reduce(.Add, @as(@Vector(2, u32), @popCount(vq ^ @as(@Vector(2, u64), @bitCast(b1[i..][0..16].*)))));
-                d2 += @reduce(.Add, @as(@Vector(2, u32), @popCount(vq ^ @as(@Vector(2, u64), @bitCast(b2[i..][0..16].*)))));
-                d3 += @reduce(.Add, @as(@Vector(2, u32), @popCount(vq ^ @as(@Vector(2, u64), @bitCast(b3[i..][0..16].*)))));
+                const wq0: u64 = @bitCast(q[i..][0..8].*);
+                const wq1: u64 = @bitCast(q[i + 8 ..][0..8].*);
+                d0 += @as(u32, @popCount(wq0 ^ @as(u64, @bitCast(b0[i..][0..8].*)))) + @as(u32, @popCount(wq1 ^ @as(u64, @bitCast(b0[i + 8 ..][0..8].*))));
+                d1 += @as(u32, @popCount(wq0 ^ @as(u64, @bitCast(b1[i..][0..8].*)))) + @as(u32, @popCount(wq1 ^ @as(u64, @bitCast(b1[i + 8 ..][0..8].*))));
+                d2 += @as(u32, @popCount(wq0 ^ @as(u64, @bitCast(b2[i..][0..8].*)))) + @as(u32, @popCount(wq1 ^ @as(u64, @bitCast(b2[i + 8 ..][0..8].*))));
+                d3 += @as(u32, @popCount(wq0 ^ @as(u64, @bitCast(b3[i..][0..8].*)))) + @as(u32, @popCount(wq1 ^ @as(u64, @bitCast(b3[i + 8 ..][0..8].*))));
                 i += 16;
+                if (i == len) return .{ d0, d1, d2, d3 };
             }
         }
     } else if (comptime is_aarch64) {
@@ -1141,15 +1249,27 @@ pub fn binaryQuantize(vec: []align(1) const f32, out: []u8) void {
 
     if (comptime has_avx512f) {
         const zero16: @Vector(16, f32) = @splat(0.0);
+        const rev16 = [16]i32{ 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8 };
         while (byte_idx + 2 <= full_bytes) : (byte_idx += 2) {
             const chunk: @Vector(16, f32) = vec[byte_idx * 8 ..][0..16].*;
-            const mask: u16 = @bitCast(chunk >= zero16);
-            out[byte_idx] = BITREV_LUT[mask & 0xFF];
-            out[byte_idx + 1] = BITREV_LUT[mask >> 8];
+            const mask: u16 = @bitCast(@shuffle(f32, chunk, undefined, rev16) >= zero16);
+            std.mem.writeInt(u16, out[byte_idx..][0..2], mask, .little);
         }
-    }
-
-    if (comptime SIMD_LANES >= 4) {
+        if (byte_idx < full_bytes) {
+            const zero8: @Vector(8, f32) = @splat(0.0);
+            const rev8 = [8]i32{ 7, 6, 5, 4, 3, 2, 1, 0 };
+            const chunk: @Vector(8, f32) = vec[byte_idx * 8 ..][0..8].*;
+            out[byte_idx] = @bitCast(@shuffle(f32, chunk, undefined, rev8) >= zero8);
+            byte_idx += 1;
+        }
+    } else if (comptime SIMD_LANES >= 8) {
+        const zero8: @Vector(8, f32) = @splat(0.0);
+        const rev8 = [8]i32{ 7, 6, 5, 4, 3, 2, 1, 0 };
+        while (byte_idx < full_bytes) : (byte_idx += 1) {
+            const chunk: @Vector(8, f32) = vec[byte_idx * 8 ..][0..8].*;
+            out[byte_idx] = @bitCast(@shuffle(f32, chunk, undefined, rev8) >= zero8);
+        }
+    } else if (comptime SIMD_LANES >= 4) {
         const zero8: @Vector(8, f32) = @splat(0.0);
         while (byte_idx < full_bytes) : (byte_idx += 1) {
             const chunk: @Vector(8, f32) = vec[byte_idx * 8 ..][0..8].*;
@@ -1188,16 +1308,33 @@ pub fn binaryQuantizeCentered(
 
     if (comptime has_avx512f) {
         const zero16: @Vector(16, f32) = @splat(0.0);
+        const rev16 = [16]i32{ 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8 };
         while (byte_idx + 2 <= full_bytes) : (byte_idx += 2) {
             const v_chunk: @Vector(16, f32) = vec[byte_idx * 8 ..][0..16].*;
             const c_chunk: @Vector(16, f32) = centroid[byte_idx * 8 ..][0..16].*;
-            const mask: u16 = @bitCast((v_chunk - c_chunk) >= zero16);
-            out[byte_idx] = BITREV_LUT[mask & 0xFF];
-            out[byte_idx + 1] = BITREV_LUT[mask >> 8];
+            const diff = v_chunk - c_chunk;
+            const mask: u16 = @bitCast(@shuffle(f32, diff, undefined, rev16) >= zero16);
+            std.mem.writeInt(u16, out[byte_idx..][0..2], mask, .little);
         }
-    }
-
-    if (comptime SIMD_LANES >= 4) {
+        if (byte_idx < full_bytes) {
+            const zero8: @Vector(8, f32) = @splat(0.0);
+            const rev8 = [8]i32{ 7, 6, 5, 4, 3, 2, 1, 0 };
+            const v_chunk: @Vector(8, f32) = vec[byte_idx * 8 ..][0..8].*;
+            const c_chunk: @Vector(8, f32) = centroid[byte_idx * 8 ..][0..8].*;
+            const diff = v_chunk - c_chunk;
+            out[byte_idx] = @bitCast(@shuffle(f32, diff, undefined, rev8) >= zero8);
+            byte_idx += 1;
+        }
+    } else if (comptime SIMD_LANES >= 8) {
+        const zero8: @Vector(8, f32) = @splat(0.0);
+        const rev8 = [8]i32{ 7, 6, 5, 4, 3, 2, 1, 0 };
+        while (byte_idx < full_bytes) : (byte_idx += 1) {
+            const v_chunk: @Vector(8, f32) = vec[byte_idx * 8 ..][0..8].*;
+            const c_chunk: @Vector(8, f32) = centroid[byte_idx * 8 ..][0..8].*;
+            const diff = v_chunk - c_chunk;
+            out[byte_idx] = @bitCast(@shuffle(f32, diff, undefined, rev8) >= zero8);
+        }
+    } else if (comptime SIMD_LANES >= 4) {
         const zero8: @Vector(8, f32) = @splat(0.0);
         while (byte_idx < full_bytes) : (byte_idx += 1) {
             const v_chunk: @Vector(8, f32) = vec[byte_idx * 8 ..][0..8].*;

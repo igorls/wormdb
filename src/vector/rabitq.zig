@@ -52,6 +52,9 @@ const has_avx512_vpopcntdq: bool = (builtin.cpu.arch == .x86_64 or builtin.cpu.a
 const has_avx512vl: bool = (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .x86) and
     std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vl);
 
+const has_avx512bw: bool = (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .x86) and
+    std.Target.x86.featureSetHas(builtin.cpu.features, .avx512bw);
+
 const has_avx2: bool = (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .x86) and
     std.Target.x86.featureSetHas(builtin.cpu.features, .avx2);
 
@@ -303,7 +306,7 @@ pub fn generateRotation(allocator: Allocator, dim: usize, seed: u64) ![]f32 {
             while (k < vec_dim) : (k += LANES) {
                 d0 = fmadd(row_i[k..][0..LANES].*, row_j[k..][0..LANES].*, d0);
             }
-            var dp: f32 = @reduce(.Add, (d0 + d1) + (d2 + d3));
+            var dp: f32 = distance.hsumVec(LANES, (d0 + d1) + (d2 + d3));
             while (k < dim) : (k += 1) dp += row_i[k] * row_j[k];
 
             // 4-way unrolled axpy: row_i -= dp * row_j
@@ -341,7 +344,7 @@ pub fn generateRotation(allocator: Allocator, dim: usize, seed: u64) ![]f32 {
             const ri: F32xN = row_i[k..][0..LANES].*;
             n0 = fmadd(ri, ri, n0);
         }
-        var norm_sq: f32 = @reduce(.Add, (n0 + n1) + (n2 + n3));
+        var norm_sq: f32 = distance.hsumVec(LANES, (n0 + n1) + (n2 + n3));
         while (k < dim) : (k += 1) norm_sq += row_i[k] * row_i[k];
 
         const norm = @sqrt(norm_sq);
@@ -414,21 +417,20 @@ pub fn applyRotation(rotation: []const f32, v: []align(1) const f32, out: []f32)
             a2 = fmadd(row2[k..][0..LANES].*, vc, a2);
             a3 = fmadd(row3[k..][0..LANES].*, vc, a3);
         }
-        var s0 = @reduce(.Add, a0 + b0);
-        var s1 = @reduce(.Add, a1 + b1);
-        var s2 = @reduce(.Add, a2 + b2);
-        var s3 = @reduce(.Add, a3 + b3);
-        while (k < dim) : (k += 1) {
-            const vk = v[k];
-            s0 += row0[k] * vk;
-            s1 += row1[k] * vk;
-            s2 += row2[k] * vk;
-            s3 += row3[k] * vk;
+        var sums = distance.hsum4Vec(LANES, a0 + b0, a1 + b1, a2 + b2, a3 + b3);
+        if (k < dim) {
+            while (k < dim) : (k += 1) {
+                const vk = v[k];
+                sums[0] += row0[k] * vk;
+                sums[1] += row1[k] * vk;
+                sums[2] += row2[k] * vk;
+                sums[3] += row3[k] * vk;
+            }
         }
-        out[i + 0] = s0;
-        out[i + 1] = s1;
-        out[i + 2] = s2;
-        out[i + 3] = s3;
+        out[i + 0] = sums[0];
+        out[i + 1] = sums[1];
+        out[i + 2] = sums[2];
+        out[i + 3] = sums[3];
     }
 
     while (i < dim) : (i += 1) {
@@ -443,8 +445,10 @@ pub fn applyRotation(rotation: []const f32, v: []align(1) const f32, out: []f32)
         while (k < vec_dim) : (k += LANES) {
             a0 = fmadd(row[k..][0..LANES].*, v[k..][0..LANES].*, a0);
         }
-        var s = @reduce(.Add, a0 + a1);
-        while (k < dim) : (k += 1) s += row[k] * v[k];
+        var s = distance.hsumVec(LANES, a0 + a1);
+        if (k < dim) {
+            while (k < dim) : (k += 1) s += row[k] * v[k];
+        }
         out[i] = s;
     }
 }
@@ -501,39 +505,35 @@ pub fn applyRotationBatch4(
             c13 = fmadd(r1, x3, c13);
         }
 
-        var s00 = @reduce(.Add, c00);
-        var s01 = @reduce(.Add, c01);
-        var s02 = @reduce(.Add, c02);
-        var s03 = @reduce(.Add, c03);
-        var s10 = @reduce(.Add, c10);
-        var s11 = @reduce(.Add, c11);
-        var s12 = @reduce(.Add, c12);
-        var s13 = @reduce(.Add, c13);
+        var s0 = distance.hsum4Vec(LANES, c00, c01, c02, c03);
+        var s1 = distance.hsum4Vec(LANES, c10, c11, c12, c13);
 
-        while (k < dim) : (k += 1) {
-            const r0k = row0[k];
-            const r1k = row1[k];
-            const x0k = v0[k];
-            const x1k = v1[k];
-            const x2k = v2[k];
-            const x3k = v3[k];
-            s00 += r0k * x0k;
-            s01 += r0k * x1k;
-            s02 += r0k * x2k;
-            s03 += r0k * x3k;
-            s10 += r1k * x0k;
-            s11 += r1k * x1k;
-            s12 += r1k * x2k;
-            s13 += r1k * x3k;
+        if (k < dim) {
+            while (k < dim) : (k += 1) {
+                const r0k = row0[k];
+                const r1k = row1[k];
+                const x0k = v0[k];
+                const x1k = v1[k];
+                const x2k = v2[k];
+                const x3k = v3[k];
+                s0[0] += r0k * x0k;
+                s0[1] += r0k * x1k;
+                s0[2] += r0k * x2k;
+                s0[3] += r0k * x3k;
+                s1[0] += r1k * x0k;
+                s1[1] += r1k * x1k;
+                s1[2] += r1k * x2k;
+                s1[3] += r1k * x3k;
+            }
         }
-        out[0][i + 0] = s00;
-        out[1][i + 0] = s01;
-        out[2][i + 0] = s02;
-        out[3][i + 0] = s03;
-        out[0][i + 1] = s10;
-        out[1][i + 1] = s11;
-        out[2][i + 1] = s12;
-        out[3][i + 1] = s13;
+        out[0][i + 0] = s0[0];
+        out[1][i + 0] = s0[1];
+        out[2][i + 0] = s0[2];
+        out[3][i + 0] = s0[3];
+        out[0][i + 1] = s1[0];
+        out[1][i + 1] = s1[1];
+        out[2][i + 1] = s1[2];
+        out[3][i + 1] = s1[3];
     }
 
     while (i < dim) : (i += 1) {
@@ -550,21 +550,20 @@ pub fn applyRotationBatch4(
             c2 = fmadd(rk, v2[k..][0..LANES].*, c2);
             c3 = fmadd(rk, v3[k..][0..LANES].*, c3);
         }
-        var s0 = @reduce(.Add, c0);
-        var s1 = @reduce(.Add, c1);
-        var s2 = @reduce(.Add, c2);
-        var s3 = @reduce(.Add, c3);
-        while (k < dim) : (k += 1) {
-            const rk = row[k];
-            s0 += rk * v0[k];
-            s1 += rk * v1[k];
-            s2 += rk * v2[k];
-            s3 += rk * v3[k];
+        var s = distance.hsum4Vec(LANES, c0, c1, c2, c3);
+        if (k < dim) {
+            while (k < dim) : (k += 1) {
+                const rk = row[k];
+                s[0] += rk * v0[k];
+                s[1] += rk * v1[k];
+                s[2] += rk * v2[k];
+                s[3] += rk * v3[k];
+            }
         }
-        out[0][i] = s0;
-        out[1][i] = s1;
-        out[2][i] = s2;
-        out[3][i] = s3;
+        out[0][i] = s[0];
+        out[1][i] = s[1];
+        out[2][i] = s[2];
+        out[3][i] = s[3];
     }
 }
 
@@ -608,11 +607,13 @@ inline fn computeResidualAndNormSq(
         residual_out[i..][0..LANES].* = r0;
         acc0 = fmadd(r0, r0, acc0);
     }
-    var sum_sq = @reduce(.Add, (acc0 + acc1) + (acc2 + acc3));
-    while (i < dim) : (i += 1) {
-        const r = v[i] - centroid[i];
-        residual_out[i] = r;
-        sum_sq += r * r;
+    var sum_sq = distance.hsumVec(LANES, (acc0 + acc1) + (acc2 + acc3));
+    if (i < dim) {
+        while (i < dim) : (i += 1) {
+            const r = v[i] - centroid[i];
+            residual_out[i] = r;
+            sum_sq += r * r;
+        }
     }
     return sum_sq;
 }
@@ -667,12 +668,13 @@ pub fn encode(
     applyRotation(params.rotation, resid_bytes, rotated_scratch);
 
     // Quantize (1-bit MSB-first code) + accumulate Σ |rotated[i]|.
-    // Uses `>= 0.0` (consistent with `distance.binaryQuantize` and tail) and `BITREV_LUT`.
+    // Uses `>= 0.0` (consistent with `distance.binaryQuantize` and tail).
     var abs_sum: f32 = 0.0;
     var i: usize = 0;
 
     if (comptime has_avx512f) {
         const zero16: @Vector(16, f32) = @splat(0.0);
+        const rev16 = [16]i32{ 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8 };
         var abs16_0: @Vector(16, f32) = @splat(0.0);
         var abs16_1: @Vector(16, f32) = @splat(0.0);
         const vec32 = dim - (dim % 32);
@@ -681,25 +683,39 @@ pub fn encode(
             const r1: @Vector(16, f32) = rotated_scratch[i + 16 ..][0..16].*;
             abs16_0 += @abs(r0);
             abs16_1 += @abs(r1);
-            const m0: u16 = @bitCast(r0 >= zero16);
-            const m1: u16 = @bitCast(r1 >= zero16);
-            code_out[i / 8 + 0] = distance.BITREV_LUT[m0 & 0xFF];
-            code_out[i / 8 + 1] = distance.BITREV_LUT[m0 >> 8];
-            code_out[i / 8 + 2] = distance.BITREV_LUT[m1 & 0xFF];
-            code_out[i / 8 + 3] = distance.BITREV_LUT[m1 >> 8];
+            const m0: u16 = @bitCast(@shuffle(f32, r0, undefined, rev16) >= zero16);
+            const m1: u16 = @bitCast(@shuffle(f32, r1, undefined, rev16) >= zero16);
+            std.mem.writeInt(u16, code_out[i / 8 ..][0..2], m0, .little);
+            std.mem.writeInt(u16, code_out[i / 8 + 2 ..][0..2], m1, .little);
         }
         if (i + 16 <= dim) {
             const r0: @Vector(16, f32) = rotated_scratch[i..][0..16].*;
             abs16_0 += @abs(r0);
-            const m0: u16 = @bitCast(r0 >= zero16);
-            code_out[i / 8 + 0] = distance.BITREV_LUT[m0 & 0xFF];
-            code_out[i / 8 + 1] = distance.BITREV_LUT[m0 >> 8];
+            const m0: u16 = @bitCast(@shuffle(f32, r0, undefined, rev16) >= zero16);
+            std.mem.writeInt(u16, code_out[i / 8 ..][0..2], m0, .little);
             i += 16;
         }
-        abs_sum += @reduce(.Add, abs16_0 + abs16_1);
-    }
-
-    if (comptime LANES >= 4) {
+        abs_sum += distance.hsumVec(16, abs16_0 + abs16_1);
+        if (i + 8 <= dim) {
+            const zero8: @Vector(8, f32) = @splat(0.0);
+            const rev8 = [8]i32{ 7, 6, 5, 4, 3, 2, 1, 0 };
+            const r_chunk: @Vector(8, f32) = rotated_scratch[i..][0..8].*;
+            abs_sum += distance.hsumVec(8, @abs(r_chunk));
+            code_out[i / 8] = @bitCast(@shuffle(f32, r_chunk, undefined, rev8) >= zero8);
+            i += 8;
+        }
+    } else if (comptime LANES >= 8) {
+        const zero8: @Vector(8, f32) = @splat(0.0);
+        const rev8 = [8]i32{ 7, 6, 5, 4, 3, 2, 1, 0 };
+        var abs8: @Vector(8, f32) = @splat(0.0);
+        const vec8 = dim - (dim % 8);
+        while (i < vec8) : (i += 8) {
+            const r_chunk: @Vector(8, f32) = rotated_scratch[i..][0..8].*;
+            abs8 += @abs(r_chunk);
+            code_out[i / 8] = @bitCast(@shuffle(f32, r_chunk, undefined, rev8) >= zero8);
+        }
+        abs_sum += distance.hsumVec(8, abs8);
+    } else if (comptime LANES >= 4) {
         const zero8: @Vector(8, f32) = @splat(0.0);
         var abs8: @Vector(8, f32) = @splat(0.0);
         const vec8 = dim - (dim % 8);
@@ -709,7 +725,7 @@ pub fn encode(
             const mask: u8 = @bitCast(r_chunk >= zero8);
             code_out[i / 8] = distance.BITREV_LUT[mask];
         }
-        abs_sum += @reduce(.Add, abs8);
+        abs_sum += distance.hsumVec(8, abs8);
     } else {
         const vec8 = dim - (dim % 8);
         while (i < vec8) : (i += 8) {
@@ -923,6 +939,20 @@ pub fn prepareQueryFromRotated(
 // ║  Estimate — Exact F32 (Single & Batch4)            ║
 // ╚═══════════════════════════════════════════════════╝
 
+const BIT_MASKS_8: @Vector(8, u32) = .{ 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01 };
+const BIT_MASKS_LO16: @Vector(16, u32) = .{
+    0x0000_0080, 0x0000_0040, 0x0000_0020, 0x0000_0010,
+    0x0000_0008, 0x0000_0004, 0x0000_0002, 0x0000_0001,
+    0x0000_8000, 0x0000_4000, 0x0000_2000, 0x0000_1000,
+    0x0000_0800, 0x0000_0400, 0x0000_0200, 0x0000_0100,
+};
+const BIT_MASKS_HI16: @Vector(16, u32) = .{
+    0x0080_0000, 0x0040_0000, 0x0020_0000, 0x0010_0000,
+    0x0008_0000, 0x0004_0000, 0x0002_0000, 0x0001_0000,
+    0x8000_0000, 0x4000_0000, 0x2000_0000, 0x1000_0000,
+    0x0800_0000, 0x0400_0000, 0x0200_0000, 0x0100_0000,
+};
+
 inline fn rawIpExactF32(q_rot_unit: []const f32, code: []const u8) f32 {
     const dim = q_rot_unit.len;
     var ip_raw: f32 = 0.0;
@@ -936,27 +966,35 @@ inline fn rawIpExactF32(q_rot_unit: []const f32, code: []const u8) f32 {
         const vec32 = dim - (dim % 32);
         while (i < vec32) : (i += 32) {
             const b = i / 8;
-            const m0: u16 = @as(u16, distance.BITREV_LUT[code[b]]) | (@as(u16, distance.BITREV_LUT[code[b + 1]]) << 8);
-            const m1: u16 = @as(u16, distance.BITREV_LUT[code[b + 2]]) | (@as(u16, distance.BITREV_LUT[code[b + 3]]) << 8);
-            const flip0 = @select(u32, @as(@Vector(16, bool), @bitCast(m0)), zero16, sign16);
-            const flip1 = @select(u32, @as(@Vector(16, bool), @bitCast(m1)), zero16, sign16);
+            const w: u32 = std.mem.readInt(u32, code[b..][0..4], .little);
+            const wv: @Vector(16, u32) = @splat(w);
+            const neg0 = (wv & BIT_MASKS_LO16) == zero16;
+            const neg1 = (wv & BIT_MASKS_HI16) == zero16;
             const q0: @Vector(16, u32) = @bitCast(@as(@Vector(16, f32), q_rot_unit[i..][0..16].*));
             const q1: @Vector(16, u32) = @bitCast(@as(@Vector(16, f32), q_rot_unit[i + 16 ..][0..16].*));
-            acc0 += @as(@Vector(16, f32), @bitCast(q0 ^ flip0));
-            acc1 += @as(@Vector(16, f32), @bitCast(q1 ^ flip1));
+            acc0 += @as(@Vector(16, f32), @bitCast(@select(u32, neg0, q0 ^ sign16, q0)));
+            acc1 += @as(@Vector(16, f32), @bitCast(@select(u32, neg1, q1 ^ sign16, q1)));
         }
         if (i + 16 <= dim) {
             const b = i / 8;
-            const m0: u16 = @as(u16, distance.BITREV_LUT[code[b]]) | (@as(u16, distance.BITREV_LUT[code[b + 1]]) << 8);
-            const flip0 = @select(u32, @as(@Vector(16, bool), @bitCast(m0)), zero16, sign16);
+            const w: u32 = std.mem.readInt(u16, code[b..][0..2], .little);
+            const wv: @Vector(16, u32) = @splat(w);
+            const neg0 = (wv & BIT_MASKS_LO16) == zero16;
             const q0: @Vector(16, u32) = @bitCast(@as(@Vector(16, f32), q_rot_unit[i..][0..16].*));
-            acc0 += @as(@Vector(16, f32), @bitCast(q0 ^ flip0));
+            acc0 += @as(@Vector(16, f32), @bitCast(@select(u32, neg0, q0 ^ sign16, q0)));
             i += 16;
         }
-        ip_raw += @reduce(.Add, acc0 + acc1);
-    }
-
-    if (comptime LANES >= 4) {
+        ip_raw = distance.hsumVec(16, acc0 + acc1);
+        if (i + 8 <= dim) {
+            const sign8: @Vector(8, u32) = @splat(0x80000000);
+            const zero8: @Vector(8, u32) = @splat(0);
+            const bv: @Vector(8, u32) = @splat(@as(u32, code[i / 8]));
+            const neg = (bv & BIT_MASKS_8) == zero8;
+            const q0: @Vector(8, u32) = @bitCast(@as(@Vector(8, f32), q_rot_unit[i..][0..8].*));
+            ip_raw += distance.hsumVec(8, @as(@Vector(8, f32), @bitCast(@select(u32, neg, q0 ^ sign8, q0))));
+            i += 8;
+        }
+    } else if (comptime LANES >= 4) {
         const sign8: @Vector(8, u32) = @splat(0x80000000);
         const zero8: @Vector(8, u32) = @splat(0);
         var acc0: @Vector(8, f32) = @splat(0.0);
@@ -964,28 +1002,30 @@ inline fn rawIpExactF32(q_rot_unit: []const f32, code: []const u8) f32 {
         const vec16 = dim - (dim % 16);
         while (i < vec16) : (i += 16) {
             const b = i / 8;
-            const m0: u8 = distance.BITREV_LUT[code[b]];
-            const m1: u8 = distance.BITREV_LUT[code[b + 1]];
-            const flip0 = @select(u32, @as(@Vector(8, bool), @bitCast(m0)), zero8, sign8);
-            const flip1 = @select(u32, @as(@Vector(8, bool), @bitCast(m1)), zero8, sign8);
+            const b0: @Vector(8, u32) = @splat(@as(u32, code[b]));
+            const b1: @Vector(8, u32) = @splat(@as(u32, code[b + 1]));
+            const flip0 = @select(u32, (b0 & BIT_MASKS_8) == zero8, sign8, zero8);
+            const flip1 = @select(u32, (b1 & BIT_MASKS_8) == zero8, sign8, zero8);
             const q0: @Vector(8, u32) = @bitCast(@as(@Vector(8, f32), q_rot_unit[i..][0..8].*));
             const q1: @Vector(8, u32) = @bitCast(@as(@Vector(8, f32), q_rot_unit[i + 8 ..][0..8].*));
             acc0 += @as(@Vector(8, f32), @bitCast(q0 ^ flip0));
             acc1 += @as(@Vector(8, f32), @bitCast(q1 ^ flip1));
         }
-        const vec8 = dim - (dim % 8);
-        while (i < vec8) : (i += 8) {
-            const m0: u8 = distance.BITREV_LUT[code[i / 8]];
-            const flip0 = @select(u32, @as(@Vector(8, bool), @bitCast(m0)), zero8, sign8);
+        if (i + 8 <= dim) {
+            const b0: @Vector(8, u32) = @splat(@as(u32, code[i / 8]));
+            const flip0 = @select(u32, (b0 & BIT_MASKS_8) == zero8, sign8, zero8);
             const q0: @Vector(8, u32) = @bitCast(@as(@Vector(8, f32), q_rot_unit[i..][0..8].*));
             acc0 += @as(@Vector(8, f32), @bitCast(q0 ^ flip0));
+            i += 8;
         }
-        ip_raw += @reduce(.Add, acc0 + acc1);
+        ip_raw = distance.hsumVec(8, acc0 + acc1);
     }
 
-    while (i < dim) : (i += 1) {
-        const bit_set = (code[i / 8] >> @as(u3, @intCast(7 - (i % 8)))) & 1;
-        ip_raw += if (bit_set != 0) q_rot_unit[i] else -q_rot_unit[i];
+    if (i < dim) {
+        while (i < dim) : (i += 1) {
+            const bit_set = (code[i / 8] >> @as(u3, @intCast(7 - (i % 8)))) & 1;
+            ip_raw += if (bit_set != 0) q_rot_unit[i] else -q_rot_unit[i];
+        }
     }
 
     return ip_raw;
@@ -1064,22 +1104,32 @@ pub fn estimateL2SqBatch4Prepared(
         while (i < vec16) : (i += 16) {
             const b = i / 8;
             const qb: @Vector(16, u32) = @bitCast(@as(@Vector(16, f32), q[i..][0..16].*));
-            const m0: u16 = @as(u16, distance.BITREV_LUT[c0[b]]) | (@as(u16, distance.BITREV_LUT[c0[b + 1]]) << 8);
-            const m1: u16 = @as(u16, distance.BITREV_LUT[c1[b]]) | (@as(u16, distance.BITREV_LUT[c1[b + 1]]) << 8);
-            const m2: u16 = @as(u16, distance.BITREV_LUT[c2[b]]) | (@as(u16, distance.BITREV_LUT[c2[b + 1]]) << 8);
-            const m3: u16 = @as(u16, distance.BITREV_LUT[c3[b]]) | (@as(u16, distance.BITREV_LUT[c3[b + 1]]) << 8);
-            a0 += @as(@Vector(16, f32), @bitCast(qb ^ @select(u32, @as(@Vector(16, bool), @bitCast(m0)), zero16, sign16)));
-            a1 += @as(@Vector(16, f32), @bitCast(qb ^ @select(u32, @as(@Vector(16, bool), @bitCast(m1)), zero16, sign16)));
-            a2 += @as(@Vector(16, f32), @bitCast(qb ^ @select(u32, @as(@Vector(16, bool), @bitCast(m2)), zero16, sign16)));
-            a3 += @as(@Vector(16, f32), @bitCast(qb ^ @select(u32, @as(@Vector(16, bool), @bitCast(m3)), zero16, sign16)));
+            const w0: @Vector(16, u32) = @splat(@as(u32, std.mem.readInt(u16, c0[b..][0..2], .little)));
+            const w1: @Vector(16, u32) = @splat(@as(u32, std.mem.readInt(u16, c1[b..][0..2], .little)));
+            const w2: @Vector(16, u32) = @splat(@as(u32, std.mem.readInt(u16, c2[b..][0..2], .little)));
+            const w3: @Vector(16, u32) = @splat(@as(u32, std.mem.readInt(u16, c3[b..][0..2], .little)));
+            a0 += @as(@Vector(16, f32), @bitCast(@select(u32, (w0 & BIT_MASKS_LO16) == zero16, qb ^ sign16, qb)));
+            a1 += @as(@Vector(16, f32), @bitCast(@select(u32, (w1 & BIT_MASKS_LO16) == zero16, qb ^ sign16, qb)));
+            a2 += @as(@Vector(16, f32), @bitCast(@select(u32, (w2 & BIT_MASKS_LO16) == zero16, qb ^ sign16, qb)));
+            a3 += @as(@Vector(16, f32), @bitCast(@select(u32, (w3 & BIT_MASKS_LO16) == zero16, qb ^ sign16, qb)));
         }
-        ips[0] += @reduce(.Add, a0);
-        ips[1] += @reduce(.Add, a1);
-        ips[2] += @reduce(.Add, a2);
-        ips[3] += @reduce(.Add, a3);
-    }
-
-    if (comptime LANES >= 4) {
+        ips = distance.hsum4Vec(16, a0, a1, a2, a3);
+        if (i + 8 <= dim) {
+            const sign8: @Vector(8, u32) = @splat(0x80000000);
+            const zero8: @Vector(8, u32) = @splat(0);
+            const b = i / 8;
+            const qb: @Vector(8, u32) = @bitCast(@as(@Vector(8, f32), q[i..][0..8].*));
+            const s8 = distance.hsum4Vec(
+                8,
+                @as(@Vector(8, f32), @bitCast(@select(u32, (@as(@Vector(8, u32), @splat(@as(u32, c0[b]))) & BIT_MASKS_8) == zero8, qb ^ sign8, qb))),
+                @as(@Vector(8, f32), @bitCast(@select(u32, (@as(@Vector(8, u32), @splat(@as(u32, c1[b]))) & BIT_MASKS_8) == zero8, qb ^ sign8, qb))),
+                @as(@Vector(8, f32), @bitCast(@select(u32, (@as(@Vector(8, u32), @splat(@as(u32, c2[b]))) & BIT_MASKS_8) == zero8, qb ^ sign8, qb))),
+                @as(@Vector(8, f32), @bitCast(@select(u32, (@as(@Vector(8, u32), @splat(@as(u32, c3[b]))) & BIT_MASKS_8) == zero8, qb ^ sign8, qb))),
+            );
+            inline for (0..4) |k| ips[k] += s8[k];
+            i += 8;
+        }
+    } else if (comptime LANES >= 4) {
         const sign8: @Vector(8, u32) = @splat(0x80000000);
         const zero8: @Vector(8, u32) = @splat(0);
         var a0: @Vector(8, f32) = @splat(0.0);
@@ -1090,29 +1140,28 @@ pub fn estimateL2SqBatch4Prepared(
         while (i < vec8) : (i += 8) {
             const b = i / 8;
             const qb: @Vector(8, u32) = @bitCast(@as(@Vector(8, f32), q[i..][0..8].*));
-            const m0: u8 = distance.BITREV_LUT[c0[b]];
-            const m1: u8 = distance.BITREV_LUT[c1[b]];
-            const m2: u8 = distance.BITREV_LUT[c2[b]];
-            const m3: u8 = distance.BITREV_LUT[c3[b]];
-            a0 += @as(@Vector(8, f32), @bitCast(qb ^ @select(u32, @as(@Vector(8, bool), @bitCast(m0)), zero8, sign8)));
-            a1 += @as(@Vector(8, f32), @bitCast(qb ^ @select(u32, @as(@Vector(8, bool), @bitCast(m1)), zero8, sign8)));
-            a2 += @as(@Vector(8, f32), @bitCast(qb ^ @select(u32, @as(@Vector(8, bool), @bitCast(m2)), zero8, sign8)));
-            a3 += @as(@Vector(8, f32), @bitCast(qb ^ @select(u32, @as(@Vector(8, bool), @bitCast(m3)), zero8, sign8)));
+            const w0: @Vector(8, u32) = @splat(@as(u32, c0[b]));
+            const w1: @Vector(8, u32) = @splat(@as(u32, c1[b]));
+            const w2: @Vector(8, u32) = @splat(@as(u32, c2[b]));
+            const w3: @Vector(8, u32) = @splat(@as(u32, c3[b]));
+            a0 += @as(@Vector(8, f32), @bitCast(qb ^ @select(u32, (w0 & BIT_MASKS_8) == zero8, sign8, zero8)));
+            a1 += @as(@Vector(8, f32), @bitCast(qb ^ @select(u32, (w1 & BIT_MASKS_8) == zero8, sign8, zero8)));
+            a2 += @as(@Vector(8, f32), @bitCast(qb ^ @select(u32, (w2 & BIT_MASKS_8) == zero8, sign8, zero8)));
+            a3 += @as(@Vector(8, f32), @bitCast(qb ^ @select(u32, (w3 & BIT_MASKS_8) == zero8, sign8, zero8)));
         }
-        ips[0] += @reduce(.Add, a0);
-        ips[1] += @reduce(.Add, a1);
-        ips[2] += @reduce(.Add, a2);
-        ips[3] += @reduce(.Add, a3);
+        ips = distance.hsum4Vec(8, a0, a1, a2, a3);
     }
 
-    while (i < dim) : (i += 1) {
-        const b = i / 8;
-        const shift: u3 = @intCast(7 - (i % 8));
-        const qv = q[i];
-        ips[0] += if (((c0[b] >> shift) & 1) != 0) qv else -qv;
-        ips[1] += if (((c1[b] >> shift) & 1) != 0) qv else -qv;
-        ips[2] += if (((c2[b] >> shift) & 1) != 0) qv else -qv;
-        ips[3] += if (((c3[b] >> shift) & 1) != 0) qv else -qv;
+    if (i < dim) {
+        while (i < dim) : (i += 1) {
+            const b = i / 8;
+            const shift: u3 = @intCast(7 - (i % 8));
+            const qv = q[i];
+            ips[0] += if (((c0[b] >> shift) & 1) != 0) qv else -qv;
+            ips[1] += if (((c1[b] >> shift) & 1) != 0) qv else -qv;
+            ips[2] += if (((c2[b] >> shift) & 1) != 0) qv else -qv;
+            ips[3] += if (((c3[b] >> shift) & 1) != 0) qv else -qv;
+        }
     }
 
     return .{
@@ -1136,7 +1185,7 @@ inline fn popcountSlice(bytes: []const u8) u32 {
             var v_acc: @Vector(8, u64) = @splat(0);
             const end64 = len - (len % 64);
             while (i < end64) : (i += 64) {
-                const v: @Vector(8, u64) = @bitCast(bytes[i..][0..64].*);
+                const v = distance.loadU64Vec(8, bytes.ptr + i);
                 v_acc += @popCount(v);
             }
             acc += @truncate(@reduce(.Add, v_acc));
@@ -1194,11 +1243,11 @@ inline fn andPopcount4Bit(
             var ac: @Vector(8, u64) = @splat(0);
             const end64 = len - (len % 64);
             while (i < end64) : (i += 64) {
-                const vc: @Vector(8, u64) = @bitCast(code[i..][0..64].*);
-                a0 += @popCount(vc & @as(@Vector(8, u64), @bitCast(qp0[i..][0..64].*)));
-                a1 += @popCount(vc & @as(@Vector(8, u64), @bitCast(qp1[i..][0..64].*)));
-                a2 += @popCount(vc & @as(@Vector(8, u64), @bitCast(qp2[i..][0..64].*)));
-                a3 += @popCount(vc & @as(@Vector(8, u64), @bitCast(qp3[i..][0..64].*)));
+                const vc = distance.loadU64Vec(8, code.ptr + i);
+                a0 += @popCount(vc & distance.loadU64Vec(8, qp0.ptr + i));
+                a1 += @popCount(vc & distance.loadU64Vec(8, qp1.ptr + i));
+                a2 += @popCount(vc & distance.loadU64Vec(8, qp2.ptr + i));
+                a3 += @popCount(vc & distance.loadU64Vec(8, qp3.ptr + i));
                 if (comptime need_code_popc) ac += @popCount(vc);
             }
             p0 += @truncate(@reduce(.Add, a0));
@@ -1209,22 +1258,13 @@ inline fn andPopcount4Bit(
         }
         if (comptime has_avx512vl) {
             if (i + 32 <= len) {
-                const vc: @Vector(4, u64) = @bitCast(code[i..][0..32].*);
-                p0 += @reduce(.Add, @as(@Vector(4, u32), @popCount(vc & @as(@Vector(4, u64), @bitCast(qp0[i..][0..32].*)))));
-                p1 += @reduce(.Add, @as(@Vector(4, u32), @popCount(vc & @as(@Vector(4, u64), @bitCast(qp1[i..][0..32].*)))));
-                p2 += @reduce(.Add, @as(@Vector(4, u32), @popCount(vc & @as(@Vector(4, u64), @bitCast(qp2[i..][0..32].*)))));
-                p3 += @reduce(.Add, @as(@Vector(4, u32), @popCount(vc & @as(@Vector(4, u64), @bitCast(qp3[i..][0..32].*)))));
-                if (comptime need_code_popc) pc += @reduce(.Add, @as(@Vector(4, u32), @popCount(vc)));
+                const vc = distance.loadU64Vec(4, code.ptr + i);
+                p0 += @truncate(@reduce(.Add, @as(@Vector(4, u64), @popCount(vc & distance.loadU64Vec(4, qp0.ptr + i)))));
+                p1 += @truncate(@reduce(.Add, @as(@Vector(4, u64), @popCount(vc & distance.loadU64Vec(4, qp1.ptr + i)))));
+                p2 += @truncate(@reduce(.Add, @as(@Vector(4, u64), @popCount(vc & distance.loadU64Vec(4, qp2.ptr + i)))));
+                p3 += @truncate(@reduce(.Add, @as(@Vector(4, u64), @popCount(vc & distance.loadU64Vec(4, qp3.ptr + i)))));
+                if (comptime need_code_popc) pc += @truncate(@reduce(.Add, @as(@Vector(4, u64), @popCount(vc))));
                 i += 32;
-            }
-            if (i + 16 <= len) {
-                const vc: @Vector(2, u64) = @bitCast(code[i..][0..16].*);
-                p0 += @reduce(.Add, @as(@Vector(2, u32), @popCount(vc & @as(@Vector(2, u64), @bitCast(qp0[i..][0..16].*)))));
-                p1 += @reduce(.Add, @as(@Vector(2, u32), @popCount(vc & @as(@Vector(2, u64), @bitCast(qp1[i..][0..16].*)))));
-                p2 += @reduce(.Add, @as(@Vector(2, u32), @popCount(vc & @as(@Vector(2, u64), @bitCast(qp2[i..][0..16].*)))));
-                p3 += @reduce(.Add, @as(@Vector(2, u32), @popCount(vc & @as(@Vector(2, u64), @bitCast(qp3[i..][0..16].*)))));
-                if (comptime need_code_popc) pc += @reduce(.Add, @as(@Vector(2, u32), @popCount(vc)));
-                i += 16;
             }
         }
     } else if (comptime is_aarch64) {
@@ -1310,15 +1350,15 @@ inline fn andPopcount4BitBatch4(
             var ac: [4]@Vector(8, u64) = @splat(@splat(0));
             const end64 = len - (len % 64);
             while (i < end64) : (i += 64) {
-                const vq0: @Vector(8, u64) = @bitCast(qp0[i..][0..64].*);
-                const vq1: @Vector(8, u64) = @bitCast(qp1[i..][0..64].*);
-                const vq2: @Vector(8, u64) = @bitCast(qp2[i..][0..64].*);
-                const vq3: @Vector(8, u64) = @bitCast(qp3[i..][0..64].*);
+                const vq0 = distance.loadU64Vec(8, qp0.ptr + i);
+                const vq1 = distance.loadU64Vec(8, qp1.ptr + i);
+                const vq2 = distance.loadU64Vec(8, qp2.ptr + i);
+                const vq3 = distance.loadU64Vec(8, qp3.ptr + i);
                 const vcs: [4]@Vector(8, u64) = .{
-                    @bitCast(c0[i..][0..64].*),
-                    @bitCast(c1[i..][0..64].*),
-                    @bitCast(c2[i..][0..64].*),
-                    @bitCast(c3[i..][0..64].*),
+                    distance.loadU64Vec(8, c0.ptr + i),
+                    distance.loadU64Vec(8, c1.ptr + i),
+                    distance.loadU64Vec(8, c2.ptr + i),
+                    distance.loadU64Vec(8, c3.ptr + i),
                 };
                 inline for (0..4) |k| {
                     a0[k] += @popCount(vcs[k] & vq0);
@@ -1338,44 +1378,24 @@ inline fn andPopcount4BitBatch4(
         }
         if (comptime has_avx512vl) {
             if (i + 32 <= len) {
-                const vq0: @Vector(4, u64) = @bitCast(qp0[i..][0..32].*);
-                const vq1: @Vector(4, u64) = @bitCast(qp1[i..][0..32].*);
-                const vq2: @Vector(4, u64) = @bitCast(qp2[i..][0..32].*);
-                const vq3: @Vector(4, u64) = @bitCast(qp3[i..][0..32].*);
+                const vq0 = distance.loadU64Vec(4, qp0.ptr + i);
+                const vq1 = distance.loadU64Vec(4, qp1.ptr + i);
+                const vq2 = distance.loadU64Vec(4, qp2.ptr + i);
+                const vq3 = distance.loadU64Vec(4, qp3.ptr + i);
                 const vcs: [4]@Vector(4, u64) = .{
-                    @bitCast(c0[i..][0..32].*),
-                    @bitCast(c1[i..][0..32].*),
-                    @bitCast(c2[i..][0..32].*),
-                    @bitCast(c3[i..][0..32].*),
+                    distance.loadU64Vec(4, c0.ptr + i),
+                    distance.loadU64Vec(4, c1.ptr + i),
+                    distance.loadU64Vec(4, c2.ptr + i),
+                    distance.loadU64Vec(4, c3.ptr + i),
                 };
                 inline for (0..4) |k| {
-                    r_p0[k] += @reduce(.Add, @as(@Vector(4, u32), @popCount(vcs[k] & vq0)));
-                    r_p1[k] += @reduce(.Add, @as(@Vector(4, u32), @popCount(vcs[k] & vq1)));
-                    r_p2[k] += @reduce(.Add, @as(@Vector(4, u32), @popCount(vcs[k] & vq2)));
-                    r_p3[k] += @reduce(.Add, @as(@Vector(4, u32), @popCount(vcs[k] & vq3)));
-                    if (comptime need_code_popc) r_pc[k] += @reduce(.Add, @as(@Vector(4, u32), @popCount(vcs[k])));
+                    r_p0[k] += @truncate(@reduce(.Add, @as(@Vector(4, u64), @popCount(vcs[k] & vq0))));
+                    r_p1[k] += @truncate(@reduce(.Add, @as(@Vector(4, u64), @popCount(vcs[k] & vq1))));
+                    r_p2[k] += @truncate(@reduce(.Add, @as(@Vector(4, u64), @popCount(vcs[k] & vq2))));
+                    r_p3[k] += @truncate(@reduce(.Add, @as(@Vector(4, u64), @popCount(vcs[k] & vq3))));
+                    if (comptime need_code_popc) r_pc[k] += @truncate(@reduce(.Add, @as(@Vector(4, u64), @popCount(vcs[k]))));
                 }
                 i += 32;
-            }
-            if (i + 16 <= len) {
-                const vq0: @Vector(2, u64) = @bitCast(qp0[i..][0..16].*);
-                const vq1: @Vector(2, u64) = @bitCast(qp1[i..][0..16].*);
-                const vq2: @Vector(2, u64) = @bitCast(qp2[i..][0..16].*);
-                const vq3: @Vector(2, u64) = @bitCast(qp3[i..][0..16].*);
-                const vcs: [4]@Vector(2, u64) = .{
-                    @bitCast(c0[i..][0..16].*),
-                    @bitCast(c1[i..][0..16].*),
-                    @bitCast(c2[i..][0..16].*),
-                    @bitCast(c3[i..][0..16].*),
-                };
-                inline for (0..4) |k| {
-                    r_p0[k] += @reduce(.Add, @as(@Vector(2, u32), @popCount(vcs[k] & vq0)));
-                    r_p1[k] += @reduce(.Add, @as(@Vector(2, u32), @popCount(vcs[k] & vq1)));
-                    r_p2[k] += @reduce(.Add, @as(@Vector(2, u32), @popCount(vcs[k] & vq2)));
-                    r_p3[k] += @reduce(.Add, @as(@Vector(2, u32), @popCount(vcs[k] & vq3)));
-                    if (comptime need_code_popc) r_pc[k] += @reduce(.Add, @as(@Vector(2, u32), @popCount(vcs[k])));
-                }
-                i += 16;
             }
         }
     } else if (comptime is_aarch64) {
@@ -1627,6 +1647,14 @@ pub fn packFastScanBlock32(codes: [32][]const u8, dim: usize, block_out: []u8) v
     }
 }
 
+inline fn pshufb512(table_4x16: @Vector(64, u8), idx: @Vector(64, u8)) @Vector(64, u8) {
+    return asm ("vpshufb %[idx], %[tbl], %[out]"
+        : [out] "=v" (-> @Vector(64, u8)),
+        : [tbl] "v" (table_4x16),
+          [idx] "v" (idx),
+    );
+}
+
 inline fn pshufb256(table_2x16: @Vector(32, u8), idx: @Vector(32, u8)) @Vector(32, u8) {
     return asm ("vpshufb %[idx], %[tbl], %[out]"
         : [out] "=x" (-> @Vector(32, u8)),
@@ -1644,8 +1672,8 @@ inline fn neonTbl16(table: @Vector(16, u8), idx: @Vector(16, u8)) @Vector(16, u8
 }
 
 /// Evaluate 32 packed vectors simultaneously via 4-bit transposed LUT lookup.
-/// Uses `vpshufb` on x86_64 AVX2/AVX-512, `tbl` on aarch64 NEON, and a
-/// bit-identical portable fallback on wasm32/baseline x86_64.
+/// Uses `vpshufb` on x86_64 AVX-512BW (4 groups/iter) / AVX2 (2 groups/iter),
+/// `tbl` on aarch64 NEON, and a bit-identical portable fallback on wasm32/baseline x86_64.
 pub fn estimateFastScanBlock32(
     lut: []const [16]u8,
     lut_vl: f32,
@@ -1664,34 +1692,92 @@ pub fn estimateFastScanBlock32(
     var sums_hi: @Vector(16, u32) = @splat(0);
 
     var g: usize = 0;
-    if (comptime has_avx2) {
-        const mask_0f: @Vector(16, u8) = @splat(0x0F);
-        const shift4: @Vector(16, u3) = @splat(4);
-        const dup_mask = [_]i32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
-        const cat_mask = [_]i32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, -1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -12, -13, -14, -15, -16 };
-        const lo_mask = [_]i32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
-        const hi_mask = [_]i32{ 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 };
+    if (comptime has_avx512bw) {
+        const lut_bytes: [*]const u8 = @ptrCast(lut.ptr);
+        const mask_0f_64: @Vector(64, u8) = @splat(0x0F);
+        const shift4_64: @Vector(64, u3) = @splat(4);
+        const lo32_m = [32]i32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 };
+        const hi32_m = [32]i32{ 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63 };
+        const lo16_m = [16]i32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+        const hi16_m = [16]i32{ 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 };
 
-        // Flush u16 accumulators every 255 groups (255*255 = 65025 <= 65535).
-        while (g < n_groups) {
-            const end = @min(n_groups, g + 255);
-            var acc_lo: @Vector(16, u16) = @splat(0);
-            var acc_hi: @Vector(16, u16) = @splat(0);
-            while (g < end) : (g += 1) {
-                const packed16: @Vector(16, u8) = block_packed[g * 16 ..][0..16].*;
-                const idx_lo = packed16 & mask_0f;
-                const idx_hi = packed16 >> shift4;
-                const lut16: @Vector(16, u8) = lut[g];
-                const lut32 = @shuffle(u8, lut16, lut16, dup_mask);
-                const idx32 = @shuffle(u8, idx_lo, idx_hi, cat_mask);
-                const res32 = pshufb256(lut32, idx32);
-                const res_lo = @shuffle(u8, res32, undefined, lo_mask);
-                const res_hi = @shuffle(u8, res32, undefined, hi_mask);
-                acc_lo += @as(@Vector(16, u16), res_lo);
-                acc_hi += @as(@Vector(16, u16), res_hi);
+        // 4 groups/iter in 512-bit ZMM; each u16 lane accumulates 2 groups/iter (flush <= 127 iters = 508 groups: 254*255 <= 65535).
+        const groups4 = n_groups - (n_groups % 4);
+        while (g < groups4) {
+            const end = @min(groups4, g + 508);
+            var acc_lo32: @Vector(32, u16) = @splat(0);
+            var acc_hi32: @Vector(32, u16) = @splat(0);
+            while (g < end) : (g += 4) {
+                const off = g * 16;
+                const packed64: @Vector(64, u8) = block_packed[off..][0..64].*;
+                const lut64: @Vector(64, u8) = lut_bytes[off..][0..64].*;
+                const res_lo64 = pshufb512(lut64, packed64 & mask_0f_64);
+                const res_hi64 = pshufb512(lut64, packed64 >> shift4_64);
+                acc_lo32 += @as(@Vector(32, u16), @shuffle(u8, res_lo64, undefined, lo32_m));
+                acc_lo32 += @as(@Vector(32, u16), @shuffle(u8, res_lo64, undefined, hi32_m));
+                acc_hi32 += @as(@Vector(32, u16), @shuffle(u8, res_hi64, undefined, lo32_m));
+                acc_hi32 += @as(@Vector(32, u16), @shuffle(u8, res_hi64, undefined, hi32_m));
             }
-            sums_lo += @as(@Vector(16, u32), acc_lo);
-            sums_hi += @as(@Vector(16, u32), acc_hi);
+            sums_lo += @as(@Vector(16, u32), @shuffle(u16, acc_lo32, undefined, lo16_m)) +
+                @as(@Vector(16, u32), @shuffle(u16, acc_lo32, undefined, hi16_m));
+            sums_hi += @as(@Vector(16, u32), @shuffle(u16, acc_hi32, undefined, lo16_m)) +
+                @as(@Vector(16, u32), @shuffle(u16, acc_hi32, undefined, hi16_m));
+        }
+
+        if (g < n_groups) {
+            const mask_0f: @Vector(16, u8) = @splat(0x0F);
+            const shift4: @Vector(16, u3) = @splat(4);
+            const dup_mask = [_]i32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+            const cat_mask = [_]i32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, -1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -12, -13, -14, -15, -16 };
+            while (g < n_groups) : (g += 1) {
+                const packed16: @Vector(16, u8) = block_packed[g * 16 ..][0..16].*;
+                const lut16: @Vector(16, u8) = lut[g];
+                const res32 = pshufb256(
+                    @shuffle(u8, lut16, lut16, dup_mask),
+                    @shuffle(u8, packed16 & mask_0f, packed16 >> shift4, cat_mask),
+                );
+                sums_lo += @as(@Vector(16, u32), @shuffle(u8, res32, undefined, lo16_m));
+                sums_hi += @as(@Vector(16, u32), @shuffle(u8, res32, undefined, hi16_m));
+            }
+        }
+    } else if (comptime has_avx2) {
+        const lut_bytes: [*]const u8 = @ptrCast(lut.ptr);
+        const mask_0f_32: @Vector(32, u8) = @splat(0x0F);
+        const shift4_32: @Vector(32, u3) = @splat(4);
+        const lo16_m = [16]i32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+        const hi16_m = [16]i32{ 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 };
+
+        // 2 groups/iter in 256-bit YMM; flush every <= 255 pairs (510 groups: 255*255 <= 65535).
+        const groups2 = n_groups - (n_groups % 2);
+        while (g < groups2) {
+            const end = @min(groups2, g + 510);
+            var acc_lo32: @Vector(32, u16) = @splat(0);
+            var acc_hi32: @Vector(32, u16) = @splat(0);
+            while (g < end) : (g += 2) {
+                const off = g * 16;
+                const packed32: @Vector(32, u8) = block_packed[off..][0..32].*;
+                const lut32: @Vector(32, u8) = lut_bytes[off..][0..32].*;
+                acc_lo32 += @as(@Vector(32, u16), pshufb256(lut32, packed32 & mask_0f_32));
+                acc_hi32 += @as(@Vector(32, u16), pshufb256(lut32, packed32 >> shift4_32));
+            }
+            sums_lo += @as(@Vector(16, u32), @shuffle(u16, acc_lo32, undefined, lo16_m)) +
+                @as(@Vector(16, u32), @shuffle(u16, acc_lo32, undefined, hi16_m));
+            sums_hi += @as(@Vector(16, u32), @shuffle(u16, acc_hi32, undefined, lo16_m)) +
+                @as(@Vector(16, u32), @shuffle(u16, acc_hi32, undefined, hi16_m));
+        }
+        if (g < n_groups) {
+            const mask_0f: @Vector(16, u8) = @splat(0x0F);
+            const shift4: @Vector(16, u3) = @splat(4);
+            const dup_mask = [_]i32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+            const cat_mask = [_]i32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, -1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -12, -13, -14, -15, -16 };
+            const packed16: @Vector(16, u8) = block_packed[g * 16 ..][0..16].*;
+            const lut16: @Vector(16, u8) = lut[g];
+            const res32 = pshufb256(
+                @shuffle(u8, lut16, lut16, dup_mask),
+                @shuffle(u8, packed16 & mask_0f, packed16 >> shift4, cat_mask),
+            );
+            sums_lo += @as(@Vector(16, u32), @shuffle(u8, res32, undefined, lo16_m));
+            sums_hi += @as(@Vector(16, u32), @shuffle(u8, res32, undefined, hi16_m));
         }
     } else if (comptime is_aarch64) {
         const mask_0f: @Vector(16, u8) = @splat(0x0F);
@@ -1728,15 +1814,41 @@ pub fn estimateFastScanBlock32(
     }
 
     const bias: f32 = @as(f32, @floatFromInt(n_groups)) * lut_vl;
-    const arr_lo: [16]u32 = sums_lo;
-    const arr_hi: [16]u32 = sums_hi;
+    if (comptime LANES >= 4) {
+        const W = if (LANES > 16) 16 else LANES;
+        const VF = @Vector(W, f32);
+        const VU = @Vector(W, u32);
+        const bias_v: VF = @splat(bias);
+        const delta_v: VF = @splat(lut_delta);
+        const ql2_v: VF = @splat(q_l2);
+        const ql2sq_v: VF = @splat(q_l2_sq);
+        const arr_lo: [16]u32 = sums_lo;
+        const arr_hi: [16]u32 = sums_hi;
 
-    inline for (0..16) |j| {
-        const ip_lo = bias + lut_delta * @as(f32, @floatFromInt(arr_lo[j]));
-        out_d2[j] = q_l2_sq + f_add[j] - (q_l2 * f_rescale[j]) * ip_lo;
+        comptime var off: usize = 0;
+        inline while (off < 16) : (off += W) {
+            const slo: VF = @floatFromInt(@as(VU, arr_lo[off..][0..W].*));
+            const ip_lo = distance.fmaddVec(W, slo, delta_v, bias_v);
+            const sc_lo = ql2_v * @as(VF, f_rescale[off..][0..W].*);
+            const add_lo = ql2sq_v + @as(VF, f_add[off..][0..W].*);
+            out_d2[off..][0..W].* = distance.fmaddVec(W, -sc_lo, ip_lo, add_lo);
 
-        const ip_hi = bias + lut_delta * @as(f32, @floatFromInt(arr_hi[j]));
-        out_d2[j + 16] = q_l2_sq + f_add[j + 16] - (q_l2 * f_rescale[j + 16]) * ip_hi;
+            const shi: VF = @floatFromInt(@as(VU, arr_hi[off..][0..W].*));
+            const ip_hi = distance.fmaddVec(W, shi, delta_v, bias_v);
+            const sc_hi = ql2_v * @as(VF, f_rescale[off + 16 ..][0..W].*);
+            const add_hi = ql2sq_v + @as(VF, f_add[off + 16 ..][0..W].*);
+            out_d2[off + 16 ..][0..W].* = distance.fmaddVec(W, -sc_hi, ip_hi, add_hi);
+        }
+    } else {
+        const arr_lo: [16]u32 = sums_lo;
+        const arr_hi: [16]u32 = sums_hi;
+        inline for (0..16) |j| {
+            const ip_lo = bias + lut_delta * @as(f32, @floatFromInt(arr_lo[j]));
+            out_d2[j] = q_l2_sq + f_add[j] - (q_l2 * f_rescale[j]) * ip_lo;
+
+            const ip_hi = bias + lut_delta * @as(f32, @floatFromInt(arr_hi[j]));
+            out_d2[j + 16] = q_l2_sq + f_add[j + 16] - (q_l2 * f_rescale[j + 16]) * ip_hi;
+        }
     }
 }
 
@@ -2398,15 +2510,15 @@ test "rabitq: odd dims, high dim (d=384), and degenerate edge cases (v==c, q==c,
     }
 }
 
-test "rabitq: FastScan32 multi-chunk u16 flush and 4-bit slab parity at d=1536 and d=1537" {
+test "rabitq: FastScan32 multi-chunk u16 flush and 4-bit slab parity at d=1536, d=1537, d=2053" {
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x1536_F532);
     const rand = prng.random();
 
-    for ([_]usize{ 1536, 1537 }) |dim| {
+    for ([_]usize{ 1536, 1537, 2053 }) |dim| {
         const cb = codeBytes(dim);
         const n_groups = fastScanGroups(dim);
-        try testing.expect(n_groups > 255); // Guarantees the 255-group u16 flush boundary runs!
+        try testing.expect(n_groups > 255); // d=2053 (514 groups) crosses AVX-512BW 508-group & AVX2 510-group flush boundaries too!
 
         // Synthetic unit rotated query (avoids O(d^3) Gram-Schmidt so test runs in <1ms).
         const q_raw = try alloc.alloc(f32, dim);

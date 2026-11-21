@@ -58,6 +58,16 @@ pub const Metric = enum {
             .l2 => l2_dist,
         };
     }
+
+    /// Convert an HNSW distance (smaller = closer) back to a similarity score
+    /// (higher = closer), matching `vsearch`'s score convention.
+    pub fn distToScore(self: Metric, dist: f32) f32 {
+        return switch (self) {
+            .cosine => 1.0 - dist,
+            .dot => -dist,
+            .l2 => 1.0 / (1.0 + @max(@as(f32, 0.0), dist)),
+        };
+    }
 };
 
 pub const cosine_dist: DistFn = cosineDistImpl;

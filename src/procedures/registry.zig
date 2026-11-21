@@ -12,10 +12,14 @@ pub const increment = @import("increment.zig");
 pub const kv_put = @import("kv_put.zig");
 pub const kv_get = @import("kv_get.zig");
 pub const kv_stats = @import("kv_stats.zig");
+pub const mget = @import("mget.zig");
 pub const scan = @import("scan.zig");
 pub const chat_send = @import("chat_send.zig");
 pub const chat_history = @import("chat_history.zig");
 pub const vsearch = @import("vsearch.zig");
+pub const vsearch_filtered = @import("vsearch_filtered.zig");
+pub const vcluster = @import("vcluster.zig");
+pub const vproject_2d = @import("vproject_2d.zig");
 /// Reaches cluster -> meshguard's locks and sockets; excluded on a narrow-atomics target.
 const cluster_on = !@import("../core/compat.zig").wasm_target;
 
@@ -65,11 +69,15 @@ const PROCEDURES = [_]Entry{
     .{ .name = "kv_put", .func = kv_put.execute },
     .{ .name = "kv_get", .func = kv_get.execute },
     .{ .name = "kv_stats", .func = kv_stats.execute },
+    .{ .name = "mget", .func = mget.execute },
     .{ .name = "scan", .func = scan.execute },
     .{ .name = "chat_send", .func = chat_send.execute },
     .{ .name = "chat_history", .func = chat_history.execute },
     .{ .name = "vsearch", .func = vsearch.execute },
     .{ .name = "vsearch_local_raw", .func = vsearch.executeLocalRaw },
+    .{ .name = "vsearch_filtered", .func = vsearch_filtered.execute },
+    .{ .name = "vcluster", .func = vcluster.execute },
+    .{ .name = "vproject_2d", .func = vproject_2d.execute },
     .{ .name = "vsearch_cluster", .func = if (cluster_on) vsearch_cluster.execute else clusterUnsupported },
     .{ .name = "vsim", .func = vsim.execute },
     .{ .name = "vinsert", .func = vinsert.execute },

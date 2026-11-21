@@ -1,13 +1,14 @@
 //! Built-in SCAN procedure
 //!
 //! Scans keys by prefix, returning matching entries as JSON.
-//! EXEC scan <prefix> [limit] [cut]
+//! EXEC scan <prefix> [limit] [cut] [after=<cursor>]
 //!
 //! - prefix: key prefix to match (e.g., "chat:general:", "user:")
 //! - limit: max results (default: 100, max: 1000)
 //! - cut: which end of the ascending match set the limit keeps —
 //!   "last" (default; newest-last for timestamp-keyed data) or
 //!   "first" (autocomplete / forward pagination)
+//! - after=<cursor>: optional exclusive lower-bound key cursor for forward pagination
 //! - Returns JSON array: [{"k":"key","v":"value","ts":1709...}, ...]
 //! - Results sorted by key ascending (lexicographic order)
 
@@ -18,7 +19,7 @@ const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 
 pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
-    const prefix = ctx.arg(0) orelse return ctx.err("scan requires at least 1 arg: <prefix> [limit] [cut]");
+    const prefix = ctx.arg(0) orelse return ctx.err("scan requires at least 1 arg: <prefix> [limit] [cut] [after=<cursor>]");
     // Range read: the token must cover every key under the prefix.
     try ctx.requirePrefix(prefix, .read);
 
@@ -29,18 +30,31 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
         if (limit == 0) limit = DEFAULT_LIMIT;
     }
 
-    // Parse optional cut ("last" default, "first" for autocomplete).
+    // Parse optional cut ("last" default, "first" for forward pagination) and optional after=<cursor>.
     var keep_first = false;
-    if (ctx.arg(2)) |cut| {
-        if (std.mem.eql(u8, cut, "first")) {
+    var after_cursor: ?[]const u8 = null;
+    if (ctx.arg(2)) |arg2| {
+        if (std.mem.startsWith(u8, arg2, "after=")) {
+            after_cursor = arg2["after=".len..];
             keep_first = true;
-        } else if (!std.mem.eql(u8, cut, "last")) {
+        } else if (std.mem.eql(u8, arg2, "first")) {
+            keep_first = true;
+        } else if (!std.mem.eql(u8, arg2, "last")) {
             return ctx.err("scan cut must be 'first' or 'last'");
+        }
+    }
+    if (ctx.arg(3)) |arg3| {
+        if (std.mem.startsWith(u8, arg3, "after=")) {
+            after_cursor = arg3["after=".len..];
+        } else {
+            return ctx.err("scan 4th arg must be after=<cursor>");
         }
     }
 
     // Execute prefix scan (arena-allocated, safe after shard unlock)
-    const results = if (keep_first)
+    const results = if (after_cursor != null)
+        try ctx.scanAfter(prefix, after_cursor, limit, keep_first)
+    else if (keep_first)
         try ctx.scanFirst(prefix, limit)
     else
         try ctx.scan(prefix, limit);

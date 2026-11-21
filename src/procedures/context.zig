@@ -626,6 +626,13 @@ pub const Ctx = struct {
         return self.store.scanPrefixFirst(prefix, limit, self.allocator);
     }
 
+    /// Cursor-paginated prefix scan: returns entries matching `prefix` with key
+    /// strictly greater than `after`. Caller MUST NOT hold any Ctx shard locks.
+    pub fn scanAfter(self: *Ctx, prefix: []const u8, after: ?[]const u8, limit: usize, keep_first: bool) ![]Store.ScanResult {
+        self.assertNoHeldShardLocks("scanAfter");
+        return self.store.scanPrefixAfter(prefix, after, limit, self.allocator, if (keep_first) .first else .last);
+    }
+
     /// Callback-based prefix scan — yields borrowed key/value slices (no
     /// arena copy). See Store.scanPrefixCallback for the callback contract.
     ///

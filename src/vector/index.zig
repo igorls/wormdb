@@ -26,14 +26,17 @@
 //!     on peers fall back to the BQ prefilter until reindexed.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("../core/compat.zig");
 const narrow_atomics = compat.narrow_atomics;
 /// The canonical signal: with it set, std.Thread.join/spawn are not analysed.
 const single_threaded = @import("build_options").single_threaded;
 const build_options = @import("build_options");
+const distance = @import("distance.zig");
 const hnsw_mod = @import("hnsw.zig");
 const metric_mod = @import("metric.zig");
 const rabitq_mod = @import("rabitq.zig");
+const topk_mod = @import("topk.zig");
 
 pub const Hnsw = hnsw_mod.Hnsw;
 pub const HnswParams = hnsw_mod.HnswParams;
@@ -70,16 +73,17 @@ pub const TombstoneResult = enum {
     missing,
 };
 
-/// Local RwLock wrapper over std.Io.RwLock. Mirrors src/core/compat.zig's
-/// shape but lives inside the vector module so `zig test` can build this
-/// file standalone (no cross-module import path). Zig 0.16's RwLock
-/// requires an Io handle for every operation; we pin it to the global
-/// blocking Io.
-const RwLock = compat.RwLock;
+/// Cache-line-padded sharded reader-writer lock (`compat.ShardedRwLock`).
+/// Eliminates cross-core reader cache-line bouncing on multi-CCD CPUs while
+/// compiling to an inert no-op on `wasm32-wasi` (`narrow_atomics`).
+const RwLock = compat.ShardedRwLock;
 
 inline fn io() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
+
+const EMPTY_U8_SLAB: [0]u8 align(64) = .{};
+const EMPTY_F32_SLAB: [0]f32 align(64) = .{};
 
 /// Result from `NamespaceIndex.search`. `key` is the stored vec key (borrowed
 /// from the index's keys[] array — valid as long as the caller holds the
@@ -89,6 +93,384 @@ pub const IndexSearchResult = struct {
     dist: f32,
     timestamp: u64,
 };
+
+/// Result from in-index BQ / RaBitQ / exact slab scans. `key` is borrowed from
+/// `NamespaceIndex.keys` and valid while the caller holds `ns_idx.lockShared()`.
+pub const IndexScoredResult = struct {
+    key: []const u8,
+    score: f32,
+    timestamp: u64,
+};
+
+/// Outcome of an in-index BQ / RaBitQ slab scan.
+/// When `needs_kv_rerank` is true, `out[0..count]` holds Stage-1 candidates whose
+/// exact Stage-2 rescore must read raw unnormalized vectors from KV *after*
+/// releasing `ns_idx.lockShared()` (e.g. `.l2`/`.dot` query on a `.cosine` NS
+/// whose HNSW slab stores unit-normalized vectors).
+pub const SlabSearchResult = struct {
+    count: usize,
+    needs_kv_rerank: bool,
+};
+
+/// Reference-counted owner for `RabitqParams` using a 32-bit atomic counter
+/// (`wasm32-wasi` safe). Allows KV-fallback RaBitQ scans to retain params and
+/// release `ns_idx.lockShared()` BEFORE calling `Store.scanPrefixCallback`,
+/// eliminating AB-BA deadlocks against `Store.writeSnapshot`.
+pub const RabitqParamsHandle = struct {
+    allocator: std.mem.Allocator,
+    params: *RabitqParams,
+    refs: std.atomic.Value(u32),
+
+    pub fn create(allocator: std.mem.Allocator, params: *RabitqParams) !*RabitqParamsHandle {
+        const h = try allocator.create(RabitqParamsHandle);
+        h.* = .{
+            .allocator = allocator,
+            .params = params,
+            .refs = .init(1),
+        };
+        return h;
+    }
+
+    pub inline fn retain(self: *RabitqParamsHandle) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    pub fn release(self: *RabitqParamsHandle) void {
+        if (self.refs.fetchSub(1, .acq_rel) == 1) {
+            self.params.deinit();
+            self.allocator.destroy(self.params);
+            self.allocator.destroy(self);
+        }
+    }
+};
+
+fn nextSlabCap(current: usize, needed: usize) usize {
+    if (current == 0) return @max(needed, 64);
+    var cap = current;
+    while (cap < needed) {
+        const step = if (cap < 1024) cap else @max(@as(usize, 256), cap / 4);
+        cap = std.mem.alignForward(usize, cap + step, 64);
+    }
+    return cap;
+}
+
+/// Dense 64B-aligned legacy 1-bit BQ code slab indexed by `node_id`.
+/// Row stride is 8B-aligned and zero-padded so `distance.hammingBatch4` hits
+/// wide u64/AVX-512 paths with zero tail divergence.
+const BqSlab = struct {
+    dim: usize = 0,
+    code_bytes: usize = 0,
+    code_stride: usize = 0,
+    len: usize = 0,
+    cap: usize = 0,
+    codes: []align(64) u8 = @constCast(&EMPTY_U8_SLAB),
+    synced: bool = true,
+
+    fn deinit(self: *BqSlab, allocator: std.mem.Allocator) void {
+        if (self.codes.len > 0) allocator.free(self.codes);
+        self.* = .{};
+    }
+
+    fn resetKeepingAlloc(self: *BqSlab, synced: bool) void {
+        self.dim = 0;
+        self.code_bytes = 0;
+        self.code_stride = 0;
+        self.len = 0;
+        self.synced = synced;
+    }
+
+    fn configure(self: *BqSlab, allocator: std.mem.Allocator, dim: usize) void {
+        const cb = distance.binaryQuantizedSize(dim);
+        const stride = std.mem.alignForward(usize, cb, 8);
+        if (self.dim != dim or self.code_stride != stride) {
+            if (self.codes.len > 0) {
+                allocator.free(self.codes);
+                self.codes = @constCast(&EMPTY_U8_SLAB);
+                self.cap = 0;
+            }
+            self.dim = dim;
+            self.code_bytes = cb;
+            self.code_stride = stride;
+            self.len = 0;
+        }
+    }
+
+    fn ensureCapacity(self: *BqSlab, allocator: std.mem.Allocator, needed: usize, exact: bool) !void {
+        if (self.code_stride == 0 or needed <= self.cap) return;
+        const target = if (exact) needed else nextSlabCap(self.cap, needed);
+        const fresh = try allocator.alignedAlloc(u8, .@"64", target * self.code_stride);
+        if (self.len > 0) {
+            @memcpy(fresh[0 .. self.len * self.code_stride], self.codes[0 .. self.len * self.code_stride]);
+        }
+        if (self.codes.len > 0) allocator.free(self.codes);
+        self.codes = fresh;
+        self.cap = target;
+    }
+
+    fn setSlot(self: *BqSlab, id: usize, code: []const u8) void {
+        const dst = self.codes[id * self.code_stride ..][0..self.code_stride];
+        @memcpy(dst[0..self.code_bytes], code[0..self.code_bytes]);
+        if (self.code_stride > self.code_bytes) {
+            @memset(dst[self.code_bytes..self.code_stride], 0);
+        }
+    }
+
+    fn appendCode(self: *BqSlab, allocator: std.mem.Allocator, dim: usize, code: []const u8) !void {
+        if (self.dim == 0) self.configure(allocator, dim);
+        try self.ensureCapacity(allocator, self.len + 1, false);
+        self.setSlot(self.len, code);
+        self.len += 1;
+    }
+
+    fn appendFromVec(self: *BqSlab, allocator: std.mem.Allocator, vec: []align(1) const f32) !void {
+        if (self.dim == 0) self.configure(allocator, vec.len);
+        try self.ensureCapacity(allocator, self.len + 1, false);
+        const dst = self.codes[self.len * self.code_stride ..][0..self.code_stride];
+        distance.binaryQuantize(vec, dst[0..self.code_bytes]);
+        if (self.code_stride > self.code_bytes) {
+            @memset(dst[self.code_bytes..self.code_stride], 0);
+        }
+        self.len += 1;
+    }
+
+    inline fn codeAt(self: *const BqSlab, id: usize) []const u8 {
+        return self.codes[id * self.code_stride ..][0..self.code_stride];
+    }
+};
+
+/// Dense 64B-aligned RaBitQ SoA + FastScan32 transposed-nibble slab indexed by `node_id`.
+/// Full 32-vector blocks are packed incrementally via `rabitq.packFastScanBlock32`
+/// and scanned via `rabitq.estimateFastScanBlock32`; partial tail `< 32` uses
+/// `rabitq.estimateL2Sq4BitSlabBatch4`.
+const RabitqSlab = struct {
+    dim: usize = 0,
+    code_bytes: usize = 0,
+    code_stride: usize = 0,
+    block_bytes: usize = 0,
+    len: usize = 0,
+    cap: usize = 0,
+    block_cap: usize = 0,
+    packed_blocks: usize = 0,
+    codes: []align(64) u8 = @constCast(&EMPTY_U8_SLAB),
+    f_add: []align(64) f32 = @constCast(&EMPTY_F32_SLAB),
+    f_rescale: []align(64) f32 = @constCast(&EMPTY_F32_SLAB),
+    popc: []u16 = &.{},
+    fastscan_blocks: []align(64) u8 = @constCast(&EMPTY_U8_SLAB),
+    synced: bool = false,
+
+    fn deinit(self: *RabitqSlab, allocator: std.mem.Allocator) void {
+        if (self.codes.len > 0) allocator.free(self.codes);
+        if (self.f_add.len > 0) allocator.free(self.f_add);
+        if (self.f_rescale.len > 0) allocator.free(self.f_rescale);
+        if (self.popc.len > 0) allocator.free(self.popc);
+        if (self.fastscan_blocks.len > 0) allocator.free(self.fastscan_blocks);
+        self.* = .{};
+    }
+
+    fn reset(self: *RabitqSlab, allocator: std.mem.Allocator, synced: bool) void {
+        self.deinit(allocator);
+        self.synced = synced;
+    }
+
+    fn configure(self: *RabitqSlab, allocator: std.mem.Allocator, dim: usize) void {
+        const cb = rabitq_mod.codeBytes(dim);
+        const stride = std.mem.alignForward(usize, cb, 8);
+        const bb = rabitq_mod.fastScanBlockBytes(dim);
+        if (self.dim != dim or self.code_stride != stride or self.block_bytes != bb) {
+            const was_synced = self.synced;
+            self.deinit(allocator);
+            self.dim = dim;
+            self.code_bytes = cb;
+            self.code_stride = stride;
+            self.block_bytes = bb;
+            self.synced = was_synced;
+        }
+    }
+
+    fn ensureCapacity(self: *RabitqSlab, allocator: std.mem.Allocator, needed: usize, exact: bool) !void {
+        if (self.code_stride == 0) return;
+        const need_nodes = needed > self.cap;
+        const needed_blocks = needed / 32;
+        const need_blocks = needed_blocks > self.block_cap;
+        if (!need_nodes and !need_blocks) return;
+
+        const target_nodes = if (need_nodes)
+            (if (exact) needed else nextSlabCap(self.cap, needed))
+        else
+            self.cap;
+        const target_blocks = if (need_blocks)
+            (if (exact) needed_blocks else @max(needed_blocks, if (self.block_cap == 0) @as(usize, 4) else self.block_cap + @max(@as(usize, 4), self.block_cap / 2)))
+        else
+            self.block_cap;
+
+        var new_codes: ?[]align(64) u8 = null;
+        errdefer if (new_codes) |b| allocator.free(b);
+        var new_f_add: ?[]align(64) f32 = null;
+        errdefer if (new_f_add) |b| allocator.free(b);
+        var new_f_rescale: ?[]align(64) f32 = null;
+        errdefer if (new_f_rescale) |b| allocator.free(b);
+        var new_popc: ?[]u16 = null;
+        errdefer if (new_popc) |b| allocator.free(b);
+        var new_blocks: ?[]align(64) u8 = null;
+        errdefer if (new_blocks) |b| allocator.free(b);
+
+        if (need_nodes) {
+            new_codes = try allocator.alignedAlloc(u8, .@"64", target_nodes * self.code_stride);
+            new_f_add = try allocator.alignedAlloc(f32, .@"64", target_nodes);
+            new_f_rescale = try allocator.alignedAlloc(f32, .@"64", target_nodes);
+            new_popc = try allocator.alloc(u16, target_nodes);
+        }
+        if (need_blocks and self.block_bytes > 0) {
+            new_blocks = try allocator.alignedAlloc(u8, .@"64", target_blocks * self.block_bytes);
+        }
+
+        if (need_nodes) {
+            if (self.len > 0) {
+                @memcpy(new_codes.?[0 .. self.len * self.code_stride], self.codes[0 .. self.len * self.code_stride]);
+                @memcpy(new_f_add.?[0..self.len], self.f_add[0..self.len]);
+                @memcpy(new_f_rescale.?[0..self.len], self.f_rescale[0..self.len]);
+                @memcpy(new_popc.?[0..self.len], self.popc[0..self.len]);
+            }
+            if (self.codes.len > 0) allocator.free(self.codes);
+            if (self.f_add.len > 0) allocator.free(self.f_add);
+            if (self.f_rescale.len > 0) allocator.free(self.f_rescale);
+            if (self.popc.len > 0) allocator.free(self.popc);
+            self.codes = new_codes.?;
+            self.f_add = new_f_add.?;
+            self.f_rescale = new_f_rescale.?;
+            self.popc = new_popc.?;
+            self.cap = target_nodes;
+        }
+        if (new_blocks) |nb| {
+            if (self.packed_blocks > 0) {
+                @memcpy(nb[0 .. self.packed_blocks * self.block_bytes], self.fastscan_blocks[0 .. self.packed_blocks * self.block_bytes]);
+            }
+            if (self.fastscan_blocks.len > 0) allocator.free(self.fastscan_blocks);
+            self.fastscan_blocks = nb;
+            self.block_cap = target_blocks;
+        }
+    }
+
+    fn setSlot(self: *RabitqSlab, id: usize, code: []const u8, l2_norm: f32, corr: f32) void {
+        const dst = self.codes[id * self.code_stride ..][0..self.code_stride];
+        @memcpy(dst[0..self.code_bytes], code[0..self.code_bytes]);
+        if (self.code_stride > self.code_bytes) {
+            @memset(dst[self.code_bytes..self.code_stride], 0);
+        }
+        const factors = rabitq_mod.computeSlabFactors(self.dim, l2_norm, corr, dst[0..self.code_bytes]);
+        self.f_add[id] = factors.f_add;
+        self.f_rescale[id] = factors.f_rescale;
+        self.popc[id] = factors.popc;
+    }
+
+    fn setTombstoneSlot(self: *RabitqSlab, id: usize) void {
+        const dst = self.codes[id * self.code_stride ..][0..self.code_stride];
+        @memset(dst, 0);
+        self.f_add[id] = std.math.inf(f32);
+        self.f_rescale[id] = 0.0;
+        self.popc[id] = 0;
+    }
+
+    fn packBlock(self: *RabitqSlab, blk_idx: usize) void {
+        const base = blk_idx * 32;
+        var ptrs: [32][]const u8 = undefined;
+        inline for (0..32) |j| {
+            ptrs[j] = self.codes[(base + j) * self.code_stride ..][0..self.code_bytes];
+        }
+        const out_blk = self.fastscan_blocks[blk_idx * self.block_bytes ..][0..self.block_bytes];
+        rabitq_mod.packFastScanBlock32(ptrs, self.dim, out_blk);
+    }
+
+    fn packAllFullBlocks(self: *RabitqSlab) void {
+        const n_blocks = self.len / 32;
+        for (0..n_blocks) |b| {
+            self.packBlock(b);
+        }
+        self.packed_blocks = n_blocks;
+    }
+
+    fn appendEncoded(self: *RabitqSlab, allocator: std.mem.Allocator, dim: usize, code: []const u8, l2_norm: f32, corr: f32) !void {
+        if (self.dim == 0) self.configure(allocator, dim);
+        try self.ensureCapacity(allocator, self.len + 1, false);
+        self.setSlot(self.len, code, l2_norm, corr);
+        self.len += 1;
+        if (self.len % 32 == 0) {
+            const blk_idx = (self.len / 32) - 1;
+            self.packBlock(blk_idx);
+            self.packed_blocks = blk_idx + 1;
+        }
+    }
+
+    inline fn codeAt(self: *const RabitqSlab, id: usize) []const u8 {
+        return self.codes[id * self.code_stride ..][0..self.code_bytes];
+    }
+};
+
+const STACK_DIM_CAP: usize = 1536;
+const STACK_SLAB_QUERY_CAP: usize = 2048;
+const STACK_LUT_GROUPS: usize = 512; // covers up to dim = 2048
+
+const IdDist = struct { id: u32, dist: f32 };
+fn idDistOf(x: IdDist) f32 {
+    return x.dist;
+}
+const IdDistHeap = topk_mod.BoundedMaxHeap(IdDist, idDistOf);
+
+const IdScore = struct { id: u32, score: f32 };
+fn idScoreOf(x: IdScore) f32 {
+    return x.score;
+}
+const IdScoreTopK = topk_mod.TopK(IdScore, idScoreOf);
+
+inline fn applyDecayIndex(raw_sim: f32, timestamp: u64, decay: f32, now_ms: u64, decay_tau_hours: f32) f32 {
+    if (decay <= 0.0) return raw_sim;
+    const age_ms = if (now_ms > timestamp) now_ms - timestamp else 0;
+    const age_hours: f32 = @as(f32, @floatFromInt(age_ms)) / 3_600_000.0;
+    const recency = @exp(-age_hours / decay_tau_hours);
+    return (1.0 - decay) * raw_sim + decay * recency;
+}
+
+inline fn rabitqD2ToSim(d2_est: f32, cosine_score: bool) f32 {
+    const d2_clamped: f32 = if (d2_est < 0.0) 0.0 else d2_est;
+    if (cosine_score) {
+        const cos_est = 1.0 - d2_clamped * 0.5;
+        const cos_clamped: f32 = if (cos_est > 1.0) 1.0 else if (cos_est < -1.0) -1.0 else cos_est;
+        return (cos_clamped + 1.0) * 0.5;
+    }
+    return 1.0 / (1.0 + d2_clamped);
+}
+
+/// Stack-buffered writer for `writeToLocked` — coalesces small field writes
+/// without altering a single byte of the `WDBHNSW2` wire format.
+fn BufferedIndexWriter(comptime InnerPtr: type) type {
+    return struct {
+        inner: InnerPtr,
+        buf: [4096]u8 = undefined,
+        pos: usize = 0,
+
+        pub fn writeAll(self: *@This(), data: []const u8) !void {
+            if (data.len <= self.buf.len - self.pos) {
+                @memcpy(self.buf[self.pos..][0..data.len], data);
+                self.pos += data.len;
+                return;
+            }
+            try self.flush();
+            if (data.len >= self.buf.len) {
+                try self.inner.writeAll(data);
+            } else {
+                @memcpy(self.buf[0..data.len], data);
+                self.pos = data.len;
+            }
+        }
+
+        pub fn flush(self: *@This()) !void {
+            if (self.pos > 0) {
+                try self.inner.writeAll(self.buf[0..self.pos]);
+                self.pos = 0;
+            }
+        }
+    };
+}
 
 /// A pending insert job for the async HNSW worker. Owns its key and vector
 /// bytes (worker frees after insertLocked). Timestamp comes from the
@@ -174,8 +556,26 @@ pub const NamespaceIndex = struct {
     /// Null until `setRabitqParams` is called (via the `vrabitq`
     /// procedure). Once installed, `applyVinsert` encodes new bq entries
     /// with `rabitq.encode` and `vsearch` scores via `rabitq.estimateL2Sq`
-    /// instead of the raw Hamming prefilter. Owned by this struct.
+    /// instead of the raw Hamming prefilter. Owned via `rabitq_handle`.
     rabitq_params: ?*RabitqParams,
+    /// Reference-counted lifetime owner for `rabitq_params`. Readers that
+    /// fall back to KV scan retain this handle and unlock `self.lock`
+    /// before touching Store shards.
+    rabitq_handle: ?*RabitqParamsHandle,
+    /// Dense 64B-aligned legacy 1-bit BQ code slab (maintained when
+    /// `rabitq_params == null`).
+    bq_slab: BqSlab,
+    /// Dense 64B-aligned RaBitQ SoA + FastScan32 slab (populated on `vrabitq`,
+    /// incremental inserts, and snapshot restore when `rabitq_params != null`).
+    rq_slab: RabitqSlab,
+    /// Lock-free flag recording whether `__meta:vecns:<namespace>` has already
+    /// been written to the Store, eliminating a per-insert Store lookup.
+    config_persisted: std.atomic.Value(bool),
+    /// True iff every valid vector under `namespace` in the attached Store is
+    /// guaranteed to be represented in this index (allowing `mode=exact` to
+    /// scan the contiguous HNSW vector slab directly). Cleared on any skipped
+    /// or failed insert or when creating an index over a non-empty KV prefix.
+    complete_with_store: bool,
 
     pub fn init(allocator: std.mem.Allocator, params: HnswParams, m: Metric) NamespaceIndex {
         // Override params.dist_fn with the chosen metric so the two can't
@@ -199,6 +599,11 @@ pub const NamespaceIndex = struct {
             .async_queue = null,
             .async_worker = null,
             .rabitq_params = null,
+            .rabitq_handle = null,
+            .bq_slab = .{},
+            .rq_slab = .{},
+            .config_persisted = .init(false),
+            .complete_with_store = true,
         };
     }
 
@@ -231,28 +636,86 @@ pub const NamespaceIndex = struct {
         // key_to_node's keys are borrowed from self.keys — only free the map.
         self.key_to_node.deinit(self.allocator);
         self.tombstones.deinit(self.allocator);
-        if (self.rabitq_params) |p| {
-            p.deinit();
-            self.allocator.destroy(p);
+        self.bq_slab.deinit(self.allocator);
+        self.rq_slab.deinit(self.allocator);
+        if (self.rabitq_handle) |h| {
+            h.release();
+            self.rabitq_handle = null;
+            self.rabitq_params = null;
         }
     }
 
     /// Install a full set of RaBitQ parameters (centroid + rotation).
-    /// Takes ownership of the passed-in struct — caller must not deinit
-    /// or destroy. Replaces any previous params (old allocations freed).
+    /// Takes ownership of `new_params` on success — caller must not deinit
+    /// or destroy after success. On allocation failure, `new_params` is
+    /// untouched so caller's `errdefer` cleans it up cleanly.
     /// Caller holds the write-lock.
-    pub fn setRabitqParams(self: *NamespaceIndex, new_params: *RabitqParams) void {
-        if (self.rabitq_params) |old| {
-            old.deinit();
-            self.allocator.destroy(old);
+    pub fn setRabitqParams(self: *NamespaceIndex, new_params: *RabitqParams) !void {
+        const handle = try RabitqParamsHandle.create(self.allocator, new_params);
+        if (self.rabitq_handle) |old| {
+            old.release();
         }
+        self.rabitq_handle = handle;
         self.rabitq_params = new_params;
+        // Legacy BQ slab is no longer used once RaBitQ params are installed.
+        self.bq_slab.deinit(self.allocator);
+        self.bq_slab.synced = false;
+        // If empty, the RaBitQ slab starts synced for upcoming inserts; otherwise
+        // `vrabitq` will populate it via `installRabitqSlabFromEncodedLocked`.
+        self.rq_slab.reset(self.allocator, self.hnsw.len() == 0);
+        if (self.hnsw.len() == 0 and new_params.dim > 0) {
+            self.rq_slab.configure(self.allocator, @intCast(new_params.dim));
+        }
     }
 
     /// Read-only access to the installed params under the caller's lock
     /// (shared is fine). Returns null if `vrabitq` has not run yet.
     pub fn getRabitqParams(self: *const NamespaceIndex) ?*const RabitqParams {
         return self.rabitq_params;
+    }
+
+    /// Retain a reference-counted handle to the installed RaBitQ params under
+    /// the caller's lock (shared or exclusive). Caller MUST call `.release()`
+    /// once finished (safe after releasing `self.lock`).
+    pub fn acquireRabitqHandleLocked(self: *const NamespaceIndex) ?*RabitqParamsHandle {
+        const h = self.rabitq_handle orelse return null;
+        h.retain();
+        return h;
+    }
+
+    /// Mark that this index may not cover every key under `namespace` in Store.
+    /// Also invalidates in-index BQ/RaBitQ slabs so `mode=bq` / `mode=bq_rerank`
+    /// fall back to KV scan until `vreindex` rebuilds a complete index.
+    /// Caller holds the write-lock.
+    pub fn markIncompleteLocked(self: *NamespaceIndex) void {
+        self.complete_with_store = false;
+        self.bq_slab.synced = false;
+        self.rq_slab.synced = false;
+    }
+
+    /// Pre-allocate graph, side-table, and quantized-slab capacity for `additional`
+    /// upcoming inserts. Caller holds the write-lock.
+    pub fn reserveAdditionalLocked(self: *NamespaceIndex, additional: usize) !void {
+        if (additional == 0) return;
+        const needed = try std.math.add(usize, self.hnsw.len(), additional);
+        try self.hnsw.reserve(additional);
+        try self.keys.ensureTotalCapacity(self.allocator, needed);
+        try self.timestamps.ensureTotalCapacity(self.allocator, needed);
+        try self.vec_hashes.ensureTotalCapacity(self.allocator, needed);
+        if (needed <= std.math.maxInt(u32)) {
+            try self.key_to_node.ensureTotalCapacity(self.allocator, @intCast(needed));
+        }
+        if (self.dim) |d| {
+            if (self.rabitq_params) |p| {
+                if (self.rq_slab.synced and p.dim == d) {
+                    if (self.rq_slab.dim == 0) self.rq_slab.configure(self.allocator, d);
+                    try self.rq_slab.ensureCapacity(self.allocator, needed, true);
+                }
+            } else if (self.bq_slab.synced) {
+                if (self.bq_slab.dim == 0) self.bq_slab.configure(self.allocator, d);
+                try self.bq_slab.ensureCapacity(self.allocator, needed, true);
+            }
+        }
     }
 
     /// Idempotently enable async mode: allocate the queue + spawn worker
@@ -331,7 +794,6 @@ pub const NamespaceIndex = struct {
 
     fn asyncWorkerLoop(self: *NamespaceIndex) void {
         const q = self.async_queue orelse return;
-        const distance = @import("distance.zig");
 
         while (true) {
             // Wait for work or shutdown.
@@ -352,12 +814,14 @@ pub const NamespaceIndex = struct {
 
                 // One write-lock acquisition for the entire drain batch.
                 self.lock.lock();
+                self.reserveAdditionalLocked(drained) catch {};
                 for (q.scratch.items) |item| {
                     const vec_f32 = distance.bytesToF32(item.vector) orelse {
                         std.log.warn("async hnsw: invalid vector bytes for key '{s}'", .{item.key});
                         continue;
                     };
                     _ = self.insertLocked(item.key, vec_f32, item.timestamp) catch |e| {
+                        self.complete_with_store = false;
                         std.log.warn("async hnsw: insert '{s}' failed: {s}", .{ item.key, @errorName(e) });
                     };
                 }
@@ -399,11 +863,25 @@ pub const NamespaceIndex = struct {
         vector: []align(1) const f32,
         timestamp: u64,
     ) !u32 {
+        return self.insertLockedWithBq(key, vector, timestamp, null);
+    }
+
+    /// Like `insertLocked`, optionally accepting the already-encoded BQ or
+    /// RaBitQ payload so bulk/single insert paths never quantize twice.
+    /// Maintains the contiguous BQ or RaBitQ FastScan32 slab in lockstep.
+    pub fn insertLockedWithBq(
+        self: *NamespaceIndex,
+        key: []const u8,
+        vector: []align(1) const f32,
+        timestamp: u64,
+        pre_encoded_bq: ?[]const u8,
+    ) !u32 {
         if (self.dim) |d| {
             if (vector.len != d) return RegistryError.DimensionMismatch;
         }
 
         const incoming_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(vector));
+        var old_live_id: ?u32 = null;
         if (self.key_to_node.get(key)) |old_id| {
             if (!self.tombstones.isSet(old_id)) {
                 if (timestamp < self.timestamps.items[old_id]) {
@@ -420,40 +898,211 @@ pub const NamespaceIndex = struct {
                     self.timestamps.items[old_id] = timestamp;
                     return old_id;
                 }
-                self.tombstones.set(old_id);
-                self.tombstone_count += 1;
+                old_live_id = old_id;
             }
         }
 
+        // Reserve all side-table capacity BEFORE mutating HNSW or tombstones so
+        // an OOM leaves the index completely consistent.
+        const next_len = self.hnsw.len() + 1;
         const key_copy = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(key_copy);
 
+        try self.keys.ensureUnusedCapacity(self.allocator, 1);
+        try self.timestamps.ensureUnusedCapacity(self.allocator, 1);
+        try self.vec_hashes.ensureUnusedCapacity(self.allocator, 1);
+        try self.key_to_node.ensureUnusedCapacity(self.allocator, 1);
+        try self.tombstones.resize(self.allocator, next_len, false);
+
+        // Pre-prepare slab slot capacity so slab append cannot fail after HNSW insert.
+        const want_rq = blk: {
+            if (self.rabitq_params) |p| {
+                if (self.rq_slab.synced and p.dim == vector.len and self.rq_slab.len == self.hnsw.len()) {
+                    if (self.rq_slab.dim == 0) self.rq_slab.configure(self.allocator, vector.len);
+                    try self.rq_slab.ensureCapacity(self.allocator, next_len, false);
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        };
+        const want_bq = blk: {
+            if (self.rabitq_params == null and self.bq_slab.synced and self.bq_slab.len == self.hnsw.len()) {
+                if (self.bq_slab.dim == 0) self.bq_slab.configure(self.allocator, vector.len);
+                try self.bq_slab.ensureCapacity(self.allocator, next_len, false);
+                break :blk true;
+            }
+            break :blk false;
+        };
+
+        // Pre-encode RaBitQ into a stack/temp buffer if needed before mutating HNSW,
+        // so any fallback heap alloc for dim > STACK_DIM_CAP fails cleanly before commit.
+        var rq_code_stack: [256]u8 = undefined;
+        var rq_code_heap: ?[]u8 = null;
+        defer if (rq_code_heap) |b| self.allocator.free(b);
+        var rq_parsed: ?rabitq_mod.Encoded = null;
+
+        if (want_rq) {
+            if (pre_encoded_bq) |pb| {
+                if (rabitq_mod.parse(pb, vector.len)) |enc| {
+                    rq_parsed = enc;
+                }
+            }
+            if (rq_parsed == null) {
+                const p = self.rabitq_params.?;
+                const cb = rabitq_mod.codeBytes(vector.len);
+                const code_dst: []u8 = if (cb <= rq_code_stack.len)
+                    rq_code_stack[0..cb]
+                else blk: {
+                    const b = try self.allocator.alloc(u8, cb);
+                    rq_code_heap = b;
+                    break :blk b;
+                };
+                rq_parsed = try self.encodeRabitqCoreLocked(self.allocator, p, vector, code_dst);
+            }
+        }
+
         const node_id = try self.hnsw.insert(vector);
-        // hnsw.insert succeeded — freeze dim on the first successful insert.
+        // hnsw.insert succeeded — commit infallibly.
+        if (old_live_id) |old_id| {
+            self.tombstones.set(old_id);
+            self.tombstone_count += 1;
+        }
         if (self.dim == null) self.dim = vector.len;
 
-        // hnsw.insert already succeeded — ensure side-tables stay in lockstep.
-        try self.keys.append(self.allocator, key_copy);
-        errdefer {
-            _ = self.keys.pop();
-        }
-        try self.timestamps.append(self.allocator, timestamp);
-        errdefer {
-            _ = self.timestamps.pop();
-        }
-        try self.vec_hashes.append(self.allocator, incoming_hash);
-        errdefer {
-            _ = self.vec_hashes.pop();
+        self.keys.appendAssumeCapacity(key_copy);
+        self.timestamps.appendAssumeCapacity(timestamp);
+        self.vec_hashes.appendAssumeCapacity(incoming_hash);
+        self.key_to_node.putAssumeCapacity(key_copy, node_id);
+
+        if (want_rq) {
+            const enc = rq_parsed.?;
+            self.rq_slab.setSlot(node_id, enc.code, enc.l2_norm, enc.corr);
+            self.rq_slab.len = next_len;
+            if (next_len % 32 == 0) {
+                const blk_idx = (next_len / 32) - 1;
+                self.rq_slab.packBlock(blk_idx);
+                self.rq_slab.packed_blocks = blk_idx + 1;
+            }
+        } else if (self.rabitq_params != null) {
+            self.rq_slab.synced = false;
         }
 
-        // Grow tombstones bitset to cover the new node. resize with `false`
-        // ensures the new slot is active (not-tombstoned) by default.
-        try self.tombstones.resize(self.allocator, self.hnsw.len(), false);
-
-        // Reverse map uses the just-duped key slice — borrow, don't re-dupe.
-        try self.key_to_node.put(self.allocator, key_copy, node_id);
+        if (want_bq) {
+            const cb = self.bq_slab.code_bytes;
+            if (pre_encoded_bq) |pb| {
+                if (pb.len == cb) {
+                    self.bq_slab.setSlot(node_id, pb);
+                } else {
+                    const dst = self.bq_slab.codes[node_id * self.bq_slab.code_stride ..][0..self.bq_slab.code_stride];
+                    distance.binaryQuantize(vector, dst[0..cb]);
+                    if (self.bq_slab.code_stride > cb) @memset(dst[cb..self.bq_slab.code_stride], 0);
+                }
+            } else {
+                const dst = self.bq_slab.codes[node_id * self.bq_slab.code_stride ..][0..self.bq_slab.code_stride];
+                distance.binaryQuantize(vector, dst[0..cb]);
+                if (self.bq_slab.code_stride > cb) @memset(dst[cb..self.bq_slab.code_stride], 0);
+            }
+            self.bq_slab.len = next_len;
+        } else if (self.rabitq_params == null) {
+            self.bq_slab.synced = false;
+        }
 
         return node_id;
+    }
+
+    fn encodeRabitqCoreLocked(
+        self: *const NamespaceIndex,
+        allocator: std.mem.Allocator,
+        p: *const RabitqParams,
+        vec_f32: []align(1) const f32,
+        code_slice: []u8,
+    ) !rabitq_mod.Encoded {
+        const dim = vec_f32.len;
+        var res_stack: [STACK_DIM_CAP]f32 = undefined;
+        var rot_stack: [STACK_DIM_CAP]f32 = undefined;
+        var norm_stack: [STACK_DIM_CAP]f32 = undefined;
+
+        var res_heap: ?[]f32 = null;
+        defer if (res_heap) |b| allocator.free(b);
+        var rot_heap: ?[]f32 = null;
+        defer if (rot_heap) |b| allocator.free(b);
+        var norm_heap: ?[]f32 = null;
+        defer if (norm_heap) |b| allocator.free(b);
+
+        const residual: []f32 = if (dim <= STACK_DIM_CAP)
+            res_stack[0..dim]
+        else blk: {
+            const b = try allocator.alloc(f32, dim);
+            res_heap = b;
+            break :blk b;
+        };
+        const rotated: []f32 = if (dim <= STACK_DIM_CAP)
+            rot_stack[0..dim]
+        else blk: {
+            const b = try allocator.alloc(f32, dim);
+            rot_heap = b;
+            break :blk b;
+        };
+
+        const encode_input: []align(1) const f32 = if (self.metric == .cosine) blk: {
+            const norm_buf: []f32 = if (dim <= STACK_DIM_CAP)
+                norm_stack[0..dim]
+            else blk2: {
+                const b = allocator.alloc(f32, dim) catch break :blk vec_f32;
+                norm_heap = b;
+                break :blk2 b;
+            };
+            if (!rabitq_mod.normalizeInto(vec_f32, norm_buf)) {
+                break :blk vec_f32;
+            }
+            break :blk @ptrCast(norm_buf);
+        } else vec_f32;
+
+        return rabitq_mod.encode(encode_input, p, residual, rotated, code_slice);
+    }
+
+    /// Encode `vec_f32` into its BQ companion format into caller-supplied
+    /// `stack_buf` when large enough, otherwise allocates with `allocator`.
+    /// Sets `heap_out.*` when a heap allocation occurred (caller must free).
+    /// Caller must hold `self.lock` (shared or exclusive).
+    pub fn encodeBqIntoLocked(
+        self: *const NamespaceIndex,
+        allocator: std.mem.Allocator,
+        vec_f32: []align(1) const f32,
+        stack_buf: []u8,
+        heap_out: *?[]u8,
+    ) ![]u8 {
+        heap_out.* = null;
+        if (self.rabitq_params) |p| {
+            if (p.dim == vec_f32.len) {
+                const needed = rabitq_mod.encodedSize(vec_f32.len);
+                const out: []u8 = if (needed <= stack_buf.len)
+                    stack_buf[0..needed]
+                else blk: {
+                    const b = try allocator.alloc(u8, needed);
+                    heap_out.* = b;
+                    break :blk b;
+                };
+                errdefer if (heap_out.*) |b| {
+                    allocator.free(b);
+                    heap_out.* = null;
+                };
+                const code_slice = out[0..rabitq_mod.codeBytes(vec_f32.len)];
+                const enc = try self.encodeRabitqCoreLocked(allocator, p, vec_f32, code_slice);
+                rabitq_mod.serialize(enc, out);
+                return out;
+            }
+        }
+        const needed = distance.binaryQuantizedSize(vec_f32.len);
+        const out: []u8 = if (needed <= stack_buf.len)
+            stack_buf[0..needed]
+        else blk: {
+            const b = try allocator.alloc(u8, needed);
+            heap_out.* = b;
+            break :blk b;
+        };
+        distance.binaryQuantize(vec_f32, out);
+        return out;
     }
 
     /// Encode `vec_f32` into its BQ companion format (RaBitQ 24B/128-dim when
@@ -464,29 +1113,12 @@ pub const NamespaceIndex = struct {
         allocator: std.mem.Allocator,
         vec_f32: []align(1) const f32,
     ) ![]u8 {
-        const distance = @import("distance.zig");
         if (self.rabitq_params) |p| {
             if (p.dim == vec_f32.len) {
                 const out = try allocator.alloc(u8, rabitq_mod.encodedSize(vec_f32.len));
                 errdefer allocator.free(out);
-
-                const residual = try allocator.alloc(f32, vec_f32.len);
-                defer allocator.free(residual);
-                const rotated = try allocator.alloc(f32, vec_f32.len);
-                defer allocator.free(rotated);
-
-                const encode_input: []align(1) const f32 = if (self.metric == .cosine) blk: {
-                    const norm_buf = allocator.alloc(f32, vec_f32.len) catch break :blk vec_f32;
-                    if (!rabitq_mod.normalizeInto(vec_f32, norm_buf)) {
-                        allocator.free(norm_buf);
-                        break :blk vec_f32;
-                    }
-                    break :blk @ptrCast(norm_buf);
-                } else vec_f32;
-                defer if (encode_input.ptr != vec_f32.ptr) allocator.free(@constCast(encode_input));
-
                 const code_slice = out[0..rabitq_mod.codeBytes(vec_f32.len)];
-                const enc = rabitq_mod.encode(encode_input, p, residual, rotated, code_slice);
+                const enc = try self.encodeRabitqCoreLocked(allocator, p, vec_f32, code_slice);
                 rabitq_mod.serialize(enc, out);
                 return out;
             }
@@ -549,10 +1181,24 @@ pub const NamespaceIndex = struct {
         out: []IndexSearchResult,
         hnsw_scratch: []hnsw_mod.SearchResult,
     ) !usize {
+        return self.searchLockedWithExclude(query, k, ef, null, out, hnsw_scratch);
+    }
+
+    /// Like `searchLocked`, additionally excluding `exclude_id` (e.g. `query_key`'s
+    /// own node ID) inside HNSW L0 traversal without oversampling `top_k`.
+    pub fn searchLockedWithExclude(
+        self: *NamespaceIndex,
+        query: []align(1) const f32,
+        k: usize,
+        ef: usize,
+        exclude_id: ?u32,
+        out: []IndexSearchResult,
+        hnsw_scratch: []hnsw_mod.SearchResult,
+    ) !usize {
         if (hnsw_scratch.len < k) return error.ScratchTooSmall;
         const filter: ?*const std.bit_set.Dynamic =
             if (self.tombstone_count > 0) &self.tombstones else null;
-        const n = try self.hnsw.search(query, k, ef, hnsw_scratch[0..k], filter);
+        const n = try self.hnsw.searchWithSkipAndExclude(query, k, ef, hnsw_scratch[0..k], filter, exclude_id);
         for (0..n) |i| {
             const r = hnsw_scratch[i];
             out[i] = .{
@@ -562,6 +1208,1079 @@ pub const NamespaceIndex = struct {
             };
         }
         return n;
+    }
+
+    // ╔═══════════════════════════════════════════════════╗
+    // ║  In-Index Contiguous Slab Scans (BQ/RaBitQ/Exact)  ║
+    // ╚═══════════════════════════════════════════════════╝
+
+    /// True when the dense legacy BQ slab can serve `query_dim` under `lockShared`.
+    pub fn canUseBqSlabLocked(self: *const NamespaceIndex, query_dim: usize) bool {
+        return self.rabitq_params == null and
+            self.pendingAsyncCount() == 0 and
+            self.bq_slab.synced and
+            self.bq_slab.len == self.hnsw.len() and
+            self.bq_slab.len > 0 and
+            self.liveCount() > 0 and
+            self.dim != null and
+            self.dim.? == query_dim;
+    }
+
+    /// True when the dense RaBitQ FastScan32/SoA slab can serve `query_dim` under `lockShared`.
+    pub fn canUseRabitqSlabLocked(self: *const NamespaceIndex, query_dim: usize) bool {
+        const p = self.rabitq_params orelse return false;
+        return self.pendingAsyncCount() == 0 and
+            self.rq_slab.synced and
+            self.rq_slab.len == self.hnsw.len() and
+            self.rq_slab.len > 0 and
+            self.liveCount() > 0 and
+            p.dim == query_dim and
+            self.dim != null and
+            self.dim.? == query_dim;
+    }
+
+    /// True when the HNSW contiguous f32 vector slab can serve exact brute-force
+    /// scans for `(query_dim, query_metric)` with 100% mathematical fidelity.
+    pub fn canUseExactSlabLocked(self: *const NamespaceIndex, query_dim: usize, query_metric: Metric) bool {
+        if (!self.complete_with_store) return false;
+        if (self.pendingAsyncCount() != 0) return false;
+        if (self.liveCount() == 0 or self.hnsw.vecStride() == 0) return false;
+        if (self.dim == null or self.dim.? != query_dim) return false;
+        if (self.hnsw.storesUnitVectors() and query_metric != .cosine) return false;
+        return true;
+    }
+
+    /// True when `self.hnsw`'s stored vectors match the exact vector space of `query_metric`
+    /// (false only when `.cosine` unit-normalized storage is queried with `.l2`/`.dot`).
+    pub inline fn canRerankFromHnswLocked(self: *const NamespaceIndex, query_metric: Metric) bool {
+        return query_metric == self.metric or !self.hnsw.storesUnitVectors();
+    }
+
+    /// Prepare a 64B-aligned, zero-padded query buffer matching `self.hnsw.vecStride()`.
+    fn prepareAlignedQuery(
+        self: *const NamespaceIndex,
+        query: []align(1) const f32,
+        query_metric: Metric,
+        dst: []align(64) f32,
+    ) f32 {
+        const dim = query.len;
+        const stride = self.hnsw.vecStride();
+        if (query_metric == .cosine and self.hnsw.storesUnitVectors()) {
+            const norm = distance.normalizeInto(query, dst[0..dim]);
+            if (stride > dim) @memset(dst[dim..stride], 0.0);
+            return norm;
+        }
+        @memcpy(dst[0..dim], query);
+        if (stride > dim) @memset(dst[dim..stride], 0.0);
+        if (query_metric == .cosine) {
+            const qn = distance.l2Norm(query);
+            if (qn > 0.0) {
+                const inv = 1.0 / qn;
+                return if (std.math.isFinite(inv)) inv else 0.0;
+            }
+            return 0.0;
+        }
+        return 1.0;
+    }
+
+    /// Rescore a slice of candidate node IDs directly against `self.hnsw`'s flat
+    /// 64B-aligned vector slab using 4-way batched SIMD. Zero shard locks, zero `getCopy`.
+    fn rescoreIdsLocked(
+        self: *const NamespaceIndex,
+        query: []align(1) const f32,
+        cand_ids: []const u32,
+        top_k: usize,
+        query_metric: Metric,
+        decay: f32,
+        now_ms: u64,
+        decay_tau_hours: f32,
+        out: []IndexScoredResult,
+        scratch_alloc: std.mem.Allocator,
+    ) !usize {
+        const n_cands = cand_ids.len;
+        const k = @min(top_k, out.len);
+        if (n_cands == 0 or k == 0) return 0;
+
+        const stride = self.hnsw.vecStride();
+        var q_stack: [STACK_SLAB_QUERY_CAP]f32 align(64) = undefined;
+        var q_heap: ?[]align(64) f32 = null;
+        defer if (q_heap) |b| scratch_alloc.free(b);
+        const q_buf: []align(64) f32 = if (stride <= STACK_SLAB_QUERY_CAP)
+            q_stack[0..stride]
+        else blk: {
+            const b = try scratch_alloc.alignedAlloc(f32, .@"64", stride);
+            q_heap = b;
+            break :blk b;
+        };
+        const q_aux = self.prepareAlignedQuery(query, query_metric, q_buf);
+        const q_ptr: [*]align(32) const f32 = q_buf.ptr;
+        const unit_cos = (query_metric == .cosine and self.hnsw.storesUnitVectors());
+
+        var heap_stack: [128]IdScore = undefined;
+        var heap_alloc: ?[]IdScore = null;
+        defer if (heap_alloc) |b| scratch_alloc.free(b);
+        const heap_buf: []IdScore = if (k <= heap_stack.len)
+            heap_stack[0..k]
+        else blk: {
+            const b = try scratch_alloc.alloc(IdScore, k);
+            heap_alloc = b;
+            break :blk b;
+        };
+        var topk = IdScoreTopK.init(heap_buf);
+        var thresh = topk.thresholdScore();
+
+        var i: usize = 0;
+        while (i + 4 <= n_cands) : (i += 4) {
+            if (i + 8 <= n_cands) {
+                inline for (0..4) |pf| {
+                    @prefetch(self.hnsw.vecPtr(cand_ids[i + 4 + pf]), .{ .locality = 3 });
+                }
+            }
+            const id0 = cand_ids[i];
+            const id1 = cand_ids[i + 1];
+            const id2 = cand_ids[i + 2];
+            const id3 = cand_ids[i + 3];
+            const raw_sims: [4]f32 = switch (query_metric) {
+                .cosine => if (unit_cos) blk: {
+                    if (!(q_aux > 0.0)) break :blk .{ 0.0, 0.0, 0.0, 0.0 };
+                    const ds = distance.dotBatch4Aligned(q_ptr, .{
+                        self.hnsw.vecPtr(id0),
+                        self.hnsw.vecPtr(id1),
+                        self.hnsw.vecPtr(id2),
+                        self.hnsw.vecPtr(id3),
+                    }, stride);
+                    break :blk .{
+                        @max(@as(f32, -1.0), @min(@as(f32, 1.0), ds[0])),
+                        @max(@as(f32, -1.0), @min(@as(f32, 1.0), ds[1])),
+                        @max(@as(f32, -1.0), @min(@as(f32, 1.0), ds[2])),
+                        @max(@as(f32, -1.0), @min(@as(f32, 1.0), ds[3])),
+                    };
+                } else distance.cosineWithQueryNormBatch4(query, q_aux, .{
+                    self.hnsw.getVector(id0),
+                    self.hnsw.getVector(id1),
+                    self.hnsw.getVector(id2),
+                    self.hnsw.getVector(id3),
+                }),
+                .dot => distance.dotBatch4Aligned(q_ptr, .{
+                    self.hnsw.vecPtr(id0),
+                    self.hnsw.vecPtr(id1),
+                    self.hnsw.vecPtr(id2),
+                    self.hnsw.vecPtr(id3),
+                }, stride),
+                .l2 => blk: {
+                    const ds = distance.l2SquaredBatch4Aligned(q_ptr, .{
+                        self.hnsw.vecPtr(id0),
+                        self.hnsw.vecPtr(id1),
+                        self.hnsw.vecPtr(id2),
+                        self.hnsw.vecPtr(id3),
+                    }, stride);
+                    break :blk .{
+                        1.0 / (1.0 + ds[0]),
+                        1.0 / (1.0 + ds[1]),
+                        1.0 / (1.0 + ds[2]),
+                        1.0 / (1.0 + ds[3]),
+                    };
+                },
+            };
+            const ids4 = [4]u32{ id0, id1, id2, id3 };
+            inline for (0..4) |lane| {
+                const cid = ids4[lane];
+                const score = applyDecayIndex(raw_sims[lane], self.timestamps.items[cid], decay, now_ms, decay_tau_hours);
+                if (score > thresh) {
+                    topk.push(.{ .id = cid, .score = score });
+                    thresh = topk.thresholdScore();
+                }
+            }
+        }
+        while (i < n_cands) : (i += 1) {
+            const cid = cand_ids[i];
+            const raw_sim: f32 = switch (query_metric) {
+                .cosine => if (unit_cos) blk: {
+                    if (!(q_aux > 0.0)) break :blk 0.0;
+                    const d = distance.dotAligned(q_ptr, self.hnsw.vecPtr(cid), stride);
+                    break :blk @max(@as(f32, -1.0), @min(@as(f32, 1.0), d));
+                } else distance.cosineWithQueryNorm(query, q_aux, self.hnsw.getVector(cid)),
+                .dot => distance.dotAligned(q_ptr, self.hnsw.vecPtr(cid), stride),
+                .l2 => 1.0 / (1.0 + distance.l2SquaredAligned(q_ptr, self.hnsw.vecPtr(cid), stride)),
+            };
+            const score = applyDecayIndex(raw_sim, self.timestamps.items[cid], decay, now_ms, decay_tau_hours);
+            if (score > thresh) {
+                topk.push(.{ .id = cid, .score = score });
+                thresh = topk.thresholdScore();
+            }
+        }
+
+        const winners = topk.sortedDesc();
+        for (winners, 0..) |w, idx| {
+            out[idx] = .{
+                .key = self.keys.items[w.id],
+                .score = w.score,
+                .timestamp = self.timestamps.items[w.id],
+            };
+        }
+        return winners.len;
+    }
+
+    /// Scan the dense legacy 1-bit BQ slab with 4-way batched Hamming and optional
+    /// zero-copy Stage-2 rerank directly against the HNSW vector slab.
+    /// Caller holds `self.lockShared()`. Returns `null` if the slab is not usable.
+    pub fn searchBqLocked(
+        self: *const NamespaceIndex,
+        query: []align(1) const f32,
+        exclude_id: ?u32,
+        top_k: usize,
+        oversample: usize,
+        query_metric: Metric,
+        decay: f32,
+        now_ms: u64,
+        decay_tau_hours: f32,
+        rerank: bool,
+        out: []IndexScoredResult,
+        scratch_alloc: std.mem.Allocator,
+    ) !?SlabSearchResult {
+        if (!self.canUseBqSlabLocked(query.len)) return null;
+        if (top_k == 0 or out.len == 0) return .{ .count = 0, .needs_kv_rerank = false };
+
+        const slab = &self.bq_slab;
+        const n = slab.len;
+        const cb = slab.code_bytes;
+        const stride = slab.code_stride;
+        const stage1_k = @min(self.liveCount(), if (rerank) top_k * oversample else top_k);
+        if (stage1_k == 0) return .{ .count = 0, .needs_kv_rerank = false };
+
+        var q_bq_stack: [256]u8 align(64) = undefined;
+        var q_bq_heap: ?[]u8 = null;
+        defer if (q_bq_heap) |b| scratch_alloc.free(b);
+        const q_bq: []u8 = if (stride <= q_bq_stack.len)
+            q_bq_stack[0..stride]
+        else blk: {
+            const b = try scratch_alloc.alloc(u8, stride);
+            q_bq_heap = b;
+            break :blk b;
+        };
+        distance.binaryQuantize(query, q_bq[0..cb]);
+        if (stride > cb) @memset(q_bq[cb..stride], 0);
+
+        const total_bits: f32 = @floatFromInt(cb * 8);
+        const inv_total_bits: f32 = 1.0 / total_bits;
+        const has_tomb = self.tombstone_count > 0;
+        const has_filter = has_tomb or exclude_id != null;
+        const ex_val: u32 = exclude_id orelse std.math.maxInt(u32);
+
+        // Stage 1: gather top `stage1_k` node IDs (zero string dupes).
+        var cand_ids_stack: [256]u32 = undefined;
+        var cand_ids_heap: ?[]u32 = null;
+        defer if (cand_ids_heap) |b| scratch_alloc.free(b);
+        const cand_ids_buf: []u32 = if (stage1_k <= cand_ids_stack.len)
+            cand_ids_stack[0..stage1_k]
+        else blk: {
+            const b = try scratch_alloc.alloc(u32, stage1_k);
+            cand_ids_heap = b;
+            break :blk b;
+        };
+        var n_stage1: usize = 0;
+
+        if (decay <= 0.0) {
+            var h_stack: [256]IdDist = undefined;
+            var h_heap: ?[]IdDist = null;
+            defer if (h_heap) |b| scratch_alloc.free(b);
+            const h_buf: []IdDist = if (stage1_k <= h_stack.len)
+                h_stack[0..stage1_k]
+            else blk: {
+                const b = try scratch_alloc.alloc(IdDist, stage1_k);
+                h_heap = b;
+                break :blk b;
+            };
+            var heap = IdDistHeap.init(h_buf);
+            var worst_ham: u32 = std.math.maxInt(u32);
+
+            var i: usize = 0;
+            while (i + 4 <= n) : (i += 4) {
+                if (i + 16 < n) {
+                    @prefetch(slab.codes.ptr + (i + 16) * stride, .{ .locality = 3 });
+                }
+                const hs = distance.hammingBatch4(q_bq, .{
+                    slab.codeAt(i),
+                    slab.codeAt(i + 1),
+                    slab.codeAt(i + 2),
+                    slab.codeAt(i + 3),
+                });
+                inline for (0..4) |lane| {
+                    const h = hs[lane];
+                    if (h < worst_ham) {
+                        const nid: u32 = @intCast(i + lane);
+                        if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
+                            heap.pushOrReplace(.{ .id = nid, .dist = @floatFromInt(h) });
+                            if (heap.isFull()) {
+                                worst_ham = @intFromFloat(heap.worstDist());
+                            }
+                        }
+                    }
+                }
+            }
+            while (i < n) : (i += 1) {
+                const h = distance.hamming(q_bq, slab.codeAt(i));
+                if (h < worst_ham) {
+                    const nid: u32 = @intCast(i);
+                    if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
+                        heap.pushOrReplace(.{ .id = nid, .dist = @floatFromInt(h) });
+                        if (heap.isFull()) {
+                            worst_ham = @intFromFloat(heap.worstDist());
+                        }
+                    }
+                }
+            }
+
+            if (!rerank) {
+                const sorted = heap.sortedAsc();
+                const emit_n = @min(sorted.len, @min(top_k, out.len));
+                for (0..emit_n) |idx| {
+                    const r = sorted[idx];
+                    out[idx] = .{
+                        .key = self.keys.items[r.id],
+                        .score = 1.0 - r.dist * inv_total_bits,
+                        .timestamp = self.timestamps.items[r.id],
+                    };
+                }
+                return .{ .count = emit_n, .needs_kv_rerank = false };
+            }
+
+            const items = heap.items();
+            n_stage1 = items.len;
+            for (items, 0..) |item, idx| cand_ids_buf[idx] = item.id;
+        } else {
+            var h_stack: [256]IdScore = undefined;
+            var h_heap: ?[]IdScore = null;
+            defer if (h_heap) |b| scratch_alloc.free(b);
+            const h_buf: []IdScore = if (stage1_k <= h_stack.len)
+                h_stack[0..stage1_k]
+            else blk: {
+                const b = try scratch_alloc.alloc(IdScore, stage1_k);
+                h_heap = b;
+                break :blk b;
+            };
+            var heap = IdScoreTopK.init(h_buf);
+            var thresh = heap.thresholdScore();
+
+            var i: usize = 0;
+            while (i + 4 <= n) : (i += 4) {
+                if (i + 16 < n) {
+                    @prefetch(slab.codes.ptr + (i + 16) * stride, .{ .locality = 3 });
+                }
+                const hs = distance.hammingBatch4(q_bq, .{
+                    slab.codeAt(i),
+                    slab.codeAt(i + 1),
+                    slab.codeAt(i + 2),
+                    slab.codeAt(i + 3),
+                });
+                inline for (0..4) |lane| {
+                    const nid: u32 = @intCast(i + lane);
+                    if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
+                        const sim = 1.0 - @as(f32, @floatFromInt(hs[lane])) * inv_total_bits;
+                        const score = applyDecayIndex(sim, self.timestamps.items[nid], decay, now_ms, decay_tau_hours);
+                        if (score > thresh) {
+                            heap.push(.{ .id = nid, .score = score });
+                            thresh = heap.thresholdScore();
+                        }
+                    }
+                }
+            }
+            while (i < n) : (i += 1) {
+                const nid: u32 = @intCast(i);
+                if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
+                    const h = distance.hamming(q_bq, slab.codeAt(i));
+                    const sim = 1.0 - @as(f32, @floatFromInt(h)) * inv_total_bits;
+                    const score = applyDecayIndex(sim, self.timestamps.items[nid], decay, now_ms, decay_tau_hours);
+                    if (score > thresh) {
+                        heap.push(.{ .id = nid, .score = score });
+                        thresh = heap.thresholdScore();
+                    }
+                }
+            }
+
+            if (!rerank) {
+                const sorted = heap.sortedDesc();
+                const emit_n = @min(sorted.len, @min(top_k, out.len));
+                for (0..emit_n) |idx| {
+                    const r = sorted[idx];
+                    out[idx] = .{
+                        .key = self.keys.items[r.id],
+                        .score = r.score,
+                        .timestamp = self.timestamps.items[r.id],
+                    };
+                }
+                return .{ .count = emit_n, .needs_kv_rerank = false };
+            }
+
+            n_stage1 = heap.len();
+            for (heap.buf[0..n_stage1], 0..) |item, idx| cand_ids_buf[idx] = item.id;
+        }
+
+        // Stage 2: rerank directly from HNSW slab when metric-compatible; otherwise
+        // return Stage-1 candidates so caller reranks from KV after releasing `self.lock`.
+        if (self.canRerankFromHnswLocked(query_metric)) {
+            const count = try self.rescoreIdsLocked(
+                query,
+                cand_ids_buf[0..n_stage1],
+                top_k,
+                query_metric,
+                decay,
+                now_ms,
+                decay_tau_hours,
+                out,
+                scratch_alloc,
+            );
+            return .{ .count = count, .needs_kv_rerank = false };
+        }
+
+        const emit_n = @min(n_stage1, out.len);
+        for (0..emit_n) |idx| {
+            const cid = cand_ids_buf[idx];
+            out[idx] = .{
+                .key = self.keys.items[cid],
+                .score = 0.0,
+                .timestamp = self.timestamps.items[cid],
+            };
+        }
+        return .{ .count = emit_n, .needs_kv_rerank = true };
+    }
+
+    /// Scan the dense RaBitQ FastScan32 + SoA slab with optional zero-copy Stage-2
+    /// rerank directly against the HNSW vector slab.
+    /// Caller holds `self.lockShared()`. Returns `null` if the slab is not usable.
+    pub fn searchRabitqLocked(
+        self: *const NamespaceIndex,
+        query: []align(1) const f32,
+        exclude_id: ?u32,
+        top_k: usize,
+        oversample: usize,
+        query_metric: Metric,
+        decay: f32,
+        now_ms: u64,
+        decay_tau_hours: f32,
+        rerank: bool,
+        out: []IndexScoredResult,
+        scratch_alloc: std.mem.Allocator,
+    ) !?SlabSearchResult {
+        if (!self.canUseRabitqSlabLocked(query.len)) return null;
+        if (top_k == 0 or out.len == 0) return .{ .count = 0, .needs_kv_rerank = false };
+
+        const p = self.rabitq_params.?;
+        const slab = &self.rq_slab;
+        const dim = query.len;
+        const n = slab.len;
+        const stage1_k = @min(self.liveCount(), if (rerank) top_k * oversample else top_k);
+        if (stage1_k == 0) return .{ .count = 0, .needs_kv_rerank = false };
+
+        // Stack-first query preparation (zero heap alloc for dim <= 2048).
+        var q_res_stack: [STACK_SLAB_QUERY_CAP]f32 = undefined;
+        var q_rot_stack: [STACK_SLAB_QUERY_CAP]f32 = undefined;
+        var q_norm_stack: [STACK_SLAB_QUERY_CAP]f32 = undefined;
+        var q_res_heap: ?[]f32 = null;
+        defer if (q_res_heap) |b| scratch_alloc.free(b);
+        var q_rot_heap: ?[]f32 = null;
+        defer if (q_rot_heap) |b| scratch_alloc.free(b);
+        var q_norm_heap: ?[]f32 = null;
+        defer if (q_norm_heap) |b| scratch_alloc.free(b);
+
+        const q_residual: []f32 = if (dim <= STACK_SLAB_QUERY_CAP) q_res_stack[0..dim] else blk: {
+            const b = try scratch_alloc.alloc(f32, dim);
+            q_res_heap = b;
+            break :blk b;
+        };
+        const q_rot_unit: []f32 = if (dim <= STACK_SLAB_QUERY_CAP) q_rot_stack[0..dim] else blk: {
+            const b = try scratch_alloc.alloc(f32, dim);
+            q_rot_heap = b;
+            break :blk b;
+        };
+        const cosine_score = (query_metric == .cosine);
+        const prepare_input: []align(1) const f32 = if (cosine_score) blk: {
+            const nb: []f32 = if (dim <= STACK_SLAB_QUERY_CAP) q_norm_stack[0..dim] else blk2: {
+                const b = try scratch_alloc.alloc(f32, dim);
+                q_norm_heap = b;
+                break :blk2 b;
+            };
+            _ = rabitq_mod.normalizeInto(query, nb);
+            break :blk @ptrCast(nb);
+        } else query;
+
+        const q_l2 = rabitq_mod.prepareQuery(prepare_input, p, q_residual, q_rot_unit);
+        const q_l2_sq = q_l2 * q_l2;
+
+        // Build FastScan32 LUT only if we have >= 1 full 32-vector block.
+        const n_blocks = slab.packed_blocks;
+        const n_groups = rabitq_mod.fastScanGroups(dim);
+        var lut_stack: [STACK_LUT_GROUPS][16]u8 = undefined;
+        var lut_heap: ?[][16]u8 = null;
+        defer if (lut_heap) |b| scratch_alloc.free(b);
+        var lut_slice: [][16]u8 = &.{};
+        var lut_scale: rabitq_mod.FastScanLutScale = .{ .vl = 0.0, .delta = 0.0 };
+        if (n_blocks > 0) {
+            lut_slice = if (n_groups <= STACK_LUT_GROUPS) lut_stack[0..n_groups] else blk: {
+                const b = try scratch_alloc.alloc([16]u8, n_groups);
+                lut_heap = b;
+                break :blk b;
+            };
+            lut_scale = rabitq_mod.buildFastScanLut(q_rot_unit, lut_slice);
+        }
+
+        // Build 4-bit bit-planes only if a partial tail (< 32 vectors) exists.
+        const tail_start = n_blocks * 32;
+        const has_tail = tail_start < n;
+        var plane_stack: [4 * 256]u8 = undefined;
+        var plane_heap: ?[]u8 = null;
+        defer if (plane_heap) |b| scratch_alloc.free(b);
+        var pq: rabitq_mod.PreparedQuery = undefined;
+        if (has_tail) {
+            const plane_bytes = 4 * slab.code_bytes;
+            const pbuf: []u8 = if (plane_bytes <= plane_stack.len) plane_stack[0..plane_bytes] else blk: {
+                const b = try scratch_alloc.alloc(u8, plane_bytes);
+                plane_heap = b;
+                break :blk b;
+            };
+            pq = rabitq_mod.prepareQueryFromRotated(q_rot_unit, q_l2, pbuf);
+        }
+
+        const has_tomb = self.tombstone_count > 0;
+        const has_filter = has_tomb or exclude_id != null;
+        const ex_val: u32 = exclude_id orelse std.math.maxInt(u32);
+
+        var cand_ids_stack: [256]u32 = undefined;
+        var cand_ids_heap: ?[]u32 = null;
+        defer if (cand_ids_heap) |b| scratch_alloc.free(b);
+        const cand_ids_buf: []u32 = if (stage1_k <= cand_ids_stack.len)
+            cand_ids_stack[0..stage1_k]
+        else blk: {
+            const b = try scratch_alloc.alloc(u32, stage1_k);
+            cand_ids_heap = b;
+            break :blk b;
+        };
+        var n_stage1: usize = 0;
+
+        if (decay <= 0.0) {
+            var h_stack: [256]IdDist = undefined;
+            var h_heap: ?[]IdDist = null;
+            defer if (h_heap) |b| scratch_alloc.free(b);
+            const h_buf: []IdDist = if (stage1_k <= h_stack.len)
+                h_stack[0..stage1_k]
+            else blk: {
+                const b = try scratch_alloc.alloc(IdDist, stage1_k);
+                h_heap = b;
+                break :blk b;
+            };
+            var heap = IdDistHeap.init(h_buf);
+            var worst_d2 = heap.worstDist();
+
+            // 1. Full 32-vector FastScan blocks.
+            var d2_buf: [32]f32 = undefined;
+            for (0..n_blocks) |blk_idx| {
+                if (blk_idx + 2 < n_blocks) {
+                    @prefetch(slab.fastscan_blocks.ptr + (blk_idx + 2) * slab.block_bytes, .{ .locality = 3 });
+                    @prefetch(slab.f_add.ptr + (blk_idx + 2) * 32, .{ .locality = 3 });
+                }
+                const base = blk_idx * 32;
+                const packed_slice = slab.fastscan_blocks[blk_idx * slab.block_bytes ..][0..slab.block_bytes];
+                rabitq_mod.estimateFastScanBlock32(
+                    lut_slice,
+                    lut_scale.vl,
+                    lut_scale.delta,
+                    q_l2,
+                    q_l2_sq,
+                    packed_slice,
+                    slab.f_add[base..][0..32],
+                    slab.f_rescale[base..][0..32],
+                    &d2_buf,
+                );
+                inline for (0..32) |lane| {
+                    const d2 = d2_buf[lane];
+                    if (d2 < worst_d2) {
+                        const nid: u32 = @intCast(base + lane);
+                        if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
+                            heap.pushOrReplace(.{ .id = nid, .dist = d2 });
+                            worst_d2 = heap.worstDist();
+                        }
+                    }
+                }
+            }
+
+            // 2. Partial tail (< 32 vectors) via 4-bit AND-Popcount SoA batch4.
+            var i = tail_start;
+            while (i < n) : (i += 4) {
+                const rem = @min(@as(usize, 4), n - i);
+                const k0 = i;
+                const k1 = if (rem > 1) i + 1 else i;
+                const k2 = if (rem > 2) i + 2 else i;
+                const k3 = if (rem > 3) i + 3 else i;
+                const ds = rabitq_mod.estimateL2Sq4BitSlabBatch4(
+                    &pq,
+                    .{ slab.codeAt(k0), slab.codeAt(k1), slab.codeAt(k2), slab.codeAt(k3) },
+                    .{ slab.f_add[k0], slab.f_add[k1], slab.f_add[k2], slab.f_add[k3] },
+                    .{ slab.f_rescale[k0], slab.f_rescale[k1], slab.f_rescale[k2], slab.f_rescale[k3] },
+                    .{ slab.popc[k0], slab.popc[k1], slab.popc[k2], slab.popc[k3] },
+                );
+                for (0..rem) |lane| {
+                    const d2 = ds[lane];
+                    if (d2 < worst_d2) {
+                        const nid: u32 = @intCast(i + lane);
+                        if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
+                            heap.pushOrReplace(.{ .id = nid, .dist = d2 });
+                            worst_d2 = heap.worstDist();
+                        }
+                    }
+                }
+            }
+
+            if (!rerank) {
+                const sorted = heap.sortedAsc();
+                const emit_n = @min(sorted.len, @min(top_k, out.len));
+                for (0..emit_n) |idx| {
+                    const r = sorted[idx];
+                    out[idx] = .{
+                        .key = self.keys.items[r.id],
+                        .score = rabitqD2ToSim(r.dist, cosine_score),
+                        .timestamp = self.timestamps.items[r.id],
+                    };
+                }
+                return .{ .count = emit_n, .needs_kv_rerank = false };
+            }
+
+            const items = heap.items();
+            n_stage1 = items.len;
+            for (items, 0..) |item, idx| cand_ids_buf[idx] = item.id;
+        } else {
+            var h_stack: [256]IdScore = undefined;
+            var h_heap: ?[]IdScore = null;
+            defer if (h_heap) |b| scratch_alloc.free(b);
+            const h_buf: []IdScore = if (stage1_k <= h_stack.len)
+                h_stack[0..stage1_k]
+            else blk: {
+                const b = try scratch_alloc.alloc(IdScore, stage1_k);
+                h_heap = b;
+                break :blk b;
+            };
+            var heap = IdScoreTopK.init(h_buf);
+            var thresh = heap.thresholdScore();
+
+            var d2_buf: [32]f32 = undefined;
+            for (0..n_blocks) |blk_idx| {
+                if (blk_idx + 2 < n_blocks) {
+                    @prefetch(slab.fastscan_blocks.ptr + (blk_idx + 2) * slab.block_bytes, .{ .locality = 3 });
+                }
+                const base = blk_idx * 32;
+                const packed_slice = slab.fastscan_blocks[blk_idx * slab.block_bytes ..][0..slab.block_bytes];
+                rabitq_mod.estimateFastScanBlock32(
+                    lut_slice,
+                    lut_scale.vl,
+                    lut_scale.delta,
+                    q_l2,
+                    q_l2_sq,
+                    packed_slice,
+                    slab.f_add[base..][0..32],
+                    slab.f_rescale[base..][0..32],
+                    &d2_buf,
+                );
+                inline for (0..32) |lane| {
+                    const nid: u32 = @intCast(base + lane);
+                    if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
+                        const raw_sim = rabitqD2ToSim(d2_buf[lane], cosine_score);
+                        const score = applyDecayIndex(raw_sim, self.timestamps.items[nid], decay, now_ms, decay_tau_hours);
+                        if (score > thresh) {
+                            heap.push(.{ .id = nid, .score = score });
+                            thresh = heap.thresholdScore();
+                        }
+                    }
+                }
+            }
+
+            var i = tail_start;
+            while (i < n) : (i += 4) {
+                const rem = @min(@as(usize, 4), n - i);
+                const k0 = i;
+                const k1 = if (rem > 1) i + 1 else i;
+                const k2 = if (rem > 2) i + 2 else i;
+                const k3 = if (rem > 3) i + 3 else i;
+                const ds = rabitq_mod.estimateL2Sq4BitSlabBatch4(
+                    &pq,
+                    .{ slab.codeAt(k0), slab.codeAt(k1), slab.codeAt(k2), slab.codeAt(k3) },
+                    .{ slab.f_add[k0], slab.f_add[k1], slab.f_add[k2], slab.f_add[k3] },
+                    .{ slab.f_rescale[k0], slab.f_rescale[k1], slab.f_rescale[k2], slab.f_rescale[k3] },
+                    .{ slab.popc[k0], slab.popc[k1], slab.popc[k2], slab.popc[k3] },
+                );
+                for (0..rem) |lane| {
+                    const nid: u32 = @intCast(i + lane);
+                    if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
+                        const raw_sim = rabitqD2ToSim(ds[lane], cosine_score);
+                        const score = applyDecayIndex(raw_sim, self.timestamps.items[nid], decay, now_ms, decay_tau_hours);
+                        if (score > thresh) {
+                            heap.push(.{ .id = nid, .score = score });
+                            thresh = heap.thresholdScore();
+                        }
+                    }
+                }
+            }
+
+            if (!rerank) {
+                const sorted = heap.sortedDesc();
+                const emit_n = @min(sorted.len, @min(top_k, out.len));
+                for (0..emit_n) |idx| {
+                    const r = sorted[idx];
+                    out[idx] = .{
+                        .key = self.keys.items[r.id],
+                        .score = r.score,
+                        .timestamp = self.timestamps.items[r.id],
+                    };
+                }
+                return .{ .count = emit_n, .needs_kv_rerank = false };
+            }
+
+            n_stage1 = heap.len();
+            for (heap.buf[0..n_stage1], 0..) |item, idx| cand_ids_buf[idx] = item.id;
+        }
+
+        if (self.canRerankFromHnswLocked(query_metric)) {
+            const count = try self.rescoreIdsLocked(
+                query,
+                cand_ids_buf[0..n_stage1],
+                top_k,
+                query_metric,
+                decay,
+                now_ms,
+                decay_tau_hours,
+                out,
+                scratch_alloc,
+            );
+            return .{ .count = count, .needs_kv_rerank = false };
+        }
+
+        const emit_n = @min(n_stage1, out.len);
+        for (0..emit_n) |idx| {
+            const cid = cand_ids_buf[idx];
+            out[idx] = .{
+                .key = self.keys.items[cid],
+                .score = 0.0,
+                .timestamp = self.timestamps.items[cid],
+            };
+        }
+        return .{ .count = emit_n, .needs_kv_rerank = true };
+    }
+
+    /// Exact brute-force scan over `self.hnsw`'s contiguous 64B-aligned vector slab
+    /// using 4-way batched SIMD. Caller holds `self.lockShared()` and must have
+    /// verified `canUseExactSlabLocked(query.len, query_metric)`.
+    pub fn searchExactLocked(
+        self: *const NamespaceIndex,
+        query: []align(1) const f32,
+        exclude_id: ?u32,
+        top_k: usize,
+        query_metric: Metric,
+        decay: f32,
+        now_ms: u64,
+        decay_tau_hours: f32,
+        out: []IndexScoredResult,
+        scratch_alloc: std.mem.Allocator,
+    ) !usize {
+        const n = self.hnsw.len();
+        const k = @min(top_k, out.len);
+        if (n == 0 or k == 0) return 0;
+
+        const stride = self.hnsw.vecStride();
+        var q_stack: [STACK_SLAB_QUERY_CAP]f32 align(64) = undefined;
+        var q_heap: ?[]align(64) f32 = null;
+        defer if (q_heap) |b| scratch_alloc.free(b);
+        const q_buf: []align(64) f32 = if (stride <= STACK_SLAB_QUERY_CAP)
+            q_stack[0..stride]
+        else blk: {
+            const b = try scratch_alloc.alignedAlloc(f32, .@"64", stride);
+            q_heap = b;
+            break :blk b;
+        };
+        const q_aux = self.prepareAlignedQuery(query, query_metric, q_buf);
+        const q_ptr: [*]align(32) const f32 = q_buf.ptr;
+        const unit_cos = (query_metric == .cosine and self.hnsw.storesUnitVectors());
+        const slab_base = self.hnsw.vectorSlab();
+
+        const has_tomb = self.tombstone_count > 0;
+        const has_filter = has_tomb or exclude_id != null;
+        const ex_val: u32 = exclude_id orelse std.math.maxInt(u32);
+
+        // Fast monotonic L2 path when decay == 0 (avoids division in inner loop).
+        if (query_metric == .l2 and decay <= 0.0) {
+            var h_stack: [128]IdDist = undefined;
+            var h_heap: ?[]IdDist = null;
+            defer if (h_heap) |b| scratch_alloc.free(b);
+            const h_buf: []IdDist = if (k <= h_stack.len)
+                h_stack[0..k]
+            else blk: {
+                const b = try scratch_alloc.alloc(IdDist, k);
+                h_heap = b;
+                break :blk b;
+            };
+            var heap = IdDistHeap.init(h_buf);
+            var worst_d2 = heap.worstDist();
+
+            var i: usize = 0;
+            while (i + 4 <= n) : (i += 4) {
+                if (i + 8 < n) {
+                    @prefetch(slab_base + (i + 8) * stride, .{ .locality = 3 });
+                }
+                const ds = distance.l2SquaredBatch4Aligned(q_ptr, .{
+                    self.hnsw.vecPtr(@intCast(i)),
+                    self.hnsw.vecPtr(@intCast(i + 1)),
+                    self.hnsw.vecPtr(@intCast(i + 2)),
+                    self.hnsw.vecPtr(@intCast(i + 3)),
+                }, stride);
+                inline for (0..4) |lane| {
+                    const d2 = ds[lane];
+                    if (d2 < worst_d2) {
+                        const nid: u32 = @intCast(i + lane);
+                        if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
+                            heap.pushOrReplace(.{ .id = nid, .dist = d2 });
+                            worst_d2 = heap.worstDist();
+                        }
+                    }
+                }
+            }
+            while (i < n) : (i += 1) {
+                const d2 = distance.l2SquaredAligned(q_ptr, self.hnsw.vecPtr(@intCast(i)), stride);
+                if (d2 < worst_d2) {
+                    const nid: u32 = @intCast(i);
+                    if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
+                        heap.pushOrReplace(.{ .id = nid, .dist = d2 });
+                        worst_d2 = heap.worstDist();
+                    }
+                }
+            }
+
+            const sorted = heap.sortedAsc();
+            for (sorted, 0..) |r, idx| {
+                out[idx] = .{
+                    .key = self.keys.items[r.id],
+                    .score = 1.0 / (1.0 + r.dist),
+                    .timestamp = self.timestamps.items[r.id],
+                };
+            }
+            return sorted.len;
+        }
+
+        // General path: cosine (unit dot or precomputed norm), dot, or L2 with decay.
+        var h_stack: [128]IdScore = undefined;
+        var h_heap: ?[]IdScore = null;
+        defer if (h_heap) |b| scratch_alloc.free(b);
+        const h_buf: []IdScore = if (k <= h_stack.len)
+            h_stack[0..k]
+        else blk: {
+            const b = try scratch_alloc.alloc(IdScore, k);
+            h_heap = b;
+            break :blk b;
+        };
+        var topk = IdScoreTopK.init(h_buf);
+        var thresh = topk.thresholdScore();
+
+        var i: usize = 0;
+        while (i + 4 <= n) : (i += 4) {
+            if (i + 8 < n) {
+                @prefetch(slab_base + (i + 8) * stride, .{ .locality = 3 });
+            }
+            const id0: u32 = @intCast(i);
+            const id1: u32 = @intCast(i + 1);
+            const id2: u32 = @intCast(i + 2);
+            const id3: u32 = @intCast(i + 3);
+            const raw_sims: [4]f32 = switch (query_metric) {
+                .cosine => if (unit_cos) blk: {
+                    if (!(q_aux > 0.0)) break :blk .{ 0.0, 0.0, 0.0, 0.0 };
+                    const ds = distance.dotBatch4Aligned(q_ptr, .{
+                        self.hnsw.vecPtr(id0),
+                        self.hnsw.vecPtr(id1),
+                        self.hnsw.vecPtr(id2),
+                        self.hnsw.vecPtr(id3),
+                    }, stride);
+                    break :blk .{
+                        @max(@as(f32, -1.0), @min(@as(f32, 1.0), ds[0])),
+                        @max(@as(f32, -1.0), @min(@as(f32, 1.0), ds[1])),
+                        @max(@as(f32, -1.0), @min(@as(f32, 1.0), ds[2])),
+                        @max(@as(f32, -1.0), @min(@as(f32, 1.0), ds[3])),
+                    };
+                } else distance.cosineWithQueryNormBatch4(query, q_aux, .{
+                    self.hnsw.getVector(id0),
+                    self.hnsw.getVector(id1),
+                    self.hnsw.getVector(id2),
+                    self.hnsw.getVector(id3),
+                }),
+                .dot => distance.dotBatch4Aligned(q_ptr, .{
+                    self.hnsw.vecPtr(id0),
+                    self.hnsw.vecPtr(id1),
+                    self.hnsw.vecPtr(id2),
+                    self.hnsw.vecPtr(id3),
+                }, stride),
+                .l2 => blk: {
+                    const ds = distance.l2SquaredBatch4Aligned(q_ptr, .{
+                        self.hnsw.vecPtr(id0),
+                        self.hnsw.vecPtr(id1),
+                        self.hnsw.vecPtr(id2),
+                        self.hnsw.vecPtr(id3),
+                    }, stride);
+                    break :blk .{
+                        1.0 / (1.0 + ds[0]),
+                        1.0 / (1.0 + ds[1]),
+                        1.0 / (1.0 + ds[2]),
+                        1.0 / (1.0 + ds[3]),
+                    };
+                },
+            };
+            inline for (0..4) |lane| {
+                const nid: u32 = @intCast(i + lane);
+                if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
+                    const score = applyDecayIndex(raw_sims[lane], self.timestamps.items[nid], decay, now_ms, decay_tau_hours);
+                    if (score > thresh) {
+                        topk.push(.{ .id = nid, .score = score });
+                        thresh = topk.thresholdScore();
+                    }
+                }
+            }
+        }
+        while (i < n) : (i += 1) {
+            const nid: u32 = @intCast(i);
+            if (!has_filter or (nid != ex_val and (!has_tomb or !self.tombstones.isSet(nid)))) {
+                const raw_sim: f32 = switch (query_metric) {
+                    .cosine => if (unit_cos) blk: {
+                        if (!(q_aux > 0.0)) break :blk 0.0;
+                        const d = distance.dotAligned(q_ptr, self.hnsw.vecPtr(nid), stride);
+                        break :blk @max(@as(f32, -1.0), @min(@as(f32, 1.0), d));
+                    } else distance.cosineWithQueryNorm(query, q_aux, self.hnsw.getVector(nid)),
+                    .dot => distance.dotAligned(q_ptr, self.hnsw.vecPtr(nid), stride),
+                    .l2 => 1.0 / (1.0 + distance.l2SquaredAligned(q_ptr, self.hnsw.vecPtr(nid), stride)),
+                };
+                const score = applyDecayIndex(raw_sim, self.timestamps.items[nid], decay, now_ms, decay_tau_hours);
+                if (score > thresh) {
+                    topk.push(.{ .id = nid, .score = score });
+                    thresh = topk.thresholdScore();
+                }
+            }
+        }
+
+        const winners = topk.sortedDesc();
+        for (winners, 0..) |w, idx| {
+            out[idx] = .{
+                .key = self.keys.items[w.id],
+                .score = w.score,
+                .timestamp = self.timestamps.items[w.id],
+            };
+        }
+        return winners.len;
+    }
+
+    /// Key + encoded RaBitQ slice pair passed by `vrabitq` to bulk-populate
+    /// `self.rq_slab` + FastScan32 blocks under a single write-lock acquisition.
+    pub const EncodedSlabEntry = struct {
+        key: []const u8,
+        encoded: []const u8,
+    };
+
+    /// Populate `self.rq_slab` + FastScan32 blocks from pre-encoded `(key, encoded)`
+    /// records built off-lock by `vrabitq`. Any live node present in `self` that
+    /// was inserted concurrently during `vrabitq` is encoded from `self.hnsw`.
+    /// Caller holds `self.lock` exclusively and `self.rabitq_params == expected_params`.
+    pub fn installRabitqSlabFromEncodedLocked(
+        self: *NamespaceIndex,
+        expected_params: *const RabitqParams,
+        entries: []const EncodedSlabEntry,
+    ) !void {
+        const cur = self.rabitq_params orelse return;
+        if (cur != expected_params) return;
+
+        const dim: usize = @intCast(expected_params.dim);
+        const total = self.hnsw.len();
+        self.rq_slab.reset(self.allocator, false);
+        if (total == 0 or dim == 0) {
+            if (dim > 0) self.rq_slab.configure(self.allocator, dim);
+            self.rq_slab.synced = (entries.len == 0);
+            return;
+        }
+        if (self.dim != null and self.dim.? != dim) return;
+
+        self.rq_slab.configure(self.allocator, dim);
+        try self.rq_slab.ensureCapacity(self.allocator, total, true);
+        self.rq_slab.len = total;
+
+        var populated = try std.bit_set.Dynamic.initEmpty(self.allocator, total);
+        defer populated.deinit(self.allocator);
+
+        // Initialize all slots as tombstoned sentinels first so tombstoned nodes
+        // have safe finite/inf factors even without KV bq entries.
+        for (0..total) |id| {
+            self.rq_slab.setTombstoneSlot(id);
+        }
+
+        for (entries) |entry| {
+            const nid = self.key_to_node.get(entry.key) orelse {
+                // Store holds a key absent from this index (incomplete index):
+                // leave `rq_slab.synced = false` so KV fallback serves full corpus.
+                self.rq_slab.reset(self.allocator, false);
+                return;
+            };
+            if (nid >= total or self.tombstones.isSet(nid)) {
+                self.rq_slab.reset(self.allocator, false);
+                return;
+            }
+            const parsed = rabitq_mod.parse(entry.encoded, dim) orelse {
+                self.rq_slab.reset(self.allocator, false);
+                return;
+            };
+            self.rq_slab.setSlot(nid, parsed.code, parsed.l2_norm, parsed.corr);
+            populated.set(nid);
+        }
+
+        // Fill any live nodes inserted concurrently between vrabitq scan & swap.
+        var code_stack: [256]u8 = undefined;
+        var code_heap: ?[]u8 = null;
+        defer if (code_heap) |b| self.allocator.free(b);
+        const cb = rabitq_mod.codeBytes(dim);
+        const code_buf: []u8 = if (cb <= code_stack.len) code_stack[0..cb] else blk: {
+            const b = try self.allocator.alloc(u8, cb);
+            code_heap = b;
+            break :blk b;
+        };
+        for (0..total) |id| {
+            if (self.tombstones.isSet(id) or populated.isSet(id)) continue;
+            const vec = self.hnsw.getVector(@intCast(id));
+            if (vec.len != dim) continue;
+            const enc = try self.encodeRabitqCoreLocked(self.allocator, expected_params, vec, code_buf);
+            self.rq_slab.setSlot(id, enc.code, enc.l2_norm, enc.corr);
+        }
+
+        self.rq_slab.packAllFullBlocks();
+        self.rq_slab.synced = true;
+    }
+
+    /// Atomically swap graph, side-tables, and slabs from an off-lock rebuilt
+    /// `NamespaceIndex` into `self` under `self.lock` (exclusive). Preserves
+    /// `self.async_*`, `self.rabitq_params`/`rabitq_handle`, and `self.config_persisted`.
+    /// After releasing `self.lock`, caller calls `fresh.deinit()` off-lock to free
+    /// the displaced old graph & tables.
+    pub fn swapRebuiltLocked(
+        self: *NamespaceIndex,
+        fresh: *NamespaceIndex,
+        built_for_rabitq: ?*const RabitqParams,
+    ) void {
+        std.mem.swap(Hnsw, &self.hnsw, &fresh.hnsw);
+        std.mem.swap(std.ArrayListUnmanaged([]u8), &self.keys, &fresh.keys);
+        std.mem.swap(std.ArrayListUnmanaged(u64), &self.timestamps, &fresh.timestamps);
+        std.mem.swap(std.ArrayListUnmanaged(u64), &self.vec_hashes, &fresh.vec_hashes);
+        std.mem.swap(std.StringHashMapUnmanaged(u32), &self.key_to_node, &fresh.key_to_node);
+        std.mem.swap(std.bit_set.Dynamic, &self.tombstones, &fresh.tombstones);
+        std.mem.swap(usize, &self.tombstone_count, &fresh.tombstone_count);
+        std.mem.swap(?usize, &self.dim, &fresh.dim);
+        std.mem.swap(BqSlab, &self.bq_slab, &fresh.bq_slab);
+        std.mem.swap(RabitqSlab, &self.rq_slab, &fresh.rq_slab);
+        self.complete_with_store = fresh.complete_with_store;
+
+        // If `vrabitq` changed `self.rabitq_params` while `fresh` was building off-lock,
+        // invalidate the rebuilt slab so `vsearch` stays 100% consistent.
+        const cur_ptr: ?*const RabitqParams = self.rabitq_params;
+        if (cur_ptr != built_for_rabitq) {
+            self.bq_slab.synced = false;
+            self.rq_slab.synced = false;
+        }
     }
 
     /// Full reset — caller must hold write-lock. Used by vreindex before
@@ -582,6 +2301,16 @@ pub const NamespaceIndex = struct {
         // Dimension must re-freeze on the next insert — `vreindex` may be
         // used to switch a namespace's dim during a full rebuild.
         self.dim = null;
+        if (self.rabitq_params) |p| {
+            self.bq_slab.deinit(self.allocator);
+            self.bq_slab.synced = false;
+            self.rq_slab.reset(self.allocator, true);
+            if (p.dim > 0) self.rq_slab.configure(self.allocator, @intCast(p.dim));
+        } else {
+            self.rq_slab.reset(self.allocator, false);
+            self.bq_slab.resetKeepingAlloc(true);
+        }
+        self.complete_with_store = true;
     }
 
     // ╔═══════════════════════════════════════════════════╗
@@ -616,7 +2345,8 @@ pub const NamespaceIndex = struct {
     /// does not lock itself so the enclosing snapshot can batch several
     /// namespaces under a consistent point-in-time view.
     pub fn writeToLocked(self: *const NamespaceIndex, writer: anytype) !void {
-        const w = writer;
+        var bw = BufferedIndexWriter(@TypeOf(writer)){ .inner = writer };
+        const w = &bw;
 
         const metric_byte: u8 = switch (self.metric) {
             .cosine => 0,
@@ -677,6 +2407,8 @@ pub const NamespaceIndex = struct {
         } else {
             try w.writeAll(&[_]u8{0});
         }
+
+        try bw.flush();
     }
 
     /// Resolver context used internally during readFromLocked — bridges
@@ -824,7 +2556,10 @@ pub const NamespaceIndex = struct {
         }
 
         // ── RaBitQ params trailer ────────────────────────────────────
+        var rabitq_handle: ?*RabitqParamsHandle = null;
+        errdefer if (rabitq_handle) |h| h.release();
         var rabitq_params_ptr: ?*RabitqParams = null;
+
         var has_rabitq_buf: [1]u8 = undefined;
         try readAllExact(reader, &has_rabitq_buf);
         if (has_rabitq_buf[0] == 1) {
@@ -837,15 +2572,16 @@ pub const NamespaceIndex = struct {
 
             const dim_usize: usize = @intCast(dim_u32);
             const centroid = try allocator.alloc(f32, dim_usize);
-            errdefer allocator.free(centroid);
+            var ownership_transferred = false;
+            errdefer if (!ownership_transferred) allocator.free(centroid);
             try readF32Slice(reader, centroid);
 
             const rotation = try allocator.alloc(f32, dim_usize * dim_usize);
-            errdefer allocator.free(rotation);
+            errdefer if (!ownership_transferred) allocator.free(rotation);
             try readF32Slice(reader, rotation);
 
             const p = try allocator.create(RabitqParams);
-            errdefer allocator.destroy(p);
+            errdefer if (!ownership_transferred) allocator.destroy(p);
             p.* = .{
                 .allocator = allocator,
                 .centroid = centroid,
@@ -853,6 +2589,9 @@ pub const NamespaceIndex = struct {
                 .dim = dim_u32,
                 .seed = seed,
             };
+            const handle = try RabitqParamsHandle.create(allocator, p);
+            ownership_transferred = true;
+            rabitq_handle = handle;
             rabitq_params_ptr = p;
             // If the graph never resolved a vector (empty namespace), fall
             // back to the params' dim so later inserts know what shape to
@@ -860,6 +2599,87 @@ pub const NamespaceIndex = struct {
             if (derived_dim == null) derived_dim = dim_usize;
         } else if (has_rabitq_buf[0] != 0) {
             return error.CorruptIndex;
+        }
+
+        // ── Rebuild in-index contiguous BQ / RaBitQ slabs ────────────
+        var bq_slab: BqSlab = .{};
+        errdefer bq_slab.deinit(allocator);
+        var rq_slab: RabitqSlab = .{};
+        errdefer rq_slab.deinit(allocator);
+
+        if (rabitq_params_ptr) |p| {
+            bq_slab.synced = false;
+            const pdim: usize = @intCast(p.dim);
+            if (node_count == 0) {
+                if (pdim > 0) rq_slab.configure(allocator, pdim);
+                rq_slab.synced = true;
+            } else if (pdim > 0 and (derived_dim == null or derived_dim.? == pdim)) {
+                rq_slab.configure(allocator, pdim);
+                try rq_slab.ensureCapacity(allocator, node_count, true);
+                rq_slab.len = node_count;
+                var all_matched = true;
+                var bq_key_stack: [512]u8 = undefined;
+                for (0..node_count) |id| {
+                    if (tombstones.isSet(id)) {
+                        rq_slab.setTombstoneSlot(id);
+                        continue;
+                    }
+                    const k = keys.items[id];
+                    const need = 3 + k.len;
+                    var bq_key_heap: ?[]u8 = null;
+                    defer if (bq_key_heap) |b| allocator.free(b);
+                    const bq_key: []const u8 = if (need <= bq_key_stack.len) blk: {
+                        @memcpy(bq_key_stack[0..3], "bq:");
+                        @memcpy(bq_key_stack[3..need], k);
+                        break :blk bq_key_stack[0..need];
+                    } else blk: {
+                        const b = try allocator.alloc(u8, need);
+                        bq_key_heap = b;
+                        @memcpy(b[0..3], "bq:");
+                        @memcpy(b[3..need], k);
+                        break :blk b;
+                    };
+                    const bq_bytes = outer_resolve(outer_ctx, bq_key) orelse {
+                        all_matched = false;
+                        break;
+                    };
+                    const parsed = rabitq_mod.parse(bq_bytes, pdim) orelse {
+                        all_matched = false;
+                        break;
+                    };
+                    rq_slab.setSlot(id, parsed.code, parsed.l2_norm, parsed.corr);
+                }
+                if (all_matched) {
+                    rq_slab.packAllFullBlocks();
+                    rq_slab.synced = true;
+                } else {
+                    rq_slab.reset(allocator, false);
+                }
+            }
+        } else if (node_count > 0) {
+            if (derived_dim) |d| {
+                bq_slab.configure(allocator, d);
+                try bq_slab.ensureCapacity(allocator, node_count, true);
+                bq_slab.len = node_count;
+                var all_ok = true;
+                for (0..node_count) |id| {
+                    const dst = bq_slab.codes[id * bq_slab.code_stride ..][0..bq_slab.code_stride];
+                    @memset(dst, 0);
+                    if (tombstones.isSet(id)) continue;
+                    const vec = hnsw.getVector(@intCast(id));
+                    if (vec.len != d) {
+                        all_ok = false;
+                        break;
+                    }
+                    distance.binaryQuantize(vec, dst[0..bq_slab.code_bytes]);
+                }
+                if (!all_ok) {
+                    bq_slab.deinit(allocator);
+                    bq_slab.synced = false;
+                }
+            } else {
+                bq_slab.synced = false;
+            }
         }
 
         return .{
@@ -878,11 +2698,20 @@ pub const NamespaceIndex = struct {
             .async_queue = null,
             .async_worker = null,
             .rabitq_params = rabitq_params_ptr,
+            .rabitq_handle = rabitq_handle,
+            .bq_slab = bq_slab,
+            .rq_slab = rq_slab,
+            .config_persisted = .init(false),
+            .complete_with_store = false,
         };
     }
 };
 
 fn writeF32Slice(writer: anytype, slice: []const f32) !void {
+    if (comptime builtin.cpu.arch.endian() == .little) {
+        try writer.writeAll(std.mem.sliceAsBytes(slice));
+        return;
+    }
     var buf: [4]u8 = undefined;
     for (slice) |x| {
         const bits: u32 = @bitCast(x);
@@ -892,6 +2721,10 @@ fn writeF32Slice(writer: anytype, slice: []const f32) !void {
 }
 
 fn readF32Slice(reader: anytype, dest: []f32) !void {
+    if (comptime builtin.cpu.arch.endian() == .little) {
+        try readAllExact(reader, std.mem.sliceAsBytes(dest));
+        return;
+    }
     var buf: [4]u8 = undefined;
     for (dest) |*slot| {
         try readAllExact(reader, &buf);
@@ -1121,7 +2954,6 @@ pub const NamespaceRegistry = struct {
         want_bq: bool,
     ) RawSetBqAction {
         if (!self.mayMatchRegisteredNamespace(key)) return .none;
-        const distance = @import("distance.zig");
 
         self.lock.lockShared();
         defer self.lock.unlockShared();
@@ -1146,15 +2978,19 @@ pub const NamespaceRegistry = struct {
                 }
                 if (distance.bytesToF32(value)) |vec| {
                     if (idx.dim == null or vec.len == idx.dim.?) {
-                        if (idx.insertLocked(key, vec, timestamp)) |_| {
-                            if (want_bq and ns.len >= encoded_ns_len) {
-                                if (idx.encodeBqLocked(self.allocator, vec) catch null) |bq| {
-                                    if (action == .upsert) self.allocator.free(action.upsert);
-                                    action = .{ .upsert = bq };
-                                    encoded_ns_len = ns.len;
-                                }
+                        const pre_bq: ?[]u8 = if (want_bq and ns.len >= encoded_ns_len)
+                            (idx.encodeBqLocked(self.allocator, vec) catch null)
+                        else
+                            null;
+                        if (idx.insertLockedWithBq(key, vec, timestamp, pre_bq)) |_| {
+                            if (pre_bq) |bq| {
+                                if (action == .upsert) self.allocator.free(action.upsert);
+                                action = .{ .upsert = bq };
+                                encoded_ns_len = ns.len;
                             }
                         } else |_| {
+                            if (pre_bq) |bq| self.allocator.free(bq);
+                            idx.markIncompleteLocked();
                             _ = idx.markTombstoneLocked(key);
                             if (action == .none) action = .delete;
                         }
@@ -1179,19 +3015,26 @@ pub const NamespaceRegistry = struct {
                 if (idx.dim) |d| {
                     if (distance.bytesToF32(value)) |vec| {
                         if (vec.len == d) {
-                            if (idx.insertLocked(key, vec, timestamp)) |_| {
-                                if (want_bq) {
-                                    if (idx.encodeBqLocked(self.allocator, vec) catch null) |bq| {
-                                        action = .{ .upsert = bq };
-                                    }
+                            const pre_bq: ?[]u8 = if (want_bq)
+                                (idx.encodeBqLocked(self.allocator, vec) catch null)
+                            else
+                                null;
+                            if (idx.insertLockedWithBq(key, vec, timestamp, pre_bq)) |_| {
+                                if (pre_bq) |bq| {
+                                    action = .{ .upsert = bq };
                                 }
-                            } else |_| {}
+                            } else |_| {
+                                if (pre_bq) |bq| self.allocator.free(bq);
+                                idx.markIncompleteLocked();
+                            }
                         } else if (want_bq) {
                             action = .delete;
                         }
                     } else if (want_bq) {
                         action = .delete;
                     }
+                } else if (distance.bytesToF32(value) != null) {
+                    idx.markIncompleteLocked();
                 }
             }
         }
@@ -1739,7 +3582,7 @@ test "registry: writeTo/readFrom preserves installed RabitqParams" {
             .dim = 4,
             .seed = 0x9999,
         };
-        idx.setRabitqParams(p);
+        try idx.setRabitqParams(p);
     }
 
     // Serialize.
@@ -1820,4 +3663,191 @@ test "insertLocked identical-write idempotence under cosine unit-normalization" 
     try testing.expect(id4 != id3);
     try testing.expectEqual(@as(usize, 2), idx.tombstone_count);
     try testing.expectEqual(@as(usize, 1), idx.liveCount());
+}
+
+test "namespace index: overwrite + post-tombstone reinsert keeps BQ, RaBitQ FastScan32, and exact slabs consistent" {
+    const alloc = testing.allocator;
+    const dim: usize = 32;
+
+    var idx = NamespaceIndex.init(alloc, .{ .m = 8, .ef_construction = 40 }, .l2);
+    defer idx.deinit();
+
+    // Insert 40 vectors (>32 so FastScan32 packs a full 32-vector block + 8-vector tail).
+    var vecs: [40][dim]f32 = undefined;
+    var key_buf: [32]u8 = undefined;
+    for (0..40) |i| {
+        for (0..dim) |d| {
+            vecs[i][d] = if (d == i % dim) 2.0 + @as(f32, @floatFromInt(i)) * 0.01 else 0.05 * @as(f32, @floatFromInt((i + d) % 5));
+        }
+        const k = std.fmt.bufPrint(&key_buf, "vec:n{d}", .{i}) catch unreachable;
+        _ = try idx.insertLocked(k, &vecs[i], 100 + i);
+    }
+    try testing.expectEqual(@as(usize, 40), idx.liveCount());
+    try testing.expect(idx.canUseBqSlabLocked(dim));
+
+    // Overwrite live key vec:n0 with a completely different vector (aligned with dim 15).
+    var v_over: [dim]f32 = @splat(0.0);
+    v_over[15] = 10.0;
+    _ = try idx.insertLocked("vec:n0", &v_over, 500);
+    try testing.expectEqual(@as(usize, 40), idx.liveCount());
+    try testing.expectEqual(@as(usize, 1), idx.tombstone_count);
+
+    // Tombstone vec:n1, then reinsert vec:n1 with a vector aligned with dim 31.
+    try testing.expectEqual(TombstoneResult.deleted, idx.markTombstoneLocked("vec:n1"));
+    try testing.expectEqual(@as(usize, 39), idx.liveCount());
+    var v_reinsert: [dim]f32 = @splat(0.0);
+    v_reinsert[31] = 10.0;
+    _ = try idx.insertLocked("vec:n1", &v_reinsert, 600);
+    try testing.expectEqual(@as(usize, 40), idx.liveCount());
+    try testing.expectEqual(@as(usize, 2), idx.tombstone_count);
+
+    // Verify legacy BQ slab + rerank finds vec:n0 first for v_over and never emits duplicate keys.
+    var out: [10]IndexScoredResult = undefined;
+    const bq_res = (try idx.searchBqLocked(&v_over, null, 10, 4, .l2, 0.0, 0, 24.0, true, &out, alloc)).?;
+    try testing.expect(!bq_res.needs_kv_rerank);
+    try testing.expectEqual(@as(usize, 10), bq_res.count);
+    try testing.expectEqualStrings("vec:n0", out[0].key);
+    for (0..bq_res.count) |a| {
+        for (a + 1..bq_res.count) |b| {
+            try testing.expect(!std.mem.eql(u8, out[a].key, out[b].key));
+        }
+    }
+
+    // Verify exact slab finds vec:n1 first for v_reinsert and no duplicates.
+    const exact_n = try idx.searchExactLocked(&v_reinsert, null, 10, .l2, 0.0, 0, 24.0, &out, alloc);
+    try testing.expectEqual(@as(usize, 10), exact_n);
+    try testing.expectEqualStrings("vec:n1", out[0].key);
+    for (0..exact_n) |a| {
+        for (a + 1..exact_n) |b| {
+            try testing.expect(!std.mem.eql(u8, out[a].key, out[b].key));
+        }
+    }
+
+    // Install RaBitQ params + populate slab, then overwrite vec:n2 and verify FastScan32 + tail consistency.
+    const centroid = try alloc.alloc(f32, dim);
+    @memset(centroid, 0.25);
+    const rotation = try rabitq_mod.generateRotation(alloc, dim, 0x123456);
+    const params = try alloc.create(RabitqParams);
+    params.* = .{
+        .allocator = alloc,
+        .centroid = centroid,
+        .rotation = rotation,
+        .dim = dim,
+        .seed = 0x123456,
+    };
+    try idx.setRabitqParams(params);
+    try idx.installRabitqSlabFromEncodedLocked(params, &.{});
+    try testing.expect(idx.canUseRabitqSlabLocked(dim));
+
+    var v_rq_over: [dim]f32 = @splat(0.0);
+    v_rq_over[7] = 12.0;
+    _ = try idx.insertLocked("vec:n2", &v_rq_over, 700);
+    try testing.expectEqual(@as(usize, 40), idx.liveCount());
+
+    const rq_res = (try idx.searchRabitqLocked(&v_rq_over, null, 10, 4, .l2, 0.0, 0, 24.0, true, &out, alloc)).?;
+    try testing.expect(!rq_res.needs_kv_rerank);
+    try testing.expectEqual(@as(usize, 10), rq_res.count);
+    try testing.expectEqualStrings("vec:n2", out[0].key);
+    for (0..rq_res.count) |a| {
+        for (a + 1..rq_res.count) |b| {
+            try testing.expect(!std.mem.eql(u8, out[a].key, out[b].key));
+        }
+    }
+}
+
+test "namespace index: ShardedRwLock concurrent readers + writer stress" {
+    if (single_threaded) return;
+
+    const alloc = testing.allocator;
+    const dim: usize = 16;
+    var idx = NamespaceIndex.init(alloc, .{ .m = 8, .ef_construction = 32 }, .cosine);
+    defer idx.deinit();
+
+    // Seed initial vectors.
+    var seed_key: [32]u8 = undefined;
+    for (0..64) |i| {
+        var v: [dim]f32 = undefined;
+        for (0..dim) |d| v[d] = @as(f32, @floatFromInt(((i * 7 + d * 3) % 19) + 1)) * 0.1;
+        const k = std.fmt.bufPrint(&seed_key, "vec:s{d}", .{i}) catch unreachable;
+        _ = try idx.insertLocked(k, &v, 10 + i);
+    }
+
+    var stop = std.atomic.Value(bool).init(false);
+    var reader_err = std.atomic.Value(bool).init(false);
+
+    const ReaderCtx = struct {
+        idx: *NamespaceIndex,
+        stop: *std.atomic.Value(bool),
+        err: *std.atomic.Value(bool),
+        tid: usize,
+    };
+
+    const readerFn = struct {
+        fn run(rc: ReaderCtx) void {
+            var q: [dim]f32 = undefined;
+            for (0..dim) |d| q[d] = @as(f32, @floatFromInt(((rc.tid + d) % 7) + 1)) * 0.2;
+            var hnsw_out: [8]IndexSearchResult = undefined;
+            var hnsw_scratch: [8]hnsw_mod.SearchResult = undefined;
+            var slab_out: [8]IndexScoredResult = undefined;
+            var iter: usize = 0;
+            while (!rc.stop.load(.acquire) or iter < 32) : (iter += 1) {
+                rc.idx.lock.lockShared();
+                defer rc.idx.lock.unlockShared();
+                const n = rc.idx.searchLocked(&q, 5, 24, &hnsw_out, &hnsw_scratch) catch {
+                    rc.err.store(true, .release);
+                    return;
+                };
+                if (n == 0) {
+                    rc.err.store(true, .release);
+                    return;
+                }
+                if ((iter & 1) == 0 and rc.idx.canUseBqSlabLocked(dim)) {
+                    _ = rc.idx.searchBqLocked(&q, null, 5, 4, .cosine, 0.0, 0, 24.0, true, &slab_out, std.heap.page_allocator) catch {
+                        rc.err.store(true, .release);
+                        return;
+                    };
+                } else if (rc.idx.canUseExactSlabLocked(dim, .cosine)) {
+                    _ = rc.idx.searchExactLocked(&q, null, 5, .cosine, 0.0, 0, 24.0, &slab_out, std.heap.page_allocator) catch {
+                        rc.err.store(true, .release);
+                        return;
+                    };
+                }
+            }
+        }
+    }.run;
+
+    var threads: [4]std.Thread = undefined;
+    for (0..threads.len) |t| {
+        threads[t] = try std.Thread.spawn(.{}, readerFn, .{ReaderCtx{
+            .idx = &idx,
+            .stop = &stop,
+            .err = &reader_err,
+            .tid = t,
+        }});
+    }
+
+    // Concurrent writer performing inserts, overwrites, and tombstones.
+    var wkey: [32]u8 = undefined;
+    for (0..48) |w| {
+        var v: [dim]f32 = undefined;
+        for (0..dim) |d| v[d] = @as(f32, @floatFromInt(((w * 5 + d) % 13) + 1)) * 0.15;
+        const k = std.fmt.bufPrint(&wkey, "vec:w{d}", .{w % 24}) catch unreachable;
+        idx.lock.lock();
+        _ = idx.insertLocked(k, &v, 200 + w) catch {
+            idx.lock.unlock();
+            stop.store(true, .release);
+            for (threads) |th| th.join();
+            return error.TestUnexpectedResult;
+        };
+        if (w % 6 == 0) {
+            const dk = std.fmt.bufPrint(&wkey, "vec:s{d}", .{w % 16}) catch unreachable;
+            _ = idx.markTombstoneLocked(dk);
+        }
+        idx.lock.unlock();
+    }
+
+    stop.store(true, .release);
+    for (threads) |th| th.join();
+    try testing.expect(!reader_err.load(.acquire));
+    try testing.expect(idx.liveCount() >= 64);
 }

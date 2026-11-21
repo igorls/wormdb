@@ -136,8 +136,102 @@ inline fn computeExactSim(metric: Metric, q: []align(1) const f32, v: []align(1)
     };
 }
 
+const IndexModule = @import("../vector/index.zig");
+
+const STACK_QUERY_BYTES: usize = 6144; // 1536 × f32 (covers OpenAI embeddings on stack)
+const STACK_DIM_CAP: usize = 1536;
+const STACK_CODE_BYTES: usize = 256; // up to 2048-dim BQ code
+
+inline fn precomputeInvQueryNorm(metric: Metric, q: []align(1) const f32) f32 {
+    if (metric != .cosine) return 0.0;
+    const qn = distance.l2Norm(q);
+    if (qn > 0.0) {
+        const inv = 1.0 / qn;
+        return if (std.math.isFinite(inv)) inv else 0.0;
+    }
+    return 0.0;
+}
+
+inline fn computeExactSimWithNorm(
+    metric: Metric,
+    q: []align(1) const f32,
+    inv_q_norm: f32,
+    v: []align(1) const f32,
+) f32 {
+    return switch (metric) {
+        .cosine => distance.cosineWithQueryNorm(q, inv_q_norm, v),
+        .dot => distance.dot(q, v),
+        .l2 => 1.0 / (1.0 + distance.l2Squared(q, v)),
+    };
+}
+
+inline fn hnswDistToSim(metric: Metric, dist: f32) f32 {
+    return switch (metric) {
+        .cosine => 1.0 - dist,
+        .dot => -dist,
+        .l2 => 1.0 / (1.0 + dist),
+    };
+}
+
+fn readKeyInto(
+    ctx: *Ctx,
+    key: []const u8,
+    stack_buf: []align(16) u8,
+    heap_out: *?[]align(16) u8,
+) !?[]const u8 {
+    heap_out.* = null;
+    switch (ctx.getInto(key, stack_buf)) {
+        .hit => |slice| return slice,
+        .miss => return null,
+        .too_small => |needed| {
+            const b = try ctx.allocator.alignedAlloc(u8, .@"16", needed);
+            errdefer ctx.allocator.free(b);
+            switch (ctx.getInto(key, b)) {
+                .hit => |slice| {
+                    heap_out.* = b;
+                    return slice;
+                },
+                .miss => {
+                    ctx.allocator.free(b);
+                    return null;
+                },
+                .too_small => {
+                    ctx.allocator.free(b);
+                    const exact = (try ctx.getCopy(key)) orelse return null;
+                    // Re-copy into 16B-aligned buffer if needed for caller consistency
+                    const b2 = try ctx.allocator.alignedAlloc(u8, .@"16", exact.len);
+                    @memcpy(b2, exact);
+                    ctx.allocator.free(exact);
+                    heap_out.* = b2;
+                    return b2;
+                },
+            }
+        },
+    }
+}
+
+fn buildBqPrefix(
+    allocator: std.mem.Allocator,
+    namespace: []const u8,
+    stack_buf: []u8,
+    heap_out: *?[]u8,
+) ![]const u8 {
+    heap_out.* = null;
+    const total = BQ_PREFIX.len + namespace.len;
+    const dst: []u8 = if (total <= stack_buf.len)
+        stack_buf[0..total]
+    else blk: {
+        const b = try allocator.alloc(u8, total);
+        heap_out.* = b;
+        break :blk b;
+    };
+    @memcpy(dst[0..BQ_PREFIX.len], BQ_PREFIX);
+    @memcpy(dst[BQ_PREFIX.len..total], namespace);
+    return dst;
+}
+
 // ╔═══════════════════════════════════════════════════╗
-// ║  Stage 1 — BQ Hamming scan                         ║
+// ║  Stage 1 — BQ Hamming scan (KV fallback)           ║
 // ╚═══════════════════════════════════════════════════╝
 
 const BQScanCtx = struct {
@@ -150,24 +244,9 @@ const BQScanCtx = struct {
     allocator: std.mem.Allocator,
     oom: bool,
     saw_any: usize,
-    /// Length of the pure-code format this scan accepts. Entries of
-    /// any other size are skipped — in particular we must NOT treat a
-    /// 24B RaBitQ entry as a 16B legacy code even though the byte
-    /// prefix "looks like" a code. The semantics differ: legacy codes
-    /// are `sign(v[i])`; RaBitQ codes are `sign(R·(v-c)/||v-c||)[i]`.
-    /// Hamming between the two bit distributions is uncorrelated.
     code_bytes: usize,
 };
 
-// TODO(tests): procedure-level integration tests for vsearch don't
-// exist in this codebase yet. Three cross-format correctness cases
-// rely on `onBQMatch` / `onRabitqMatch` silently rejecting the wrong
-// size: (a) metric=cosine with RaBitQ params installed, (b) restart
-// without snapshot so params are lost but bq entries are still 24B,
-// (c) legacy 16B entries present in a namespace that later got
-// vrabitq'd. Each currently relies on code review; adding a harness
-// that boots a Ctx + Store + Registry would let all three regress
-// loudly.
 fn onBQMatch(
     raw_ctx: *anyopaque,
     bq_key: []const u8,
@@ -178,18 +257,12 @@ fn onBQMatch(
     _ = is_worm;
     const sc: *BQScanCtx = @ptrCast(@alignCast(raw_ctx));
 
-    // Skip anything that isn't the exact legacy format. RaBitQ entries
-    // (code_bytes + 8) are rotated-residual signs and are meaningless
-    // under naive sign(query) Hamming — if a namespace is entirely
-    // RaBitQ-format but params got lost (crash-without-snapshot), we
-    // want `saw_any == 0` so the caller falls through to brute-force.
     if (bq_value.len != sc.code_bytes) return .cont;
 
-    // Derive the vec key by stripping the 3-byte "bq:" prefix.
     if (bq_key.len <= BQ_PREFIX.len) return .cont;
     const vec_key = bq_key[BQ_PREFIX.len..];
 
-    if (std.mem.eql(u8, vec_key, sc.query_key)) return .cont;
+    if (sc.query_key.len != 0 and std.mem.eql(u8, vec_key, sc.query_key)) return .cont;
 
     sc.saw_any += 1;
 
@@ -198,7 +271,7 @@ fn onBQMatch(
     const sim = 1.0 - @as(f32, @floatFromInt(ham_dist)) / total_bits;
     const score = applyDecay(sim, timestamp, sc.decay, sc.now_ms, sc.decay_tau_hours);
 
-    if (score <= sc.heap.thresholdScore()) return .cont;
+    if (!(score > sc.heap.thresholdScore())) return .cont;
 
     const key_copy = sc.allocator.dupe(u8, vec_key) catch {
         sc.oom = true;
@@ -209,14 +282,12 @@ fn onBQMatch(
 }
 
 // ╔═══════════════════════════════════════════════════╗
-// ║  Stage 1 — RaBitQ estimator scan (L2 only)         ║
+// ║  Stage 1 — RaBitQ 4-bit estimator scan (KV fallback)║
 // ╚═══════════════════════════════════════════════════╝
 
 const RabitqScanCtx = struct {
-    q_rot_unit: []const f32,
-    q_l2: f32,
+    pq: rabitq.PreparedQuery,
     query_key: []const u8,
-    code_bytes: usize,
     dim: usize,
     decay: f32,
     decay_tau_hours: f32,
@@ -225,11 +296,6 @@ const RabitqScanCtx = struct {
     allocator: std.mem.Allocator,
     oom: bool,
     saw_any: usize,
-    /// True iff the namespace was vrabitq'd in cosine mode (vectors
-    /// pre-normalized to the unit sphere). Converts the estimator's
-    /// L2² output to cosine via `cos = 1 - L²/2` instead of the
-    /// generic `1/(1+d²)` mapping. Cosine score is in [-1, 1] so we
-    /// shift to [0, 1] to keep the TopK heap semantics consistent.
     cosine_score: bool,
 };
 
@@ -242,22 +308,19 @@ fn onRabitqMatch(
 ) Store.ScanAction {
     _ = is_worm;
     const sc: *RabitqScanCtx = @ptrCast(@alignCast(raw_ctx));
-    sc.saw_any += 1;
 
     if (bq_key.len <= BQ_PREFIX.len) return .cont;
     const vec_key = bq_key[BQ_PREFIX.len..];
-    if (std.mem.eql(u8, vec_key, sc.query_key)) return .cont;
+    if (sc.query_key.len != 0 and std.mem.eql(u8, vec_key, sc.query_key)) return .cont;
 
-    // Only process RaBitQ-format entries; skip legacy 16-byte codes
-    // silently — they were written before `vrabitq` ran on this namespace.
+    // Only process RaBitQ-format entries; skip legacy 16-byte codes silently.
     const enc = rabitq.parse(bq_value, sc.dim) orelse return .cont;
+    sc.saw_any += 1;
 
-    const d2_est = rabitq.estimateL2Sq(sc.q_rot_unit, sc.q_l2, enc.code, enc.l2_norm, enc.corr);
+    const d2_est = rabitq.estimateL2Sq4Bit(&sc.pq, enc.code, enc.l2_norm, enc.corr);
     const d2_clamped: f32 = if (d2_est < 0.0) 0.0 else d2_est;
 
     const raw_sim: f32 = if (sc.cosine_score) blk: {
-        // On the unit sphere: L²(q, v) = 2(1 - q·v), so q·v = 1 - L²/2.
-        // Map cosine ∈ [-1, 1] to score ∈ [0, 1] via (cos + 1) / 2.
         const cos_est = 1.0 - d2_clamped * 0.5;
         const cos_clamped: f32 = if (cos_est > 1.0) 1.0 else if (cos_est < -1.0) -1.0 else cos_est;
         break :blk (cos_clamped + 1.0) * 0.5;
@@ -265,7 +328,7 @@ fn onRabitqMatch(
 
     const score = applyDecay(raw_sim, timestamp, sc.decay, sc.now_ms, sc.decay_tau_hours);
 
-    if (score <= sc.heap.thresholdScore()) return .cont;
+    if (!(score > sc.heap.thresholdScore())) return .cont;
 
     const key_copy = sc.allocator.dupe(u8, vec_key) catch {
         sc.oom = true;
@@ -276,12 +339,13 @@ fn onRabitqMatch(
 }
 
 // ╔═══════════════════════════════════════════════════╗
-// ║  Exact (brute-force) scan                          ║
+// ║  Exact (brute-force) scan (KV fallback)            ║
 // ╚═══════════════════════════════════════════════════╝
 
 const ExactScanCtx = struct {
     query_key: []const u8,
     query_vec: []align(1) const f32,
+    inv_q_norm: f32,
     metric: Metric,
     decay: f32,
     decay_tau_hours: f32,
@@ -301,15 +365,15 @@ fn onExactMatch(
     _ = is_worm;
     const sc: *ExactScanCtx = @ptrCast(@alignCast(raw_ctx));
 
-    if (std.mem.eql(u8, key, sc.query_key)) return .cont;
+    if (sc.query_key.len != 0 and std.mem.eql(u8, key, sc.query_key)) return .cont;
 
     const vec = distance.bytesToF32(value) orelse return .cont;
     if (vec.len != sc.query_vec.len) return .cont;
 
-    const raw_sim = computeExactSim(sc.metric, sc.query_vec, vec);
+    const raw_sim = computeExactSimWithNorm(sc.metric, sc.query_vec, sc.inv_q_norm, vec);
     const score = applyDecay(raw_sim, timestamp, sc.decay, sc.now_ms, sc.decay_tau_hours);
 
-    if (score <= sc.heap.thresholdScore()) return .cont;
+    if (!(score > sc.heap.thresholdScore())) return .cont;
 
     const key_copy = sc.allocator.dupe(u8, key) catch {
         sc.oom = true;
@@ -323,17 +387,13 @@ fn onExactMatch(
 // ║  HNSW dispatch                                     ║
 // ╚═══════════════════════════════════════════════════╝
 
-const IndexModule = @import("../vector/index.zig");
+fn computeEf(k_req: usize, top_k: usize, ef_override: ?usize) usize {
+    return if (ef_override) |custom_ef|
+        @max(k_req, custom_ef)
+    else
+        @max(k_req, @max(top_k * 2, DEFAULT_HNSW_EF));
+}
 
-/// Stage 1 via HNSW. Returns true if the heap was populated from HNSW;
-/// false if the index is empty (caller falls back to BQ or brute-force).
-///
-/// Since `ns_idx.metric == metric` is verified by the caller, `Hnsw.search`
-/// already computes the exact distance `r.dist` against the full-precision
-/// vectors stored in `node.vector`. We convert `r.dist` directly back to
-/// similarity (`cosine: 1 - d`, `dot: -d`, `l2: 1 / (1 + d)`) under a single
-/// shared lock acquisition, copy candidate keys, release `ns_idx.lock`, and
-/// verify existence in the KV store without holding the index lock.
 fn runHnswDispatch(
     ctx: *Ctx,
     query_key: []const u8,
@@ -345,22 +405,49 @@ fn runHnswDispatch(
     decay_tau_hours: f32,
     ef_override: ?usize,
     now_ms: u64,
+    store_synced: bool,
     heap: *TopKCandidate,
 ) !bool {
-    // When temporal decay is disabled, similarity is strictly monotonic in
-    // `r.dist`, so we only need `top_k + 8` results (extra headroom in case
-    // `query_key` is in the index or an unattached store deleted keys). When
-    // decay > 0, oversample so recency re-ranking can promote slightly further
-    // but newer vectors.
-    const k_req = if (decay > 0.0) top_k * STAGE1_OVERSAMPLE else top_k + 8;
-    const ef = if (ef_override) |custom_ef|
-        @max(k_req, custom_ef)
+    const k_req = if (decay > 0.0)
+        top_k * STAGE1_OVERSAMPLE
+    else if (store_synced)
+        top_k
     else
-        @max(k_req, @max(top_k * 2, DEFAULT_HNSW_EF));
+        top_k + 8;
+    const ef = computeEf(k_req, top_k, ef_override);
 
-    const raw_buf = try ctx.allocator.alloc(IndexModule.IndexSearchResult, k_req);
-    const hnsw_scratch = try ctx.allocator.alloc(hnsw_mod.SearchResult, k_req);
-    const cands = try ctx.allocator.alloc(Candidate, k_req);
+    var raw_stack: [128]IndexModule.IndexSearchResult = undefined;
+    var raw_heap: ?[]IndexModule.IndexSearchResult = null;
+    defer if (raw_heap) |b| ctx.allocator.free(b);
+    const raw_buf: []IndexModule.IndexSearchResult = if (k_req <= raw_stack.len)
+        raw_stack[0..k_req]
+    else blk: {
+        const b = try ctx.allocator.alloc(IndexModule.IndexSearchResult, k_req);
+        raw_heap = b;
+        break :blk b;
+    };
+
+    var scratch_stack: [128]hnsw_mod.SearchResult = undefined;
+    var scratch_heap: ?[]hnsw_mod.SearchResult = null;
+    defer if (scratch_heap) |b| ctx.allocator.free(b);
+    const hnsw_scratch: []hnsw_mod.SearchResult = if (k_req <= scratch_stack.len)
+        scratch_stack[0..k_req]
+    else blk: {
+        const b = try ctx.allocator.alloc(hnsw_mod.SearchResult, k_req);
+        scratch_heap = b;
+        break :blk b;
+    };
+
+    var cands_stack: [128]Candidate = undefined;
+    var cands_heap: ?[]Candidate = null;
+    defer if (cands_heap) |b| ctx.allocator.free(b);
+    const cands: []Candidate = if (k_req <= cands_stack.len)
+        cands_stack[0..k_req]
+    else blk: {
+        const b = try ctx.allocator.alloc(Candidate, k_req);
+        cands_heap = b;
+        break :blk b;
+    };
 
     var n_cands: usize = 0;
     {
@@ -368,17 +455,14 @@ fn runHnswDispatch(
         defer ns_idx.lock.unlockShared();
 
         if (ns_idx.len() == 0) return false;
-        const n_found = try ns_idx.searchLocked(query_vec, k_req, ef, raw_buf, hnsw_scratch);
+        const exclude_id: ?u32 = if (query_key.len != 0) ns_idx.nodeIdFor(query_key) else null;
+        const n_found = try ns_idx.searchLockedWithExclude(query_vec, k_req, ef, exclude_id, raw_buf, hnsw_scratch);
         if (n_found == 0) return false;
 
         for (raw_buf[0..n_found]) |r| {
-            if (std.mem.eql(u8, r.key, query_key)) continue;
+            if (query_key.len != 0 and std.mem.eql(u8, r.key, query_key)) continue;
 
-            const raw_sim: f32 = switch (metric) {
-                .cosine => 1.0 - r.dist,
-                .dot => -r.dist,
-                .l2 => 1.0 / (1.0 + r.dist),
-            };
+            const raw_sim = hnswDistToSim(metric, r.dist);
             const score = applyDecay(raw_sim, r.timestamp, decay, now_ms, decay_tau_hours);
             cands[n_cands] = .{
                 .key = try ctx.allocator.dupe(u8, r.key),
@@ -389,43 +473,290 @@ fn runHnswDispatch(
         }
     }
 
-    // Index lock is released; verify key existence in the KV store (never take
-    // shard locks while holding `ns_idx.lock`).
-    for (cands[0..n_cands]) |cand| {
-        if (cand.score <= heap.thresholdScore()) continue;
-        if (!ctx.store.exists(cand.key) and ctx.store.sstHit(cand.key) == null) continue;
-        heap.push(cand);
+    // Index lock is released. When `store_synced` (store.vector_registry == reg),
+    // every DEL/SET already tombstoned `ns_idx` synchronously, so skip 18× store.exists()!
+    if (store_synced) {
+        for (cands[0..n_cands]) |cand| {
+            if (!(cand.score > heap.thresholdScore())) continue;
+            heap.push(cand);
+        }
+    } else {
+        for (cands[0..n_cands]) |cand| {
+            if (!(cand.score > heap.thresholdScore())) continue;
+            if (!ctx.store.exists(cand.key) and ctx.store.sstHit(cand.key) == null) continue;
+            heap.push(cand);
+        }
     }
 
     return true;
 }
 
 // ╔═══════════════════════════════════════════════════╗
-// ║  JSON emission                                     ║
+// ║  Fast formatting & JSON emission                   ║
 // ╚═══════════════════════════════════════════════════╝
+
+/// Fast base-10 formatter for `u64` timestamps and counters.
+pub fn appendU64Dec(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, val: u64) !void {
+    var buf: [20]u8 = undefined;
+    var i: usize = buf.len;
+    var v = val;
+    if (v == 0) {
+        try list.append(alloc, '0');
+        return;
+    }
+    while (v > 0) {
+        i -= 1;
+        buf[i] = @as(u8, @intCast(v % 10)) + '0';
+        v /= 10;
+    }
+    try list.appendSlice(alloc, buf[i..]);
+}
+
+/// Fast fixed-point `{d:.6}` formatter for finite scores with `|x| <= 1e6`;
+/// falls back to `std.fmt.bufPrint` for extreme magnitudes or non-finite values.
+pub fn appendScoreFixed6(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, val: f32) !void {
+    if (!std.math.isFinite(val) or @abs(val) > 1_000_000.0) {
+        var fbuf: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&fbuf, "{d:.6}", .{val}) catch "0";
+        try list.appendSlice(alloc, s);
+        return;
+    }
+
+    const neg = val < 0.0;
+    const scaled: u64 = @intFromFloat(@round(@abs(@as(f64, val)) * 1_000_000.0));
+    const int_part: u64 = scaled / 1_000_000;
+    const frac_part: u64 = scaled % 1_000_000;
+
+    var buf: [32]u8 = undefined;
+    var pos: usize = 0;
+    if (neg and scaled != 0) {
+        buf[pos] = '-';
+        pos += 1;
+    }
+
+    // Integer digits.
+    if (int_part == 0) {
+        buf[pos] = '0';
+        pos += 1;
+    } else {
+        var tmp: [20]u8 = undefined;
+        var ti: usize = tmp.len;
+        var iv = int_part;
+        while (iv > 0) {
+            ti -= 1;
+            tmp[ti] = @as(u8, @intCast(iv % 10)) + '0';
+            iv /= 10;
+        }
+        const int_len = tmp.len - ti;
+        @memcpy(buf[pos..][0..int_len], tmp[ti..]);
+        pos += int_len;
+    }
+
+    buf[pos] = '.';
+    pos += 1;
+
+    // 6 fractional digits (zero-padded).
+    var fv = frac_part;
+    var fi: usize = 6;
+    while (fi > 0) {
+        fi -= 1;
+        buf[pos + fi] = @as(u8, @intCast(fv % 10)) + '0';
+        fv /= 10;
+    }
+    pos += 6;
+
+    try list.appendSlice(alloc, buf[0..pos]);
+}
 
 fn emitJson(ctx: *Ctx, results: []const Candidate) !Ctx.Result {
     var json: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer json.deinit(ctx.allocator);
+    var cap: usize = 2;
+    for (results) |r| cap += r.key.len + 44;
+    try json.ensureTotalCapacity(ctx.allocator, cap);
+
     try json.append(ctx.allocator, '[');
     for (results, 0..) |r, idx| {
         if (idx > 0) try json.append(ctx.allocator, ',');
         try json.appendSlice(ctx.allocator, "{\"k\":\"");
         try appendJsonEscaped(&json, ctx.allocator, r.key);
         try json.appendSlice(ctx.allocator, "\",\"s\":");
-
-        var score_buf: [32]u8 = undefined;
-        const score_str = std.fmt.bufPrint(&score_buf, "{d:.6}", .{r.score}) catch "0";
-        try json.appendSlice(ctx.allocator, score_str);
-
+        try appendScoreFixed6(&json, ctx.allocator, r.score);
         try json.appendSlice(ctx.allocator, ",\"ts\":");
-        var ts_buf: [20]u8 = undefined;
-        const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{r.timestamp}) catch "0";
-        try json.appendSlice(ctx.allocator, ts_str);
-
+        try appendU64Dec(&json, ctx.allocator, r.timestamp);
         try json.append(ctx.allocator, '}');
     }
     try json.append(ctx.allocator, ']');
-    return ctx.value(try json.toOwnedSlice(ctx.allocator));
+    return ctx.valueOwned(try json.toOwnedSlice(ctx.allocator));
+}
+
+fn emitJsonFromScored(ctx: *Ctx, results: []const IndexModule.IndexScoredResult) !Ctx.Result {
+    var json: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer json.deinit(ctx.allocator);
+    var cap: usize = 2;
+    for (results) |r| cap += r.key.len + 44;
+    try json.ensureTotalCapacity(ctx.allocator, cap);
+
+    try json.append(ctx.allocator, '[');
+    for (results, 0..) |r, idx| {
+        if (idx > 0) try json.append(ctx.allocator, ',');
+        try json.appendSlice(ctx.allocator, "{\"k\":\"");
+        try appendJsonEscaped(&json, ctx.allocator, r.key);
+        try json.appendSlice(ctx.allocator, "\",\"s\":");
+        try appendScoreFixed6(&json, ctx.allocator, r.score);
+        try json.appendSlice(ctx.allocator, ",\"ts\":");
+        try appendU64Dec(&json, ctx.allocator, r.timestamp);
+        try json.append(ctx.allocator, '}');
+    }
+    try json.append(ctx.allocator, ']');
+    return ctx.valueOwned(try json.toOwnedSlice(ctx.allocator));
+}
+
+fn emitJsonFromHnsw(ctx: *Ctx, results: []const IndexModule.IndexSearchResult, metric: Metric) !Ctx.Result {
+    var json: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer json.deinit(ctx.allocator);
+    var cap: usize = 2;
+    for (results) |r| cap += r.key.len + 44;
+    try json.ensureTotalCapacity(ctx.allocator, cap);
+
+    try json.append(ctx.allocator, '[');
+    for (results, 0..) |r, idx| {
+        if (idx > 0) try json.append(ctx.allocator, ',');
+        try json.appendSlice(ctx.allocator, "{\"k\":\"");
+        try appendJsonEscaped(&json, ctx.allocator, r.key);
+        try json.appendSlice(ctx.allocator, "\",\"s\":");
+        try appendScoreFixed6(&json, ctx.allocator, hnswDistToSim(metric, r.dist));
+        try json.appendSlice(ctx.allocator, ",\"ts\":");
+        try appendU64Dec(&json, ctx.allocator, r.timestamp);
+        try json.append(ctx.allocator, '}');
+    }
+    try json.append(ctx.allocator, ']');
+    return ctx.valueOwned(try json.toOwnedSlice(ctx.allocator));
+}
+
+/// Direct zero-key-dupe serving path when `store_synced` and `sst_count == 0`
+/// and caller ALREADY holds `ns_idx.lock.lockShared()`. Returns `null` when
+/// caller must fall back to `runSearch` (e.g. `decay > 0` on HNSW, `needs_kv_rerank`,
+/// empty/incomplete index, or legacy/mixed KV corpus).
+fn serveDirectLocked(
+    ctx: *Ctx,
+    ns_idx: *IndexModule.NamespaceIndex,
+    query_vec: []align(1) const f32,
+    exclude_id: ?u32,
+    params: SearchParams,
+    now_ms: u64,
+) !?Ctx.Result {
+    const top_k = params.top_k;
+    const metric = params.metric;
+    const decay = params.decay;
+    const mode = params.mode;
+
+    // 1. HNSW direct zero-copy path (auto mode, matching metric, no decay).
+    if (mode == .auto and ns_idx.metric == metric and decay <= 0.0 and ns_idx.len() > 0) {
+        if (ns_idx.dim == null or ns_idx.dim.? == query_vec.len) {
+            const ef = computeEf(top_k, top_k, params.ef);
+            var raw_stack: [MAX_TOP_K]IndexModule.IndexSearchResult = undefined;
+            var scratch_stack: [MAX_TOP_K]hnsw_mod.SearchResult = undefined;
+            const n_found = try ns_idx.searchLockedWithExclude(
+                query_vec,
+                top_k,
+                ef,
+                exclude_id,
+                raw_stack[0..top_k],
+                scratch_stack[0..top_k],
+            );
+            if (n_found > 0 or ns_idx.complete_with_store) {
+                return try emitJsonFromHnsw(ctx, raw_stack[0..n_found], metric);
+            }
+        }
+    }
+
+    // 2. Quantized slab direct path (RaBitQ FastScan32 or Legacy BQ 4-way Hamming).
+    if (mode == .auto or mode == .bq or mode == .bq_rerank) {
+        // Only take slab in auto mode when HNSW wasn't eligible (metric mismatch / empty HNSW).
+        const hnsw_would_run = (mode == .auto and ns_idx.metric == metric and ns_idx.len() > 0);
+        if (!hnsw_would_run) {
+            if (ns_idx.rabitq_params != null) {
+                const rabitq_metric_ok = (metric == .cosine and ns_idx.metric == .cosine) or
+                    (metric == .l2 and ns_idx.metric != .cosine);
+                if (rabitq_metric_ok and ns_idx.canUseRabitqSlabLocked(query_vec.len)) {
+                    const rerank = (mode != .bq);
+                    if (!rerank or ns_idx.canRerankFromHnswLocked(metric)) {
+                        var slab_out: [MAX_TOP_K]IndexModule.IndexScoredResult = undefined;
+                        if (try ns_idx.searchRabitqLocked(
+                            query_vec,
+                            exclude_id,
+                            top_k,
+                            STAGE1_OVERSAMPLE,
+                            metric,
+                            decay,
+                            now_ms,
+                            params.decay_tau_hours,
+                            rerank,
+                            slab_out[0..top_k],
+                            ctx.allocator,
+                        )) |res| {
+                            if (!res.needs_kv_rerank) {
+                                return try emitJsonFromScored(ctx, slab_out[0..res.count]);
+                            }
+                        }
+                    }
+                } else if (!rabitq_metric_ok and ns_idx.canUseExactSlabLocked(query_vec.len, metric)) {
+                    var slab_out: [MAX_TOP_K]IndexModule.IndexScoredResult = undefined;
+                    const n_found = try ns_idx.searchExactLocked(
+                        query_vec,
+                        exclude_id,
+                        top_k,
+                        metric,
+                        decay,
+                        now_ms,
+                        params.decay_tau_hours,
+                        slab_out[0..top_k],
+                        ctx.allocator,
+                    );
+                    return try emitJsonFromScored(ctx, slab_out[0..n_found]);
+                }
+            } else if (ns_idx.canUseBqSlabLocked(query_vec.len) and ns_idx.canRerankFromHnswLocked(metric)) {
+                var slab_out: [MAX_TOP_K]IndexModule.IndexScoredResult = undefined;
+                if (try ns_idx.searchBqLocked(
+                    query_vec,
+                    exclude_id,
+                    top_k,
+                    STAGE1_OVERSAMPLE,
+                    metric,
+                    decay,
+                    now_ms,
+                    params.decay_tau_hours,
+                    true,
+                    slab_out[0..top_k],
+                    ctx.allocator,
+                )) |res| {
+                    if (!res.needs_kv_rerank) {
+                        return try emitJsonFromScored(ctx, slab_out[0..res.count]);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Exact contiguous f32 slab direct path.
+    if (mode == .exact and ns_idx.canUseExactSlabLocked(query_vec.len, metric)) {
+        var slab_out: [MAX_TOP_K]IndexModule.IndexScoredResult = undefined;
+        const n_found = try ns_idx.searchExactLocked(
+            query_vec,
+            exclude_id,
+            top_k,
+            metric,
+            decay,
+            now_ms,
+            params.decay_tau_hours,
+            slab_out[0..top_k],
+            ctx.allocator,
+        );
+        return try emitJsonFromScored(ctx, slab_out[0..n_found]);
+    }
+
+    return null;
 }
 
 pub fn appendJsonEscaped(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, s: []const u8) !void {
@@ -494,18 +825,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     try ctx.requireRead(query_key);
     try ctx.requirePrefix(namespace, .read);
 
-    // ── Load query vector (locks internally, safe before scans) ──
-    const query_bytes = (try ctx.getCopy(query_key)) orelse
-        return ctx.err("vsearch: query key not found");
-
-    const query_vec = distance.bytesToF32(query_bytes) orelse
-        return ctx.err("vsearch: query value is not a valid f32 vector (byte length must be multiple of 4)");
-
-    // ── Allocate final top-K heap and run the shared search core ──
-    const final_buf = try ctx.allocator.alloc(Candidate, top_k);
-    var final_heap = TopKCandidate.init(final_buf);
-
-    if (try runSearch(ctx, query_key, query_vec, .{
+    const search_params = SearchParams{
         .top_k = top_k,
         .namespace = namespace,
         .metric = metric,
@@ -513,25 +833,96 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
         .mode = mode,
         .decay_tau_hours = decay_tau_hours,
         .ef = ef_override,
-    }, &final_heap)) |msg| return ctx.err(msg);
+    };
+    const now_ms: u64 = if (decay > 0.0) ctx.timestamp() else 0;
+
+    // Hoist registry lookup once for the entire query.
+    const reg_opt = ctx.vector_registry;
+    const store_synced = (reg_opt != null and ctx.store.vector_registry == reg_opt);
+    const ns_idx_opt: ?*IndexModule.NamespaceIndex = if (reg_opt) |reg| reg.get(namespace) else null;
+
+    // ── Zero-shard-lock ultra-fast path ──────────────────────────
+    // When `query_key` lives inside `ns_idx` (synchronized with Store, no SSTs,
+    // no pending async writes, and HNSW vector space matches `metric`), read the
+    // 64B-aligned query directly from `hnsw.getVector` and serve inside ONE
+    // `ShardedRwLock.lockShared()` → 0 shard locks, 0 query copies, 0 key dupes.
+    if (ns_idx_opt) |ns_idx| {
+        if (store_synced and ctx.store.sst_count == 0 and std.mem.startsWith(u8, query_key, namespace)) {
+            ns_idx.lock.lockShared();
+            defer ns_idx.lock.unlockShared();
+            if (ns_idx.pendingAsyncCount() == 0 and ns_idx.canRerankFromHnswLocked(metric)) {
+                if (ns_idx.nodeIdFor(query_key)) |qid| {
+                    if (!ns_idx.isTombstoned(qid)) {
+                        const q_aligned = ns_idx.hnsw.getVector(qid);
+                        if (q_aligned.len > 0) {
+                            if (try serveDirectLocked(ctx, ns_idx, q_aligned, qid, search_params, now_ms)) |res| {
+                                return res;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Load query vector into 16B-aligned stack buffer (zero alloc for dim <= 1536) ──
+    var q_stack: [STACK_QUERY_BYTES]u8 align(16) = undefined;
+    var q_heap: ?[]align(16) u8 = null;
+    defer if (q_heap) |b| ctx.allocator.free(b);
+
+    const query_bytes = (try readKeyInto(ctx, query_key, &q_stack, &q_heap)) orelse
+        return ctx.err("vsearch: query key not found");
+
+    const query_vec = distance.bytesToF32(query_bytes) orelse
+        return ctx.err("vsearch: query value is not a valid f32 vector (byte length must be multiple of 4)");
+
+    // ── Direct slab / HNSW path for external query key (0 key dupes) ──
+    if (ns_idx_opt) |ns_idx| {
+        if (store_synced and ctx.store.sst_count == 0) {
+            ns_idx.lock.lockShared();
+            defer ns_idx.lock.unlockShared();
+            const exclude_id = ns_idx.nodeIdFor(query_key);
+            if (try serveDirectLocked(ctx, ns_idx, query_vec, exclude_id, search_params, now_ms)) |res| {
+                return res;
+            }
+        }
+    }
+
+    // ── Stack-allocated final top-K heap + shared search core ────
+    var final_buf: [MAX_TOP_K]Candidate = undefined;
+    var final_heap = TopKCandidate.init(final_buf[0..top_k]);
+
+    if (try runSearchWithIndex(ctx, query_key, query_vec, search_params, ns_idx_opt, store_synced, now_ms, &final_heap)) |msg| {
+        return ctx.err(msg);
+    }
 
     return emitJson(ctx, final_heap.sortedDesc());
 }
 
-/// Shared search core — HNSW → BQ/RaBitQ prefilter → brute-force dispatch,
-/// populating `final_heap` with the top-K candidates for an *inline* query
-/// vector. `query_key` is only used to exclude the query's own stored entry
-/// from the candidate set (pass "" when the query has no local key, e.g.
-/// a scatter sub-query arriving over replication).
-///
-/// Returns null on success; on a soft failure (OOM inside a scan callback)
-/// returns the error message the caller should surface via `ctx.err` —
-/// preserving the exact error strings the pre-refactor `vsearch` emitted.
+/// Shared search core — HNSW → BQ/RaBitQ slab or KV prefilter → Exact slab or
+/// brute-force dispatch, populating `final_heap` with the top-K candidates.
 pub fn runSearch(
     ctx: *Ctx,
     query_key: []const u8,
     query_vec: []align(1) const f32,
     params: SearchParams,
+    final_heap: *TopKCandidate,
+) anyerror!?[]const u8 {
+    const reg_opt = ctx.vector_registry;
+    const store_synced = (reg_opt != null and ctx.store.vector_registry == reg_opt);
+    const ns_idx_opt: ?*IndexModule.NamespaceIndex = if (reg_opt) |reg| reg.get(params.namespace) else null;
+    const now_ms: u64 = if (params.decay > 0.0) ctx.timestamp() else 0;
+    return runSearchWithIndex(ctx, query_key, query_vec, params, ns_idx_opt, store_synced, now_ms, final_heap);
+}
+
+fn runSearchWithIndex(
+    ctx: *Ctx,
+    query_key: []const u8,
+    query_vec: []align(1) const f32,
+    params: SearchParams,
+    ns_idx_opt: ?*IndexModule.NamespaceIndex,
+    store_synced: bool,
+    now_ms: u64,
     final_heap: *TopKCandidate,
 ) anyerror!?[]const u8 {
     const top_k = params.top_k;
@@ -541,128 +932,244 @@ pub fn runSearch(
     const mode = params.mode;
     const decay_tau_hours = params.decay_tau_hours;
 
-    const now_ms = ctx.timestamp();
-
     // ── Stage 1A: HNSW (auto mode, namespace has matching index) ──
-    // Preferred path when available — ~5-50× faster than BQ at large N.
-    // The namespace's HNSW must have been built with the same metric the
-    // caller is querying with; mismatches fall through to BQ, which
-    // doesn't depend on the graph's distance choice.
     if (mode == .auto) {
-        if (ctx.vector_registry) |reg| {
-            if (reg.get(namespace)) |ns_idx| {
-                if (ns_idx.metric == metric) {
-                    if (try runHnswDispatch(
-                        ctx,
-                        query_key,
-                        ns_idx,
-                        query_vec,
-                        top_k,
-                        metric,
-                        decay,
-                        decay_tau_hours,
-                        params.ef,
-                        now_ms,
-                        final_heap,
-                    )) {
-                        return null;
-                    }
-                    // runHnswDispatch returned false → index is empty; fall
-                    // through to BQ / brute-force paths.
+        if (ns_idx_opt) |ns_idx| {
+            if (ns_idx.metric == metric) {
+                if (try runHnswDispatch(
+                    ctx,
+                    query_key,
+                    ns_idx,
+                    query_vec,
+                    top_k,
+                    metric,
+                    decay,
+                    decay_tau_hours,
+                    params.ef,
+                    now_ms,
+                    store_synced,
+                    final_heap,
+                )) {
+                    return null;
                 }
-                // Metric mismatch: fall through, log at debug level to help
-                // operators notice un-indexed query shapes.
-                if (ns_idx.metric != metric) {
-                    std.log.debug("vsearch: metric mismatch in '{s}' (index={s}, query={s}); using BQ fallback", .{
-                        namespace, ns_idx.metric.name(), metric.name(),
-                    });
-                }
+            } else {
+                std.log.debug("vsearch: metric mismatch in '{s}' (index={s}, query={s}); using BQ fallback", .{
+                    namespace, ns_idx.metric.name(), metric.name(),
+                });
             }
         }
     }
 
-    // ── Stage 1B: Quantized prefilter ───────────────────────────
-    // Enters when caller explicitly asked for bq/bq_rerank OR when auto
-    // mode fell through (no HNSW, metric mismatch). Full exact mode
-    // skips this and goes straight to the brute-force scan below.
-    //
-    // Dispatch:
-    //   - RaBitQ params installed + metric=l2 → unbiased estimator
-    //   - No RaBitQ params → legacy Hamming prefilter (works for any metric)
-    //   - RaBitQ params installed + metric≠l2 → SKIP quantized path.
-    //     The stored codes are `sign(R·(v-c)/||v-c||)`, uncorrelated with
-    //     `sign(query)`, so naive-Hamming on a non-rotated query would
-    //     return near-random top-M. Fall through to brute-force; users
-    //     querying cosine/dot on a RaBitQ namespace pay the full-precision
-    //     scan cost until a per-metric encoder is added.
+    const inv_q_norm = precomputeInvQueryNorm(metric, query_vec);
+    const use_in_index_slabs = store_synced and ctx.store.sst_count == 0;
+
+    // ── Stage 1B: Quantized prefilter (in-index slab first, deadlock-free KV fallback) ──
     if (mode == .auto or mode == .bq or mode == .bq_rerank) {
-        const ns_idx_opt: ?*IndexModule.NamespaceIndex =
-            if (ctx.vector_registry) |reg| reg.get(namespace) else null;
+        // Step 1: Try in-index RaBitQ / BQ slab OR retain refcounted RaBitQ handle,
+        // ALWAYS releasing `ns_idx.lockShared()` BEFORE any Store shard access!
+        var rq_handle: ?*IndexModule.RabitqParamsHandle = null;
+        defer if (rq_handle) |h| h.release();
+        var has_params = false;
 
-        // Branch on whether RaBitQ params are installed. The lock is
-        // held for the full stage-1 scan in the RaBitQ branch so a
-        // concurrent `EXEC vrabitq` can't free the params out from
-        // under us (it takes the exclusive lock via setRabitqParams).
-        // The scan itself only touches store shard locks, not the
-        // namespace lock, so the extended critical section doesn't
-        // risk deadlock.
-        const has_params = blk: {
-            if (ns_idx_opt) |idx| {
-                idx.lock.lockShared();
-                const got = idx.rabitq_params != null;
-                if (!got) idx.lock.unlockShared();
-                break :blk got;
+        const KvRerankCand = struct { key: []const u8, timestamp: u64 };
+        var kv_rerank_cands: ?[]KvRerankCand = null;
+        defer if (kv_rerank_cands) |buf| ctx.allocator.free(buf);
+        var kv_rerank_count: usize = 0;
+
+        if (ns_idx_opt) |idx| {
+            idx.lock.lockShared();
+            var unlocked = false;
+            defer if (!unlocked) idx.lock.unlockShared();
+
+            has_params = (idx.rabitq_params != null);
+            const exclude_id: ?u32 = if (query_key.len != 0) idx.nodeIdFor(query_key) else null;
+
+            if (has_params) {
+                const rabitq_metric_ok = (metric == .cosine and idx.metric == .cosine) or
+                    (metric == .l2 and idx.metric != .cosine);
+                if (rabitq_metric_ok) {
+                    if (use_in_index_slabs and idx.canUseRabitqSlabLocked(query_vec.len)) {
+                        const rerank = (mode != .bq);
+                        const need_stage1_out = rerank and !idx.canRerankFromHnswLocked(metric);
+                        const out_cap = if (need_stage1_out) @min(idx.liveCount(), top_k * STAGE1_OVERSAMPLE) else top_k;
+                        var slab_stack: [128]IndexModule.IndexScoredResult = undefined;
+                        var slab_heap: ?[]IndexModule.IndexScoredResult = null;
+                        defer if (slab_heap) |b| ctx.allocator.free(b);
+                        const slab_buf: []IndexModule.IndexScoredResult = if (out_cap <= slab_stack.len)
+                            slab_stack[0..out_cap]
+                        else blk: {
+                            const b = try ctx.allocator.alloc(IndexModule.IndexScoredResult, out_cap);
+                            slab_heap = b;
+                            break :blk b;
+                        };
+                        if (try idx.searchRabitqLocked(
+                            query_vec,
+                            exclude_id,
+                            top_k,
+                            STAGE1_OVERSAMPLE,
+                            metric,
+                            decay,
+                            now_ms,
+                            decay_tau_hours,
+                            rerank,
+                            slab_buf,
+                            ctx.allocator,
+                        )) |res| {
+                            if (!res.needs_kv_rerank) {
+                                for (slab_buf[0..res.count]) |r| {
+                                    final_heap.push(.{
+                                        .key = try ctx.allocator.dupe(u8, r.key),
+                                        .score = r.score,
+                                        .timestamp = r.timestamp,
+                                    });
+                                }
+                                return null;
+                            }
+                            const cbuf = try ctx.allocator.alloc(KvRerankCand, res.count);
+                            kv_rerank_cands = cbuf;
+                            for (slab_buf[0..res.count], 0..) |r, ci| {
+                                cbuf[ci] = .{
+                                    .key = try ctx.allocator.dupe(u8, r.key),
+                                    .timestamp = r.timestamp,
+                                };
+                            }
+                            kv_rerank_count = res.count;
+                        }
+                    } else {
+                        // KV fallback: retain refcounted params handle BEFORE unlocking!
+                        rq_handle = idx.acquireRabitqHandleLocked();
+                    }
+                }
+            } else if (use_in_index_slabs and idx.canUseBqSlabLocked(query_vec.len)) {
+                const need_stage1_out = !idx.canRerankFromHnswLocked(metric);
+                const out_cap = if (need_stage1_out) @min(idx.liveCount(), top_k * STAGE1_OVERSAMPLE) else top_k;
+                var slab_stack: [128]IndexModule.IndexScoredResult = undefined;
+                var slab_heap: ?[]IndexModule.IndexScoredResult = null;
+                defer if (slab_heap) |b| ctx.allocator.free(b);
+                const slab_buf: []IndexModule.IndexScoredResult = if (out_cap <= slab_stack.len)
+                    slab_stack[0..out_cap]
+                else blk: {
+                    const b = try ctx.allocator.alloc(IndexModule.IndexScoredResult, out_cap);
+                    slab_heap = b;
+                    break :blk b;
+                };
+                if (try idx.searchBqLocked(
+                    query_vec,
+                    exclude_id,
+                    top_k,
+                    STAGE1_OVERSAMPLE,
+                    metric,
+                    decay,
+                    now_ms,
+                    decay_tau_hours,
+                    true,
+                    slab_buf,
+                    ctx.allocator,
+                )) |res| {
+                    if (!res.needs_kv_rerank) {
+                        for (slab_buf[0..res.count]) |r| {
+                            final_heap.push(.{
+                                .key = try ctx.allocator.dupe(u8, r.key),
+                                .score = r.score,
+                                .timestamp = r.timestamp,
+                            });
+                        }
+                        return null;
+                    }
+                    const cbuf = try ctx.allocator.alloc(KvRerankCand, res.count);
+                    kv_rerank_cands = cbuf;
+                    for (slab_buf[0..res.count], 0..) |r, ci| {
+                        cbuf[ci] = .{
+                            .key = try ctx.allocator.dupe(u8, r.key),
+                            .timestamp = r.timestamp,
+                        };
+                    }
+                    kv_rerank_count = res.count;
+                }
             }
-            break :blk false;
-        };
 
-        // Case 1: params installed but metric is unsupported by the
-        // estimator → drop BQ entirely. Today only L2 and cosine are
-        // wired; dot product is deferred (would need per-vector inner
-        // product factors stored at encode time).
-        const rabitq_metric_ok = (metric == .l2) or (metric == .cosine);
-        if (has_params and !rabitq_metric_ok) {
-            ns_idx_opt.?.lock.unlockShared();
-            // Fall through (no `return`) so the brute-force block runs.
-        } else if (has_params) {
-            // Case 2: RaBitQ estimator path (L2 or cosine).
-            defer ns_idx_opt.?.lock.unlockShared();
-            const p = ns_idx_opt.?.rabitq_params.?;
-            if (p.dim != query_vec.len) {
-                // Dim mismatch — shouldn't happen in practice (freeze
-                // is shared with the graph), but skip the BQ stage and
-                // fall through to brute-force if it does.
-            } else {
+            idx.lock.unlockShared();
+            unlocked = true;
+        }
+
+        // Deferred KV Stage-2 rerank (e.g. `.cosine` namespace queried with `.l2`/`.dot`):
+        // runs completely outside `ns_idx.lock`!
+        if (kv_rerank_cands) |cbuf| {
+            var val_stack: [STACK_QUERY_BYTES]u8 align(16) = undefined;
+            for (cbuf[0..kv_rerank_count]) |cand| {
+                var val_heap: ?[]align(16) u8 = null;
+                defer if (val_heap) |b| ctx.allocator.free(b);
+                const vec_bytes = (try readKeyInto(ctx, cand.key, &val_stack, &val_heap)) orelse continue;
+                const vec = distance.bytesToF32(vec_bytes) orelse continue;
+                if (vec.len != query_vec.len) continue;
+                const raw_sim = computeExactSimWithNorm(metric, query_vec, inv_q_norm, vec);
+                const score = applyDecay(raw_sim, cand.timestamp, decay, now_ms, decay_tau_hours);
+                if (!(score > final_heap.thresholdScore())) continue;
+                final_heap.push(.{ .key = cand.key, .score = score, .timestamp = cand.timestamp });
+            }
+            return null;
+        }
+
+        // Case 2: RaBitQ KV fallback (ZERO index locks held during scan or rerank!).
+        if (rq_handle) |handle| {
+            const p = handle.params;
+            if (p.dim == query_vec.len) {
+                const dim = query_vec.len;
                 const stage1_size = top_k * STAGE1_OVERSAMPLE;
                 const stage1_buf = try ctx.allocator.alloc(Candidate, stage1_size);
+                defer ctx.allocator.free(stage1_buf);
                 var stage1_heap = TopKCandidate.init(stage1_buf);
 
-                const bq_prefix = try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ BQ_PREFIX, namespace });
+                var bq_prefix_stack: [256]u8 = undefined;
+                var bq_prefix_heap: ?[]u8 = null;
+                defer if (bq_prefix_heap) |b| ctx.allocator.free(b);
+                const bq_prefix = try buildBqPrefix(ctx.allocator, namespace, &bq_prefix_stack, &bq_prefix_heap);
 
-                const dim = query_vec.len;
-                const q_residual = try ctx.allocator.alloc(f32, dim);
-                const q_rot_unit = try ctx.allocator.alloc(f32, dim);
+                var q_res_stack: [STACK_DIM_CAP]f32 = undefined;
+                var q_rot_stack: [STACK_DIM_CAP]f32 = undefined;
+                var q_norm_stack: [STACK_DIM_CAP]f32 = undefined;
+                var q_res_heap: ?[]f32 = null;
+                defer if (q_res_heap) |b| ctx.allocator.free(b);
+                var q_rot_heap: ?[]f32 = null;
+                defer if (q_rot_heap) |b| ctx.allocator.free(b);
+                var q_norm_heap: ?[]f32 = null;
+                defer if (q_norm_heap) |b| ctx.allocator.free(b);
 
-                // Cosine namespaces pre-normalized at encode time, so
-                // the query also normalizes before residual/rotation
-                // computation. The estimator's L2² output then maps to
-                // cosine via `cos = 1 - L²/2` on the unit sphere.
+                const q_residual: []f32 = if (dim <= STACK_DIM_CAP) q_res_stack[0..dim] else blk: {
+                    const b = try ctx.allocator.alloc(f32, dim);
+                    q_res_heap = b;
+                    break :blk b;
+                };
+                const q_rot_unit: []f32 = if (dim <= STACK_DIM_CAP) q_rot_stack[0..dim] else blk: {
+                    const b = try ctx.allocator.alloc(f32, dim);
+                    q_rot_heap = b;
+                    break :blk b;
+                };
                 const prepare_input: []align(1) const f32 = if (metric == .cosine) blk: {
-                    const norm_buf = try ctx.allocator.alloc(f32, dim);
-                    if (!rabitq.normalizeInto(query_vec, norm_buf)) {
-                        // Zero query — degenerate; treat as if all
-                        // candidates are equidistant.
-                    }
-                    break :blk @ptrCast(norm_buf);
+                    const nb: []f32 = if (dim <= STACK_DIM_CAP) q_norm_stack[0..dim] else blk2: {
+                        const b = try ctx.allocator.alloc(f32, dim);
+                        q_norm_heap = b;
+                        break :blk2 b;
+                    };
+                    _ = rabitq.normalizeInto(query_vec, nb);
+                    break :blk @ptrCast(nb);
                 } else query_vec;
 
-                const q_l2 = rabitq.prepareQuery(prepare_input, p, q_residual, q_rot_unit);
+                const cb = rabitq.codeBytes(dim);
+                const plane_bytes = 4 * cb;
+                var plane_stack: [4 * STACK_CODE_BYTES]u8 = undefined;
+                var plane_heap: ?[]u8 = null;
+                defer if (plane_heap) |b| ctx.allocator.free(b);
+                const plane_buf: []u8 = if (plane_bytes <= plane_stack.len) plane_stack[0..plane_bytes] else blk: {
+                    const b = try ctx.allocator.alloc(u8, plane_bytes);
+                    plane_heap = b;
+                    break :blk b;
+                };
+                const pq = rabitq.prepareQueryFull(prepare_input, p, q_residual, q_rot_unit, plane_buf);
 
                 var rq_sc = RabitqScanCtx{
-                    .q_rot_unit = q_rot_unit,
-                    .q_l2 = q_l2,
+                    .pq = pq,
                     .query_key = query_key,
-                    .code_bytes = rabitq.codeBytes(dim),
                     .dim = dim,
                     .decay = decay,
                     .decay_tau_hours = decay_tau_hours,
@@ -674,7 +1181,6 @@ pub fn runSearch(
                     .cosine_score = (metric == .cosine),
                 };
                 ctx.scanCallback(bq_prefix, @ptrCast(&rq_sc), onRabitqMatch);
-
                 if (rq_sc.oom) return "vsearch: out of memory during BQ stage";
 
                 if (rq_sc.saw_any > 0) {
@@ -685,32 +1191,46 @@ pub fn runSearch(
                             final_heap.push(.{ .key = cand.key, .score = cand.score, .timestamp = cand.timestamp });
                         }
                     } else {
+                        var val_stack: [STACK_QUERY_BYTES]u8 align(16) = undefined;
                         for (candidates) |cand| {
-                            const vec_bytes = (try ctx.getCopy(cand.key)) orelse continue;
+                            var val_heap: ?[]align(16) u8 = null;
+                            defer if (val_heap) |b| ctx.allocator.free(b);
+                            const vec_bytes = (try readKeyInto(ctx, cand.key, &val_stack, &val_heap)) orelse continue;
                             const vec = distance.bytesToF32(vec_bytes) orelse continue;
                             if (vec.len != query_vec.len) continue;
-                            const raw_sim = computeExactSim(metric, query_vec, vec);
+                            const raw_sim = computeExactSimWithNorm(metric, query_vec, inv_q_norm, vec);
                             const score = applyDecay(raw_sim, cand.timestamp, decay, now_ms, decay_tau_hours);
+                            if (!(score > final_heap.thresholdScore())) continue;
                             final_heap.push(.{ .key = cand.key, .score = score, .timestamp = cand.timestamp });
                         }
                     }
                     return null;
                 }
-                // Fall through (empty namespace → brute-force).
             }
         }
 
-        // Case 3: no params installed → legacy Hamming prefilter.
+        // Case 3: no RaBitQ params installed → legacy Hamming KV fallback.
         if (!has_params) {
             const query_bq_size = distance.binaryQuantizedSize(query_vec.len);
-            const query_bq = try ctx.allocator.alloc(u8, query_bq_size);
+            var q_bq_stack: [STACK_CODE_BYTES]u8 = undefined;
+            var q_bq_heap: ?[]u8 = null;
+            defer if (q_bq_heap) |b| ctx.allocator.free(b);
+            const query_bq: []u8 = if (query_bq_size <= q_bq_stack.len) q_bq_stack[0..query_bq_size] else blk: {
+                const b = try ctx.allocator.alloc(u8, query_bq_size);
+                q_bq_heap = b;
+                break :blk b;
+            };
             distance.binaryQuantize(query_vec, query_bq);
 
             const stage1_size = top_k * STAGE1_OVERSAMPLE;
             const stage1_buf = try ctx.allocator.alloc(Candidate, stage1_size);
+            defer ctx.allocator.free(stage1_buf);
             var stage1_heap = TopKCandidate.init(stage1_buf);
 
-            const bq_prefix = try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ BQ_PREFIX, namespace });
+            var bq_prefix_stack: [256]u8 = undefined;
+            var bq_prefix_heap: ?[]u8 = null;
+            defer if (bq_prefix_heap) |b| ctx.allocator.free(b);
+            const bq_prefix = try buildBqPrefix(ctx.allocator, namespace, &bq_prefix_stack, &bq_prefix_heap);
 
             var bq_sc = BQScanCtx{
                 .query_bq = query_bq,
@@ -729,27 +1249,59 @@ pub fn runSearch(
 
             if (bq_sc.saw_any > 0) {
                 const candidates = stage1_heap.sortedDesc();
+                var val_stack: [STACK_QUERY_BYTES]u8 align(16) = undefined;
                 for (candidates) |cand| {
-                    const vec_bytes = (try ctx.getCopy(cand.key)) orelse continue;
+                    var val_heap: ?[]align(16) u8 = null;
+                    defer if (val_heap) |b| ctx.allocator.free(b);
+                    const vec_bytes = (try readKeyInto(ctx, cand.key, &val_stack, &val_heap)) orelse continue;
                     const vec = distance.bytesToF32(vec_bytes) orelse continue;
                     if (vec.len != query_vec.len) continue;
-                    const raw_sim = computeExactSim(metric, query_vec, vec);
+                    const raw_sim = computeExactSimWithNorm(metric, query_vec, inv_q_norm, vec);
                     const score = applyDecay(raw_sim, cand.timestamp, decay, now_ms, decay_tau_hours);
+                    if (!(score > final_heap.thresholdScore())) continue;
                     final_heap.push(.{ .key = cand.key, .score = score, .timestamp = cand.timestamp });
                 }
                 return null;
             }
-            // Fall through to brute-force when no bq:* entries exist.
         }
-
-        // All reachable BQ branches have either returned a result or
-        // fallen through to brute-force below.
     }
 
-    // ── Brute-force path (mode=exact or auto-fallback) ───────────
+    // ── Exact path: contiguous HNSW vector slab when guaranteed complete ──
+    if (use_in_index_slabs) {
+        if (ns_idx_opt) |ns_idx| {
+            ns_idx.lock.lockShared();
+            defer ns_idx.lock.unlockShared();
+            if (ns_idx.canUseExactSlabLocked(query_vec.len, metric)) {
+                const exclude_id: ?u32 = if (query_key.len != 0) ns_idx.nodeIdFor(query_key) else null;
+                var slab_out: [MAX_TOP_K]IndexModule.IndexScoredResult = undefined;
+                const n_found = try ns_idx.searchExactLocked(
+                    query_vec,
+                    exclude_id,
+                    top_k,
+                    metric,
+                    decay,
+                    now_ms,
+                    decay_tau_hours,
+                    slab_out[0..top_k],
+                    ctx.allocator,
+                );
+                for (slab_out[0..n_found]) |r| {
+                    final_heap.push(.{
+                        .key = try ctx.allocator.dupe(u8, r.key),
+                        .score = r.score,
+                        .timestamp = r.timestamp,
+                    });
+                }
+                return null;
+            }
+        }
+    }
+
+    // ── Brute-force KV fallback (with precomputed inv_q_norm) ────
     var exact_sc = ExactScanCtx{
         .query_key = query_key,
         .query_vec = query_vec,
+        .inv_q_norm = inv_q_norm,
         .metric = metric,
         .decay = decay,
         .decay_tau_hours = decay_tau_hours,
@@ -767,20 +1319,6 @@ pub fn runSearch(
 // ╔═══════════════════════════════════════════════════╗
 // ║  vsearch_local_raw — inline-query peer sub-search  ║
 // ╚═══════════════════════════════════════════════════╝
-//
-// EXEC vsearch_local_raw <query_b64> <top_k> [namespace] [metric] [decay] [mode] [decay_tau_hours] [ef]
-//
-// Same search as `vsearch` but the query vector is passed INLINE as
-// standard base64 of the raw little-endian f32 bytes — no key lookup.
-// This is the peer-side half of `vsearch_cluster`'s scatter-gather: the
-// coordinator holds the query vector; the queried peer may not have it
-// stored under any key. Exposed to peers over the replication channel
-// (see `isAllowedReplicationProcedure` in src/server/tcp.zig — org-
-// authenticated when W2 enforcement is on) and never re-scatters, so
-// there is no fan-out loop.
-//
-// Returns the same JSON array shape as `vsearch`:
-//   [{"k":"vec:ns:id","s":0.95,"ts":1709...}, ...]
 
 pub fn executeLocalRaw(ctx: *Ctx) anyerror!Ctx.Result {
     const query_b64 = ctx.arg(0) orelse
@@ -815,23 +1353,28 @@ pub fn executeLocalRaw(ctx: *Ctx) anyerror!Ctx.Result {
     // ── Authorize: results come from the whole namespace ──
     try ctx.requirePrefix(namespace, .read);
 
-    // ── Decode the inline query vector (base64 of raw f32 LE bytes) ──
+    // ── Decode inline query vector into 16B-aligned stack buffer ──
     const decoder = std.base64.standard.Decoder;
     const decoded_len = decoder.calcSizeForSlice(query_b64) catch
         return ctx.err("vsearch_local_raw: query is not valid base64");
-    const decoded = try ctx.allocator.alloc(u8, decoded_len);
+
+    var dec_stack: [STACK_QUERY_BYTES]u8 align(16) = undefined;
+    var dec_heap: ?[]align(16) u8 = null;
+    defer if (dec_heap) |b| ctx.allocator.free(b);
+    const decoded: []u8 = if (decoded_len <= dec_stack.len)
+        dec_stack[0..decoded_len]
+    else blk: {
+        const b = try ctx.allocator.alignedAlloc(u8, .@"16", decoded_len);
+        dec_heap = b;
+        break :blk b;
+    };
     decoder.decode(decoded, query_b64) catch
         return ctx.err("vsearch_local_raw: query is not valid base64");
 
     const query_vec = distance.bytesToF32(decoded) orelse
         return ctx.err("vsearch_local_raw: query is not a valid f32 vector (byte length must be a positive multiple of 4)");
 
-    // ── Run the shared search core with no self-key exclusion ──
-    // ("" never equals a stored key under a non-empty namespace prefix.)
-    const final_buf = try ctx.allocator.alloc(Candidate, top_k);
-    var final_heap = TopKCandidate.init(final_buf);
-
-    if (try runSearch(ctx, "", query_vec, .{
+    const search_params = SearchParams{
         .top_k = top_k,
         .namespace = namespace,
         .metric = metric,
@@ -839,7 +1382,29 @@ pub fn executeLocalRaw(ctx: *Ctx) anyerror!Ctx.Result {
         .mode = mode,
         .decay_tau_hours = decay_tau_hours,
         .ef = ef_override,
-    }, &final_heap)) |msg| return ctx.err(msg);
+    };
+    const now_ms: u64 = if (decay > 0.0) ctx.timestamp() else 0;
+    const reg_opt = ctx.vector_registry;
+    const store_synced = (reg_opt != null and ctx.store.vector_registry == reg_opt);
+    const ns_idx_opt: ?*IndexModule.NamespaceIndex = if (reg_opt) |reg| reg.get(namespace) else null;
+
+    // Direct zero-key-dupe path when synchronized with Store.
+    if (ns_idx_opt) |ns_idx| {
+        if (store_synced and ctx.store.sst_count == 0) {
+            ns_idx.lock.lockShared();
+            defer ns_idx.lock.unlockShared();
+            if (try serveDirectLocked(ctx, ns_idx, query_vec, null, search_params, now_ms)) |res| {
+                return res;
+            }
+        }
+    }
+
+    var final_buf: [MAX_TOP_K]Candidate = undefined;
+    var final_heap = TopKCandidate.init(final_buf[0..top_k]);
+
+    if (try runSearchWithIndex(ctx, "", query_vec, search_params, ns_idx_opt, store_synced, now_ms, &final_heap)) |msg| {
+        return ctx.err(msg);
+    }
 
     return emitJson(ctx, final_heap.sortedDesc());
 }
@@ -1122,4 +1687,366 @@ test "vsearch: optional ef argument accepts integer or ef=<N> and rejects 0" {
         &registry,
     );
     try testing.expect(bad_zero == .err);
+}
+
+test "vsearch E2E: vrabitq + mode=bq & bq_rerank (L2, cosine, dot fallthrough)" {
+    const vector_ops = @import("vector_ops.zig");
+    const vrabitq = @import("vrabitq.zig");
+    const alloc = testing.allocator;
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    inline for ([_]Metric{ .l2, .cosine }) |ns_metric| {
+        var store = try Store.init(alloc, Config{ .persistence = .none });
+        defer store.deinit();
+        var reg = IndexModule.NamespaceRegistry.init(alloc, .{ .m = 8, .ef_construction = 40 });
+        defer reg.deinit();
+        store.vector_registry = &reg;
+
+        const ns = if (ns_metric == .l2) "vec:e2e_l2:" else "vec:e2e_cos:";
+        const dim: usize = 64;
+        var prng = std.Random.DefaultPrng.init(0xC0FFEE1234);
+        const rand = prng.random();
+        var key_buf: [64]u8 = undefined;
+        var vec_buf: [dim]f32 = undefined;
+
+        // 40 vectors (>32 so FastScan32 packs 1 full block + 8-vector tail).
+        for (0..40) |i| {
+            for (&vec_buf) |*x| x.* = rand.floatNorm(f32);
+            if (i == 17) {
+                @memset(&vec_buf, 0.0);
+                vec_buf[0] = 5.0;
+                vec_buf[1] = 1.0;
+            }
+            const k = std.fmt.bufPrint(&key_buf, "{s}{d}", .{ ns, i }) catch unreachable;
+            try vector_ops.applyVinsert(&store, null, null, &reg, alloc, .{
+                .key = k,
+                .vector = std.mem.sliceAsBytes(&vec_buf),
+                .worm = false,
+                .namespace = ns,
+                .metric = ns_metric,
+                .timestamp = 1_700_000_000_000 + i,
+                .replicate = false,
+            });
+        }
+
+        // Query aligned with item 17.
+        var q_vec: [dim]f32 = @splat(0.0);
+        q_vec[0] = 5.0;
+        q_vec[1] = 1.0;
+        try store.set("q_target", std.mem.sliceAsBytes(&q_vec), false);
+
+        // Run vrabitq on the namespace.
+        const rq_res = try testRunProcWithRegistry(&store, vrabitq.execute, &.{ ns, "123" }, arena, &reg);
+        try testing.expect(rq_res == .value);
+
+        const mname = ns_metric.name();
+        const want_k = std.fmt.bufPrint(&key_buf, "\"k\":\"{s}17\"", .{ns}) catch unreachable;
+
+        // 1. mode=bq (pure FastScan32 RaBitQ estimator, no rerank)
+        const res_bq = try testRunProcWithRegistry(&store, execute, &.{ "q_target", "5", ns, mname, "0", "bq" }, arena, &reg);
+        try testing.expect(res_bq == .value);
+        try testing.expect(std.mem.indexOf(u8, res_bq.value.?, want_k) != null);
+
+        // 2. mode=bq_rerank (FastScan32 + zero-copy HNSW slab rerank)
+        const res_rr = try testRunProcWithRegistry(&store, execute, &.{ "q_target", "5", ns, mname, "0", "bq_rerank" }, arena, &reg);
+        try testing.expect(res_rr == .value);
+        try testing.expect(std.mem.startsWith(u8, res_rr.value.?, try std.fmt.allocPrint(arena, "[{{{s}", .{want_k})));
+
+        // 3. mode=bq with dot metric falls through to exact (dot is unsupported by RaBitQ).
+        const res_dot = try testRunProcWithRegistry(&store, execute, &.{ "q_target", "5", ns, "dot", "0", "bq" }, arena, &reg);
+        try testing.expect(res_dot == .value);
+        try testing.expect(std.mem.startsWith(u8, res_dot.value.?, try std.fmt.allocPrint(arena, "[{{{s}", .{want_k})));
+    }
+}
+
+test "vsearch E2E: cosine namespace queried with l2/dot (pre- and post-vrabitq) preserves raw magnitude" {
+    const vector_ops = @import("vector_ops.zig");
+    const vrabitq = @import("vrabitq.zig");
+    const alloc = testing.allocator;
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.init(alloc, Config{ .persistence = .none });
+    defer store.deinit();
+    var reg = IndexModule.NamespaceRegistry.init(alloc, .{ .m = 8, .ef_construction = 40 });
+    defer reg.deinit();
+    store.vector_registry = &reg;
+
+    const ns = "vec:cos_raw:";
+    // Same direction [1, 0, ...], VERY different magnitudes:
+    //   v_small = [1, 0, ...]  (unit norm = [1, 0])
+    //   v_huge  = [100, 0, ...] (unit norm = [1, 0] — IDENTICAL in cosine HNSW!)
+    // Query = [100, 0, ...] → under L2 and DOT, v_huge MUST beat v_small decisively!
+    // If HNSW unit-normalized slab were mistakenly used, v_small and v_huge would tie!
+    var v_small: [16]f32 = @splat(0.0);
+    v_small[0] = 1.0;
+    var v_huge: [16]f32 = @splat(0.0);
+    v_huge[0] = 100.0;
+    var v_other: [16]f32 = @splat(0.0);
+    v_other[1] = 1.0;
+
+    try vector_ops.applyVinsert(&store, null, null, &reg, alloc, .{
+        .key = "vec:cos_raw:small",
+        .vector = std.mem.sliceAsBytes(&v_small),
+        .worm = false,
+        .namespace = ns,
+        .metric = .cosine,
+        .timestamp = 10,
+        .replicate = false,
+    });
+    try vector_ops.applyVinsert(&store, null, null, &reg, alloc, .{
+        .key = "vec:cos_raw:huge",
+        .vector = std.mem.sliceAsBytes(&v_huge),
+        .worm = false,
+        .namespace = ns,
+        .metric = .cosine,
+        .timestamp = 20,
+        .replicate = false,
+    });
+    try vector_ops.applyVinsert(&store, null, null, &reg, alloc, .{
+        .key = "vec:cos_raw:other",
+        .vector = std.mem.sliceAsBytes(&v_other),
+        .worm = false,
+        .namespace = ns,
+        .metric = .cosine,
+        .timestamp = 30,
+        .replicate = false,
+    });
+    try store.set("q_huge", std.mem.sliceAsBytes(&v_huge), false);
+
+    // Pre-vrabitq: legacy BQ slab must defer to KV rerank, exact must use KV scan.
+    inline for ([_][]const u8{ "auto", "bq", "bq_rerank", "exact" }) |mode_s| {
+        const res_l2 = try testRunProcWithRegistry(&store, execute, &.{ "q_huge", "2", ns, "l2", "0", mode_s }, arena, &reg);
+        try testing.expect(res_l2 == .value);
+        try testing.expect(std.mem.startsWith(u8, res_l2.value.?, "[{\"k\":\"vec:cos_raw:huge\",\"s\":1.000000"));
+
+        const res_dot = try testRunProcWithRegistry(&store, execute, &.{ "q_huge", "2", ns, "dot", "0", mode_s }, arena, &reg);
+        try testing.expect(res_dot == .value);
+        try testing.expect(std.mem.startsWith(u8, res_dot.value.?, "[{\"k\":\"vec:cos_raw:huge\",\"s\":10000.000000"));
+    }
+
+    // Post-vrabitq: cosine RaBitQ params installed → L2/dot queries MUST fall through to exact KV.
+    const rq_res = try testRunProcWithRegistry(&store, vrabitq.execute, &.{ ns, "7" }, arena, &reg);
+    try testing.expect(rq_res == .value);
+
+    inline for ([_][]const u8{ "auto", "bq", "bq_rerank", "exact" }) |mode_s| {
+        const res_l2 = try testRunProcWithRegistry(&store, execute, &.{ "q_huge", "2", ns, "l2", "0", mode_s }, arena, &reg);
+        try testing.expect(res_l2 == .value);
+        try testing.expect(std.mem.startsWith(u8, res_l2.value.?, "[{\"k\":\"vec:cos_raw:huge\",\"s\":1.000000"));
+
+        const res_dot = try testRunProcWithRegistry(&store, execute, &.{ "q_huge", "2", ns, "dot", "0", mode_s }, arena, &reg);
+        try testing.expect(res_dot == .value);
+        try testing.expect(std.mem.startsWith(u8, res_dot.value.?, "[{\"k\":\"vec:cos_raw:huge\",\"s\":10000.000000"));
+    }
+}
+
+test "vsearch E2E: mixed legacy 16B/24B KV fallback and lost-params crash fallback" {
+    const vector_ops = @import("vector_ops.zig");
+    const vrabitq = @import("vrabitq.zig");
+    const alloc = testing.allocator;
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.init(alloc, Config{ .persistence = .none });
+    defer store.deinit();
+    var reg = IndexModule.NamespaceRegistry.init(alloc, .{ .m = 8, .ef_construction = 40 });
+    defer reg.deinit();
+    store.vector_registry = &reg;
+
+    const ns = "vec:mix:";
+    const dim: usize = 128;
+    var v1: [dim]f32 = @splat(0.1);
+    v1[0] = 5.0;
+    var v2: [dim]f32 = @splat(0.1);
+    v2[1] = 5.0;
+    var v3: [dim]f32 = @splat(0.1);
+    v3[2] = 5.0;
+
+    try vector_ops.applyVinsert(&store, null, null, &reg, alloc, .{
+        .key = "vec:mix:a",
+        .vector = std.mem.sliceAsBytes(&v1),
+        .worm = false,
+        .namespace = ns,
+        .metric = .l2,
+        .timestamp = 10,
+        .replicate = false,
+    });
+    try vector_ops.applyVinsert(&store, null, null, &reg, alloc, .{
+        .key = "vec:mix:b",
+        .vector = std.mem.sliceAsBytes(&v2),
+        .worm = false,
+        .namespace = ns,
+        .metric = .l2,
+        .timestamp = 20,
+        .replicate = false,
+    });
+    try vector_ops.applyVinsert(&store, null, null, &reg, alloc, .{
+        .key = "vec:mix:c",
+        .vector = std.mem.sliceAsBytes(&v3),
+        .worm = false,
+        .namespace = ns,
+        .metric = .l2,
+        .timestamp = 30,
+        .replicate = false,
+    });
+    try store.set("q_mix", std.mem.sliceAsBytes(&v1), false);
+
+    // Run vrabitq so all bq:* become 24-byte RaBitQ entries.
+    const rq_res = try testRunProcWithRegistry(&store, vrabitq.execute, &.{ ns, "55" }, arena, &reg);
+    try testing.expect(rq_res == .value);
+
+    // 1. Mixed corpus: overwrite bq:vec:mix:c with a legacy 16B code and mark rq_slab unsynced
+    //    (exercising deadlock-free RaBitQ KV fallback skipping legacy 16B cleanly).
+    var legacy_bq: [16]u8 = undefined;
+    distance.binaryQuantize(&v3, &legacy_bq);
+    try store.setWithTimestampNoVectorSync("bq:vec:mix:c", &legacy_bq, false, 30);
+    const idx = reg.get(ns).?;
+    idx.lock.lock();
+    idx.rq_slab.synced = false;
+    idx.lock.unlock();
+
+    const mixed_res = try testRunProcWithRegistry(&store, execute, &.{ "q_mix", "2", ns, "l2", "0", "bq_rerank" }, arena, &reg);
+    try testing.expect(mixed_res == .value);
+    try testing.expect(std.mem.startsWith(u8, mixed_res.value.?, "[{\"k\":\"vec:mix:a\""));
+    try testing.expect(std.mem.indexOf(u8, mixed_res.value.?, "vec:mix:c") == null);
+
+    // 2. Lost-params crash fallback: drop registry entry while 24B bq:* entries remain in KV.
+    //    Ensure bq:vec:mix:c is also 24B so ALL entries are 24B, forcing saw_any == 0 -> exact KV.
+    const bq_a = (try store.getValueDupe("bq:vec:mix:a", alloc)).?;
+    defer alloc.free(bq_a);
+    try store.setWithTimestampNoVectorSync("bq:vec:mix:c", bq_a, false, 30);
+    reg.remove(ns);
+
+    const lost_res = try testRunProcWithRegistry(&store, execute, &.{ "q_mix", "2", ns, "l2", "0", "auto" }, arena, &reg);
+    try testing.expect(lost_res == .value);
+    try testing.expect(std.mem.startsWith(u8, lost_res.value.?, "[{\"k\":\"vec:mix:a\""));
+}
+
+test "vsearch E2E: temporal decay > 0 promotes newer neighbor across HNSW, slab, and exact modes" {
+    const vector_ops = @import("vector_ops.zig");
+    const alloc = testing.allocator;
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.init(alloc, Config{ .persistence = .none });
+    defer store.deinit();
+    var reg = IndexModule.NamespaceRegistry.init(alloc, .{ .m = 8, .ef_construction = 40 });
+    defer reg.deinit();
+    store.vector_registry = &reg;
+
+    const ns = "vec:dec:";
+    const q = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+    const v_old_near = [_]f32{ 0.99, 0.14, 0.0, 0.0 }; // cos ≈ 0.99, ancient timestamp
+    const v_new_mid = [_]f32{ 0.85, 0.52, 0.0, 0.0 }; // cos ≈ 0.85, brand-new timestamp
+
+    const now_ms: u64 = @intCast(@max(@as(i64, 0), @import("../core/compat.zig").nowMs()));
+    const old_ts: u64 = if (now_ms > 30 * 24 * 3_600_000) now_ms - 30 * 24 * 3_600_000 else 1;
+
+    try vector_ops.applyVinsert(&store, null, null, &reg, alloc, .{
+        .key = "vec:dec:old",
+        .vector = std.mem.sliceAsBytes(&v_old_near),
+        .worm = false,
+        .namespace = ns,
+        .metric = .cosine,
+        .timestamp = old_ts,
+        .replicate = false,
+    });
+    try vector_ops.applyVinsert(&store, null, null, &reg, alloc, .{
+        .key = "vec:dec:new",
+        .vector = std.mem.sliceAsBytes(&v_new_mid),
+        .worm = false,
+        .namespace = ns,
+        .metric = .cosine,
+        .timestamp = now_ms,
+        .replicate = false,
+    });
+    try store.set("q_dec", std.mem.sliceAsBytes(&q), false);
+
+    // Without decay: vec:dec:old wins.
+    const no_dec = try testRunProcWithRegistry(&store, execute, &.{ "q_dec", "2", ns, "cosine", "0", "auto" }, arena, &reg);
+    try testing.expect(no_dec == .value);
+    try testing.expect(std.mem.startsWith(u8, no_dec.value.?, "[{\"k\":\"vec:dec:old\""));
+
+    // With strong decay (0.5, tau=24h): vec:dec:new wins across auto, bq_rerank, and exact!
+    inline for ([_][]const u8{ "auto", "bq_rerank", "exact" }) |mode_s| {
+        const with_dec = try testRunProcWithRegistry(&store, execute, &.{ "q_dec", "2", ns, "cosine", "0.5", mode_s, "24" }, arena, &reg);
+        try testing.expect(with_dec == .value);
+        try testing.expect(std.mem.startsWith(u8, with_dec.value.?, "[{\"k\":\"vec:dec:new\""));
+    }
+}
+
+test "vsearch E2E: pre-existing KV vec/bq keys before getOrCreate are preserved on mode=bq_rerank and vreindex restores slab" {
+    const vector_ops = @import("vector_ops.zig");
+    const vreindex = @import("vreindex.zig");
+    const alloc = testing.allocator;
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try Store.init(alloc, Config{ .persistence = .none });
+    defer store.deinit();
+    var reg = IndexModule.NamespaceRegistry.init(alloc, .{ .m = 8, .ef_construction = 32 });
+    defer reg.deinit();
+    store.vector_registry = &reg;
+
+    const ns = "vec:pre:";
+    const v_old = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+    const v_new = [_]f32{ 0.0, 1.0, 0.0, 0.0 };
+    var bq_old: [1]u8 = undefined;
+    distance.binaryQuantize(&v_old, &bq_old);
+
+    // Pre-existing vec + bq entries written BEFORE the namespace index exists.
+    try store.set("vec:pre:old", std.mem.sliceAsBytes(&v_old), false);
+    try store.set("bq:vec:pre:old", &bq_old, false);
+    try store.set("q_pre", std.mem.sliceAsBytes(&v_old), false);
+
+    // Now insert a new vector via applyVinsert (creates index on non-empty prefix -> incomplete).
+    try vector_ops.applyVinsert(&store, null, null, &reg, alloc, .{
+        .key = "vec:pre:new",
+        .vector = std.mem.sliceAsBytes(&v_new),
+        .worm = false,
+        .namespace = ns,
+        .metric = .cosine,
+        .timestamp = 100,
+        .replicate = false,
+    });
+
+    const idx = reg.get(ns).?;
+    {
+        idx.lock.lockShared();
+        defer idx.lock.unlockShared();
+        try testing.expect(!idx.complete_with_store);
+        try testing.expect(!idx.bq_slab.synced);
+        try testing.expect(!idx.canUseBqSlabLocked(4));
+    }
+
+    // mode=bq_rerank must fall back to KV scan and find vec:pre:old (not silently drop it!).
+    const before_reindex = try testRunProcWithRegistry(&store, execute, &.{ "q_pre", "2", ns, "cosine", "0", "bq_rerank" }, arena, &reg);
+    try testing.expect(before_reindex == .value);
+    try testing.expect(std.mem.startsWith(u8, before_reindex.value.?, "[{\"k\":\"vec:pre:old\""));
+
+    // Running vreindex rebuilds complete index and re-enables the fast BQ slab.
+    const ri = try testRunProcWithRegistry(&store, vreindex.execute, &.{ns}, arena, &reg);
+    try testing.expect(ri == .value);
+    {
+        idx.lock.lockShared();
+        defer idx.lock.unlockShared();
+        try testing.expect(idx.complete_with_store);
+        try testing.expect(idx.bq_slab.synced);
+        try testing.expect(idx.canUseBqSlabLocked(4));
+    }
+
+    const after_reindex = try testRunProcWithRegistry(&store, execute, &.{ "q_pre", "2", ns, "cosine", "0", "bq_rerank" }, arena, &reg);
+    try testing.expect(after_reindex == .value);
+    try testing.expect(std.mem.startsWith(u8, after_reindex.value.?, "[{\"k\":\"vec:pre:old\""));
 }

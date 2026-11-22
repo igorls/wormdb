@@ -52,8 +52,13 @@ const has_avx512_vpopcntdq: bool = (builtin.cpu.arch == .x86_64 or builtin.cpu.a
 const has_avx512vl: bool = (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .x86) and
     std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vl);
 
+/// Gates the `pshufb512` FastScan kernel only. Its zmm (`v`) inline-asm constraints are
+/// accepted by the LLVM backend alone; Debug builds on x86_64 Linux use Zig's self-hosted
+/// backend, so on an AVX-512 host they fall through to the AVX2 kernel instead of failing
+/// to compile.
 const has_avx512bw: bool = (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .x86) and
-    std.Target.x86.featureSetHas(builtin.cpu.features, .avx512bw);
+    std.Target.x86.featureSetHas(builtin.cpu.features, .avx512bw) and
+    builtin.zig_backend == .stage2_llvm;
 
 const has_avx2: bool = (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .x86) and
     std.Target.x86.featureSetHas(builtin.cpu.features, .avx2);

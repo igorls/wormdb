@@ -416,6 +416,10 @@ const RABITQ_SEL_GUARD: usize = 32;
 const is_x86_64 = builtin.cpu.arch == .x86_64;
 const has_avx512f = is_x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx512f);
 const has_avx2 = is_x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx2);
+/// `compressStore16Avx512` needs the `{k1}` mask-register inline-asm constraint, which
+/// only the LLVM backend accepts. Debug builds on x86_64 Linux use Zig's self-hosted
+/// backend, so on an AVX-512 host they take the bitmask path instead of failing to compile.
+const has_avx512_compress_asm = has_avx512f and builtin.zig_backend == .stage2_llvm;
 
 const IdDist = struct { id: u32, dist: f32 };
 fn idDistOf(x: IdDist) f32 {
@@ -2527,7 +2531,7 @@ pub const NamespaceIndex = struct {
                 var threshold: f32 = std.math.inf(f32);
 
                 // 1. Full 32-vector FastScan blocks.
-                if (comptime has_avx512f) {
+                if (comptime has_avx512_compress_asm) {
                     if (!has_filter) {
                         const iota0: @Vector(16, u32) = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
                         const iota1: @Vector(16, u32) = .{ 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 };

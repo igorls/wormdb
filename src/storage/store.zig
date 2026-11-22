@@ -3,8 +3,11 @@
 const std = @import("std");
 const core = @import("../core/mod.zig");
 const wal_mod = @import("wal.zig");
+const btree_mod = @import("btree.zig");
+const CollectedKeys = btree_mod.CollectedKeys;
 
 const Entry = core.types.Entry;
+const OrderedIndex = btree_mod.OrderedIndex(*Entry, true);
 const EntryFlags = core.types.EntryFlags;
 const StoreError = core.types.StoreError;
 const Config = core.config.Config;
@@ -46,105 +49,32 @@ pub fn shardIndex(key: []const u8) usize {
 
 const Shard = struct {
     /// Align each shard to a single 64-byte cache line (mutex 8B + unmanaged map 16B
-    /// + sorted slice 24B = 48B padded to 64B). Zero cross-core false sharing AND
-    /// the entire `[256]Shard` table fits in 16 KiB (half of L1D).
+    /// = 24B padded to 64B). Zero cross-core false sharing AND the entire `[256]Shard`
+    /// table fits in 16 KiB (half of L1D).
     mutex: core.compat.Mutex align(64),
     data: std.StringHashMapUnmanaged(*Entry),
-    /// The shard's entries sorted by key ascending — the same `*Entry` objects
-    /// as `data`, never owned separately. Maintained by `shardPutLocked` /
-    /// `shardRemoveLocked` on every mutation, it turns prefix scans and counts
-    /// into O(log n) range seeks instead of full-shard walks. Snapshot files
-    /// store keys globally sorted, so snapshot load appends at the tail and
-    /// pays no memmove churn; random-order writes pay an ordered insert
-    /// (memmove within one shard ≈ n/SHARD_COUNT pointers, trivial next to the
-    /// WAL write they accompany).
-    sorted: std.ArrayListUnmanaged(*Entry),
 };
 comptime {
     std.debug.assert(@sizeOf(Shard) <= 64);
 }
 
-/// Three-way comparison of a key against a prefix *range*:
-///   .lt — key sorts before every key carrying `prefix`
-///   .eq — key carries `prefix`
-///   .gt — key sorts after every key carrying `prefix`
-/// Comparing against the range (rather than computing a successor key) avoids
-/// the 0xFF-increment edge cases entirely and needs no allocation.
-fn prefixCompare(key: []const u8, prefix: []const u8) std.math.Order {
-    const n = @min(key.len, prefix.len);
-    const ord = std.mem.order(u8, key[0..n], prefix[0..n]);
-    if (ord != .eq) return ord;
-    if (key.len >= prefix.len) return .eq;
-    return .lt; // key is a strict prefix of `prefix` — sorts before the range
-}
+const PrehashedStringCtx = struct {
+    h: u64,
 
-/// First index in the sorted shard index whose key does not sort before `key`.
-fn lowerBoundKey(items: []const *Entry, key: []const u8) usize {
-    var lo: usize = 0;
-    var hi: usize = items.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        if (std.mem.order(u8, items[mid].key, key) == .lt) lo = mid + 1 else hi = mid;
-    }
-    return lo;
-}
-
-const PrefixRange = struct { lo: usize, hi: usize };
-
-/// Half-open index range [lo, hi) of keys carrying `prefix` in a sorted shard
-/// index — lower-bound binary search, fast empty-match exit, and equality-only
-/// `startsWith` upper-bound search (every key >= start is either matching or .gt).
-fn prefixRange(items: []const *Entry, prefix: []const u8) PrefixRange {
-    if (items.len == 0) return .{ .lo = 0, .hi = 0 };
-    if (prefix.len == 0) return .{ .lo = 0, .hi = items.len };
-
-    var lo: usize = 0;
-    var hi: usize = items.len;
-    while (lo < hi) { // lower bound: first key not .lt the range
-        const mid = lo + (hi - lo) / 2;
-        if (prefixCompare(items[mid].key, prefix) == .lt) lo = mid + 1 else hi = mid;
-    }
-    const start = lo;
-    if (start == items.len or !std.mem.startsWith(u8, items[start].key, prefix)) {
-        return .{ .lo = start, .hi = start };
+    pub fn hash(self: @This(), _: []const u8) u64 {
+        return self.h;
     }
 
-    lo = start + 1;
-    hi = items.len;
-    while (lo < hi) { // upper bound: first key >= start that does not start with prefix
-        const mid = lo + (hi - lo) / 2;
-        if (!std.mem.startsWith(u8, items[mid].key, prefix)) hi = mid else lo = mid + 1;
+    pub fn eql(_: @This(), a: []const u8, b: []const u8) bool {
+        return std.mem.eql(u8, a, b);
     }
-    return .{ .lo = start, .hi = lo };
-}
+};
 
-/// Remove `key` from a shard's hashmap + ordered index. Caller must hold the
+/// Remove `key` from a shard's hashmap + global ordered index. Caller must hold the
 /// shard lock and owns destroying the returned entry.
 fn shardRemoveLocked(store: *Store, shard: *Shard, key: []const u8) ?*Entry {
     const removed = shard.data.fetchRemove(key) orelse return null;
-    const idx = lowerBoundKey(shard.sorted.items, key);
-    if (idx < shard.sorted.items.len and shard.sorted.items[idx] == removed.value) {
-        _ = shard.sorted.orderedRemove(idx);
-    } else {
-        // Unreachable if every mutation goes through the shard helpers — but
-        // the caller is about to destroy the entry, so NEVER leave its pointer
-        // behind: sweep the index for it before giving up (a dangling pointer
-        // here would be a use-after-free on the next scan).
-        const found = blk: {
-            for (shard.sorted.items, 0..) |e, i| {
-                if (e == removed.value) {
-                    _ = shard.sorted.orderedRemove(i);
-                    break :blk true;
-                }
-            }
-            break :blk false;
-        };
-        if (found) {
-            std.log.warn("store: ordered index position drift on remove of '{s}' (recovered)", .{key});
-        } else {
-            std.log.err("store: ordered index missing entry on remove of '{s}'", .{key});
-        }
-    }
+    store.ordered.remove(key);
     _ = store.live_keys.fetchSub(1, .monotonic);
     return removed.value;
 }
@@ -157,6 +87,10 @@ pub const LockPair = struct {
 pub const Store = struct {
     allocator: std.mem.Allocator,
     shards: [SHARD_COUNT]Shard,
+    /// Heap-allocated radix-partitioned (first-byte) ordered B+Tree replacing
+    /// per-shard sorted slices (keeps `Store` compact on stack and gives
+    /// `ShardedRwLock` buckets a stable address).
+    ordered: *OrderedIndex,
     /// Live (non-sst) key count — maintained by shardPut/Remove for O(1) STATUS.
     /// Avoids locking all 256 shards on every STATUS call (#91).
     live_keys: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
@@ -249,6 +183,11 @@ pub const Store = struct {
         self.sst_count += 1;
     }
 
+    /// True when one or more frozen SST segments are mounted as a read overlay.
+    pub fn hasFrozenSegments(self: *const Store) bool {
+        return self.sst_count > 0;
+    }
+
     /// Overlay lookup behind the live shards: first attached sst that has the
     /// key wins. Lock-free — frozen mappings are immutable and immortal.
     pub fn sstHit(self: *const Store, key: []const u8) ?Sst.Hit {
@@ -266,18 +205,9 @@ pub const Store = struct {
         return self.shards[si].data.contains(key);
     }
 
-    /// True if ANY live key starts with `prefix` — O(SHARDS·log n), no walk.
-    /// Scan overlays use this to skip the per-key containsLive shadow probe
-    /// entirely in the common frozen-dataset case (live store empty or
-    /// disjoint), where per-yield lock+hash probes dominate large scans.
+    /// True if ANY live key starts with `prefix` — O(log n) in a single ordered bucket.
     fn livePrefixNonEmpty(self: *Store, prefix: []const u8) bool {
-        for (&self.shards) |*shard| {
-            shard.mutex.lock();
-            defer shard.mutex.unlock();
-            const range = prefixRange(shard.sorted.items, prefix);
-            if (range.hi > range.lo) return true;
-        }
-        return false;
+        return self.ordered.hasPrefix(prefix);
     }
 
     /// Attach a frozen read-only segment under `name`. Re-attaching the same name
@@ -334,13 +264,18 @@ pub const Store = struct {
             shard.* = .{
                 .mutex = .{},
                 .data = .empty,
-                .sorted = .empty,
             };
         }
+
+        const ordered = try allocator.create(OrderedIndex);
+        errdefer allocator.destroy(ordered);
+        ordered.* = OrderedIndex.init(allocator);
+        errdefer ordered.deinit();
 
         var store = Store{
             .allocator = allocator,
             .shards = shards,
+            .ordered = ordered,
             .wal = wal,
             .wal_enqueue_mutex = .{},
             .config = config,
@@ -388,13 +323,14 @@ pub const Store = struct {
             };
         }
         if (self.wal) |*w| w.deinit();
+        self.ordered.deinit();
+        self.allocator.destroy(self.ordered);
         for (&self.shards) |*shard| {
             var iter = shard.data.iterator();
             while (iter.next()) |entry| {
                 self.destroyEntry(entry.value_ptr.*);
             }
             shard.data.deinit(self.allocator);
-            shard.sorted.deinit(self.allocator);
         }
         self.snapshot_arena.deinit();
         self.seq_hints = @splat(.{});
@@ -422,35 +358,23 @@ pub const Store = struct {
     fn shardReservePutLocked(self: *Store, shard: *Shard, _: []const u8) StoreError!void {
         if (@import("builtin").is_test and self.fail_put_reserve_for_test) return error.OutOfMemory;
         shard.data.ensureUnusedCapacity(self.allocator, 1) catch return error.OutOfMemory;
-        shard.sorted.ensureUnusedCapacity(self.allocator, 1) catch return error.OutOfMemory;
     }
 
     fn shardPutAssumeCapacityLocked(self: *Store, shard: *Shard, entry: *Entry) void {
-        const items = shard.sorted.items;
-        // O(1) tail-append fast path for sequential / timestamp-keyed / snapshot inserts.
-        if (items.len == 0 or std.mem.order(u8, items[items.len - 1].key, entry.key) == .lt) {
+        if (shard.data.fetchRemove(entry.key)) |removed| {
+            // Existing key replaced (e.g. arena-owned snapshot entry superseded or WAL replay):
+            // update `ordered` value/key pointer under exclusive bucket lock BEFORE destroying `removed.value`.
             shard.data.putAssumeCapacity(entry.key, entry);
-            shard.sorted.appendAssumeCapacity(entry);
-            _ = self.live_keys.fetchAdd(1, .monotonic);
+            self.ordered.replaceValue(entry.key, entry);
+            self.destroyEntry(removed.value);
             return;
         }
-
-        const idx = lowerBoundKey(items, entry.key);
-        const replacing = idx < items.len and std.mem.eql(u8, items[idx].key, entry.key);
-
-        if (replacing) {
-            // Same key ⇒ same ordered position: swap the pointer in place. The
-            // map must re-key to the NEW entry's key bytes (the old key memory
-            // dies with the old entry), hence remove + re-insert.
-            const old = shard.data.fetchRemove(entry.key).?.value;
-            shard.data.putAssumeCapacity(entry.key, entry);
-            shard.sorted.items[idx] = entry;
-            self.destroyEntry(old);
-        } else {
-            shard.data.putAssumeCapacity(entry.key, entry);
-            shard.sorted.insertAssumeCapacity(idx, entry);
-            _ = self.live_keys.fetchAdd(1, .monotonic);
-        }
+        shard.data.putAssumeCapacity(entry.key, entry);
+        const si = (@intFromPtr(shard) - @intFromPtr(&self.shards[0])) / @sizeOf(Shard);
+        self.ordered.insert(entry.key, entry, si) catch |err| {
+            std.log.err("store: ordered index insert failed for '{s}': {s}", .{ entry.key, @errorName(err) });
+        };
+        _ = self.live_keys.fetchAdd(1, .monotonic);
     }
 
     /// Delete without WAL or WORM checks — the procedure-context (`Ctx.del`)
@@ -1202,6 +1126,249 @@ pub const Store = struct {
         cut: ScanCut,
         after: ?[]const u8,
     ) ![]ScanResult {
+        // Fast path (no frozen SST overlay and non-empty prefix): acquire ONE bucket's
+        // shared lock and read `slot.value` (`*Entry`) directly under non-blocking
+        // `shard.mutex.tryLock()`. Eliminates key staging copies AND all hash-table
+        // probes while remaining 100% deadlock-free (any `tryLock()` miss immediately
+        // drops `bucket.lock` and falls through to the lock-decoupled path below).
+        if (self.sst_count == 0 and prefix.len > 0) fast_path: {
+            var out: std.ArrayListUnmanaged(ScanResult) = .empty;
+            var keep_out = false;
+            defer if (!keep_out) {
+                for (out.items) |r| {
+                    alloc.free(r.key);
+                    alloc.free(r.value);
+                }
+                out.deinit(alloc);
+            };
+
+            const b = &self.ordered.buckets[prefix[0]];
+            b.lock.lockShared();
+            var b_locked = true;
+            defer if (b_locked) b.lock.unlockShared();
+
+            const pre_cap = if (limit > 0) @min(limit, 1024) else 0;
+            if (pre_cap > 0) {
+                try out.ensureTotalCapacity(alloc, pre_cap);
+            }
+            const use_p8_fast = prefix.len <= 8;
+            const p8_mask: u64 = if (prefix.len >= 8)
+                std.math.maxInt(u64)
+            else
+                (~@as(u64, 0)) << @intCast((8 - prefix.len) * 8);
+            const p8_target: u64 = btree_mod.loadPrefix8(prefix) & p8_mask;
+
+            if (limit > 0 and cut == .last) {
+                if (b.seekLast(prefix, after)) |start| {
+                    var leaf: ?*OrderedIndex.LeafNode = start.leaf;
+                    var idx = start.idx;
+                    while (leaf) |lf| {
+                        while (true) {
+                            const slot = &lf.slots[idx];
+                            const k = slot.key.slice();
+                            if (use_p8_fast) {
+                                if ((lf.prefix8[idx] & p8_mask) != p8_target or k.len < prefix.len) {
+                                    leaf = null;
+                                    break;
+                                }
+                            } else if (!std.mem.startsWith(u8, k, prefix)) {
+                                leaf = null;
+                                break;
+                            }
+                            if (after) |cursor| {
+                                if (std.mem.order(u8, k, cursor) != .gt) {
+                                    leaf = null;
+                                    break;
+                                }
+                            }
+                            if (idx >= 2) {
+                                const pf = &lf.slots[idx - 2];
+                                @prefetch(pf.value, .{ .rw = .read, .locality = 1, .cache = .data });
+                                @prefetch(&self.shards[pf.shard_idx], .{ .rw = .write, .locality = 1, .cache = .data });
+                            }
+                            const shard = &self.shards[slot.shard_idx];
+                            if (!shard.mutex.tryLock()) {
+                                b.lock.unlockShared();
+                                b_locked = false;
+                                break :fast_path;
+                            }
+                            const e = slot.value;
+                            const val_copy = alloc.dupe(u8, e.value) catch |err| {
+                                shard.mutex.unlock();
+                                return err;
+                            };
+                            const ts = e.timestamp;
+                            const worm = e.flags.is_worm;
+                            shard.mutex.unlock();
+                            const key_copy = alloc.dupe(u8, k) catch |err| {
+                                alloc.free(val_copy);
+                                return err;
+                            };
+                            const row = ScanResult{
+                                .key = key_copy,
+                                .value = val_copy,
+                                .timestamp = ts,
+                                .is_worm = worm,
+                            };
+                            if (out.items.len < out.capacity) {
+                                out.appendAssumeCapacity(row);
+                            } else {
+                                out.append(alloc, row) catch |err| {
+                                    alloc.free(key_copy);
+                                    alloc.free(val_copy);
+                                    return err;
+                                };
+                            }
+                            if (out.items.len >= limit) {
+                                leaf = null;
+                                break;
+                            }
+                            if (idx == 0) break;
+                            idx -= 1;
+                        }
+                        if (leaf) |cur_lf| {
+                            leaf = cur_lf.prev;
+                            if (leaf) |prev_lf| {
+                                if (prev_lf.hdr.count == 0) break;
+                                idx = prev_lf.hdr.count - 1;
+                            }
+                        }
+                    }
+                    std.mem.reverse(ScanResult, out.items);
+                }
+            } else {
+                if (b.seekFirst(prefix, after)) |start| {
+                    var leaf: ?*OrderedIndex.LeafNode = start.leaf;
+                    var idx = start.idx;
+                    while (leaf) |lf| {
+                        const cnt: usize = lf.hdr.count;
+                        while (idx < cnt) : (idx += 1) {
+                            const slot = &lf.slots[idx];
+                            const k = slot.key.slice();
+                            if (use_p8_fast) {
+                                if ((lf.prefix8[idx] & p8_mask) != p8_target or k.len < prefix.len) {
+                                    leaf = null;
+                                    break;
+                                }
+                            } else if (!std.mem.startsWith(u8, k, prefix)) {
+                                leaf = null;
+                                break;
+                            }
+                            if (idx + 2 < cnt) {
+                                const pf = &lf.slots[idx + 2];
+                                @prefetch(pf.value, .{ .rw = .read, .locality = 1, .cache = .data });
+                                @prefetch(&self.shards[pf.shard_idx], .{ .rw = .write, .locality = 1, .cache = .data });
+                            }
+                            const shard = &self.shards[slot.shard_idx];
+                            if (!shard.mutex.tryLock()) {
+                                b.lock.unlockShared();
+                                b_locked = false;
+                                break :fast_path;
+                            }
+                            const e = slot.value;
+                            const val_copy = alloc.dupe(u8, e.value) catch |err| {
+                                shard.mutex.unlock();
+                                return err;
+                            };
+                            const ts = e.timestamp;
+                            const worm = e.flags.is_worm;
+                            shard.mutex.unlock();
+                            const key_copy = alloc.dupe(u8, k) catch |err| {
+                                alloc.free(val_copy);
+                                return err;
+                            };
+                            const row = ScanResult{
+                                .key = key_copy,
+                                .value = val_copy,
+                                .timestamp = ts,
+                                .is_worm = worm,
+                            };
+                            if (out.items.len < out.capacity) {
+                                out.appendAssumeCapacity(row);
+                            } else {
+                                out.append(alloc, row) catch |err| {
+                                    alloc.free(key_copy);
+                                    alloc.free(val_copy);
+                                    return err;
+                                };
+                            }
+                            if (limit > 0 and out.items.len >= limit) {
+                                leaf = null;
+                                break;
+                            }
+                        }
+                        if (leaf) |cur_lf| {
+                            leaf = cur_lf.next;
+                            idx = 0;
+                        }
+                    }
+                }
+            }
+
+            b.lock.unlockShared();
+            b_locked = false;
+            const slice = try out.toOwnedSlice(alloc);
+            keep_out = true;
+            return slice;
+        }
+
+        var collected = CollectedKeys{};
+        defer collected.deinit(alloc);
+
+        const bcut: btree_mod.Cut = switch (cut) {
+            .first => .first,
+            .last => .last,
+        };
+        try self.ordered.collectRange(alloc, prefix, after, limit, bcut, &collected);
+        const key_refs = collected.refs();
+
+        // Fast path (no frozen SST overlay mounted): `collected` already contains
+        // the exact `<= limit` keys in strict global ascending order — zero heap
+        // sifting, zero eviction churn, zero post-sort!
+        if (self.sst_count == 0) {
+            var out: std.ArrayListUnmanaged(ScanResult) = .empty;
+            errdefer {
+                for (out.items) |r| {
+                    alloc.free(r.key);
+                    alloc.free(r.value);
+                }
+                out.deinit(alloc);
+            }
+            if (key_refs.len == 0) return try out.toOwnedSlice(alloc);
+            try out.ensureTotalCapacity(alloc, key_refs.len);
+
+            for (key_refs) |ref| {
+                const k = collected.keySlice(ref);
+                const shard = &self.shards[ref.shard_idx];
+                shard.mutex.lock();
+                const entry_opt = shard.data.getAdapted(k, PrehashedStringCtx{ .h = ref.key_hash });
+                if (entry_opt) |e| {
+                    const key_copy = alloc.dupe(u8, e.key) catch |err| {
+                        shard.mutex.unlock();
+                        return err;
+                    };
+                    const val_copy = alloc.dupe(u8, e.value) catch |err| {
+                        shard.mutex.unlock();
+                        alloc.free(key_copy);
+                        return err;
+                    };
+                    const ts = e.timestamp;
+                    const worm = e.flags.is_worm;
+                    shard.mutex.unlock();
+                    out.appendAssumeCapacity(.{
+                        .key = key_copy,
+                        .value = val_copy,
+                        .timestamp = ts,
+                        .is_worm = worm,
+                    });
+                } else {
+                    shard.mutex.unlock();
+                }
+            }
+            return try out.toOwnedSlice(alloc);
+        }
+
+        // SST overlay path: merge live results + frozen SST ranges with bounded heap.
         var results: std.ArrayListUnmanaged(ScanResult) = .empty;
         errdefer {
             for (results.items) |r| {
@@ -1212,64 +1379,25 @@ pub const Store = struct {
         }
         if (limit > 0) {
             try results.ensureTotalCapacity(alloc, @min(limit, 1024));
+        } else if (key_refs.len > 0) {
+            try results.ensureTotalCapacity(alloc, key_refs.len);
         }
 
         const prefix_len = prefix.len;
-
-        // Collect each shard's match range. With a bounded heap of size `limit`
-        // and sorted shard ranges, we stop iterating a shard as soon as the
-        // first candidate fails to beat the heap's eviction root — zero extra
-        // allocations or copies for dominated keys.
-        for (&self.shards) |*shard| {
+        for (key_refs) |ref| {
+            const k = collected.keySlice(ref);
+            const shard = &self.shards[ref.shard_idx];
             shard.mutex.lock();
-            defer shard.mutex.unlock();
-
-            var range = prefixRange(shard.sorted.items, prefix);
-            if (after) |cursor| {
-                if (range.lo < range.hi) {
-                    var lo = lowerBoundKey(shard.sorted.items[range.lo..range.hi], cursor) + range.lo;
-                    if (lo < range.hi and std.mem.eql(u8, shard.sorted.items[lo].key, cursor)) {
-                        lo += 1;
-                    }
-                    range.lo = lo;
-                }
-            }
-            if (range.lo == range.hi) continue;
-
-            if (limit == 0) {
-                // Unbounded scan fast path: pre-reserve this shard's matches and
-                // append directly without bounded-heap checks.
-                try results.ensureUnusedCapacity(alloc, range.hi - range.lo);
-                for (shard.sorted.items[range.lo..range.hi]) |e| {
-                    const key_copy = try alloc.dupe(u8, e.key);
-                    errdefer alloc.free(key_copy);
-                    const val_copy = try alloc.dupe(u8, e.value);
-                    results.appendAssumeCapacity(.{
-                        .key = key_copy,
-                        .value = val_copy,
-                        .timestamp = e.timestamp,
-                        .is_worm = e.flags.is_worm,
-                    });
-                }
-            } else if (cut == .last) {
-                const start = if (range.hi - range.lo > limit) range.hi - limit else range.lo;
-                var idx = range.hi;
-                while (idx > start) {
-                    idx -= 1;
-                    const e = shard.sorted.items[idx];
-                    if (!try scanHeapOffer(&results, alloc, limit, cut, prefix_len, e.key, e.value, e.timestamp, e.flags.is_worm)) {
-                        // Descending traversal: all earlier keys in this shard are even smaller.
-                        break;
-                    }
-                }
+            const entry_opt = shard.data.getAdapted(k, PrehashedStringCtx{ .h = ref.key_hash });
+            if (entry_opt) |e| {
+                const offered = scanHeapOffer(&results, alloc, limit, cut, prefix_len, e.key, e.value, e.timestamp, e.flags.is_worm) catch |err| {
+                    shard.mutex.unlock();
+                    return err;
+                };
+                shard.mutex.unlock();
+                _ = offered;
             } else {
-                const end = if (range.hi - range.lo > limit) range.lo + limit else range.hi;
-                for (shard.sorted.items[range.lo..end]) |e| {
-                    if (!try scanHeapOffer(&results, alloc, limit, cut, prefix_len, e.key, e.value, e.timestamp, e.flags.is_worm)) {
-                        // Ascending traversal: all subsequent keys in this shard are even larger.
-                        break;
-                    }
-                }
+                shard.mutex.unlock();
             }
         }
 
@@ -1277,7 +1405,7 @@ pub const Store = struct {
         // mounted segment (two binary searches + an index slice). Keys present
         // in the live shards are skipped — live writes shadow frozen data.
         // No shard lock is held here, so the containsLive probe cannot deadlock.
-        const live_may_shadow = self.sst_count > 0 and self.livePrefixNonEmpty(prefix);
+        const live_may_shadow = self.livePrefixNonEmpty(prefix);
         for (self.ssts_buf[0..self.sst_count]) |sst| {
             var range = sst.prefixRange(prefix);
             if (after) |cursor| {
@@ -1406,22 +1534,102 @@ pub const Store = struct {
             is_worm: bool,
         ) ScanAction,
     ) void {
-        for (&self.shards) |*shard| {
-            shard.mutex.lock();
-            defer shard.mutex.unlock();
+        var cursor_stack: [512]u8 = undefined;
+        var cursor_heap: std.ArrayListUnmanaged(u8) = .empty;
+        defer cursor_heap.deinit(self.allocator);
+        var cursor: ?[]const u8 = null;
+        var fast_done = false;
 
-            const range = prefixRange(shard.sorted.items, prefix);
-            for (shard.sorted.items[range.lo..range.hi]) |e| {
-                switch (callback(context, e.key, e.value, e.timestamp, e.flags.is_worm)) {
-                    .cont => {},
-                    .stop => return,
+        // Fast path for non-empty prefixes: walk leaf chain directly under one
+        // shared bucket lock using non-blocking `shard.mutex.tryLock()` — zero
+        // staging copies, zero hash lookups, zero allocations. If any shard is
+        // contended, record the last yielded key as a cursor, release `bucket.lock`
+        // immediately (zero deadlock), and resume via the lock-decoupled chunk loop.
+        if (prefix.len > 0) fast_cb: {
+            const b = &self.ordered.buckets[prefix[0]];
+            b.lock.lockShared();
+            var b_locked = true;
+            defer if (b_locked) b.lock.unlockShared();
+
+            var prev_yielded: ?[]const u8 = null;
+            if (b.seekFirst(prefix, null)) |start| {
+                var leaf: ?*OrderedIndex.LeafNode = start.leaf;
+                var idx = start.idx;
+                while (leaf) |lf| {
+                    while (idx < lf.hdr.count) : (idx += 1) {
+                        const slot = &lf.slots[idx];
+                        const k = slot.key.slice();
+                        if (!std.mem.startsWith(u8, k, prefix)) {
+                            fast_done = true;
+                            break :fast_cb;
+                        }
+                        const shard = &self.shards[slot.shard_idx];
+                        if (!shard.mutex.tryLock()) {
+                            if (prev_yielded) |pk| {
+                                if (pk.len <= cursor_stack.len) {
+                                    @memcpy(cursor_stack[0..pk.len], pk);
+                                    cursor = cursor_stack[0..pk.len];
+                                } else {
+                                    cursor_heap.clearRetainingCapacity();
+                                    cursor_heap.appendSlice(self.allocator, pk) catch break :fast_cb;
+                                    cursor = cursor_heap.items;
+                                }
+                            }
+                            b.lock.unlockShared();
+                            b_locked = false;
+                            break :fast_cb;
+                        }
+                        const e = slot.value;
+                        const action = callback(context, e.key, e.value, e.timestamp, e.flags.is_worm);
+                        shard.mutex.unlock();
+                        if (action == .stop) return;
+                        prev_yielded = k;
+                    }
+                    leaf = lf.next;
+                    idx = 0;
+                }
+            }
+            fast_done = true;
+        }
+
+        if (!fast_done) {
+            const CHUNK: usize = 64;
+            var chunk = CollectedKeys{};
+            defer chunk.deinit(self.allocator);
+
+            while (true) {
+                chunk.clear();
+                self.ordered.collectRange(self.allocator, prefix, cursor, CHUNK, .first, &chunk) catch break;
+                const key_refs = chunk.refs();
+                if (key_refs.len == 0) break;
+
+                for (key_refs) |ref| {
+                    const k = chunk.keySlice(ref);
+                    const shard = &self.shards[ref.shard_idx];
+                    shard.mutex.lock();
+                    if (shard.data.getAdapted(k, PrehashedStringCtx{ .h = ref.key_hash })) |e| {
+                        const action = callback(context, e.key, e.value, e.timestamp, e.flags.is_worm);
+                        shard.mutex.unlock();
+                        if (action == .stop) return;
+                    } else {
+                        shard.mutex.unlock();
+                    }
+                }
+
+                if (key_refs.len < CHUNK) break;
+                const last_k = chunk.keySlice(key_refs[key_refs.len - 1]);
+                if (last_k.len <= cursor_stack.len) {
+                    @memcpy(cursor_stack[0..last_k.len], last_k);
+                    cursor = cursor_stack[0..last_k.len];
+                } else {
+                    cursor_heap.clearRetainingCapacity();
+                    cursor_heap.appendSlice(self.allocator, last_k) catch break;
+                    cursor = cursor_heap.items;
                 }
             }
         }
 
-        // Frozen sst overlay — yielded after the live shards (ascending within
-        // each sst, like each shard), skipping live-shadowed keys. No shard
-        // lock is held during the callback for these.
+        // Frozen sst overlay — yielded after the live entries, skipping live-shadowed keys.
         const live_may_shadow = self.sst_count > 0 and self.livePrefixNonEmpty(prefix);
         for (self.ssts_buf[0..self.sst_count]) |sst| {
             const range = sst.prefixRange(prefix);
@@ -1437,21 +1645,10 @@ pub const Store = struct {
         }
     }
 
-    /// Count keys matching a prefix. Pure binary search per shard —
-    /// O(SHARDS·log n), no allocation, no walking of the matches.
+    /// Count keys matching a prefix. O(log n) in a single ordered B+Tree bucket
+    /// via maintained subtree counts — no allocation, no walking of matches.
     pub fn countPrefix(self: *Store, prefix: []const u8) usize {
-        var total: usize = 0;
-        for (&self.shards) |*shard| {
-            shard.mutex.lock();
-            defer shard.mutex.unlock();
-
-            const range = prefixRange(shard.sorted.items, prefix);
-            total += range.hi - range.lo;
-        }
-        // Frozen sst ranges are added raw: a live entry shadowing a frozen key
-        // double-counts (walking arbitrarily large ranges to dedup would defeat
-        // the O(log n) contract). Exact only when live and frozen keys are
-        // disjoint — the normal frozen-dataset deployment.
+        var total: usize = self.ordered.countPrefix(prefix);
         for (self.ssts_buf[0..self.sst_count]) |sst| {
             const range = sst.prefixRange(prefix);
             total += range.hi - range.lo;
@@ -1918,8 +2115,7 @@ pub const Store = struct {
         defer snap_arena.deinit();
         const snap_alloc = snap_arena.allocator();
 
-        var shard_slices: [SHARD_COUNT][]SnapRec = undefined;
-        var total_records: usize = 0;
+        var records: std.ArrayListUnmanaged(SnapRec) = .empty;
 
         var hnsw_trailer: std.ArrayListUnmanaged(u8) = .empty;
         defer hnsw_trailer.deinit(self.allocator);
@@ -1928,22 +2124,28 @@ pub const Store = struct {
             for (&self.shards) |*shard| shard.mutex.lock();
             defer for (&self.shards) |*shard| shard.mutex.unlock();
 
-            for (&self.shards, 0..) |*shard, si| {
-                const items = shard.sorted.items;
-                total_records += items.len;
-                const slice = try snap_alloc.alloc(SnapRec, items.len);
-                for (items, 0..) |entry, i| {
+            try records.ensureTotalCapacity(snap_alloc, self.live_keys.load(.monotonic));
+
+            const VisitCtx = struct {
+                snap_alloc: std.mem.Allocator,
+                records: *std.ArrayListUnmanaged(SnapRec),
+            };
+            var vctx = VisitCtx{
+                .snap_alloc = snap_alloc,
+                .records = &records,
+            };
+            try self.ordered.visitAllSorted(&vctx, struct {
+                fn visit(c: *VisitCtx, entry: *Entry) anyerror!void {
                     var flags = entry.flags;
                     flags.arena_owned = false;
-                    slice[i] = .{
-                        .key = try snap_alloc.dupe(u8, entry.key),
-                        .value = try snap_alloc.dupe(u8, entry.value),
+                    try c.records.append(c.snap_alloc, .{
+                        .key = try c.snap_alloc.dupe(u8, entry.key),
+                        .value = try c.snap_alloc.dupe(u8, entry.value),
                         .flags = flags,
                         .timestamp = entry.timestamp,
-                    };
+                    });
                 }
-                shard_slices[si] = slice;
-            }
+            }.visit);
 
             // Capture HNSW while shards are still locked so the trailer matches
             // the copied KV set (Copilot: unlocked writeTo raced with vinsert).
@@ -1972,9 +2174,6 @@ pub const Store = struct {
         var file_open = true;
         defer if (file_open) compat.File.close(snapshot_file);
 
-        // Mirror of the load path's buffering: per-field raw writes cost a
-        // kernel round-trip each (shutdown saves of multi-million-key stores
-        // took minutes of syscall overhead).
         var writer = BufferedFileWriter{
             .file = snapshot_file,
             .buf = try self.allocator.alloc(u8, SNAPSHOT_READ_BUF_SIZE),
@@ -1988,67 +2187,11 @@ pub const Store = struct {
         try writer.writeAll(version_buf[0..4]);
 
         var count_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, count_buf[0..8], @intCast(total_records), .little);
+        std.mem.writeInt(u64, count_buf[0..8], @intCast(records.items.len), .little);
         try writer.writeAll(count_buf[0..8]);
 
-        // 256-way min-heap merge across already-sorted shard slices: O(N log 256)
-        const MergeCursor = struct {
-            shard_idx: u16,
-            pos: u32,
-            rec: SnapRec,
-        };
-        var heap: [SHARD_COUNT]MergeCursor = undefined;
-        var heap_len: usize = 0;
-
-        const siftUp = struct {
-            fn call(h: []MergeCursor, start: usize) void {
-                var idx = start;
-                while (idx > 0) {
-                    const parent = (idx - 1) / 2;
-                    if (std.mem.lessThan(u8, h[idx].rec.key, h[parent].rec.key)) {
-                        std.mem.swap(MergeCursor, &h[idx], &h[parent]);
-                        idx = parent;
-                    } else break;
-                }
-            }
-        }.call;
-
-        const siftDown = struct {
-            fn call(h: []MergeCursor, start: usize) void {
-                var idx = start;
-                const len = h.len;
-                while (true) {
-                    const left = 2 * idx + 1;
-                    if (left >= len) break;
-                    var smallest = left;
-                    const right = left + 1;
-                    if (right < len and std.mem.lessThan(u8, h[right].rec.key, h[left].rec.key)) {
-                        smallest = right;
-                    }
-                    if (std.mem.lessThan(u8, h[smallest].rec.key, h[idx].rec.key)) {
-                        std.mem.swap(MergeCursor, &h[idx], &h[smallest]);
-                        idx = smallest;
-                    } else break;
-                }
-            }
-        }.call;
-
-        for (shard_slices, 0..) |slice, si| {
-            if (slice.len > 0) {
-                heap[heap_len] = .{
-                    .shard_idx = @intCast(si),
-                    .pos = 0,
-                    .rec = slice[0],
-                };
-                siftUp(heap[0 .. heap_len + 1], heap_len);
-                heap_len += 1;
-            }
-        }
-
-        while (heap_len > 0) {
-            const top = heap[0];
-            const rec = top.rec;
-
+        // Records are already in strict global ascending order from OrderedIndex.
+        for (records.items) |rec| {
             var header_buf: [17]u8 = undefined;
             std.mem.writeInt(u32, header_buf[0..4], @intCast(rec.key.len), .little);
             std.mem.writeInt(u32, header_buf[4..8], @intCast(rec.value.len), .little);
@@ -2057,23 +2200,6 @@ pub const Store = struct {
             try writer.writeAll(header_buf[0..]);
             try writer.writeAll(rec.key);
             try writer.writeAll(rec.value);
-
-            const next_pos = top.pos + 1;
-            const s_slice = shard_slices[top.shard_idx];
-            if (next_pos < s_slice.len) {
-                heap[0] = .{
-                    .shard_idx = top.shard_idx,
-                    .pos = next_pos,
-                    .rec = s_slice[next_pos],
-                };
-                siftDown(heap[0..heap_len], 0);
-            } else {
-                heap_len -= 1;
-                if (heap_len > 0) {
-                    heap[0] = heap[heap_len];
-                    siftDown(heap[0..heap_len], 0);
-                }
-            }
         }
 
         if (hnsw_trailer.items.len > 0) {
@@ -2209,7 +2335,6 @@ pub const Store = struct {
         const per_shard: u32 = @intCast(entry_count / SHARD_COUNT + entry_count / SHARD_COUNT / 8 + 16);
         for (&self.shards) |*shard| {
             try shard.data.ensureTotalCapacity(self.allocator, per_shard);
-            try shard.sorted.ensureTotalCapacity(self.allocator, per_shard);
         }
 
         // All snapshot entries (key, value, Entry struct) come from the bump
@@ -2254,9 +2379,26 @@ pub const Store = struct {
                 .flags = flags,
             };
 
-            const shard = &self.shards[shardIndex(entry.key)];
-            try self.shardPutLocked(shard, entry);
+            const si = shardIndex(entry.key);
+            const shard = &self.shards[si];
+            const kh = std.hash_map.hashString(entry.key);
+            try shard.data.ensureUnusedCapacity(self.allocator, 1);
+            const gop = shard.data.getOrPutAssumeCapacityAdapted(entry.key, PrehashedStringCtx{ .h = kh });
+            if (gop.found_existing) {
+                const old_entry = gop.value_ptr.*;
+                gop.key_ptr.* = entry.key;
+                gop.value_ptr.* = entry;
+                try self.ordered.finishBulkLoad();
+                self.ordered.replaceValue(entry.key, entry);
+                self.destroyEntry(old_entry);
+            } else {
+                gop.key_ptr.* = entry.key;
+                gop.value_ptr.* = entry;
+                try self.ordered.appendBulkUnlockedWithHash(entry.key, entry, kh, si);
+                _ = self.live_keys.fetchAdd(1, .monotonic);
+            }
         }
+        try self.ordered.finishBulkLoad();
 
         std.log.info("Snapshot load complete.", .{});
 
@@ -3662,4 +3804,138 @@ test "Store.readWithCallback borrows value without copying and reports misses" {
     var miss_probe = Probe{};
     try testing.expect(!store.readWithCallback("meta:999", &miss_probe, Probe.onVal));
     try testing.expect(!miss_probe.called);
+}
+
+test "Store OrderedIndex concurrent inserts, overwrites, deletes, and prefix scans" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const testing = std.testing;
+
+    var store = try Store.init(testing.allocator, .{ .persistence = .none });
+    defer store.deinit();
+
+    // Pre-populate both short inline (<=16B) and long borrowed (>16B) keys.
+    var kbuf: [64]u8 = undefined;
+    for (0..300) |i| {
+        const k = try std.fmt.bufPrint(&kbuf, "item:{d:0>6}", .{i});
+        try store.set(k, "init-val", false);
+        const kl = try std.fmt.bufPrint(&kbuf, "long_concurrent_prefix_key:{d:0>6}", .{i});
+        try store.set(kl, "init-long-val", false);
+    }
+
+    const WorkerCtx = struct {
+        store: *Store,
+        alloc: std.mem.Allocator,
+        tid: usize,
+        stop: *std.atomic.Value(bool),
+        err_count: std.atomic.Value(usize) = .init(0),
+
+        fn runWriter(self: *@This()) void {
+            var buf: [64]u8 = undefined;
+            var vbuf: [32]u8 = undefined;
+            for (0..600) |iter| {
+                const idx = (self.tid * 97 + iter * 13) % 500;
+                const k = std.fmt.bufPrint(&buf, "item:{d:0>6}", .{idx}) catch continue;
+                const v = std.fmt.bufPrint(&vbuf, "v-{d}-{d}", .{ self.tid, iter }) catch continue;
+                if ((iter & 7) == 0) {
+                    _ = self.store.delete(k) catch {};
+                } else {
+                    self.store.set(k, v, false) catch {
+                        _ = self.err_count.fetchAdd(1, .monotonic);
+                    };
+                }
+                const kl = std.fmt.bufPrint(&buf, "long_concurrent_prefix_key:{d:0>6}", .{idx}) catch continue;
+                if ((iter & 7) == 3) {
+                    _ = self.store.delete(kl) catch {};
+                } else {
+                    self.store.set(kl, v, false) catch {
+                        _ = self.err_count.fetchAdd(1, .monotonic);
+                    };
+                }
+            }
+        }
+
+        fn runReader(self: *@This()) void {
+            const CbCtx = struct {
+                prev_len: usize = 0,
+                prev_buf: [64]u8 = undefined,
+                out_of_order: bool = false,
+                fn onRow(raw: *anyopaque, key: []const u8, _: []const u8, _: u64, _: bool) Store.ScanAction {
+                    const c: *@This() = @ptrCast(@alignCast(raw));
+                    if (c.prev_len > 0 and std.mem.order(u8, c.prev_buf[0..c.prev_len], key) != .lt) {
+                        c.out_of_order = true;
+                        return .stop;
+                    }
+                    const n = @min(key.len, c.prev_buf.len);
+                    @memcpy(c.prev_buf[0..n], key[0..n]);
+                    c.prev_len = n;
+                    return .cont;
+                }
+            };
+
+            while (!self.stop.load(.acquire)) {
+                const res = self.store.scanPrefixFirst("item:", 32, self.alloc) catch {
+                    _ = self.err_count.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                for (1..res.len) |j| {
+                    if (std.mem.order(u8, res[j - 1].key, res[j].key) != .lt) {
+                        _ = self.err_count.fetchAdd(1, .monotonic);
+                    }
+                }
+                for (res) |r| {
+                    self.alloc.free(r.key);
+                    self.alloc.free(r.value);
+                }
+                self.alloc.free(res);
+
+                const last_res = self.store.scanPrefix("long_concurrent_prefix_key:", 16, self.alloc) catch {
+                    _ = self.err_count.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                for (1..last_res.len) |j| {
+                    if (std.mem.order(u8, last_res[j - 1].key, last_res[j].key) != .lt) {
+                        _ = self.err_count.fetchAdd(1, .monotonic);
+                    }
+                }
+                for (last_res) |r| {
+                    self.alloc.free(r.key);
+                    self.alloc.free(r.value);
+                }
+                self.alloc.free(last_res);
+
+                _ = self.store.countPrefix("item:");
+
+                var cb_ctx = CbCtx{};
+                self.store.scanPrefixCallback("item:", &cb_ctx, CbCtx.onRow);
+                if (cb_ctx.out_of_order) {
+                    _ = self.err_count.fetchAdd(1, .monotonic);
+                }
+            }
+        }
+    };
+
+    var stop = std.atomic.Value(bool).init(false);
+    var writers: [4]WorkerCtx = undefined;
+    var readers: [4]WorkerCtx = undefined;
+    var w_threads: [4]std.Thread = undefined;
+    var r_threads: [4]std.Thread = undefined;
+
+    for (0..4) |i| {
+        readers[i] = .{ .store = &store, .alloc = testing.allocator, .tid = i, .stop = &stop };
+        r_threads[i] = try std.Thread.spawn(.{}, WorkerCtx.runReader, .{&readers[i]});
+    }
+    for (0..4) |i| {
+        writers[i] = .{ .store = &store, .alloc = testing.allocator, .tid = i, .stop = &stop };
+        w_threads[i] = try std.Thread.spawn(.{}, WorkerCtx.runWriter, .{&writers[i]});
+    }
+
+    for (&w_threads) |th| th.join();
+    stop.store(true, .release);
+    for (&r_threads) |th| th.join();
+
+    for (&writers) |*w| try testing.expectEqual(@as(usize, 0), w.err_count.load(.monotonic));
+    for (&readers) |*r| try testing.expectEqual(@as(usize, 0), r.err_count.load(.monotonic));
+
+    // Final consistency: OrderedIndex count must exactly match Store live key count.
+    try testing.expectEqual(store.count(), store.countPrefix(""));
 }

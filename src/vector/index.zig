@@ -1212,7 +1212,8 @@ pub const NamespaceIndex = struct {
         // an OOM leaves the index completely consistent.
         const next_len = self.hnsw.len() + 1;
         const key_copy = try self.allocator.dupe(u8, key);
-        errdefer self.allocator.free(key_copy);
+        var key_owned_by_index = false;
+        errdefer if (!key_owned_by_index) self.allocator.free(key_copy);
 
         try self.keys.ensureUnusedCapacity(self.allocator, 1);
         try self.timestamps.ensureUnusedCapacity(self.allocator, 1);
@@ -1267,7 +1268,17 @@ pub const NamespaceIndex = struct {
             }
         }
 
-        const node_id = try self.hnsw.insert(vector);
+        const node_id = self.hnsw.insert(vector) catch |err| {
+            // `Hnsw.insert` is not atomic: a failure while linking leaves the node
+            // appended. Give it side-table entries so node ids stay aligned with keys.
+            if (self.hnsw.len() == next_len) {
+                if (self.dim == null) self.dim = vector.len;
+                self.absorbFailedNodeLocked(@intCast(next_len - 1), key_copy, timestamp, incoming_hash, old_live_id);
+                key_owned_by_index = true;
+                self.markIncompleteLocked();
+            }
+            return err;
+        };
         // hnsw.insert succeeded — commit infallibly.
         if (old_live_id) |old_id| {
             self.tombstones.set(old_id);
@@ -1314,6 +1325,38 @@ pub const NamespaceIndex = struct {
         }
 
         return node_id;
+    }
+
+    /// Give an HNSW node that a failed insert left behind its side-table entries, in
+    /// the same state as a key that was inserted and then deleted: the node keeps its
+    /// key, timestamp and hash, any live node it would have superseded is tombstoned,
+    /// and the node itself is tombstoned so searches traverse it but never return it.
+    /// This keeps `hnsw.len() == keys.items.len` and survives a snapshot round-trip
+    /// (the reverse map resolves the key to the tombstoned node, as after a delete).
+    ///
+    /// Caller holds the write-lock, has reserved one slot in `keys`, `timestamps`,
+    /// `vec_hashes` and `key_to_node`, has sized `tombstones` past `node_id`, and
+    /// passes `node_id == keys.items.len`. Takes ownership of `key_copy`. The caller
+    /// should also `markIncompleteLocked()`: the store holds a vector the index lacks.
+    fn absorbFailedNodeLocked(
+        self: *NamespaceIndex,
+        node_id: u32,
+        key_copy: []u8,
+        timestamp: u64,
+        vec_hash: u64,
+        old_live_id: ?u32,
+    ) void {
+        std.debug.assert(node_id == self.keys.items.len);
+        if (old_live_id) |old_id| {
+            self.tombstones.set(old_id);
+            self.tombstone_count += 1;
+        }
+        self.keys.appendAssumeCapacity(key_copy);
+        self.timestamps.appendAssumeCapacity(timestamp);
+        self.vec_hashes.appendAssumeCapacity(vec_hash);
+        self.key_to_node.putAssumeCapacity(key_copy, node_id);
+        self.tombstones.set(node_id);
+        self.tombstone_count += 1;
     }
 
     pub const BatchInsertItem = struct {
@@ -1469,7 +1512,29 @@ pub const NamespaceIndex = struct {
             }
 
             // Pass 2: Parallel multi-threaded HNSW graph construction!
-            const base_id = try self.hnsw.insertBatchParallel(batch_vecs.items);
+            const base_id = self.hnsw.insertBatchParallel(batch_vecs.items) catch |err| {
+                // Not atomic: seed nodes, or the whole batch when a worker fails
+                // mid-link, may already be appended as ids `base_len + i` for
+                // `staged[i]`. Give each one side-table entries so node ids stay
+                // aligned with keys; the rest of the batch was never appended.
+                const appended = self.hnsw.len() - base_len;
+                if (appended > 0) {
+                    if (self.dim == null) self.dim = target_dim;
+                    for (staged.items[0..appended], 0..) |st, i| {
+                        self.absorbFailedNodeLocked(
+                            @intCast(base_len + i),
+                            st.key_copy,
+                            items[st.item_idx].timestamp,
+                            st.incoming_hash,
+                            st.old_live_id,
+                        );
+                    }
+                    // Those key copies now belong to `self.keys`.
+                    staged.replaceRangeAssumeCapacity(0, appended, &.{});
+                    self.markIncompleteLocked();
+                }
+                return err;
+            };
 
             // Pass 3: Infallible commit of side-tables and quantized slabs.
             if (self.dim == null) self.dim = target_dim;
@@ -4927,4 +4992,140 @@ test "namespace index: large-M RaBitQ batched select and BQ counting-bucket pari
         try testing.expect(!std.mem.eql(u8, r.key, "vec:r:1250"));
         try testing.expect(!std.mem.eql(u8, r.key, "vec:r:1251"));
     }
+}
+
+test "namespace index: failed batch insert keeps node ids aligned with keys" {
+    const alloc = testing.allocator;
+    const dim: usize = 16;
+    const n_a: usize = 64;
+    const n_b: usize = 300;
+    const n_c: usize = 100;
+    const n_total = n_a + n_b + n_c;
+
+    var prng = std.Random.DefaultPrng.init(0xFA11_BA7C);
+    const rand = prng.random();
+    const data = try alloc.alloc(f32, n_total * dim);
+    defer alloc.free(data);
+    for (data) |*x| x.* = rand.floatNorm(f32);
+
+    const key_store = try alloc.alloc([16]u8, n_total);
+    defer alloc.free(key_store);
+    const items = try alloc.alloc(NamespaceIndex.BatchInsertItem, n_total);
+    defer alloc.free(items);
+    for (0..n_total) |i| {
+        const tag: u8 = if (i < n_a) 'a' else if (i < n_a + n_b) 'b' else 'c';
+        const rel: usize = if (i < n_a) i else if (i < n_a + n_b) i - n_a else i - n_a - n_b;
+        const k = std.fmt.bufPrint(&key_store[i], "vec:{c}{d}", .{ tag, rel }) catch unreachable;
+        items[i] = .{ .key = k, .vector = data[i * dim ..][0..dim], .timestamp = 100 + i };
+    }
+    const batch_a = items[0..n_a];
+    const batch_b = items[n_a .. n_a + n_b];
+    const batch_c = items[n_a + n_b ..];
+    // First item of batch B overwrites a live key from batch A with a new vector.
+    batch_b[0].key = batch_a[0].key;
+
+    var idx = NamespaceIndex.init(alloc, .{ .m = 8, .ef_construction = 64 }, .l2);
+    defer idx.deinit();
+
+    try testing.expectEqual(n_a, try idx.insertBatchLocked(batch_a));
+    try testing.expectEqual(n_a, idx.hnsw.len());
+
+    // Fail while linking the 101st node of batch B. On the parallel path every node
+    // of the batch is already appended; on the sequential fallback only the first 101.
+    idx.hnsw.fail_link_node_for_test = @intCast(n_a + 100);
+    try testing.expectError(error.OutOfMemory, idx.insertBatchLocked(batch_b));
+    idx.hnsw.fail_link_node_for_test = null;
+
+    const appended = idx.hnsw.len() - n_a;
+    try testing.expect(appended >= 101 and appended <= n_b);
+    try testing.expectEqual(idx.hnsw.len(), idx.keys.items.len);
+    try testing.expectEqual(idx.hnsw.len(), idx.timestamps.items.len);
+    try testing.expectEqual(idx.hnsw.len(), idx.vec_hashes.items.len);
+    // Every appended node is tombstoned, as is the live node `vec:a0` it superseded.
+    try testing.expectEqual(appended + 1, idx.tombstone_count);
+    try testing.expectEqual(n_a - 1, idx.liveCount());
+    try testing.expect(!idx.complete_with_store);
+    for (n_a..idx.hnsw.len()) |id| try testing.expect(idx.tombstones.isSet(id));
+
+    var out: [10]IndexSearchResult = undefined;
+    var scratch: [10]hnsw_mod.SearchResult = undefined;
+
+    // Surviving keys are still found; nothing from the failed batch is returned.
+    var n = try idx.searchLocked(batch_a[5].vector, 10, 256, &out, &scratch);
+    try testing.expect(n > 0);
+    try testing.expectEqualStrings("vec:a5", out[0].key);
+    for ([_]usize{ 0, 7, 150, 299 }) |bi| {
+        n = try idx.searchLocked(batch_b[bi].vector, 10, 256, &out, &scratch);
+        for (out[0..n]) |r| {
+            try testing.expect(!std.mem.startsWith(u8, r.key, "vec:b"));
+            try testing.expect(!std.mem.eql(u8, r.key, "vec:a0"));
+        }
+    }
+
+    // A later batch gets ids that map back to its own keys.
+    try testing.expectEqual(n_c, try idx.insertBatchLocked(batch_c));
+    try testing.expectEqual(idx.hnsw.len(), idx.keys.items.len);
+    for ([_]usize{ 0, 7, 99 }) |ci| {
+        n = try idx.searchLocked(batch_c[ci].vector, 10, 256, &out, &scratch);
+        try testing.expect(n > 0);
+        try testing.expectEqualStrings(batch_c[ci].key, out[0].key);
+        const nid = idx.nodeIdFor(batch_c[ci].key).?;
+        try testing.expectEqualStrings(batch_c[ci].key, idx.keys.items[nid]);
+        try testing.expect(!idx.tombstones.isSet(nid));
+    }
+
+    // Retrying the failed batch succeeds and its keys become searchable.
+    try testing.expectEqual(n_b, try idx.insertBatchLocked(batch_b));
+    try testing.expectEqual(idx.hnsw.len(), idx.keys.items.len);
+    try testing.expectEqual(n_a - 1 + n_c + n_b, idx.liveCount());
+    for ([_]usize{ 0, 7, 150, 299 }) |bi| {
+        n = try idx.searchLocked(batch_b[bi].vector, 10, 256, &out, &scratch);
+        try testing.expect(n > 0);
+        try testing.expectEqualStrings(batch_b[bi].key, out[0].key);
+    }
+}
+
+test "namespace index: failed single insert keeps node ids aligned with keys" {
+    const alloc = testing.allocator;
+    const dim: usize = 8;
+
+    var idx = NamespaceIndex.init(alloc, .{ .m = 8, .ef_construction = 40 }, .l2);
+    defer idx.deinit();
+
+    var vecs: [6][dim]f32 = undefined;
+    var key_buf: [16]u8 = undefined;
+    for (0..6) |i| {
+        for (0..dim) |d| vecs[i][d] = if (d == i) 1.0 else 0.01 * @as(f32, @floatFromInt(i + d));
+    }
+    for (0..4) |i| {
+        const k = std.fmt.bufPrint(&key_buf, "vec:s{d}", .{i}) catch unreachable;
+        _ = try idx.insertLocked(k, &vecs[i], 100 + i);
+    }
+
+    // The node is appended before linking fails; it must not be left without a key.
+    idx.hnsw.fail_link_node_for_test = 4;
+    try testing.expectError(error.OutOfMemory, idx.insertLocked("vec:s4", &vecs[4], 200));
+    idx.hnsw.fail_link_node_for_test = null;
+
+    try testing.expectEqual(@as(usize, 5), idx.hnsw.len());
+    try testing.expectEqual(idx.hnsw.len(), idx.keys.items.len);
+    try testing.expectEqual(@as(usize, 4), idx.liveCount());
+    try testing.expect(idx.tombstones.isSet(4));
+    try testing.expect(!idx.complete_with_store);
+
+    var out: [5]IndexSearchResult = undefined;
+    var scratch: [5]hnsw_mod.SearchResult = undefined;
+    var n = try idx.searchLocked(&vecs[4], 5, 32, &out, &scratch);
+    try testing.expectEqual(@as(usize, 4), n);
+    for (out[0..n]) |r| try testing.expect(!std.mem.eql(u8, r.key, "vec:s4"));
+
+    // Retry and a fresh key both land on ids that map to their own keys.
+    _ = try idx.insertLocked("vec:s4", &vecs[4], 201);
+    _ = try idx.insertLocked("vec:s5", &vecs[5], 202);
+    try testing.expectEqual(idx.hnsw.len(), idx.keys.items.len);
+    try testing.expectEqual(@as(usize, 6), idx.liveCount());
+    n = try idx.searchLocked(&vecs[4], 1, 32, &out, &scratch);
+    try testing.expectEqualStrings("vec:s4", out[0].key);
+    n = try idx.searchLocked(&vecs[5], 1, 32, &out, &scratch);
+    try testing.expectEqualStrings("vec:s5", out[0].key);
 }

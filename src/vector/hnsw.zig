@@ -562,6 +562,10 @@ pub const Hnsw = struct {
     insert_scratch: InsertScratch,
     /// Thread-safe scratch pool for concurrent `search`.
     scratch_pool: SearchScratchPool,
+    /// Test-only fault injection: linking the node with this id fails with
+    /// `error.OutOfMemory` after the node has been appended, in both `insert`
+    /// and `insertBatchParallel`. Ignored outside test builds.
+    fail_link_node_for_test: ?u32 = null,
 
     pub fn init(allocator: std.mem.Allocator, params: HnswParams) Hnsw {
         return .{
@@ -1441,6 +1445,11 @@ pub const Hnsw = struct {
     ///
     /// Thread safety: caller must serialize inserts. Searches on the same
     /// graph from other threads are unsafe during insert.
+    ///
+    /// Not atomic on failure: an error raised while linking leaves the node
+    /// appended (`len()` grew by one) with a valid vector and valid, possibly
+    /// partial, links. Callers that keep per-node side tables must compare
+    /// `len()` before and after and account for such a node.
     pub fn insert(self: *Hnsw, vector: []align(1) const f32) !u32 {
         if (self.dim == 0 and self.node_count == 0) {
             self.dim = vector.len;
@@ -1484,6 +1493,12 @@ pub const Hnsw = struct {
             self.entry_point = new_id;
             self.top_level = new_level;
             return new_id;
+        }
+
+        if (builtin.is_test) {
+            if (self.fail_link_node_for_test) |fid| {
+                if (fid == new_id) return error.OutOfMemory;
+            }
         }
 
         const q_ptr: [*]align(32) const f32 = self.vecPtr(new_id);
@@ -1702,6 +1717,12 @@ pub const Hnsw = struct {
     /// Thread safety: caller must hold exclusive access to `Hnsw` (no concurrent
     /// `search()` or `insert()` calls). Falls back cleanly to sequential `insert()`
     /// for single-threaded/wasm targets, small batches (<32), or `max(m, m_max0) > 64`.
+    ///
+    /// Not atomic on failure: on error a prefix of `vectors` (or all of them, when a
+    /// worker fails mid-link) may already be appended, so `len()` can exceed its
+    /// pre-call value. Appended nodes always occupy contiguous ids starting at the
+    /// pre-call `len()`, in `vectors` order, and hold valid vectors and valid, possibly
+    /// partial, links. Callers that keep per-node side tables must account for them.
     pub fn insertBatchParallel(self: *Hnsw, vectors: []const []align(1) const f32) !u32 {
         if (vectors.len == 0) return @intCast(self.node_count);
 
@@ -2198,6 +2219,12 @@ pub const Hnsw = struct {
         scratch: *SearchScratch,
         eps: *std.ArrayListUnmanaged(PQItem),
     ) !void {
+        if (builtin.is_test) {
+            if (self.fail_link_node_for_test) |fid| {
+                if (fid == new_id) return error.OutOfMemory;
+            }
+        }
+
         const q_ptr: [*]align(32) const f32 = self.vecPtr(new_id);
 
         state.ep_lock.lock();

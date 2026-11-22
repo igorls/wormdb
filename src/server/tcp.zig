@@ -174,21 +174,24 @@ pub const Server = struct {
         stalled_since_ns: ?i128 = null,
         epoll_out_armed: bool = false,
         reaping: bool = false,
+        /// Intrusive link in `SubReactor.reap_head` (reactor thread only), so queuing a
+        /// session for teardown never allocates and therefore can never fail.
+        reap_next: ?*SubSession = null,
     };
 
     /// Dedicated Linux epoll + eventfd reactor for parked Pub/Sub subscribers.
     /// Eliminates fixed threadpool starvation (>worker_count idle subscribers pin 0 workers)
     /// and coalesces pipelined publish bursts into single non-blocking `send()` syscalls.
     const SubReactor = if (builtin.os.tag == .linux) struct {
-        const linux = std.os.linux;
-        const posix = std.posix;
+        /// Linux syscall shims (epoll, eventfd, non-blocking send/peek).
+        const rio = core.compat.reactor;
         const WAKE_TAG: u64 = std.math.maxInt(u64);
         const MAX_EVENTS: usize = 256;
 
         server: *Server,
         allocator: std.mem.Allocator,
-        epoll_fd: posix.fd_t,
-        wake_fd: posix.fd_t,
+        epoll_fd: rio.fd_t,
+        wake_fd: rio.fd_t,
         running: std.atomic.Value(bool) = .init(true),
         sleeping: std.atomic.Value(bool) = .init(false),
 
@@ -197,29 +200,26 @@ pub const Server = struct {
 
         dirty_mutex: core.compat.Mutex = .{},
         dirty_list: std.ArrayListUnmanaged(*SubSession) = .empty,
+        /// Set under `dirty_mutex` once `reactorLoop` has released its last dirty refs.
+        /// A publisher that arrives later must not queue: nothing would ever release
+        /// the retain, and the session's teardown waits for `in_flight == 0`.
+        dirty_closed: bool = false,
 
         /// Owned strictly by `reactorLoop` (no mutex required).
-        parked_set: std.AutoHashMapUnmanaged(posix.fd_t, *SubSession) = .empty,
-        reap_list: std.ArrayListUnmanaged(*SubSession) = .empty,
+        parked_set: std.AutoHashMapUnmanaged(rio.fd_t, *SubSession) = .empty,
+        /// Sessions closed by the reactor and awaiting `in_flight == 0`, linked through
+        /// `SubSession.reap_next`.
+        reap_head: ?*SubSession = null,
         thread: ?std.Thread = null,
 
         fn create(server: *Server) !*SubReactor {
-            const ep_rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
-            if (posix.errno(ep_rc) != .SUCCESS) return error.EpollCreateFailed;
-            const epoll_fd: posix.fd_t = @intCast(ep_rc);
+            const epoll_fd = try rio.epollCreate();
             errdefer core.compat.close(epoll_fd);
 
-            const wf_rc = linux.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
-            if (posix.errno(wf_rc) != .SUCCESS) return error.EventFdCreateFailed;
-            const wake_fd: posix.fd_t = @intCast(wf_rc);
+            const wake_fd = try rio.eventFd();
             errdefer core.compat.close(wake_fd);
 
-            var ev = linux.epoll_event{
-                .events = linux.EPOLL.IN,
-                .data = .{ .u64 = WAKE_TAG },
-            };
-            const ctl_rc = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, wake_fd, &ev);
-            if (posix.errno(ctl_rc) != .SUCCESS) return error.EpollCtlFailed;
+            try rio.epollAdd(epoll_fd, wake_fd, rio.IN, WAKE_TAG);
 
             const self = try server.allocator.create(SubReactor);
             errdefer server.allocator.destroy(self);
@@ -233,16 +233,23 @@ pub const Server = struct {
             return self;
         }
 
-        fn stopAndDestroy(self: *SubReactor) void {
+        /// Stop the reactor thread. On return every parked session has been reaped and
+        /// the reactor pushes nothing more onto `conn_queue`, but the struct stays valid:
+        /// sessions still queued for a worker keep a `conn_ctx.reactor` pointer to it
+        /// until `Server.drainQueueOnShutdown` has destroyed them.
+        fn stopAndJoin(self: *SubReactor) void {
             self.running.store(false, .seq_cst);
             self.wakeForce();
             if (self.thread) |t| t.join();
             self.thread = null;
+        }
 
+        /// Free the reactor. Call after `stopAndJoin`, once no session references it.
+        fn destroy(self: *SubReactor) void {
+            std.debug.assert(self.thread == null);
             self.park_list.deinit(self.allocator);
             self.dirty_list.deinit(self.allocator);
             self.parked_set.deinit(self.allocator);
-            self.reap_list.deinit(self.allocator);
             core.compat.close(self.wake_fd);
             core.compat.close(self.epoll_fd);
             self.allocator.destroy(self);
@@ -257,16 +264,11 @@ pub const Server = struct {
         }
 
         fn wakeForce(self: *SubReactor) void {
-            var one: u64 = 1;
-            _ = std.c.write(self.wake_fd, @ptrCast(&one), @sizeOf(u64));
+            rio.eventFdSignal(self.wake_fd);
         }
 
         fn drainWakeFd(self: *SubReactor) void {
-            var val: u64 = 0;
-            while (true) {
-                const rc = std.c.read(self.wake_fd, @ptrCast(&val), @sizeOf(u64));
-                if (rc <= 0) break;
-            }
+            rio.eventFdDrain(self.wake_fd);
         }
 
         /// Hand ownership of an idle subscribed session from a worker thread to the reactor.
@@ -288,13 +290,14 @@ pub const Server = struct {
         fn enqueueFlush(self: *SubReactor, session: *SubSession) void {
             ConnectionContext.retain(@ptrCast(&session.conn_ctx));
             self.dirty_mutex.lock();
-            self.dirty_list.append(self.allocator, session) catch {
-                self.dirty_mutex.unlock();
+            const queued = !self.dirty_closed and
+                if (self.dirty_list.append(self.allocator, session)) |_| true else |_| false;
+            self.dirty_mutex.unlock();
+            if (!queued) {
                 session.conn_ctx.out_queued.store(false, .release);
                 ConnectionContext.release(@ptrCast(&session.conn_ctx));
                 return;
-            };
-            self.dirty_mutex.unlock();
+            }
             self.wakeIfSleeping();
         }
 
@@ -312,14 +315,9 @@ pub const Server = struct {
         fn modEpollOut(self: *SubReactor, session: *SubSession, want_out: bool) void {
             if (session.epoll_out_armed == want_out) return;
             const fd = session.stream.getHandle();
-            var ev = linux.epoll_event{
-                .events = linux.EPOLL.IN | linux.EPOLL.RDHUP | (if (want_out) @as(u32, linux.EPOLL.OUT) else @as(u32, 0)),
-                .data = .{ .u64 = @intFromPtr(session) },
-            };
-            const rc = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, fd, &ev);
-            if (posix.errno(rc) == .SUCCESS) {
-                session.epoll_out_armed = want_out;
-            }
+            const events = rio.IN | rio.RDHUP | (if (want_out) rio.OUT else @as(u32, 0));
+            rio.epollMod(self.epoll_fd, fd, events, @intFromPtr(session)) catch return;
+            session.epoll_out_armed = want_out;
         }
 
         fn beginReap(self: *SubReactor, session: *SubSession) void {
@@ -327,27 +325,27 @@ pub const Server = struct {
             session.reaping = true;
             const fd = session.stream.getHandle();
             if (self.parked_set.remove(fd)) {
-                _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
+                rio.epollDel(self.epoll_fd, fd);
             }
             session.conn_ctx.parked.store(false, .release);
             session.conn_ctx.closed.store(true, .release);
             session.conn_ctx.unsubscribeAll();
             session.stream.shutdown();
-            self.reap_list.append(self.allocator, session) catch {
-                // Fallback: wait synchronously only on OOM
-                self.server.destroySession(session);
-            };
+            // Never destroy inline: the caller may be the dirty-list pass, which still
+            // holds an `in_flight` retain that only this thread releases, so waiting
+            // for it here would spin forever. The intrusive link cannot fail.
+            session.reap_next = self.reap_head;
+            self.reap_head = session;
         }
 
         fn tryCompleteReaps(self: *SubReactor) void {
-            var i: usize = 0;
-            while (i < self.reap_list.items.len) {
-                const sess = self.reap_list.items[i];
+            var link: *?*SubSession = &self.reap_head;
+            while (link.*) |sess| {
                 if (sess.conn_ctx.in_flight.load(.acquire) == 0) {
-                    _ = self.reap_list.swapRemove(i);
+                    link.* = sess.reap_next;
                     self.server.destroySession(sess);
                 } else {
-                    i += 1;
+                    link = &sess.reap_next;
                 }
             }
         }
@@ -361,7 +359,6 @@ pub const Server = struct {
             }
 
             const fd = session.stream.getHandle();
-            const send_flags: u32 = linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL;
 
             while (true) {
                 if (session.flush_pos >= session.flush_buf.items.len) {
@@ -380,17 +377,18 @@ pub const Server = struct {
                 }
 
                 const pending = session.flush_buf.items[session.flush_pos..];
-                const rc = std.c.send(fd, pending.ptr, pending.len, send_flags);
-                if (rc > 0) {
-                    session.flush_pos += @intCast(rc);
-                    session.stalled_since_ns = null;
-                    continue;
-                }
-                if (rc == 0) {
-                    self.beginReap(session);
-                    return;
-                }
-                const err = posix.errno(rc);
+                const err = switch (rio.sendNonBlocking(fd, pending)) {
+                    .sent => |n| {
+                        session.flush_pos += n;
+                        session.stalled_since_ns = null;
+                        continue;
+                    },
+                    .closed => {
+                        self.beginReap(session);
+                        return;
+                    },
+                    .failed => |e| e,
+                };
                 switch (err) {
                     .INTR => continue,
                     .AGAIN => {
@@ -421,7 +419,7 @@ pub const Server = struct {
         fn unparkToWorker(self: *SubReactor, session: *SubSession) void {
             const fd = session.stream.getHandle();
             _ = self.parked_set.remove(fd);
-            _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
+            rio.epollDel(self.epoll_fd, fd);
             session.epoll_out_armed = false;
             session.conn_ctx.parked.store(false, .release);
 
@@ -438,7 +436,7 @@ pub const Server = struct {
         }
 
         fn reactorLoop(self: *SubReactor) void {
-            var events: [MAX_EVENTS]linux.epoll_event = undefined;
+            var events: [MAX_EVENTS]rio.Event = undefined;
             var local_park: std.ArrayListUnmanaged(*SubSession) = .empty;
             defer local_park.deinit(self.allocator);
             var local_dirty: std.ArrayListUnmanaged(*SubSession) = .empty;
@@ -461,17 +459,12 @@ pub const Server = struct {
                         continue;
                     }
                     const fd = session.stream.getHandle();
-                    var ev = linux.epoll_event{
-                        .events = linux.EPOLL.IN | linux.EPOLL.RDHUP,
-                        .data = .{ .u64 = @intFromPtr(session) },
-                    };
-                    const rc = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, fd, &ev);
-                    if (posix.errno(rc) != .SUCCESS) {
+                    rio.epollAdd(self.epoll_fd, fd, rio.IN | rio.RDHUP, @intFromPtr(session)) catch {
                         self.beginReap(session);
                         continue;
-                    }
+                    };
                     self.parked_set.put(self.allocator, fd, session) catch {
-                        _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
+                        rio.epollDel(self.epoll_fd, fd);
                         self.beginReap(session);
                         continue;
                     };
@@ -497,7 +490,7 @@ pub const Server = struct {
                 local_dirty.clearRetainingCapacity();
 
                 // 3. Reap any closed sessions whose in-flight publish refs have hit 0.
-                if (self.reap_list.items.len > 0) self.tryCompleteReaps();
+                if (self.reap_head != null) self.tryCompleteReaps();
 
                 // 4. Periodic sweep (every 50 ms) for stalled EPOLLOUT timeouts & auth expiry.
                 const now = core.compat.nowNs();
@@ -537,7 +530,7 @@ pub const Server = struct {
                         }
                     }
                     for (to_evict[0..evict_n]) |sess| self.beginReap(sess);
-                    if (self.reap_list.items.len > 0) self.tryCompleteReaps();
+                    if (self.reap_head != null) self.tryCompleteReaps();
                 }
 
                 // 5. Dekker handshake before blocking in epoll_wait.
@@ -547,13 +540,11 @@ pub const Server = struct {
                     continue;
                 }
 
-                const wait_ms: i32 = if (self.reap_list.items.len > 0) 5 else 50;
-                const rc = linux.epoll_wait(self.epoll_fd, &events, MAX_EVENTS, wait_ms);
+                const wait_ms: i32 = if (self.reap_head != null) 5 else 50;
+                const ready = rio.epollWait(self.epoll_fd, &events, wait_ms);
                 self.sleeping.store(false, .release);
-                if (posix.errno(rc) != .SUCCESS) continue;
-                const nfds: usize = rc;
 
-                for (events[0..nfds]) |ev| {
+                for (ready orelse continue) |ev| {
                     if (ev.data.u64 == WAKE_TAG) {
                         self.drainWakeFd();
                         continue;
@@ -562,25 +553,22 @@ pub const Server = struct {
                     const fd = session.stream.getHandle();
                     if (!self.parked_set.contains(fd)) continue;
 
-                    if ((ev.events & linux.EPOLL.OUT) != 0) {
+                    if ((ev.events & rio.OUT) != 0) {
                         self.drainSessionOut(session);
                         if (!self.parked_set.contains(fd)) continue;
                     }
-                    if (session.conn_ctx.closed.load(.acquire) or (ev.events & (linux.EPOLL.ERR | linux.EPOLL.HUP)) != 0) {
+                    if (session.conn_ctx.closed.load(.acquire) or (ev.events & (rio.ERR | rio.HUP)) != 0) {
                         self.beginReap(session);
                         continue;
                     }
-                    if ((ev.events & (linux.EPOLL.IN | linux.EPOLL.RDHUP)) != 0) {
-                        var peek: [1]u8 = undefined;
-                        const prc = std.c.recv(fd, &peek, 1, linux.MSG.PEEK | linux.MSG.DONTWAIT);
-                        if (prc > 0) {
+                    if ((ev.events & (rio.IN | rio.RDHUP)) != 0) {
+                        switch (rio.peekReadable(fd)) {
                             // Client sent a command (e.g. UNSUB, SUB, PING) — resume on worker.
-                            self.unparkToWorker(session);
-                        } else if (prc == 0) {
+                            .data => self.unparkToWorker(session),
                             // Clean EOF — reap directly on reactor without touching a worker.
-                            self.beginReap(session);
-                        } else if (posix.errno(prc) != .AGAIN and posix.errno(prc) != .INTR) {
-                            self.beginReap(session);
+                            .eof => self.beginReap(session),
+                            .would_block => {},
+                            .failed => self.beginReap(session),
                         }
                     }
                 }
@@ -588,6 +576,7 @@ pub const Server = struct {
 
             // Shutdown cleanup: release any queued dirty refs, parked sessions, and reaps.
             self.dirty_mutex.lock();
+            self.dirty_closed = true;
             for (self.dirty_list.items) |session| {
                 session.conn_ctx.out_queued.store(false, .release);
                 ConnectionContext.release(@ptrCast(&session.conn_ctx));
@@ -600,19 +589,25 @@ pub const Server = struct {
             self.park_list.clearRetainingCapacity();
             self.park_mutex.unlock();
 
-            var remaining_parked: std.ArrayListUnmanaged(*SubSession) = .empty;
-            defer remaining_parked.deinit(self.allocator);
-            var it = self.parked_set.valueIterator();
-            while (it.next()) |sp| remaining_parked.append(self.allocator, sp.*) catch {};
-            for (remaining_parked.items) |session| self.beginReap(session);
+            // `beginReap` removes the session from `parked_set`, so restart the iterator
+            // each time instead of staging the sessions in a list that could fail to grow.
+            while (true) {
+                var it = self.parked_set.valueIterator();
+                const sp = it.next() orelse break;
+                const session = sp.*;
+                self.beginReap(session);
+                // Defensive: a session already marked reaping is not unlinked above.
+                _ = self.parked_set.remove(session.stream.getHandle());
+            }
 
-            while (self.reap_list.items.len > 0) {
+            while (self.reap_head != null) {
                 self.tryCompleteReaps();
-                if (self.reap_list.items.len > 0) std.Thread.yield() catch {};
+                if (self.reap_head != null) std.Thread.yield() catch {};
             }
         }
     } else struct {
-        fn stopAndDestroy(_: *@This()) void {}
+        fn stopAndJoin(_: *@This()) void {}
+        fn destroy(_: *@This()) void {}
         fn enqueueFlush(_: *@This(), _: *SubSession) void {}
         fn wakeIfSleeping(_: *@This()) void {}
     };
@@ -917,9 +912,15 @@ pub const Server = struct {
             self.sub_reactor = try SubReactor.create(self);
         }
         defer {
+            // Teardown order: the reactor can still hand a resumed session to
+            // `conn_queue` until its thread has exited, and by then the workers may
+            // already have drained the queue and gone. So stop the reactor first, sweep
+            // the queue once more, and only then free the reactor those sessions point at.
+            if (self.sub_reactor) |reactor| reactor.stopAndJoin();
+            self.drainQueueOnShutdown();
             if (self.sub_reactor) |reactor| {
-                reactor.stopAndDestroy();
                 self.sub_reactor = null;
+                reactor.destroy();
             }
         }
 
@@ -1018,9 +1019,32 @@ pub const Server = struct {
         }
     }
 
+    /// Ask `run` to return. Safe to call from any thread, before, during or after
+    /// `run`: it only flips the flag. It must not touch `sub_reactor`, which `run`
+    /// creates and frees on its own thread; `run` wakes the reactor itself during
+    /// teardown (`SubReactor.stopAndJoin`).
     pub fn stop(self: *Server) void {
         self.running.store(false, .release);
-        if (self.sub_reactor) |reactor| reactor.wakeIfSleeping();
+    }
+
+    /// Final sweep of `conn_queue` during `run` teardown, after the workers and the
+    /// reactor thread have exited so nothing can push or pop concurrently. Entries can
+    /// still be here: the accept loop or the reactor may have pushed after the last
+    /// worker finished its own shutdown drain. Without this sweep each one would leak
+    /// its socket and its connection-limit slot.
+    fn drainQueueOnShutdown(self: *Server) void {
+        while (self.conn_queue.pop()) |queued| {
+            switch (queued) {
+                .accepted => |acc| {
+                    var stream = acc.conn.stream;
+                    stream.close();
+                    if (acc.ip_key) |key| self.ip_limiter.release(key);
+                    self.connection_limit.release();
+                },
+                .resumed => |sess| self.destroySession(sess),
+            }
+        }
+        if (self.metrics) |metrics| metrics.setTcpConnectionQueueDepth(0);
     }
 
     fn destroySession(self: *Server, session: *SubSession) void {
@@ -3081,4 +3105,218 @@ test "SubReactor re-parks a subscriber after a rate-limited reply" {
     try testing.expect(ev == .event);
     try testing.expectEqualStrings("repark:test", ev.event.channel);
     try testing.expectEqualStrings("after-limit", ev.event.message);
+}
+
+test "SubReactor defers reaping while a dirty-list ref is still in flight" {
+    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    const net = core.compat.net;
+
+    var store = try Store.init(testing.allocator, .{ .persistence = .none });
+    defer store.deinit();
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+    var server = Server.init(testing.allocator, &store, &bus, .{});
+    defer server.deinit();
+
+    var listener = try (try net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+    const port = listener.inner.socket.address.getPort();
+    var client = try net.tcpConnectToAddress(net.Address.initIp4(.{ 127, 0, 0, 1 }, port));
+    defer client.close();
+    const accepted = try listener.accept();
+
+    // A subscribed session built the way `handleConnection` builds it.
+    try testing.expect(server.connection_limit.acquire(server.config.max_connections));
+    const session = try testing.allocator.create(Server.SubSession);
+    session.* = .{
+        .stream = accepted.stream,
+        .ip_key = null,
+        .conn_ctx = Server.ConnectionContext.init(testing.allocator, &bus, null),
+        .metrics_shard = 0,
+    };
+    session.conn_ctx.stream = &session.stream;
+    session.conn_ctx.session = session;
+    session.conn_ctx.binary_mode = true;
+    try session.conn_ctx.subscribe("reap:test", null);
+    try testing.expectEqual(@as(u64, 1), bus.subscriberCount());
+
+    // Reactor state without its thread: reap bookkeeping is single-threaded. The
+    // failing allocator proves queuing a reap needs no memory.
+    var reactor = Server.SubReactor{
+        .server = &server,
+        .allocator = testing.failing_allocator,
+        .epoll_fd = -1,
+        .wake_fd = -1,
+    };
+
+    // Stand in for a queued dirty-list entry: one in-flight ref that only the
+    // reactor thread releases, after `beginReap` has returned.
+    Server.ConnectionContext.retain(@ptrCast(&session.conn_ctx));
+    reactor.beginReap(session);
+    try testing.expect(session.reaping);
+    try testing.expect(session.conn_ctx.closed.load(.acquire));
+    try testing.expectEqual(@as(u64, 0), bus.subscriberCount());
+
+    // Still referenced: the session must stay queued, not be destroyed.
+    reactor.tryCompleteReaps();
+    try testing.expect(reactor.reap_head == session);
+    try testing.expectEqual(@as(usize, 1), server.connection_limit.active.load(.acquire));
+
+    Server.ConnectionContext.release(@ptrCast(&session.conn_ctx));
+    reactor.tryCompleteReaps();
+    try testing.expect(reactor.reap_head == null);
+    try testing.expectEqual(@as(usize, 0), server.connection_limit.active.load(.acquire));
+}
+
+test "shutdown drain releases sessions and connections left in the queue" {
+    if (comptime core.compat.wasm_target) return error.SkipZigTest;
+    const testing = std.testing;
+    const net = core.compat.net;
+
+    var store = try Store.init(testing.allocator, .{ .persistence = .none });
+    defer store.deinit();
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+    var server = Server.init(testing.allocator, &store, &bus, .{});
+    defer server.deinit();
+
+    var listener = try (try net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+    const port = listener.inner.socket.address.getPort();
+    const addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+
+    var client_a = try net.tcpConnectToAddress(addr);
+    defer client_a.close();
+    const accepted_a = try listener.accept();
+    var client_b = try net.tcpConnectToAddress(addr);
+    defer client_b.close();
+    const accepted_b = try listener.accept();
+
+    // A subscriber the reactor handed back for a worker after the last worker exited.
+    try testing.expect(server.connection_limit.acquire(server.config.max_connections));
+    const session = try testing.allocator.create(Server.SubSession);
+    session.* = .{
+        .stream = accepted_a.stream,
+        .ip_key = null,
+        .conn_ctx = Server.ConnectionContext.init(testing.allocator, &bus, null),
+        .metrics_shard = 0,
+    };
+    session.conn_ctx.stream = &session.stream;
+    session.conn_ctx.session = session;
+    session.conn_ctx.binary_mode = true;
+    try session.conn_ctx.subscribe("drain:test", null);
+    try testing.expect(server.conn_queue.push(.{ .resumed = session }));
+
+    // A connection the accept loop queued after the last worker exited.
+    try testing.expect(server.connection_limit.acquire(server.config.max_connections));
+    try testing.expect(server.conn_queue.push(.{ .accepted = .{ .conn = accepted_b, .ip_key = null } }));
+
+    server.drainQueueOnShutdown();
+
+    try testing.expectEqual(@as(usize, 0), server.conn_queue.len());
+    try testing.expectEqual(@as(usize, 0), server.connection_limit.active.load(.acquire));
+    try testing.expectEqual(@as(u64, 0), bus.subscriberCount());
+
+    // Both peers see their socket closed rather than a connection nobody serves.
+    var sink: [8]u8 = undefined;
+    client_a.beginRead(5_000, false);
+    try testing.expectEqual(@as(usize, 0), client_a.read(&sink) catch 0);
+    client_b.beginRead(5_000, false);
+    try testing.expectEqual(@as(usize, 0), client_b.read(&sink) catch 0);
+}
+
+test "SubReactor shutdown releases parked and resuming subscribers" {
+    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    const net = core.compat.net;
+
+    var store = try Store.init(testing.allocator, .{ .persistence = .none });
+    defer store.deinit();
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    var probe = try (try net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    const port = probe.inner.socket.address.getPort();
+    probe.deinit();
+
+    var server = Server.init(testing.allocator, &store, &bus, .{
+        .bind_address = "127.0.0.1",
+        .port = port,
+        .worker_count = 2,
+        .timeout_ms = 5_000,
+    });
+    defer server.deinit();
+
+    const RunCtx = struct {
+        s: *Server,
+        fn run(ctx: @This()) void {
+            ctx.s.run() catch {};
+        }
+    };
+    const addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+    const srv_th = try std.Thread.spawn(.{}, RunCtx.run, .{RunCtx{ .s = &server }});
+    var joined = false;
+    defer if (!joined) {
+        server.stop();
+        if (net.tcpConnectToAddress(addr)) |*wake_c| {
+            var wc = wake_c.*;
+            wc.close();
+        } else |_| {}
+        srv_th.join();
+    };
+
+    const ReadAdapter = struct {
+        stream: *net.Stream,
+        pub fn read(a: *@This(), dest: []u8) !usize {
+            return a.stream.read(dest);
+        }
+    };
+
+    const n_subs: usize = 8;
+    var subs: [n_subs]net.Stream = undefined;
+    var opened: usize = 0;
+    defer for (0..opened) |i| subs[i].close();
+
+    for (0..n_subs) |i| {
+        var c: net.Stream = undefined;
+        var tries: usize = 0;
+        while (true) : (tries += 1) {
+            if (net.tcpConnectToAddress(addr)) |s| {
+                c = s;
+                break;
+            } else |_| {
+                if (tries > 200) return error.TestUnexpectedResult;
+                core.compat.io().sleep(.fromMilliseconds(5), .awake) catch {};
+            }
+        }
+        subs[i] = c;
+        opened += 1;
+        core.compat.setNoDelay(c.getHandle());
+        subs[i].beginRead(5_000, false);
+        try subs[i].writeAll(&wire.WIRE_MAGIC);
+        try wire.writeCommand(&subs[i], .{ .subscribe = .{ .channel = "shutdown:test", .filter = null } });
+        var r = ReadAdapter{ .stream = &subs[i] };
+        const resp = try wire.readResponseAlloc(&r, testing.allocator);
+        defer protocol.deinitResponse(testing.allocator, resp);
+        try testing.expect(resp == .ok);
+    }
+
+    // Half the subscribers send a command right as the server stops, so the reactor
+    // is handing sessions back to the worker queue while the workers are leaving.
+    // Whichever side wins each hand-off, every session must be torn down.
+    for (0..n_subs / 2) |i| {
+        try wire.writeCommand(&subs[i], .{ .get = "shutdown:missing" });
+    }
+    server.stop();
+    if (net.tcpConnectToAddress(addr)) |*wake_c| {
+        var wc = wake_c.*;
+        wc.close();
+    } else |_| {}
+    srv_th.join();
+    joined = true;
+
+    try testing.expectEqual(@as(usize, 0), server.conn_queue.len());
+    try testing.expectEqual(@as(usize, 0), server.connection_limit.active.load(.acquire));
+    try testing.expectEqual(@as(u64, 0), bus.subscriberCount());
 }

@@ -453,6 +453,112 @@ pub fn close(fd: std.posix.fd_t) void {
     _ = std.c.close(fd);
 }
 
+/// Linux epoll + eventfd + non-blocking socket shims for reactor loops (the TCP
+/// server's `SubReactor`). Thin wrappers over the raw syscalls, with no policy of
+/// their own, so a std API break is patched here instead of in each event loop.
+/// Empty on other targets: callers gate on `builtin.target.os.tag == .linux`.
+pub const reactor = if (builtin.target.os.tag == .linux) struct {
+    const linux = std.os.linux;
+    const posix = std.posix;
+
+    pub const fd_t = posix.fd_t;
+    pub const Event = linux.epoll_event;
+    pub const IN: u32 = linux.EPOLL.IN;
+    pub const OUT: u32 = linux.EPOLL.OUT;
+    pub const ERR: u32 = linux.EPOLL.ERR;
+    pub const HUP: u32 = linux.EPOLL.HUP;
+    pub const RDHUP: u32 = linux.EPOLL.RDHUP;
+
+    /// New close-on-exec epoll instance.
+    pub fn epollCreate() !fd_t {
+        const rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
+        if (posix.errno(rc) != .SUCCESS) return error.EpollCreateFailed;
+        return @intCast(rc);
+    }
+
+    /// New non-blocking, close-on-exec eventfd with a zero counter.
+    pub fn eventFd() !fd_t {
+        const rc = linux.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
+        if (posix.errno(rc) != .SUCCESS) return error.EventFdCreateFailed;
+        return @intCast(rc);
+    }
+
+    /// Register `fd` for `events`; `data` comes back in `Event.data.u64`.
+    pub fn epollAdd(epoll_fd: fd_t, fd: fd_t, events: u32, data: u64) !void {
+        var ev = Event{ .events = events, .data = .{ .u64 = data } };
+        const rc = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, fd, &ev);
+        if (posix.errno(rc) != .SUCCESS) return error.EpollCtlFailed;
+    }
+
+    /// Replace the interest set and user data of an already registered `fd`.
+    pub fn epollMod(epoll_fd: fd_t, fd: fd_t, events: u32, data: u64) !void {
+        var ev = Event{ .events = events, .data = .{ .u64 = data } };
+        const rc = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_MOD, fd, &ev);
+        if (posix.errno(rc) != .SUCCESS) return error.EpollCtlFailed;
+    }
+
+    /// Deregister `fd`. Best-effort: failures (e.g. not registered) are ignored.
+    pub fn epollDel(epoll_fd: fd_t, fd: fd_t) void {
+        _ = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
+    }
+
+    /// Wait up to `timeout_ms` for readiness. Returns the filled prefix of `events`
+    /// (empty on timeout), or null when the wait failed, EINTR included.
+    pub fn epollWait(epoll_fd: fd_t, events: []Event, timeout_ms: i32) ?[]Event {
+        const rc = linux.epoll_wait(epoll_fd, events.ptr, @intCast(events.len), timeout_ms);
+        if (posix.errno(rc) != .SUCCESS) return null;
+        return events[0..rc];
+    }
+
+    /// Add one to an eventfd counter, waking a waiter. Best-effort.
+    pub fn eventFdSignal(fd: fd_t) void {
+        var one: u64 = 1;
+        _ = std.c.write(fd, @ptrCast(&one), @sizeOf(u64));
+    }
+
+    /// Reset a non-blocking eventfd counter to zero.
+    pub fn eventFdDrain(fd: fd_t) void {
+        var val: u64 = 0;
+        while (true) {
+            const rc = std.c.read(fd, @ptrCast(&val), @sizeOf(u64));
+            if (rc <= 0) break;
+        }
+    }
+
+    pub const SendResult = union(enum) {
+        /// Bytes accepted by the kernel (always > 0).
+        sent: usize,
+        /// `send` returned 0.
+        closed,
+        /// `send` failed; `.AGAIN` means the socket buffer is full, `.INTR` retry.
+        failed: posix.E,
+    };
+
+    /// One non-blocking `send(2)` with SIGPIPE suppressed. Never waits and never
+    /// retries: the caller owns the EAGAIN / EINTR policy.
+    pub fn sendNonBlocking(fd: fd_t, data: []const u8) SendResult {
+        const rc = std.c.send(fd, data.ptr, data.len, linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL);
+        if (rc > 0) return .{ .sent = @intCast(rc) };
+        if (rc == 0) return .closed;
+        return .{ .failed = posix.errno(rc) };
+    }
+
+    pub const Readable = enum { data, eof, would_block, failed };
+
+    /// Non-consuming, non-blocking probe of a socket's read side: is there request
+    /// data, a clean EOF, nothing yet (EAGAIN / EINTR), or a socket error?
+    pub fn peekReadable(fd: fd_t) Readable {
+        var peek: [1]u8 = undefined;
+        const rc = std.c.recv(fd, &peek, 1, linux.MSG.PEEK | linux.MSG.DONTWAIT);
+        if (rc > 0) return .data;
+        if (rc == 0) return .eof;
+        return switch (posix.errno(rc)) {
+            .AGAIN, .INTR => .would_block,
+            else => .failed,
+        };
+    }
+} else struct {};
+
 /// Disable Nagle's algorithm (TCP_NODELAY) on a connected socket — critical
 /// for low-latency request/response. Best-effort: failures are ignored.
 ///

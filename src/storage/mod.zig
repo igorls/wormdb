@@ -8,6 +8,7 @@ const std = @import("std");
 const core = @import("../core/mod.zig");
 
 pub const wal = @import("wal.zig");
+pub const btree = @import("btree.zig");
 pub const store = @import("store.zig");
 pub const segment = @import("segment.zig");
 pub const sst = @import("sst.zig");

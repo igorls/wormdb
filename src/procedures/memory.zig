@@ -861,30 +861,28 @@ fn runHnswDispatch(
     const stage1_size = top_k * HNSW_EF_SEARCH_FACTOR;
     const raw_buf = try ctx.allocator.alloc(IndexModule.IndexSearchResult, stage1_size);
     const hnsw_scratch = try ctx.allocator.alloc(hnsw_mod.SearchResult, stage1_size);
+    const stage1_keys = try ctx.allocator.alloc([]u8, stage1_size);
+    const stage1_ts = try ctx.allocator.alloc(u64, stage1_size);
     const ef = stage1_size;
 
+    // Duplicate borrowed NamespaceIndex key slices BEFORE releasing the shared lock so a
+    // concurrent `clearLocked`/`vreindex` cannot free `ns_idx.keys` while we read them.
     const n_stage1 = blk: {
         ns_idx.lock.lockShared();
         defer ns_idx.lock.unlockShared();
         if (ns_idx.len() == 0) break :blk @as(usize, 0);
-        break :blk try ns_idx.searchLocked(query_vec, stage1_size, ef, raw_buf, hnsw_scratch);
+        const found = try ns_idx.searchLocked(query_vec, stage1_size, ef, raw_buf, hnsw_scratch);
+        for (raw_buf[0..found], 0..) |r, i| {
+            stage1_keys[i] = try ctx.allocator.dupe(u8, r.key);
+            stage1_ts[i] = r.timestamp;
+        }
+        break :blk found;
     };
 
     if (n_stage1 == 0) return false;
 
     const vec_prefix = try std.fmt.allocPrint(ctx.allocator, "vec:mem:{s}:", .{ns});
     defer ctx.allocator.free(vec_prefix);
-
-    const stage1_keys = try ctx.allocator.alloc([]u8, n_stage1);
-    const stage1_ts = try ctx.allocator.alloc(u64, n_stage1);
-    {
-        ns_idx.lock.lockShared();
-        defer ns_idx.lock.unlockShared();
-        for (raw_buf[0..n_stage1], 0..) |r, i| {
-            stage1_keys[i] = try ctx.allocator.dupe(u8, r.key);
-            stage1_ts[i] = r.timestamp;
-        }
-    }
 
     for (0..n_stage1) |i| {
         if (!try candidateMatchesFilter(ctx, filter, ns, vec_prefix, stage1_keys[i], stage1_ts[i])) continue;
@@ -1048,7 +1046,7 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
                 .allocator = ctx.allocator,
                 .oom = false,
             };
-            ctx.scanCallback(vec_namespace, @ptrCast(&brute_sc), onBruteMatch);
+            try ctx.scanCallback(vec_namespace, @ptrCast(&brute_sc), onBruteMatch);
             if (brute_sc.oom) return ctx.err("mem_query: out of memory during brute-force scan");
         }
     }
@@ -1216,7 +1214,7 @@ pub fn memRange(ctx: *Ctx) anyerror!Ctx.Result {
         scan_ctx.items.deinit(scan_ctx.allocator);
     }
 
-    ctx.scanCallback(doc_prefix, @ptrCast(&scan_ctx), onRangeDoc);
+    try ctx.scanCallback(doc_prefix, @ptrCast(&scan_ctx), onRangeDoc);
     if (scan_ctx.oom) return ctx.err("mem_range: out of memory during scan");
 
     std.sort.heap(RangeItem, scan_ctx.items.items, {}, rangeItemLessThan);
@@ -1498,7 +1496,7 @@ fn collectVerifySet(ctx: *Ctx, prefix: []const u8, kind: VerifyKind, ids: *Verif
         .kind = kind,
         .ids = ids,
     };
-    ctx.scanCallback(prefix, @ptrCast(&collector), collectVerifyId);
+    try ctx.scanCallback(prefix, @ptrCast(&collector), collectVerifyId);
     if (collector.oom) return error.OutOfMemory;
 }
 
@@ -1655,7 +1653,7 @@ pub fn memDrop(ctx: *Ctx) anyerror!Ctx.Result {
             for (collector.keys.items) |k| collector.allocator.free(k);
             collector.keys.deinit(collector.allocator);
         }
-        ctx.scanCallback(prefix, @ptrCast(&collector), collectDropKey);
+        try ctx.scanCallback(prefix, @ptrCast(&collector), collectDropKey);
         if (collector.oom) return ctx.err("mem_drop: out of memory collecting keys");
 
         for (collector.keys.items) |k| {
@@ -1753,7 +1751,7 @@ pub fn memResetIndex(ctx: *Ctx) anyerror!Ctx.Result {
             for (collector.keys.items) |k| collector.allocator.free(k);
             collector.keys.deinit(collector.allocator);
         }
-        ctx.scanCallback(prefix, @ptrCast(&collector), collectDropKey);
+        try ctx.scanCallback(prefix, @ptrCast(&collector), collectDropKey);
         if (collector.oom)
             return ctx.err("mem_reset_index: out of memory collecting keys");
 

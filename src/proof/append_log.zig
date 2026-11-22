@@ -98,15 +98,19 @@ const EVENT_KEY_LEN: usize = EVENT_PREFIX_LEN + 8;
 const STATE_PREFIX_LEN: usize = ACCUMULATOR_STATE_PREFIX.len + (HASH_LEN * 2) + ACCUMULATOR_STATE_SUFFIX.len;
 const STATE_KEY_LEN: usize = STATE_PREFIX_LEN + 8;
 
-fn formatEventKeyFromHex(out: *[EVENT_KEY_LEN]u8, log_hex: *const [HASH_LEN * 2]u8, seq: u64) []const u8 {
+fn formatEventPrefixFromHex(out: *[EVENT_PREFIX_LEN]u8, log_hex: *const [HASH_LEN * 2]u8) []const u8 {
     var pos: usize = 0;
     @memcpy(out[pos..][0..STORAGE_PREFIX.len], STORAGE_PREFIX);
     pos += STORAGE_PREFIX.len;
     @memcpy(out[pos..][0 .. HASH_LEN * 2], log_hex);
     pos += HASH_LEN * 2;
     @memcpy(out[pos..][0..EVENT_SUFFIX.len], EVENT_SUFFIX);
-    pos += EVENT_SUFFIX.len;
-    std.mem.writeInt(u64, out[pos..][0..8], seq, .big);
+    return out[0..];
+}
+
+fn formatEventKeyFromHex(out: *[EVENT_KEY_LEN]u8, log_hex: *const [HASH_LEN * 2]u8, seq: u64) []const u8 {
+    _ = formatEventPrefixFromHex(out[0..EVENT_PREFIX_LEN], log_hex);
+    std.mem.writeInt(u64, out[EVENT_PREFIX_LEN..][0..8], seq, .big);
     return out[0..];
 }
 
@@ -198,8 +202,58 @@ pub fn append(
 
 /// Verify every event currently stored for `log_id`.
 pub fn verifyStore(allocator: std.mem.Allocator, store: *Store, log_id: []const u8) !VerifyReport {
-    const prefix = try eventKeyPrefix(allocator, log_id);
-    defer allocator.free(prefix);
+    const log_hash = hashBytes(log_id);
+    var log_hex: [HASH_LEN * 2]u8 = undefined;
+    _ = hashToHex(log_hash, &log_hex);
+    var prefix_buf: [EVENT_PREFIX_LEN]u8 = undefined;
+    const prefix = formatEventPrefixFromHex(&prefix_buf, &log_hex);
+
+    // Zero-allocation streaming path when no frozen SST overlay is mounted:
+    // `scanPrefixCallback` yields live entries in strict global ascending order
+    // directly from the ordered B+Tree without copying keys or envelopes.
+    if (!store.hasFrozenSegments()) {
+        const VerifyCtx = struct {
+            prefix: []const u8,
+            verifier: Verifier,
+            err: ?anyerror = null,
+        };
+        var ctx = VerifyCtx{
+            .prefix = prefix,
+            .verifier = Verifier.init(log_id),
+        };
+        try store.scanPrefixCallback(prefix, &ctx, struct {
+            fn onEvent(raw: *anyopaque, key: []const u8, value: []const u8, timestamp: u64, is_worm: bool) Store.ScanAction {
+                const c: *VerifyCtx = @ptrCast(@alignCast(raw));
+                if (!is_worm) {
+                    c.err = error.NonWormEvent;
+                    return .stop;
+                }
+                const key_seq = seqFromEventKey(c.prefix, key) catch |e| {
+                    c.err = e;
+                    return .stop;
+                };
+                const view = decodeEnvelope(value) catch |e| {
+                    c.err = e;
+                    return .stop;
+                };
+                if (view.seq != key_seq) {
+                    c.err = error.SequenceKeyMismatch;
+                    return .stop;
+                }
+                if (view.ingest_time_ms != timestamp) {
+                    c.err = error.ReceiptTimestampMismatch;
+                    return .stop;
+                }
+                c.verifier.accept(view) catch |e| {
+                    c.err = e;
+                    return .stop;
+                };
+                return .cont;
+            }
+        }.onEvent);
+        if (ctx.err) |e| return e;
+        return ctx.verifier.report();
+    }
 
     const results = try store.scanPrefix(prefix, 0, allocator);
     defer {

@@ -93,18 +93,29 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     try ctx.requireRead(query_key);
     try ctx.requirePrefix(namespace, .read);
 
-    // ── Resolve the query vector locally (same path as vsearch) ──
-    const query_bytes = (try ctx.getCopy(query_key)) orelse
-        return ctx.err("vsearch_cluster: query key not found");
+    // ── Resolve the query vector locally via stack buffer (zero alloc for dim <= 1536) ──
+    var q_stack: [6144]u8 align(16) = undefined;
+    var q_heap: ?[]const u8 = null;
+    defer if (q_heap) |b| ctx.allocator.free(b);
+    const query_bytes: []const u8 = switch (ctx.getInto(query_key, &q_stack)) {
+        .hit => |s| s,
+        .miss => return ctx.err("vsearch_cluster: query key not found"),
+        .too_small => blk: {
+            const copy = (try ctx.getCopy(query_key)) orelse
+                return ctx.err("vsearch_cluster: query key not found");
+            q_heap = copy;
+            break :blk copy;
+        },
+    };
 
     const query_vec = distance.bytesToF32(query_bytes) orelse
         return ctx.err("vsearch_cluster: query value is not a valid f32 vector (byte length must be multiple of 4)");
 
     // ── Local search via the shared core ────────────────────────
+    var local_stack_buf: [vsearch.MAX_TOP_K]vsearch.Candidate = undefined;
     var local_candidates: []vsearch.Candidate = &.{};
     if (include_self) {
-        const local_buf = try ctx.allocator.alloc(vsearch.Candidate, top_k);
-        var local_heap = vsearch.TopKCandidate.init(local_buf);
+        var local_heap = vsearch.TopKCandidate.init(local_stack_buf[0..top_k]);
         if (try vsearch.runSearch(ctx, query_key, query_vec, .{
             .top_k = top_k,
             .namespace = namespace,
@@ -226,40 +237,32 @@ fn emitClusterJson(
     partial: bool,
 ) !Ctx.Result {
     var json: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer json.deinit(ctx.allocator);
+    var cap: usize = 80;
+    for (items) |r| cap += r.key.len + 60;
+    try json.ensureTotalCapacity(ctx.allocator, cap);
+
     try json.appendSlice(ctx.allocator, "{\"items\":[");
     for (items, 0..) |r, idx| {
         if (idx > 0) try json.append(ctx.allocator, ',');
         try json.appendSlice(ctx.allocator, "{\"k\":\"");
         try vsearch.appendJsonEscaped(&json, ctx.allocator, r.key);
         try json.appendSlice(ctx.allocator, "\",\"s\":");
-
-        var score_buf: [32]u8 = undefined;
-        const score_str = std.fmt.bufPrint(&score_buf, "{d:.6}", .{r.score}) catch "0";
-        try json.appendSlice(ctx.allocator, score_str);
-
+        try vsearch.appendScoreFixed6(&json, ctx.allocator, r.score);
         try json.appendSlice(ctx.allocator, ",\"ts\":");
-        var ts_buf: [20]u8 = undefined;
-        const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{r.timestamp}) catch "0";
-        try json.appendSlice(ctx.allocator, ts_str);
-
+        try vsearch.appendU64Dec(&json, ctx.allocator, r.timestamp);
         try json.appendSlice(ctx.allocator, ",\"src\":\"");
         try json.appendSlice(ctx.allocator, if (r.local) "local" else "peer");
         try json.appendSlice(ctx.allocator, "\"}");
     }
     try json.appendSlice(ctx.allocator, "],\"peers_queried\":");
-    try appendUsize(&json, ctx.allocator, peers_queried);
+    try vsearch.appendU64Dec(&json, ctx.allocator, @intCast(peers_queried));
     try json.appendSlice(ctx.allocator, ",\"peers_failed\":");
-    try appendUsize(&json, ctx.allocator, peers_failed);
+    try vsearch.appendU64Dec(&json, ctx.allocator, @intCast(peers_failed));
     try json.appendSlice(ctx.allocator, ",\"partial\":");
     try json.appendSlice(ctx.allocator, if (partial) "true" else "false");
     try json.append(ctx.allocator, '}');
-    return ctx.value(try json.toOwnedSlice(ctx.allocator));
-}
-
-fn appendUsize(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, n: usize) !void {
-    var buf: [32]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{d}", .{n}) catch "0";
-    try list.appendSlice(allocator, s);
+    return ctx.valueOwned(try json.toOwnedSlice(ctx.allocator));
 }
 
 // ╔═══════════════════════════════════════════════════╗

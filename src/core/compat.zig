@@ -138,6 +138,139 @@ pub const RwLock = struct {
     }
 };
 
+/// Cache-line-padded sharded reader-writer lock for high-contention read-mostly paths
+/// (e.g. `NamespaceRegistry` and `NamespaceIndex`).
+///
+/// Readers increment only their thread-local 64-byte-aligned 32-bit slot, avoiding
+/// cross-core atomic RMW cache-line bouncing on multi-CCD CPUs. Writers acquire an
+/// internal `writer_mutex`, set `writer_state` to block new readers (preventing writer
+/// starvation), and drain all `NUM_SLOTS` reader slots before entering the critical section.
+///
+/// Uses only 32-bit atomics (`u32`) and compiles to an inert no-op when `narrow_atomics`
+/// or `builtin.single_threaded` is true (`wasm32-wasi` compatible).
+pub const ShardedRwLock = struct {
+    pub const NUM_SLOTS: usize = 16;
+    const no_sync = narrow_atomics or builtin.single_threaded;
+
+    const ReaderSlot = struct {
+        count: std.atomic.Value(u32) align(64) = .init(0),
+    };
+
+    const Inner = struct {
+        slots: [NUM_SLOTS]ReaderSlot = @splat(.{}),
+        /// 0 = unlocked, 1 = writer active/draining, 2 = writer active + >=1 reader parked.
+        writer_state: std.atomic.Value(u32) align(64) = .init(0),
+        writer_mutex: Mutex = .{},
+    };
+
+    inner: if (no_sync) struct {} else Inner = .{},
+
+    const SlotAssign = struct {
+        var next_slot: std.atomic.Value(u32) = .init(0);
+        threadlocal var tls_slot_plus_one: u32 = 0;
+
+        inline fn current() usize {
+            const cached = tls_slot_plus_one;
+            if (cached != 0) return @intCast(cached - 1);
+            const assigned: u32 = next_slot.fetchAdd(1, .monotonic) & @as(u32, @intCast(NUM_SLOTS - 1));
+            tls_slot_plus_one = assigned + 1;
+            return @intCast(assigned);
+        }
+    };
+
+    pub fn lockShared(self: *ShardedRwLock) void {
+        if (comptime no_sync) return else {
+            const slot = &self.inner.slots[SlotAssign.current()].count;
+            while (true) {
+                if (self.inner.writer_state.load(.acquire) != 0) {
+                    self.waitForWriter();
+                }
+
+                // Dekker publish: seq_cst RMW on this thread's private slot followed by
+                // seq_cst load of writer_state guarantees mutual exclusion with a writer's
+                // seq_cst store to writer_state followed by seq_cst drain of every slot.
+                _ = slot.fetchAdd(1, .seq_cst);
+                if (self.inner.writer_state.load(.seq_cst) == 0) {
+                    return;
+                }
+
+                // A writer raced in: back off our slot and wake it if it is draining us.
+                const prev = slot.fetchSub(1, .seq_cst);
+                if (prev == 1) {
+                    Futex.wake(slot, 1);
+                }
+                self.waitForWriter();
+            }
+        }
+    }
+
+    pub fn unlockShared(self: *ShardedRwLock) void {
+        if (comptime no_sync) return else {
+            const slot = &self.inner.slots[SlotAssign.current()].count;
+            const prev = slot.fetchSub(1, .seq_cst);
+            // Hot path: writer_state remains in Shared (S) cache state across all cores.
+            if (prev == 1 and self.inner.writer_state.load(.seq_cst) != 0) {
+                Futex.wake(slot, 1);
+            }
+        }
+    }
+
+    pub fn lock(self: *ShardedRwLock) void {
+        if (comptime no_sync) return else {
+            self.inner.writer_mutex.lock();
+            self.inner.writer_state.store(1, .seq_cst);
+
+            for (&self.inner.slots) |*slot| {
+                var spins: u32 = 0;
+                while (true) {
+                    const cur = slot.count.load(.seq_cst);
+                    if (cur == 0) break;
+                    if (spins < 64) {
+                        std.atomic.spinLoopHint();
+                        spins += 1;
+                    } else if (spins < 80) {
+                        std.Thread.yield() catch {};
+                        spins += 1;
+                    } else {
+                        Futex.timedWait(&slot.count, cur, 1_000_000);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn unlock(self: *ShardedRwLock) void {
+        if (comptime no_sync) return else {
+            const prev = self.inner.writer_state.swap(0, .seq_cst);
+            if (prev == 2) {
+                Futex.wake(&self.inner.writer_state, std.math.maxInt(i32));
+            }
+            self.inner.writer_mutex.unlock();
+        }
+    }
+
+    fn waitForWriter(self: *ShardedRwLock) void {
+        if (comptime no_sync) return else {
+            var spins: u32 = 0;
+            while (true) {
+                const ws = self.inner.writer_state.load(.acquire);
+                if (ws == 0) return;
+                if (spins < 32) {
+                    std.atomic.spinLoopHint();
+                    spins += 1;
+                    continue;
+                }
+                if (ws == 1) {
+                    _ = self.inner.writer_state.cmpxchgStrong(1, 2, .acq_rel, .acquire);
+                }
+                if (self.inner.writer_state.load(.acquire) == 2) {
+                    Futex.timedWait(&self.inner.writer_state, 2, 1_000_000);
+                }
+            }
+        }
+    }
+};
+
 /// Futex compatibility wrapper.
 /// In 0.16, std.Thread.Futex moved to std.Io.futexWait/futexWake.
 pub const Futex = struct {
@@ -320,22 +453,135 @@ pub fn close(fd: std.posix.fd_t) void {
     _ = std.c.close(fd);
 }
 
+/// Linux epoll + eventfd + non-blocking socket shims for reactor loops (the TCP
+/// server's `SubReactor`). Thin wrappers over the raw syscalls, with no policy of
+/// their own, so a std API break is patched here instead of in each event loop.
+/// Empty on other targets: callers gate on `builtin.target.os.tag == .linux`.
+pub const reactor = if (builtin.target.os.tag == .linux) struct {
+    const linux = std.os.linux;
+    const posix = std.posix;
+
+    pub const fd_t = posix.fd_t;
+    pub const Event = linux.epoll_event;
+    pub const IN: u32 = linux.EPOLL.IN;
+    pub const OUT: u32 = linux.EPOLL.OUT;
+    pub const ERR: u32 = linux.EPOLL.ERR;
+    pub const HUP: u32 = linux.EPOLL.HUP;
+    pub const RDHUP: u32 = linux.EPOLL.RDHUP;
+
+    /// New close-on-exec epoll instance.
+    pub fn epollCreate() !fd_t {
+        const rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
+        if (posix.errno(rc) != .SUCCESS) return error.EpollCreateFailed;
+        return @intCast(rc);
+    }
+
+    /// New non-blocking, close-on-exec eventfd with a zero counter.
+    pub fn eventFd() !fd_t {
+        const rc = linux.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
+        if (posix.errno(rc) != .SUCCESS) return error.EventFdCreateFailed;
+        return @intCast(rc);
+    }
+
+    /// Register `fd` for `events`; `data` comes back in `Event.data.u64`.
+    pub fn epollAdd(epoll_fd: fd_t, fd: fd_t, events: u32, data: u64) !void {
+        var ev = Event{ .events = events, .data = .{ .u64 = data } };
+        const rc = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, fd, &ev);
+        if (posix.errno(rc) != .SUCCESS) return error.EpollCtlFailed;
+    }
+
+    /// Replace the interest set and user data of an already registered `fd`.
+    pub fn epollMod(epoll_fd: fd_t, fd: fd_t, events: u32, data: u64) !void {
+        var ev = Event{ .events = events, .data = .{ .u64 = data } };
+        const rc = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_MOD, fd, &ev);
+        if (posix.errno(rc) != .SUCCESS) return error.EpollCtlFailed;
+    }
+
+    /// Deregister `fd`. Best-effort: failures (e.g. not registered) are ignored.
+    pub fn epollDel(epoll_fd: fd_t, fd: fd_t) void {
+        _ = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
+    }
+
+    /// Wait up to `timeout_ms` for readiness. Returns the filled prefix of `events`
+    /// (empty on timeout), or null when the wait failed, EINTR included.
+    pub fn epollWait(epoll_fd: fd_t, events: []Event, timeout_ms: i32) ?[]Event {
+        const rc = linux.epoll_wait(epoll_fd, events.ptr, @intCast(events.len), timeout_ms);
+        if (posix.errno(rc) != .SUCCESS) return null;
+        return events[0..rc];
+    }
+
+    /// Add one to an eventfd counter, waking a waiter. Best-effort.
+    pub fn eventFdSignal(fd: fd_t) void {
+        var one: u64 = 1;
+        _ = std.c.write(fd, @ptrCast(&one), @sizeOf(u64));
+    }
+
+    /// Reset a non-blocking eventfd counter to zero.
+    pub fn eventFdDrain(fd: fd_t) void {
+        var val: u64 = 0;
+        while (true) {
+            const rc = std.c.read(fd, @ptrCast(&val), @sizeOf(u64));
+            if (rc <= 0) break;
+        }
+    }
+
+    pub const SendResult = union(enum) {
+        /// Bytes accepted by the kernel (always > 0).
+        sent: usize,
+        /// `send` returned 0.
+        closed,
+        /// `send` failed; `.AGAIN` means the socket buffer is full, `.INTR` retry.
+        failed: posix.E,
+    };
+
+    /// One non-blocking `send(2)` with SIGPIPE suppressed. Never waits and never
+    /// retries: the caller owns the EAGAIN / EINTR policy.
+    pub fn sendNonBlocking(fd: fd_t, data: []const u8) SendResult {
+        const rc = std.c.send(fd, data.ptr, data.len, linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL);
+        if (rc > 0) return .{ .sent = @intCast(rc) };
+        if (rc == 0) return .closed;
+        return .{ .failed = posix.errno(rc) };
+    }
+
+    pub const Readable = enum { data, eof, would_block, failed };
+
+    /// Non-consuming, non-blocking probe of a socket's read side: is there request
+    /// data, a clean EOF, nothing yet (EAGAIN / EINTR), or a socket error?
+    pub fn peekReadable(fd: fd_t) Readable {
+        var peek: [1]u8 = undefined;
+        const rc = std.c.recv(fd, &peek, 1, linux.MSG.PEEK | linux.MSG.DONTWAIT);
+        if (rc > 0) return .data;
+        if (rc == 0) return .eof;
+        return switch (posix.errno(rc)) {
+            .AGAIN, .INTR => .would_block,
+            else => .failed,
+        };
+    }
+} else struct {};
+
 /// Disable Nagle's algorithm (TCP_NODELAY) on a connected socket — critical
 /// for low-latency request/response. Best-effort: failures are ignored.
 ///
-/// `std.posix.setsockopt` is a hard `@compileError` on Windows, so the Windows
-/// path calls Winsock's `setsockopt` directly. The Io.net socket handle is a
-/// `HANDLE` wrapping the underlying `SOCKET`, recovered here via `@intFromPtr`.
+/// Windows sockets created by Zig 0.17 `std.Io.net` are raw `\Device\Afd\Endpoint`
+/// kernel handles, NOT Winsock `SOCKET`s (calling `ws2_32.setsockopt` fails silently
+/// with `WSAENOTSOCK`, leaving Nagle enabled and causing 15.6ms delayed-ACK stalls).
+/// Issue `IOCTL.AFD.SOCKOPT` directly via `std.Io.Operation.device_io_control`.
 pub fn setNoDelay(handle: std.posix.fd_t) void {
     if (builtin.os.tag == .windows) {
-        const setsockopt = @extern(
-            *const fn (usize, c_int, c_int, [*]const u8, c_int) callconv(.c) c_int,
-            .{ .name = "setsockopt", .library_name = "ws2_32" },
-        );
-        const IPPROTO_TCP: c_int = 6;
-        const TCP_NODELAY: c_int = 1;
-        const one: c_int = 1;
-        _ = setsockopt(@intFromPtr(handle), IPPROTO_TCP, TCP_NODELAY, @ptrCast(&one), @sizeOf(c_int));
+        const win = std.os.windows;
+        var one: u32 = 1;
+        const info = win.AFD.SOCKOPT_INFO{
+            .mode = .set,
+            .level = win.ws2_32.IPPROTO.TCP,
+            .optname = win.ws2_32.TCP.NODELAY,
+            .optval = @ptrCast(&one),
+            .optlen = @sizeOf(u32),
+        };
+        _ = io().operate(.{ .device_io_control = .{
+            .file = .{ .handle = handle, .flags = .{ .nonblocking = true } },
+            .code = win.IOCTL.AFD.SOCKOPT,
+            .in = std.mem.asBytes(&info),
+        } }) catch {};
     } else {
         std.posix.setsockopt(
             handle,
@@ -343,6 +589,40 @@ pub fn setNoDelay(handle: std.posix.fd_t) void {
             std.posix.TCP.NODELAY,
             &std.mem.toBytes(@as(c_int, 1)),
         ) catch {};
+    }
+}
+
+/// Read TCP_NODELAY state for a socket (used by tests to verify `setNoDelay`).
+fn getNoDelay(handle: std.posix.fd_t) !bool {
+    if (builtin.os.tag == .windows) {
+        const win = std.os.windows;
+        var val: u32 = 0;
+        const info = win.AFD.SOCKOPT_INFO{
+            .mode = .get,
+            .level = win.ws2_32.IPPROTO.TCP,
+            .optname = win.ws2_32.TCP.NODELAY,
+            .optval = @ptrCast(&val),
+            .optlen = @sizeOf(u32),
+        };
+        const res = try io().operate(.{ .device_io_control = .{
+            .file = .{ .handle = handle, .flags = .{ .nonblocking = true } },
+            .code = win.IOCTL.AFD.SOCKOPT,
+            .in = std.mem.asBytes(&info),
+            .out = std.mem.asBytes(&val),
+        } });
+        if (res.device_io_control.u.Status != .SUCCESS) return error.SocketOptionFailed;
+        return val != 0;
+    } else {
+        var val: c_int = 0;
+        var len: std.posix.socklen_t = @sizeOf(c_int);
+        if (std.c.getsockopt(
+            handle,
+            std.posix.IPPROTO.TCP,
+            std.posix.TCP.NODELAY,
+            @ptrCast(&val),
+            &len,
+        ) != 0) return error.SocketOptionFailed;
+        return val != 0;
     }
 }
 
@@ -373,6 +653,60 @@ pub fn setSendTimeoutMs(handle: std.posix.fd_t, timeout_ms: u32) void {
             std.mem.asBytes(&timeval),
         ) catch {};
     }
+}
+
+/// Windows AFD write with lazy deadline computation: skips `nowNs()` completely
+/// on the common synchronous `.SUCCESS` completion path, while still enforcing
+/// `timeout_ms` across `.PENDING` waits and multi-chunk partial writes.
+fn socketWindowsWriteWithTimeout(
+    event_slot: *?std.os.windows.HANDLE,
+    handle: std.posix.fd_t,
+    buf: []const u8,
+    timeout_ms: usize,
+    deadline_opt: *?i128,
+) !usize {
+    const win = std.os.windows;
+    if (deadline_opt.*) |d| {
+        if (d <= nowNs()) return error.Timeout;
+    }
+    const event = event_slot.* orelse blk: {
+        var ev: win.HANDLE = undefined;
+        const event_all_access: win.ACCESS_MASK = @bitCast(@as(u32, 0x001f0003));
+        if (win.ntdll.NtCreateEvent(&ev, event_all_access, null, .Notification, .FALSE) != .SUCCESS) return error.SystemResources;
+        event_slot.* = ev;
+        break :blk ev;
+    };
+    var iovec = win.AFD.WSABUF(.@"const"){ .len = @intCast(@min(buf.len, std.math.maxInt(u32))), .buf = buf.ptr };
+    const request: win.AFD.SEND_INFO = .{
+        .BufferArray = @ptrCast(&iovec),
+        .BufferCount = 1,
+        .AfdFlags = .{ .NO_FAST_IO = true, .OVERLAPPED = true },
+        .TdiFlags = .{},
+    };
+    var iosb: win.IO_STATUS_BLOCK = undefined;
+    const status = win.ntdll.NtDeviceIoControlFile(handle, event, null, null, &iosb, win.IOCTL.AFD.SEND, &request, @sizeOf(@TypeOf(request)), null, 0);
+    switch (status) {
+        .SUCCESS => {},
+        .PENDING => {
+            const d = deadline_opt.* orelse blk: {
+                const computed = nowNs() + @as(i128, timeout_ms) * 1_000_000;
+                deadline_opt.* = computed;
+                break :blk computed;
+            };
+            const remaining = @max(d - nowNs(), 0);
+            const timeout: i64 = -@as(i64, @intCast(@min(@divTrunc(remaining + 99, 100), std.math.maxInt(i64))));
+            const waited = win.ntdll.NtWaitForSingleObject(event, .FALSE, &timeout);
+            if (waited != .SUCCESS) {
+                var cancel_iosb: win.IO_STATUS_BLOCK = undefined;
+                _ = win.ntdll.NtCancelIoFileEx(handle, &iosb, &cancel_iosb);
+                _ = win.ntdll.NtWaitForSingleObject(event, .FALSE, null);
+                return if (waited == .TIMEOUT) error.Timeout else error.SocketIoFailed;
+            }
+        },
+        else => return error.SocketIoFailed,
+    }
+    if (iosb.u.Status != .SUCCESS) return error.SocketIoFailed;
+    return iosb.Information;
 }
 
 /// Windows sockets created by Zig use AFD directly and are not Winsock socket
@@ -431,6 +765,25 @@ fn waitReadable(handle: std.posix.fd_t, deadline_ns: i128) !void {
             return error.SocketPollFailed;
         }
         if ((pfd.revents & std.posix.POLL.NVAL) != 0) return error.SocketPollFailed;
+        if (rc > 0) return;
+    }
+}
+
+/// POSIX readiness wait for socket writability bounded by an absolute deadline.
+fn waitWritable(handle: std.posix.fd_t, deadline_ns: i128) !void {
+    while (true) {
+        const remaining = deadline_ns - nowNs();
+        if (remaining <= 0) return error.Timeout;
+        const ms: c_int = @intCast(@min(@divTrunc(remaining + 999_999, 1_000_000), std.math.maxInt(c_int)));
+        var pfd = std.posix.pollfd{ .fd = handle, .events = std.posix.POLL.OUT, .revents = 0 };
+        const rc = std.c.poll(@ptrCast(&pfd), 1, ms);
+        if (rc < 0) {
+            if (std.posix.errno(rc) == .INTR) continue;
+            return error.SocketPollFailed;
+        }
+        if ((pfd.revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0) {
+            return error.BrokenPipe;
+        }
         if (rc > 0) return;
     }
 }
@@ -611,7 +964,6 @@ pub const net = if (wasm_target) struct {} else struct {
 
         pub fn writeAll(self: *Stream, data: []const u8) !void {
             const handle = self.inner.socket.handle;
-            const deadline: ?i128 = if (self.write_timeout_ms > 0) nowNs() + @as(i128, self.write_timeout_ms) * 1_000_000 else null;
             if (builtin.os.tag == .windows) {
                 // AFD send; use a cancellable request when a deadline is set.
                 // netWrite treats `data[data.len-1]` as the splat pattern, so
@@ -620,11 +972,12 @@ pub const net = if (wasm_target) struct {} else struct {
                 // slice underflows `data.len - 1` inside the vtable).
                 const zio = io();
                 const empty_header: []const u8 = "";
+                var deadline_opt: ?i128 = null;
                 var written: usize = 0;
                 while (written < data.len) {
                     const chunk = [_][]const u8{data[written..]};
-                    const n = if (deadline) |d|
-                        try socketWindowsBefore(false, &self.afd_write_event, handle, data[written..], d)
+                    const n = if (self.write_timeout_ms > 0)
+                        try socketWindowsWriteWithTimeout(&self.afd_write_event, handle, data[written..], self.write_timeout_ms, &deadline_opt)
                     else
                         try (try zio.operate(.{ .net_write = .{
                             .socket_handle = handle,
@@ -634,18 +987,38 @@ pub const net = if (wasm_target) struct {} else struct {
                         } })).net_write;
                     if (n == 0) return error.BrokenPipe;
                     written += n;
+                    // If a partial write occurred with a timeout configured, anchor the deadline
+                    // now so remaining chunks are bounded by the total write budget.
+                    if (written < data.len and self.write_timeout_ms > 0 and deadline_opt == null) {
+                        deadline_opt = nowNs() + @as(i128, self.write_timeout_ms) * 1_000_000;
+                    }
                 }
                 return;
             }
+            const send_flags: u32 = std.posix.MSG.DONTWAIT | (if (builtin.os.tag == .linux) std.posix.MSG.NOSIGNAL else 0);
+            var deadline_opt: ?i128 = null;
             var written: usize = 0;
             while (written < data.len) {
-                if (deadline) |d| if (nowNs() >= d) return error.Timeout;
-                const rc = std.c.write(handle, data[written..].ptr, data.len - written);
+                const rc = if (self.write_timeout_ms > 0)
+                    std.c.send(handle, data[written..].ptr, data.len - written, send_flags)
+                else
+                    std.c.write(handle, data[written..].ptr, data.len - written);
                 if (rc < 0) {
                     const errno = std.posix.errno(rc);
                     switch (errno) {
                         .INTR => continue,
-                        .AGAIN => return error.WouldBlock, // respect SO_SNDTIMEO
+                        .AGAIN => {
+                            if (self.write_timeout_ms > 0) {
+                                const d = deadline_opt orelse blk: {
+                                    const fresh = nowNs() + @as(i128, self.write_timeout_ms) * 1_000_000;
+                                    deadline_opt = fresh;
+                                    break :blk fresh;
+                                };
+                                try waitWritable(handle, d);
+                                continue;
+                            }
+                            return error.WouldBlock;
+                        },
                         .PIPE => return error.BrokenPipe,
                         .CONNRESET => return error.ConnectionResetByPeer,
                         .BADF => return error.NotOpenForWriting,
@@ -655,6 +1028,9 @@ pub const net = if (wasm_target) struct {} else struct {
                 const n: usize = @intCast(rc);
                 if (n == 0) return error.BrokenPipe;
                 written += n;
+                if (written < data.len and self.write_timeout_ms > 0 and deadline_opt == null) {
+                    deadline_opt = nowNs() + @as(i128, self.write_timeout_ms) * 1_000_000;
+                }
             }
         }
 
@@ -869,4 +1245,126 @@ test "Stream.shutdown from another thread wakes a blocked reader" {
     const elapsed_ms = @divTrunc(nowNs() - started, 1_000_000);
     if (result) |n| try testing.expectEqual(@as(usize, 0), n) else |_| {}
     try testing.expect(elapsed_ms < 4_000);
+}
+
+test "setNoDelay actually enables TCP_NODELAY in the kernel" {
+    if (comptime wasm_target) return error.SkipZigTest;
+    const testing = std.testing;
+
+    const listen_addr = try net.Address.parseIp("127.0.0.1", 0);
+    var listener = try listen_addr.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+    const bound_port = listener.inner.socket.address.getPort();
+
+    const Client = struct {
+        port: u16,
+        fn run(c: @This()) void {
+            var s = net.tcpConnectToAddress(net.Address.initIp4(.{ 127, 0, 0, 1 }, c.port)) catch return;
+            defer s.close();
+            setNoDelay(s.getHandle());
+            var b: [1]u8 = undefined;
+            _ = s.read(&b) catch {};
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Client.run, .{Client{ .port = bound_port }});
+    defer th.join();
+
+    var conn = try listener.accept();
+    defer conn.stream.close();
+
+    try testing.expect(!(try getNoDelay(conn.stream.getHandle())));
+    setNoDelay(conn.stream.getHandle());
+    try testing.expect(try getNoDelay(conn.stream.getHandle()));
+}
+
+test "ShardedRwLock basic single-threaded lock and unlock" {
+    var rw = ShardedRwLock{};
+    rw.lockShared();
+    rw.unlockShared();
+    rw.lock();
+    rw.unlock();
+}
+
+test "ShardedRwLock multi-threaded mutual exclusion under 8 readers + 2 writers" {
+    if (comptime wasm_target or builtin.single_threaded) return error.SkipZigTest;
+    const testing = std.testing;
+
+    const Shared = struct {
+        rw: ShardedRwLock = .{},
+        // Two fields written under exclusive lock must ALWAYS satisfy b == a * 3 + 7
+        // when observed under shared lock; a torn/racy read violates this invariant.
+        a: u64 = 0,
+        b: u64 = 7,
+        active_writers: std.atomic.Value(u32) = .init(0),
+        active_readers: std.atomic.Value(u32) = .init(0),
+        violations: std.atomic.Value(u32) = .init(0),
+        stop: std.atomic.Value(bool) = .init(false),
+        reads_completed: std.atomic.Value(u32) = .init(0),
+    };
+
+    const Reader = struct {
+        fn run(s: *Shared) void {
+            var local_reads: u32 = 0;
+            while (!s.stop.load(.acquire) or local_reads < 1_000) {
+                s.rw.lockShared();
+                _ = s.active_readers.fetchAdd(1, .acq_rel);
+                if (s.active_writers.load(.acquire) != 0) {
+                    _ = s.violations.fetchAdd(1, .monotonic);
+                }
+                const a = s.a;
+                const b = s.b;
+                if (b != a *% 3 +% 7) {
+                    _ = s.violations.fetchAdd(1, .monotonic);
+                }
+                _ = s.active_readers.fetchSub(1, .acq_rel);
+                s.rw.unlockShared();
+                local_reads += 1;
+                if (local_reads >= 20_000) break;
+            }
+            _ = s.reads_completed.fetchAdd(local_reads, .release);
+        }
+    };
+
+    const Writer = struct {
+        fn run(s: *Shared, iters: u32) void {
+            for (0..iters) |_| {
+                s.rw.lock();
+                const prev_w = s.active_writers.fetchAdd(1, .acq_rel);
+                if (prev_w != 0 or s.active_readers.load(.acquire) != 0) {
+                    _ = s.violations.fetchAdd(1, .monotonic);
+                }
+                const next_a = s.a +% 1;
+                s.a = next_a;
+                // Deliberately separate the two writes to expose any missing exclusion.
+                std.atomic.spinLoopHint();
+                s.b = next_a *% 3 +% 7;
+                _ = s.active_writers.fetchSub(1, .acq_rel);
+                s.rw.unlock();
+            }
+        }
+    };
+
+    var shared = Shared{};
+    const NUM_READERS = 8;
+    const NUM_WRITERS = 2;
+    const WRITER_ITERS: u32 = 500;
+
+    var readers: [NUM_READERS]std.Thread = undefined;
+    var writers: [NUM_WRITERS]std.Thread = undefined;
+
+    for (&readers) |*th| {
+        th.* = try std.Thread.spawn(.{}, Reader.run, .{&shared});
+    }
+    for (&writers) |*th| {
+        th.* = try std.Thread.spawn(.{}, Writer.run, .{ &shared, WRITER_ITERS });
+    }
+
+    for (&writers) |*th| th.join();
+    shared.stop.store(true, .release);
+    for (&readers) |*th| th.join();
+
+    try testing.expectEqual(@as(u32, 0), shared.violations.load(.acquire));
+    try testing.expectEqual(@as(u64, NUM_WRITERS * WRITER_ITERS), shared.a);
+    try testing.expectEqual(@as(u64, (NUM_WRITERS * WRITER_ITERS) * 3 + 7), shared.b);
+    try testing.expect(shared.reads_completed.load(.acquire) >= NUM_READERS * 1_000);
 }

@@ -59,8 +59,13 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     else
         try ctx.scan(prefix, limit);
 
-    // Build JSON response
+    // Build JSON response with pre-estimated capacity to avoid repeated growth reallocs.
+    var est_bytes: usize = 2;
+    for (results) |r| {
+        est_bytes += r.key.len + r.value.len + 44;
+    }
     var json: std.ArrayListUnmanaged(u8) = .empty;
+    try json.ensureTotalCapacity(ctx.allocator, est_bytes);
     try json.append(ctx.allocator, '[');
 
     for (results, 0..) |r, i| {

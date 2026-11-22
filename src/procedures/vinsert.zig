@@ -48,10 +48,13 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     else
         .cosine;
 
-    // Build the full vec key into a stable scratch buffer (the procedure
-    // allocator is arena-owned, so the slice outlives this call).
-    const vec_key = try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ namespace, id });
-    defer ctx.allocator.free(vec_key);
+    // Build the full vec key on stack (MAX_NAMESPACE_LEN + MAX_ID_LEN = 384 <= 512).
+    var vec_key_buf: [512]u8 = undefined;
+    const vec_key = blk: {
+        @memcpy(vec_key_buf[0..namespace.len], namespace);
+        @memcpy(vec_key_buf[namespace.len .. namespace.len + id.len], id);
+        break :blk vec_key_buf[0 .. namespace.len + id.len];
+    };
 
     // The BQ companion (bq:<key>) and the __meta: counter are derived from
     // this key; authorizing the vector key authorizes them.
@@ -83,8 +86,8 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
 
     // Bump the local per-node insert counter (kept for vstats.inserts).
     // Not replicated by design — each node tracks its own direct inserts.
-    const stats_key = try std.fmt.allocPrint(ctx.allocator, "__meta:{s}count", .{namespace});
-    defer ctx.allocator.free(stats_key);
+    var stats_key_buf: [256]u8 = undefined;
+    const stats_key = std.fmt.bufPrint(&stats_key_buf, "__meta:{s}count", .{namespace}) catch unreachable;
     ctx.lockKey(stats_key);
     const count = ctx.getInt(i64, stats_key) orelse 0;
     ctx.setInt(stats_key, count + 1);

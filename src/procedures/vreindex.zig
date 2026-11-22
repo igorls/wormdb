@@ -37,14 +37,30 @@ const Metric = @import("../vector/metric.zig").Metric;
 
 const DEFAULT_NAMESPACE: []const u8 = "vec:";
 
-/// Scan callback state — one per vreindex invocation.
-const RebuildCtx = struct {
-    ns_idx: *IndexModule.NamespaceIndex,
-    expected_dim: usize, // 0 = not yet captured
-    now_ms: u64,
-    inserted: usize,
-    skipped: usize,
-    oom: bool,
+const EntryMeta = struct {
+    key_off: usize,
+    key_len: usize,
+    vec_off: usize,
+    timestamp: u64,
+};
+
+/// Phase 1 scan state: copies valid vector entries out of Store shards with NO
+/// `NamespaceIndex` lock held (prevents AB-BA deadlock vs `writeSnapshot` and
+/// eliminates 40–200ms per-shard stalls during HNSW construction).
+const CollectCtx = struct {
+    allocator: std.mem.Allocator,
+    keys_blob: std.ArrayListUnmanaged(u8) = .empty,
+    vecs_blob: std.ArrayListUnmanaged(f32) = .empty,
+    entries: std.ArrayListUnmanaged(EntryMeta) = .empty,
+    expected_dim: usize = 0,
+    skipped: usize = 0,
+    oom: bool = false,
+
+    fn deinit(self: *CollectCtx) void {
+        self.keys_blob.deinit(self.allocator);
+        self.vecs_blob.deinit(self.allocator);
+        self.entries.deinit(self.allocator);
+    }
 };
 
 fn onVectorMatch(
@@ -55,33 +71,43 @@ fn onVectorMatch(
     is_worm: bool,
 ) Store.ScanAction {
     _ = is_worm;
-    const sc: *RebuildCtx = @ptrCast(@alignCast(raw_ctx));
+    const cc: *CollectCtx = @ptrCast(@alignCast(raw_ctx));
 
     const vec = distance.bytesToF32(value) orelse {
-        sc.skipped += 1;
+        cc.skipped += 1;
         return .cont;
     };
 
     // Lock dimension on first valid vector; reject mismatches to keep the
     // graph consistent.
-    if (sc.expected_dim == 0) {
-        sc.expected_dim = vec.len;
-    } else if (vec.len != sc.expected_dim) {
-        sc.skipped += 1;
+    if (cc.expected_dim == 0) {
+        cc.expected_dim = vec.len;
+    } else if (vec.len != cc.expected_dim) {
+        cc.skipped += 1;
         return .cont;
     }
 
-    // Reuse the entry's own timestamp (WORM stability) rather than now_ms,
-    // so temporal-decay queries give the same answers before/after rebuild.
-    _ = sc.ns_idx.insertLocked(key, vec, timestamp) catch |e| {
-        if (e == error.OutOfMemory) {
-            sc.oom = true;
-            return .stop;
-        }
-        sc.skipped += 1;
-        return .cont;
+    const key_off = cc.keys_blob.items.len;
+    cc.keys_blob.appendSlice(cc.allocator, key) catch {
+        cc.oom = true;
+        return .stop;
     };
-    sc.inserted += 1;
+    const vec_off = cc.vecs_blob.items.len;
+    const dst = cc.vecs_blob.addManyAsSlice(cc.allocator, vec.len) catch {
+        cc.oom = true;
+        return .stop;
+    };
+    @memcpy(std.mem.sliceAsBytes(dst), value);
+
+    cc.entries.append(cc.allocator, .{
+        .key_off = key_off,
+        .key_len = key.len,
+        .vec_off = vec_off,
+        .timestamp = timestamp,
+    }) catch {
+        cc.oom = true;
+        return .stop;
+    };
     return .cont;
 }
 
@@ -89,7 +115,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     const namespace = ctx.arg(0) orelse DEFAULT_NAMESPACE;
 
     // Rebuilding the serving index for a namespace is a write over that
-    // namespace (it stalls inserts and swaps the graph every reader sees).
+    // namespace (it replaces the graph every reader sees).
     try ctx.requirePrefix(namespace, .write);
 
     const reg = ctx.vector_registry orelse
@@ -111,40 +137,124 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
         return ctx.err(ctx.fmt("vreindex: getOrCreate failed: {s}", .{@errorName(e)}));
     };
 
-    // Take the write lock for the rebuild. Inserts wait; searches that
-    // grab the shared lock before us see the old graph (if any).
-    ns_idx.lock.lock();
-    defer ns_idx.lock.unlock();
+    // ── Phase 1: collect valid vectors from Store with NO ns_idx lock held ──
+    var cc = CollectCtx{ .allocator = ctx.allocator };
+    defer cc.deinit();
+    try ctx.scanCallback(namespace, @ptrCast(&cc), onVectorMatch);
+    if (cc.oom) return ctx.err("vreindex: out of memory during scan");
 
-    ns_idx.clearLocked();
+    // ── Phase 2: build fresh HNSW + slabs completely off-lock ──────────────
+    ns_idx.lock.lockShared();
+    const hnsw_params = ns_idx.hnsw.params;
+    const rq_handle = ns_idx.acquireRabitqHandleLocked();
+    ns_idx.lock.unlockShared();
+    defer if (rq_handle) |h| h.release();
 
-    var rc = RebuildCtx{
-        .ns_idx = ns_idx,
-        .expected_dim = 0,
-        .now_ms = ctx.timestamp(),
-        .inserted = 0,
-        .skipped = 0,
-        .oom = false,
-    };
+    const built_for_params: ?*const @import("../vector/rabitq.zig").RabitqParams =
+        if (rq_handle) |h| h.params else null;
 
-    // scanCallback locks each shard independently; it must not run while
-    // the procedure holds any shard locks. vreindex holds only the
-    // ns_idx lock (a different class) — safe.
-    ctx.scanCallback(namespace, @ptrCast(&rc), onVectorMatch);
+    var fresh = IndexModule.NamespaceIndex.init(ns_idx.allocator, hnsw_params, ns_idx.metric);
+    defer {
+        // Borrowed pointer only (owned by `rq_handle`, never by `fresh`).
+        fresh.rabitq_params = null;
+        fresh.deinit();
+    }
+    if (rq_handle) |h| {
+        fresh.rabitq_params = h.params;
+        fresh.bq_slab.synced = false;
+        fresh.rq_slab.synced = true;
+    }
 
-    if (rc.oom) return ctx.err("vreindex: out of memory during rebuild");
+    if (cc.entries.items.len > 0) {
+        fresh.reserveAdditionalLocked(cc.entries.items.len) catch {
+            return ctx.err("vreindex: out of memory during rebuild");
+        };
+    }
+
+    var inserted: usize = 0;
+    var skipped: usize = cc.skipped;
+    const dim = cc.expected_dim;
+    for (cc.entries.items) |entry| {
+        const key = cc.keys_blob.items[entry.key_off..][0..entry.key_len];
+        const vec: []align(1) const f32 = cc.vecs_blob.items[entry.vec_off..][0..dim];
+        _ = fresh.insertLocked(key, vec, entry.timestamp) catch |e| {
+            if (e == error.OutOfMemory) {
+                return ctx.err("vreindex: out of memory during rebuild");
+            }
+            skipped += 1;
+            continue;
+        };
+        inserted += 1;
+    }
+    fresh.complete_with_store = (skipped == 0);
+
+    // ── Phase 3: <1µs atomic swap under exclusive lock; old graph freed off-lock ──
+    {
+        ns_idx.lock.lock();
+        defer ns_idx.lock.unlock();
+        ns_idx.swapRebuiltLocked(&fresh, built_for_params);
+    }
 
     var json: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer json.deinit(ctx.allocator);
+    try json.ensureTotalCapacity(ctx.allocator, namespace.len + 64);
     try json.appendSlice(ctx.allocator, "{\"namespace\":\"");
     try json.appendSlice(ctx.allocator, namespace);
     try json.appendSlice(ctx.allocator, "\",\"inserted\":");
     var buf: [32]u8 = undefined;
-    var s = std.fmt.bufPrint(&buf, "{d}", .{rc.inserted}) catch "0";
+    var s = std.fmt.bufPrint(&buf, "{d}", .{inserted}) catch "0";
     try json.appendSlice(ctx.allocator, s);
     try json.appendSlice(ctx.allocator, ",\"skipped\":");
-    s = std.fmt.bufPrint(&buf, "{d}", .{rc.skipped}) catch "0";
+    s = std.fmt.bufPrint(&buf, "{d}", .{skipped}) catch "0";
     try json.appendSlice(ctx.allocator, s);
     try json.append(ctx.allocator, '}');
 
-    return ctx.value(try json.toOwnedSlice(ctx.allocator));
+    return ctx.valueOwned(try json.toOwnedSlice(ctx.allocator));
+}
+
+test "vreindex: off-lock rebuild reclaims tombstones with zero leaks" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var store = try Store.init(alloc, .{ .persistence = .none });
+    defer store.deinit();
+    var reg = IndexModule.NamespaceRegistry.init(alloc, .{ .m = 4, .ef_construction = 32 });
+    defer reg.deinit();
+    store.vector_registry = &reg;
+
+    const v1 = [_]f32{ 1, 0, 0, 0 };
+    const v2 = [_]f32{ 0, 1, 0, 0 };
+    const v3 = [_]f32{ 0, 0, 1, 0 };
+    try store.set("vec:r:1", std.mem.sliceAsBytes(&v1), false);
+    try store.set("vec:r:2", std.mem.sliceAsBytes(&v2), false);
+    try store.set("vec:r:3", std.mem.sliceAsBytes(&v3), false);
+
+    // Seed index with a tombstoned node first so swapRebuiltLocked frees non-empty old graph.
+    const idx = try reg.getOrCreate("vec:r:", .cosine);
+    {
+        idx.lock.lock();
+        defer idx.lock.unlock();
+        _ = try idx.insertLocked("vec:r:stale", &v1, 1);
+        _ = idx.markTombstoneLocked("vec:r:stale");
+        idx.markIncompleteLocked();
+    }
+
+    const args = [_][]const u8{"vec:r:"};
+    var ctx = Ctx.init(&store, &args, alloc, null, null, null, &reg);
+    defer ctx.deinit();
+
+    const res = try execute(&ctx);
+    defer if (res == .value) if (res.value) |v| alloc.free(v);
+    try testing.expect(res == .value);
+    const json = res.value.?;
+    try testing.expect(std.mem.indexOf(u8, json, "\"inserted\":3") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"skipped\":0") != null);
+
+    idx.lock.lockShared();
+    defer idx.lock.unlockShared();
+    try testing.expectEqual(@as(usize, 3), idx.len());
+    try testing.expectEqual(@as(usize, 0), idx.tombstone_count);
+    try testing.expect(idx.complete_with_store);
+    try testing.expect(idx.canUseBqSlabLocked(4));
+    try testing.expect(idx.canUseExactSlabLocked(4, .cosine));
 }

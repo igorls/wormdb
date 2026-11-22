@@ -221,7 +221,7 @@ fn benchKvStore(alloc: std.mem.Allocator) !void {
         };
         const t0 = nowNs();
         for (0..iters) |_| {
-            store_rnd.scanPrefixCallback("scan:1k:", @ptrCast(&sink), Cb.onMatch);
+            try store_rnd.scanPrefixCallback("scan:1k:", @ptrCast(&sink), Cb.onMatch);
         }
         const t1 = nowNs();
         std.mem.doNotOptimizeAway(sink);
@@ -724,6 +724,15 @@ fn benchVectorEngine(alloc: std.mem.Allocator) !void {
         const c1 = nowNs();
         std.mem.doNotOptimizeAway(sink_f);
 
+        // Dot Product
+        const d0 = nowNs();
+        for (1..N_VEC + 1) |i| {
+            const v: []align(1) const f32 = vec_mem[i * dim ..][0..dim];
+            sink_f += distance.dot(query_vec, v);
+        }
+        const d1 = nowNs();
+        std.mem.doNotOptimizeAway(sink_f);
+
         // L2 Squared
         const l0 = nowNs();
         for (1..N_VEC + 1) |i| {
@@ -745,6 +754,7 @@ fn benchVectorEngine(alloc: std.mem.Allocator) !void {
 
         var name_buf: [64]u8 = undefined;
         printRow(try std.fmt.bufPrint(&name_buf, "distance.cosine (dim={d})", .{dim}), N_VEC, c1 - c0, "");
+        printRow(try std.fmt.bufPrint(&name_buf, "distance.dot (dim={d})", .{dim}), N_VEC, d1 - d0, "");
         printRow(try std.fmt.bufPrint(&name_buf, "distance.l2Squared (dim={d})", .{dim}), N_VEC, l1 - l0, "");
         printRow(try std.fmt.bufPrint(&name_buf, "distance.binaryQuantize (dim={d})", .{dim}), N_VEC + 1, q1 - q0, "");
         printRow(try std.fmt.bufPrint(&name_buf, "distance.hamming (dim={d}, {d}B)", .{ dim, bq_size }), N_VEC, h1 - h0, "");
@@ -852,9 +862,10 @@ fn benchVectorEngine(alloc: std.mem.Allocator) !void {
     {
         const dim: usize = 128;
         const n_ins: usize = 2_000;
-        const vec_bytes = try alloc.alloc(u8, n_ins * dim * 4);
-        defer alloc.free(vec_bytes);
-        rand.bytes(vec_bytes);
+        const vec_floats = try alloc.alloc(f32, n_ins * dim);
+        defer alloc.free(vec_floats);
+        for (vec_floats) |*f| f.* = rand.floatNorm(f32);
+        const vec_bytes = std.mem.sliceAsBytes(vec_floats);
 
         var store = try Store.init(alloc, .{ .persistence = .none, .sync_writes = false });
         defer store.deinit();

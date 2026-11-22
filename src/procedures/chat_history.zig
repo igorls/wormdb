@@ -27,24 +27,31 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
         if (limit == 0) limit = DEFAULT_LIMIT;
     }
 
-    // Build prefix: chat:<room>:
-    const prefix = try std.fmt.allocPrint(ctx.allocator, "chat:{s}:", .{room});
+    // Build prefix: chat:<room>: using stack buffer for typical room names.
+    var prefix_stack: [128]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_stack, "chat:{s}:", .{room}) catch
+        try std.fmt.allocPrint(ctx.allocator, "chat:{s}:", .{room});
     try ctx.requirePrefix(prefix, .read);
 
     // Scan for matching messages (already sorted by key = chronological)
     const results = try ctx.scan(prefix, limit);
 
-    // Build JSON response — values are already JSON objects from chat_send
-    // We return them as a JSON array directly
-    var json: std.ArrayListUnmanaged(u8) = .empty;
-    try json.append(ctx.allocator, '[');
-
+    // Build JSON response — values are already JSON objects from chat_send.
+    // Exact byte length is known up front, so allocate once and copy directly.
+    var total_len: usize = 2 + (if (results.len > 1) results.len - 1 else 0);
+    for (results) |r| total_len += r.value.len;
+    const out = try ctx.allocator.alloc(u8, total_len);
+    var pos: usize = 0;
+    out[pos] = '[';
+    pos += 1;
     for (results, 0..) |r, i| {
-        if (i > 0) try json.append(ctx.allocator, ',');
-        // r.value is already a JSON object from chat_send: {"user":"...","text":"...","ts":...}
-        try json.appendSlice(ctx.allocator, r.value);
+        if (i > 0) {
+            out[pos] = ',';
+            pos += 1;
+        }
+        @memcpy(out[pos..][0..r.value.len], r.value);
+        pos += r.value.len;
     }
-
-    try json.append(ctx.allocator, ']');
-    return ctx.value(try json.toOwnedSlice(ctx.allocator));
+    out[pos] = ']';
+    return ctx.value(out);
 }

@@ -34,13 +34,26 @@ pub fn main(init: std.process.Init) !void {
     const alloc = std.heap.c_allocator;
 
     var only_ns_sync = false;
+    var only_wal_mt = false;
+    var only_vsearch = false;
     var args_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
     defer args_it.deinit();
     _ = args_it.next();
     while (args_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--only-ns-sync")) only_ns_sync = true;
+        if (std.mem.eql(u8, arg, "--only-wal-mt")) only_wal_mt = true;
+        if (std.mem.eql(u8, arg, "--only-vsearch")) only_vsearch = true;
     }
 
+    if (only_wal_mt) {
+        try benchMtWalContention(alloc);
+        return;
+    }
+    if (only_vsearch) {
+        try benchVsearchModes(alloc);
+        try benchVsearchRecallAndEf(alloc);
+        return;
+    }
     try benchMtNamespaceSync(alloc);
     if (only_ns_sync) return;
     try benchMtWalContention(alloc);

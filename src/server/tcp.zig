@@ -1316,7 +1316,14 @@ pub const Server = struct {
             if (conn_ctx.rate_limiter) |*limiter| {
                 if (!limiter.allow(core.compat.nowNs())) {
                     wire.writeResponse(&w, .{ .err = "rate limited" }) catch return .closed;
-                    if (!reader.hasBuffered()) w.flush() catch return .closed;
+                    if (!reader.hasBuffered()) {
+                        if (burst_had_success) {
+                            if (self.metrics) |metrics| metrics.touchTcpSuccessMsShard(metrics_shard);
+                            burst_had_success = false;
+                        }
+                        w.flush() catch return .closed;
+                        if (self.parkIfIdleSubscriber(session)) return .parked;
+                    }
                     continue;
                 }
             }
@@ -1340,7 +1347,8 @@ pub const Server = struct {
                     error.InvalidPredicate => "invalid filter predicate",
                 };
                 wire.writeResponse(&w, .{ .err = err_msg }) catch return .closed;
-                if (!reader.hasBuffered()) {
+                const idle = !reader.hasBuffered();
+                if (idle) {
                     if (burst_had_success) {
                         if (self.metrics) |metrics| metrics.touchTcpSuccessMsShard(metrics_shard);
                         burst_had_success = false;
@@ -1348,6 +1356,7 @@ pub const Server = struct {
                     w.flush() catch return .closed;
                 }
                 if (self.metrics) |metrics| metrics.completeTcpCommandShard(metrics_shard, false, false);
+                if (idle and self.parkIfIdleSubscriber(session)) return .parked;
                 continue;
             };
 
@@ -1365,21 +1374,30 @@ pub const Server = struct {
             }
             if (!more_buffered) {
                 w.flush() catch return .closed;
-                // Park idle subscribed connections onto SubReactor on Linux so they pin 0 worker threads.
-                if (comptime builtin.os.tag == .linux) {
-                    if (self.sub_reactor) |reactor| {
-                        if (conn_ctx.subscriptions.count() > 0 and
-                            !conn_ctx.closed.load(.acquire) and
-                            (!self.config.auth_enforce or conn_ctx.auth_state != null))
-                        {
-                            if (reactor.park(session)) {
-                                return .parked;
-                            }
-                        }
-                    }
+                if (self.parkIfIdleSubscriber(session)) return .parked;
+            }
+        }
+    }
+
+    /// Park an idle subscribed connection onto the SubReactor (Linux) so it pins no
+    /// worker thread and its queued events keep draining. Every reply path that leaves
+    /// the connection idle must go through here: the reactor skips unparked sessions,
+    /// so events published meanwhile would sit in `out_buf` until the next command.
+    /// Caller must have flushed its write adapter and hold no buffered request bytes.
+    /// Returns true when the reactor now owns the session.
+    fn parkIfIdleSubscriber(self: *Server, session: *SubSession) bool {
+        if (comptime builtin.target.os.tag == .linux) {
+            if (self.sub_reactor) |reactor| {
+                const conn_ctx = &session.conn_ctx;
+                if (conn_ctx.subscriptions.count() > 0 and
+                    !conn_ctx.closed.load(.acquire) and
+                    (!self.config.auth_enforce or conn_ctx.auth_state != null))
+                {
+                    return reactor.park(session);
                 }
             }
         }
+        return false;
     }
 
     /// Server side of the W2 org handshake: send a fresh 32-byte challenge,
@@ -2955,4 +2973,112 @@ test "SubReactor serves more subscribers than worker threads and resumes on UNSU
     try testing.expectEqualStrings("alive", g_resp.value.?);
 
     for (0..n_subs) |i| subs[i].close();
+}
+
+test "SubReactor re-parks a subscriber after a rate-limited reply" {
+    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    const net = core.compat.net;
+
+    var store = try Store.init(testing.allocator, .{ .persistence = .none });
+    defer store.deinit();
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    var probe = try (try net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    const port = probe.inner.socket.address.getPort();
+    probe.deinit();
+
+    // One command per second: SUB spends the only token, so the next frame is refused.
+    var server = Server.init(testing.allocator, &store, &bus, .{
+        .bind_address = "127.0.0.1",
+        .port = port,
+        .worker_count = 2,
+        .timeout_ms = 5_000,
+        .max_commands_per_sec = 1,
+    });
+    defer server.deinit();
+
+    const RunCtx = struct {
+        s: *Server,
+        fn run(ctx: @This()) void {
+            ctx.s.run() catch {};
+        }
+    };
+    const srv_th = try std.Thread.spawn(.{}, RunCtx.run, .{RunCtx{ .s = &server }});
+    defer {
+        server.stop();
+        if (net.tcpConnectToAddress(net.Address.initIp4(.{ 127, 0, 0, 1 }, port))) |*wake_c| {
+            var wc = wake_c.*;
+            wc.close();
+        } else |_| {}
+        srv_th.join();
+    }
+
+    const ReadAdapter = struct {
+        stream: *net.Stream,
+        pub fn read(a: *@This(), dest: []u8) !usize {
+            return a.stream.read(dest);
+        }
+    };
+
+    const addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+    var sub_c: net.Stream = undefined;
+    var tries: usize = 0;
+    while (true) : (tries += 1) {
+        if (net.tcpConnectToAddress(addr)) |s| {
+            sub_c = s;
+            break;
+        } else |_| {
+            if (tries > 200) return error.TestUnexpectedResult;
+            core.compat.io().sleep(.fromMilliseconds(5), .awake) catch {};
+        }
+    }
+    defer sub_c.close();
+    core.compat.setNoDelay(sub_c.getHandle());
+    sub_c.beginRead(5_000, false);
+    try sub_c.writeAll(&wire.WIRE_MAGIC);
+    try wire.writeCommand(&sub_c, .{ .subscribe = .{ .channel = "repark:test", .filter = null } });
+    var sub_r = ReadAdapter{ .stream = &sub_c };
+    {
+        const resp = try wire.readResponseAlloc(&sub_r, testing.allocator);
+        defer protocol.deinitResponse(testing.allocator, resp);
+        try testing.expect(resp == .ok);
+    }
+
+    // Unpark the session with commands until one is refused. The refusal is the last
+    // reply on an otherwise idle connection, which is the state under test.
+    var limited = false;
+    var attempts: usize = 0;
+    while (!limited and attempts < 20) : (attempts += 1) {
+        try wire.writeCommand(&sub_c, .{ .get = "repark:missing" });
+        const resp = try wire.readResponseAlloc(&sub_r, testing.allocator);
+        defer protocol.deinitResponse(testing.allocator, resp);
+        if (resp == .err) {
+            try testing.expectEqualStrings("rate limited", resp.err);
+            limited = true;
+        }
+    }
+    try testing.expect(limited);
+
+    var pub_c = try net.tcpConnectToAddress(addr);
+    defer pub_c.close();
+    core.compat.setNoDelay(pub_c.getHandle());
+    pub_c.beginRead(5_000, false);
+    try pub_c.writeAll(&wire.WIRE_MAGIC);
+    try wire.writeCommand(&pub_c, .{ .publish = .{ .channel = "repark:test", .message = "after-limit" } });
+    var pub_r = ReadAdapter{ .stream = &pub_c };
+    {
+        const resp = try wire.readResponseAlloc(&pub_r, testing.allocator);
+        defer protocol.deinitResponse(testing.allocator, resp);
+        try testing.expect(resp == .ok);
+    }
+
+    // The event must arrive without the subscriber sending anything else.
+    const ev = try wire.readResponseAlloc(&sub_r, testing.allocator);
+    defer protocol.deinitResponse(testing.allocator, ev);
+    try testing.expect(ev == .event);
+    try testing.expectEqualStrings("repark:test", ev.event.channel);
+    try testing.expectEqualStrings("after-limit", ev.event.message);
 }

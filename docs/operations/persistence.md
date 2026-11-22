@@ -81,6 +81,8 @@ No disk IO at all. No snapshot, no WAL. Data exists only in process memory and i
 ## WAL Implementation Details
 
 - Records are protected with CRC32 checksums to detect corruption during replay.
+- With synchronous writes, a background writer group-commits: each pass over its queues is written as one batch between a begin marker and a commit marker, followed by a single flush. Replay applies a batch only if its commit marker is on disk, so recovery never holds part of a batch. After a crash you get every write up to one point in time, across all keys, and none after it. A batch left incomplete by the crash is removed from the log at startup.
+- WAL files that contain batch markers cannot be read by builds from before they were introduced. WAL files written by those earlier builds are still read as before.
 - WAL truncation happens only in `full` mode, after a successful snapshot write.
 - The `wal_size` field in `STATUS` output tracks the current WAL file size in bytes — use this for monitoring growth.
 - Snapshot v2 persists HNSW graphs, tombstones, timestamps, and RaBitQ parameters in an `WDBHNSW2` trailer after the KV snapshot.

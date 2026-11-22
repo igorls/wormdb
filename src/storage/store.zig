@@ -1877,6 +1877,9 @@ pub const Store = struct {
             record_count += 1;
         }
 
+        // Cut off a torn tail before the first append can land behind it.
+        try self.wal.?.finishReplay(&iter);
+
         if (record_count > 0) {
             std.log.info("WAL replay complete. Processed {d} records.", .{record_count});
         }
@@ -3650,6 +3653,69 @@ test "sst overlay: get, shadow, scan merge, worm enforcement" {
 
     // A frozen WORM key may not be shadowed by a live write.
     try testing.expectError(error.WormViolation, store.set("worm:x", "overwrite", false));
+}
+
+test "background WAL: a torn batch is dropped on restart and later writes survive" {
+    const testing = std.testing;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/torn_batch_restart.wal", .{tmp_path});
+    defer testing.allocator.free(wal_path);
+    compat.File.close(try compat.Dir.createFile(tmp_dir.dir, "torn_batch_restart.wal", .{}));
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/torn_batch_restart.snapshot", .{tmp_path});
+    defer testing.allocator.free(snapshot_path);
+
+    const cfg = Config{
+        .wal_path = wal_path,
+        .snapshot_path = snapshot_path,
+        .persistence = .full,
+        .sync_writes = true,
+    };
+
+    {
+        var store = try Store.init(testing.allocator, cfg);
+        defer store.deinit();
+        try store.startBackgroundTasks();
+        try store.set("keep:1", "a", false);
+        try store.set("keep:2", "b", false);
+    }
+
+    // A crash mid-sweep leaves a begin marker and part of the batch, no commit marker.
+    {
+        const f = try compat.Dir.openFile(compat.cwd(), wal_path, .{ .mode = .read_write });
+        defer compat.File.close(f);
+        try compat.File.seekTo(f, (try compat.File.stat(f)).size);
+        var rec_buf: [256]u8 = undefined;
+        const rec = Wal.encodeSetRecord(&rec_buf, "torn:1", "x", .{ .is_worm = false, .is_deleted = false }, 1);
+        var marker: [Wal.BATCH_MARKER_LEN]u8 = undefined;
+        // The batch claimed two records; only the first reached the disk.
+        Wal.encodeBatchMarker(&marker, .batch_begin, rec.len * 2);
+        try compat.File.writeAll(f, &marker);
+        try compat.File.writeAll(f, rec);
+    }
+
+    {
+        var store = try Store.init(testing.allocator, cfg);
+        defer store.deinit();
+        try store.startBackgroundTasks();
+        try testing.expectEqualStrings("a", store.get("keep:1").?.value);
+        try testing.expectEqualStrings("b", store.get("keep:2").?.value);
+        try testing.expect(store.get("torn:1") == null);
+        try store.set("after:1", "c", false);
+    }
+
+    // The write made after the restart is not hidden behind the torn batch.
+    {
+        var store = try Store.init(testing.allocator, cfg);
+        defer store.deinit();
+        try testing.expectEqualStrings("a", store.get("keep:1").?.value);
+        try testing.expectEqualStrings("c", store.get("after:1").?.value);
+        try testing.expect(store.get("torn:1") == null);
+        try testing.expectEqual(@as(usize, 3), store.count());
+    }
 }
 
 test "background WAL writer: concurrent SET, DELETE, and save preserve lock order" {

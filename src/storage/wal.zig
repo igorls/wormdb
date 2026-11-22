@@ -22,7 +22,8 @@ pub const Wal = struct {
     path: []const u8,
     sync_writes: bool,
     write_count: usize,
-    /// Bytes written directly (before startBackground or in direct mode) plus initial file size.
+    /// Bytes written directly (before startBackground or in direct mode) plus initial file size,
+    /// plus the batch markers the background writer adds around each sweep.
     /// Background mode tracks per-lane enqueued bytes in `lanes[i].bytes_enqueued` to avoid
     /// global cache-line bouncing on hot multi-threaded writes.
     wal_bytes: std.atomic.Value(usize),
@@ -58,6 +59,11 @@ pub const Wal = struct {
     /// to preserve strict per-lane FIFO ordering.
     pub const LANE_MAX_INLINE: usize = 64 * 1024;
     const WRITER_STAGE_CAP: usize = 256 * 1024;
+    /// Lock-free attempts at a consistent lane cut before producers are frozen for one scan.
+    const CUT_RETRIES: usize = 8;
+    const BATCH_MARKER_PAYLOAD: usize = 8;
+    /// On-disk size of a `batch_begin` / `batch_commit` marker record.
+    pub const BATCH_MARKER_LEN: usize = @sizeOf(RecordHeader) + BATCH_MARKER_PAYLOAD;
 
     const WalLane = struct {
         /// Leaf mutex serializing multi-producer writes onto this lane.
@@ -644,50 +650,105 @@ pub const Wal = struct {
         stage_pos.* += data.len;
     }
 
+    /// What the background writer will drain in one batch: every lane's published tail
+    /// and pending oversized record, all as of one instant.
+    const LaneCut = struct {
+        tails: [WAL_LANES]usize,
+        larges: [WAL_LANES]?[*]u8,
+
+        fn eql(a: *const LaneCut, b: *const LaneCut) bool {
+            return std.mem.eql(usize, &a.tails, &b.tails) and std.mem.eql(?[*]u8, &a.larges, &b.larges);
+        }
+    };
+
+    fn collectLanes(self: *Wal, cut: *LaneCut) void {
+        for (&self.lanes, 0..) |*lane, i| {
+            cut.tails[i] = lane.tail.load(.seq_cst);
+            cut.larges[i] = lane.large_pending.load(.seq_cst);
+        }
+    }
+
+    /// Take a consistent cut across all lanes: the returned state is one that every lane
+    /// held at the same instant. Draining lanes one at a time against their live tails
+    /// would not be: a record published on lane 20 while the sweep is at lane 10 could
+    /// reach disk without an earlier record that landed on lane 5 just after the sweep
+    /// passed it.
+    ///
+    /// Tails only grow, and only this thread clears `large_pending`, so two successive
+    /// scans that read identical values prove no lane changed between them. If producers
+    /// keep publishing between every pair of scans, freeze them for one scan by taking
+    /// each lane mutex (the same leaf mutex a producer holds to publish).
+    fn snapshotLanes(self: *Wal, cut: *LaneCut) void {
+        var prev: LaneCut = undefined;
+        self.collectLanes(&prev);
+        var tries: usize = 0;
+        while (tries < CUT_RETRIES) : (tries += 1) {
+            self.collectLanes(cut);
+            if (prev.eql(cut)) return;
+            prev = cut.*;
+        }
+        for (&self.lanes) |*lane| lane.mutex.lock();
+        self.collectLanes(cut);
+        for (&self.lanes) |*lane| lane.mutex.unlock();
+    }
+
     fn writerLoop(self: *Wal) void {
         const stage = self.writer_stage;
+        var cut: LaneCut = undefined;
         while (self.writer_running.load(.acquire) or self.hasPendingRecords()) {
             var stage_pos: usize = 0;
-            var drained_bytes: usize = 0;
 
-            // Sweep all 32 lanes, draining complete record-bounded snapshots from each lane
-            // before moving to the next so records from different lanes never interleave mid-frame.
-            for (&self.lanes) |*lane| {
-                const head = lane.head.load(.monotonic);
-                const tail = lane.tail.load(.acquire);
-                const avail = tail -% head;
-                if (avail > 0) {
-                    const pos = head & LANE_RING_MASK;
-                    const first = @min(avail, LANE_RING_CAP - pos);
-                    self.stageAppend(&stage_pos, lane.ring[pos .. pos + first]);
-                    if (first < avail) {
-                        self.stageAppend(&stage_pos, lane.ring[0 .. avail - first]);
-                    }
-                    lane.head.store(head +% avail, .seq_cst);
-                    wakeLaneProducers(lane);
-                    drained_bytes += avail;
-                }
-
-                if (lane.large_pending.load(.acquire)) |ptr| {
-                    // Flush staged bytes first so any earlier ring records from this lane hit disk first.
-                    if (stage_pos > 0) {
-                        compat.File.writeAll(self.file, stage[0..stage_pos]) catch {};
-                        stage_pos = 0;
-                    }
-                    const len = lane.large_pending_len;
-                    compat.File.writeAll(self.file, ptr[0..len]) catch {};
-                    self.allocator.free(ptr[0..len]);
-                    lane.large_pending_len = 0;
-                    lane.large_pending.store(null, .seq_cst);
-                    wakeLaneProducers(lane);
-                    drained_bytes += len;
-                }
+            self.snapshotLanes(&cut);
+            var batch_bytes: u64 = 0;
+            for (&self.lanes, 0..) |*lane, i| {
+                batch_bytes += cut.tails[i] -% lane.head.load(.monotonic);
+                // `large_pending_len` is written before the pointer is published.
+                if (cut.larges[i] != null) batch_bytes += lane.large_pending_len;
             }
 
-            if (drained_bytes > 0) {
+            if (batch_bytes > 0) {
+                // One batch = everything published up to the cut, bracketed by markers so
+                // replay applies it whole or not at all (see `WalIterator`). Records from
+                // different lanes never interleave mid-frame.
+                var marker: [BATCH_MARKER_LEN]u8 = undefined;
+                encodeBatchMarker(&marker, .batch_begin, batch_bytes);
+                self.stageAppend(&stage_pos, &marker);
+
+                for (&self.lanes, 0..) |*lane, i| {
+                    const head = lane.head.load(.monotonic);
+                    const avail = cut.tails[i] -% head;
+                    if (avail > 0) {
+                        const pos = head & LANE_RING_MASK;
+                        const first = @min(avail, LANE_RING_CAP - pos);
+                        self.stageAppend(&stage_pos, lane.ring[pos .. pos + first]);
+                        if (first < avail) {
+                            self.stageAppend(&stage_pos, lane.ring[0 .. avail - first]);
+                        }
+                        lane.head.store(head +% avail, .seq_cst);
+                        wakeLaneProducers(lane);
+                    }
+
+                    if (cut.larges[i]) |ptr| {
+                        // Flush staged bytes first so any earlier ring records from this lane hit disk first.
+                        if (stage_pos > 0) {
+                            compat.File.writeAll(self.file, stage[0..stage_pos]) catch {};
+                            stage_pos = 0;
+                        }
+                        const len = lane.large_pending_len;
+                        compat.File.writeAll(self.file, ptr[0..len]) catch {};
+                        self.allocator.free(ptr[0..len]);
+                        lane.large_pending_len = 0;
+                        lane.large_pending.store(null, .seq_cst);
+                        wakeLaneProducers(lane);
+                    }
+                }
+
+                encodeBatchMarker(&marker, .batch_commit, batch_bytes);
+                self.stageAppend(&stage_pos, &marker);
                 if (stage_pos > 0) {
                     compat.File.writeAll(self.file, stage[0..stage_pos]) catch {};
                 }
+                _ = self.wal_bytes.fetchAdd(2 * BATCH_MARKER_LEN, .monotonic);
                 self.write_count += 1;
                 // Single fsync for the entire multi-lane batch — group commit durability.
                 if (self.sync_writes) {
@@ -713,6 +774,35 @@ pub const Wal = struct {
 
         // Final durability point on shutdown.
         compat.File.sync(self.file) catch {};
+    }
+
+    /// Encode a batch marker record: a normal record header plus the batch body length.
+    pub fn encodeBatchMarker(dst: *[BATCH_MARKER_LEN]u8, kind: WalRecordType, batch_bytes: u64) void {
+        std.mem.writeInt(u64, dst[@sizeOf(RecordHeader)..][0..8], batch_bytes, .little);
+        const header = RecordHeader{
+            .crc = crc32(dst[@sizeOf(RecordHeader)..]),
+            .record_type = @backingInt(kind),
+            .length = BATCH_MARKER_PAYLOAD,
+        };
+        @memcpy(dst[0..@sizeOf(RecordHeader)], std.mem.asBytes(&header));
+    }
+
+    /// Call once after replaying the log with `iter`, before anything is appended.
+    /// If the log ended in a torn batch (or a cut-off header or marker), that tail is
+    /// removed so new appends cannot be glued onto it and committed by a later marker.
+    /// Leaves the file positioned for append either way.
+    pub fn finishReplay(self: *Wal, iter: *const WalIterator) !void {
+        const file_size = (try compat.File.stat(self.file)).size;
+        // A read error is not evidence of a torn tail: leave the file alone.
+        if (iter.tail_torn and !iter.read_failed and iter.valid_end < file_size) {
+            std.log.warn("WAL: discarding {d} bytes of torn tail at offset {d}", .{ file_size - iter.valid_end, iter.valid_end });
+            try compat.File.setLength(self.file, iter.valid_end);
+            if (self.sync_writes) try compat.File.sync(self.file);
+            self.wal_bytes.store(@intCast(iter.valid_end), .monotonic);
+            try compat.File.seekTo(self.file, iter.valid_end);
+            return;
+        }
+        try compat.File.seekTo(self.file, file_size);
     }
 
     pub fn iterator(self: *Wal) WalIterator {
@@ -777,6 +867,15 @@ pub const WalRecord = union(enum) {
     };
 };
 
+/// Sequential reader over the log's data records.
+///
+/// The background writer brackets everything it drains in one sweep with a
+/// `batch_begin` / `batch_commit` marker pair, each carrying the batch body length.
+/// A batch whose commit marker is not on disk was cut short by a crash; because it
+/// mixes lanes, a prefix of it could hold a later write without an earlier write to
+/// another key, so the iterator ends the log at that batch's begin marker instead of
+/// yielding any of it. Records outside a batch (direct-mode writes, logs written before
+/// markers existed) are each complete on their own. Markers are never yielded.
 pub const WalIterator = struct {
     file: std.Io.File,
     allocator: std.mem.Allocator,
@@ -784,6 +883,22 @@ pub const WalIterator = struct {
     buf_pos: usize = 0,
     buf_end: usize = 0,
     done: bool = false,
+    /// Bytes pulled from the file so far (the OS file position).
+    file_read: u64 = 0,
+    /// Log offset of the next unconsumed byte.
+    consumed: u64 = 0,
+    /// Offset just past the last complete record or batch. Everything after it is a
+    /// torn tail; see `Wal.finishReplay`.
+    valid_end: u64 = 0,
+    /// End offset of the committed batch being read, if any.
+    batch_end: ?u64 = null,
+    /// A read error ended the iteration, so `valid_end` says nothing about the tail.
+    read_failed: bool = false,
+    /// The log ended in something only an interrupted write leaves behind: a batch
+    /// with no commit marker, or a cut-off header or marker. `Wal.finishReplay` removes
+    /// it. A data record cut short outside a batch does not set this; that case keeps
+    /// its long-standing behaviour of ending the log without touching the file.
+    tail_torn: bool = false,
 
     fn readBuffered(self: *WalIterator, dest: []u8) !usize {
         var total: usize = 0;
@@ -791,73 +906,145 @@ pub const WalIterator = struct {
             const avail = self.buf_end - self.buf_pos;
             if (avail == 0) {
                 if (dest.len - total >= self.read_buf.len) {
-                    return total + try compat.File.readAll(self.file, dest[total..]);
+                    const n = try compat.File.readAll(self.file, dest[total..]);
+                    self.file_read += n;
+                    self.consumed += n;
+                    return total + n;
                 }
                 self.buf_pos = 0;
                 self.buf_end = try compat.File.readAll(self.file, &self.read_buf);
+                self.file_read += self.buf_end;
                 if (self.buf_end == 0) break;
                 continue;
             }
             const n = @min(avail, dest.len - total);
             @memcpy(dest[total..][0..n], self.read_buf[self.buf_pos..][0..n]);
             self.buf_pos += n;
+            self.consumed += n;
             total += n;
         }
         return total;
     }
 
+    fn isBatchMarker(raw_type: u8) bool {
+        return raw_type == @backingInt(WalRecordType.batch_begin) or
+            raw_type == @backingInt(WalRecordType.batch_commit);
+    }
+
+    /// Whether a valid commit marker for a `batch_bytes`-long batch sits at `offset`.
+    /// Reads at an absolute position, then restores the sequential read position.
+    fn commitMarkerAt(self: *WalIterator, offset: u64, batch_bytes: u64) bool {
+        var raw: [Wal.BATCH_MARKER_LEN]u8 = undefined;
+        compat.File.seekTo(self.file, offset) catch return false;
+        const n = compat.File.readAll(self.file, &raw) catch 0;
+        compat.File.seekTo(self.file, self.file_read) catch {
+            // The sequential position is lost; stop rather than read from the wrong place.
+            self.read_failed = true;
+            self.done = true;
+            return false;
+        };
+        if (n < raw.len) return false;
+        const header: *align(1) const Wal.RecordHeader = @ptrCast(&raw);
+        const payload = raw[@sizeOf(Wal.RecordHeader)..];
+        if (header.record_type != @backingInt(WalRecordType.batch_commit)) return false;
+        if (header.length != payload.len) return false;
+        if (crc32(payload) != header.crc) return false;
+        return std.mem.readInt(u64, payload[0..8], .little) == batch_bytes;
+    }
+
     pub fn next(self: *WalIterator) !?WalRecord {
-        if (self.done) return null;
+        while (true) {
+            if (self.done) return null;
+            const record_start = self.consumed;
 
-        var header: Wal.RecordHeader = undefined;
-        const header_bytes_read = self.readBuffered(std.mem.asBytes(&header)) catch {
-            self.done = true;
-            return null;
-        };
-
-        if (header_bytes_read < @sizeOf(Wal.RecordHeader)) {
-            self.done = true;
-            return null;
-        }
-
-        const payload_len: usize = @intCast(header.length);
-        if (payload_len == 0 or payload_len > 1024 * 1024 * 100) return error.Corruption;
-
-        // Zero-copy fast path when payload is already contiguous in read_buf
-        if (self.buf_end - self.buf_pos >= payload_len) {
-            const payload = self.read_buf[self.buf_pos .. self.buf_pos + payload_len];
-            self.buf_pos += payload_len;
-            if (crc32(payload) != header.crc) return error.Corruption;
-            const record_type: WalRecordType = @fromBackingInt(@intCast(header.record_type));
-            return switch (record_type) {
-                .set => try self.parseSet(payload),
-                .delete => try self.parseDelete(payload),
-                .vinsert => try self.parseVinsert(payload),
-                .vdelete => try self.parseVdelete(payload),
+            var header: Wal.RecordHeader = undefined;
+            const header_bytes_read = self.readBuffered(std.mem.asBytes(&header)) catch {
+                self.read_failed = true;
+                self.done = true;
+                return null;
             };
+
+            if (header_bytes_read < @sizeOf(Wal.RecordHeader)) {
+                // Fewer bytes than a header: nothing recoverable, safe to drop.
+                if (header_bytes_read > 0) self.tail_torn = true;
+                self.done = true;
+                return null;
+            }
+
+            const payload_len: usize = @intCast(header.length);
+            if (payload_len == 0 or payload_len > 1024 * 1024 * 100) return error.Corruption;
+
+            // Zero-copy fast path when payload is already contiguous in read_buf
+            var heap_payload: ?[]u8 = null;
+            defer if (heap_payload) |hp| self.allocator.free(hp);
+            const payload: []const u8 = if (self.buf_end - self.buf_pos >= payload_len) blk: {
+                const in_buf = self.read_buf[self.buf_pos .. self.buf_pos + payload_len];
+                self.buf_pos += payload_len;
+                self.consumed += payload_len;
+                break :blk in_buf;
+            } else blk: {
+                const hp = try self.allocator.alloc(u8, payload_len);
+                heap_payload = hp;
+                const payload_read = self.readBuffered(hp) catch {
+                    self.read_failed = true;
+                    self.done = true;
+                    return null;
+                };
+                if (payload_read < payload_len) {
+                    if (isBatchMarker(header.record_type)) self.tail_torn = true;
+                    self.done = true;
+                    return null;
+                }
+                break :blk hp;
+            };
+
+            if (crc32(payload) != header.crc) return error.Corruption;
+
+            // A type this build does not know is corruption, not undefined behaviour.
+            const record_type = std.enums.fromInt(WalRecordType, header.record_type) orelse return error.Corruption;
+            switch (record_type) {
+                .batch_begin => {
+                    if (self.batch_end != null or payload.len != 8) return error.Corruption;
+                    const batch_bytes = std.mem.readInt(u64, payload[0..8], .little);
+                    const body_end = std.math.add(u64, self.consumed, batch_bytes) catch return error.Corruption;
+                    if (!self.commitMarkerAt(body_end, batch_bytes)) {
+                        if (self.read_failed) return null;
+                        // Nothing is written after a batch until its commit marker is
+                        // down, so a batch without one is torn only if it is the last
+                        // thing in the file. Anything else is damage, not a crash.
+                        const file_size = (compat.File.stat(self.file) catch return error.Corruption).size;
+                        if (file_size > body_end + Wal.BATCH_MARKER_LEN) return error.Corruption;
+                        // Torn batch: the log ends before its begin marker.
+                        self.tail_torn = true;
+                        self.done = true;
+                        return null;
+                    }
+                    self.batch_end = body_end;
+                    continue;
+                },
+                .batch_commit => {
+                    const body_end = self.batch_end orelse return error.Corruption;
+                    if (record_start != body_end) return error.Corruption;
+                    self.batch_end = null;
+                    self.valid_end = self.consumed;
+                    continue;
+                },
+                .set, .delete, .vinsert, .vdelete => {
+                    if (self.batch_end) |body_end| {
+                        if (self.consumed > body_end) return error.Corruption;
+                    }
+                    const record: WalRecord = switch (record_type) {
+                        .set => try self.parseSet(payload),
+                        .delete => try self.parseDelete(payload),
+                        .vinsert => try self.parseVinsert(payload),
+                        .vdelete => try self.parseVdelete(payload),
+                        .batch_begin, .batch_commit => unreachable,
+                    };
+                    if (self.batch_end == null) self.valid_end = self.consumed;
+                    return record;
+                },
+            }
         }
-
-        const payload = try self.allocator.alloc(u8, payload_len);
-        defer self.allocator.free(payload);
-
-        const payload_read = self.readBuffered(payload) catch {
-            self.done = true;
-            return null;
-        };
-        if (payload_read < payload_len) {
-            self.done = true;
-            return null;
-        }
-
-        if (crc32(payload) != header.crc) return error.Corruption;
-
-        const record_type: WalRecordType = @fromBackingInt(@intCast(header.record_type));
-        return switch (record_type) {
-            .set => try self.parseSet(payload),
-            .delete => try self.parseDelete(payload),
-            .vinsert => try self.parseVinsert(payload),
-            .vdelete => try self.parseVdelete(payload),
-        };
     }
 
     fn parseSet(self: *WalIterator, payload: []const u8) !WalRecord {
@@ -1212,4 +1399,281 @@ test "sharded bg-WAL preserves strict FIFO ordering across inline and >64 KiB ov
     try testing.expectEqualStrings("same_key", r5.delete);
 
     try testing.expect((try iter.next()) == null);
+}
+
+/// Builds raw log bytes for the batch-marker tests.
+const BatchTestLog = struct {
+    bytes: std.ArrayListUnmanaged(u8) = .empty,
+
+    const alloc = std.testing.allocator;
+
+    fn deinit(self: *BatchTestLog) void {
+        self.bytes.deinit(alloc);
+    }
+
+    fn set(self: *BatchTestLog, key: []const u8) !void {
+        var buf: [256]u8 = undefined;
+        const rec = Wal.encodeSetRecord(&buf, key, "value", .{ .is_worm = false, .is_deleted = false }, 7);
+        try self.bytes.appendSlice(alloc, rec);
+    }
+
+    fn marker(self: *BatchTestLog, kind: WalRecordType, batch_bytes: u64) !void {
+        var raw: [Wal.BATCH_MARKER_LEN]u8 = undefined;
+        Wal.encodeBatchMarker(&raw, kind, batch_bytes);
+        try self.bytes.appendSlice(alloc, &raw);
+    }
+
+    /// A batch body holding one SET per key, with its begin marker and, unless
+    /// `commit` is false, its commit marker.
+    fn batch(self: *BatchTestLog, keys: []const []const u8, commit: bool) !void {
+        var body = BatchTestLog{};
+        defer body.deinit();
+        for (keys) |k| try body.set(k);
+        try self.marker(.batch_begin, body.bytes.items.len);
+        try self.bytes.appendSlice(alloc, body.bytes.items);
+        if (commit) try self.marker(.batch_commit, body.bytes.items.len);
+    }
+
+    /// Replace the file at `path` with the first `len` bytes of the log.
+    fn writeTo(self: *const BatchTestLog, path: []const u8, len: usize) !void {
+        const f = try compat.Dir.createFile(compat.cwd(), path, .{});
+        defer compat.File.close(f);
+        try compat.File.writeAll(f, self.bytes.items[0..len]);
+    }
+};
+
+const BatchReplay = struct {
+    /// Keys of the SET records the iterator yielded, comma-joined.
+    keys: []u8,
+    tail_torn: bool,
+    valid_end: u64,
+};
+
+/// Replay the log at `path`. With `finish`, also run `Wal.finishReplay`.
+fn replayBatchTestLog(path: []const u8, finish: bool) !BatchReplay {
+    const alloc = std.testing.allocator;
+    var wal = try Wal.init(alloc, path, false);
+    defer wal.deinit();
+    var iter = wal.iterator();
+    var joined: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer joined.deinit(alloc);
+    while (try iter.next()) |rec| {
+        defer iter.deinitRecord(rec);
+        if (joined.items.len > 0) try joined.append(alloc, ',');
+        try joined.appendSlice(alloc, rec.set.key);
+    }
+    if (finish) try wal.finishReplay(&iter);
+    return .{ .keys = try joined.toOwnedSlice(alloc), .tail_torn = iter.tail_torn, .valid_end = iter.valid_end };
+}
+
+fn batchTestPath(tmp: *std.testing.TmpDir, name: []const u8) ![]u8 {
+    const alloc = std.testing.allocator;
+    const dir = try compat.Dir.realPathAlloc(tmp.dir, alloc, ".");
+    defer alloc.free(dir);
+    return std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, name });
+}
+
+test "background writer brackets each sweep with batch markers that replay hides" {
+    if (!Wal.use_background_writer) return;
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try batchTestPath(&tmp, "batch_markers.wal");
+    defer allocator.free(file);
+    compat.File.close(try compat.Dir.createFile(compat.cwd(), file, .{}));
+
+    const flags = EntryFlags{ .is_worm = false, .is_deleted = false };
+    {
+        var wal = try Wal.init(allocator, file, true);
+        defer wal.deinit();
+        try wal.startBackground();
+        var buf: [256]u8 = undefined;
+        try wal.commitRecordBytesForLane(1, Wal.encodeSetRecord(&buf, "lane1", "a", flags, 1));
+        try wal.commitRecordBytesForLane(9, Wal.encodeSetRecord(&buf, "lane9", "b", flags, 2));
+        try wal.commitRecordBytesForLane(30, Wal.encodeSetRecord(&buf, "lane30", "c", flags, 3));
+    }
+
+    // The raw file opens with a begin marker and closes with a commit marker.
+    const raw_file = try compat.Dir.openFile(compat.cwd(), file, .{ .mode = .read_only });
+    defer compat.File.close(raw_file);
+    const size: usize = @intCast((try compat.File.stat(raw_file)).size);
+    const raw = try allocator.alloc(u8, size);
+    defer allocator.free(raw);
+    try testing.expectEqual(size, try compat.File.readAll(raw_file, raw));
+    try testing.expect(size > 2 * Wal.BATCH_MARKER_LEN);
+    const first: *align(1) const Wal.RecordHeader = @ptrCast(raw.ptr);
+    try testing.expectEqual(@backingInt(WalRecordType.batch_begin), first.record_type);
+    const last: *align(1) const Wal.RecordHeader = @ptrCast(raw.ptr + size - Wal.BATCH_MARKER_LEN);
+    try testing.expectEqual(@backingInt(WalRecordType.batch_commit), last.record_type);
+
+    // Replay yields the three data records and nothing else, with no tail to drop.
+    var wal_ro = try Wal.init(allocator, file, false);
+    defer wal_ro.deinit();
+    var iter = wal_ro.iterator();
+    var seen: usize = 0;
+    while (try iter.next()) |rec| {
+        defer iter.deinitRecord(rec);
+        try testing.expect(rec == .set);
+        seen += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), seen);
+    try testing.expect(!iter.tail_torn);
+    try testing.expectEqual(@as(u64, size), iter.valid_end);
+    // `size()` accounts for the marker bytes too.
+    try testing.expectEqual(size, try wal_ro.size());
+}
+
+test "replay ends at a batch with no commit marker and finishReplay removes it" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try batchTestPath(&tmp, "torn_batch.wal");
+    defer allocator.free(file);
+
+    var log = BatchTestLog{};
+    defer log.deinit();
+    try log.set("direct"); // written outside any batch: complete on its own
+    try log.batch(&.{ "a1", "a2" }, true);
+    const committed_len = log.bytes.items.len;
+    try log.batch(&.{ "b1", "b2" }, false); // crash before the commit marker
+    try log.writeTo(file, log.bytes.items.len);
+
+    const first = try replayBatchTestLog(file, true);
+    defer allocator.free(first.keys);
+    try testing.expectEqualStrings("direct,a1,a2", first.keys);
+    try testing.expect(first.tail_torn);
+    try testing.expectEqual(@as(u64, committed_len), first.valid_end);
+
+    // The torn batch is gone from the file, so a later append is not glued onto it.
+    {
+        var wal = try Wal.init(allocator, file, false);
+        defer wal.deinit();
+        try testing.expectEqual(committed_len, try wal.size());
+        var buf: [256]u8 = undefined;
+        const rec = Wal.encodeSetRecord(&buf, "after", "value", .{ .is_worm = false, .is_deleted = false }, 9);
+        try wal.commitRecordBytesForLane(0, rec);
+    }
+    const second = try replayBatchTestLog(file, true);
+    defer allocator.free(second.keys);
+    try testing.expectEqualStrings("direct,a1,a2,after", second.keys);
+    try testing.expect(!second.tail_torn);
+}
+
+test "a log cut anywhere inside its last batch replays only the batches before it" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try batchTestPath(&tmp, "cut_anywhere.wal");
+    defer allocator.free(file);
+
+    var log = BatchTestLog{};
+    defer log.deinit();
+    try log.batch(&.{ "a1", "a2" }, true);
+    const end_a = log.bytes.items.len;
+    try log.batch(&.{ "b1", "b2", "b3" }, true);
+    const end_b = log.bytes.items.len;
+
+    var cut = end_a;
+    while (cut <= end_b) : (cut += 1) {
+        try log.writeTo(file, cut);
+        const got = try replayBatchTestLog(file, true);
+        defer allocator.free(got.keys);
+        if (cut == end_b) {
+            try testing.expectEqualStrings("a1,a2,b1,b2,b3", got.keys);
+            try testing.expect(!got.tail_torn);
+        } else {
+            // Never a prefix of batch B, whatever the cut point.
+            try testing.expectEqualStrings("a1,a2", got.keys);
+            try testing.expectEqual(cut != end_a, got.tail_torn);
+        }
+        try testing.expectEqual(@as(u64, if (cut == end_b) end_b else end_a), got.valid_end);
+
+        // After finishReplay the file holds exactly the complete batches.
+        var wal = try Wal.init(allocator, file, false);
+        defer wal.deinit();
+        try testing.expectEqual(@as(usize, if (cut == end_b) end_b else end_a), try wal.size());
+    }
+}
+
+test "a log from before batch markers replays unchanged" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try batchTestPath(&tmp, "legacy.wal");
+    defer allocator.free(file);
+
+    var log = BatchTestLog{};
+    defer log.deinit();
+    try log.set("k1");
+    try log.set("k2");
+    try log.set("k3");
+    const full = log.bytes.items.len;
+
+    try log.writeTo(file, full);
+    const whole = try replayBatchTestLog(file, true);
+    defer allocator.free(whole.keys);
+    try testing.expectEqualStrings("k1,k2,k3", whole.keys);
+    try testing.expect(!whole.tail_torn);
+
+    // A data record cut short outside a batch still just ends the log; the file is
+    // left as it was.
+    try log.writeTo(file, full - 3);
+    const short = try replayBatchTestLog(file, true);
+    defer allocator.free(short.keys);
+    try testing.expectEqualStrings("k1,k2", short.keys);
+    try testing.expect(!short.tail_torn);
+    var wal = try Wal.init(allocator, file, false);
+    defer wal.deinit();
+    try testing.expectEqual(full - 3, try wal.size());
+}
+
+test "damage in a committed batch, misplaced markers and unknown record types are corruption" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try batchTestPath(&tmp, "batch_corruption.wal");
+    defer allocator.free(file);
+
+    // A flipped byte inside a batch whose commit marker is present.
+    {
+        var log = BatchTestLog{};
+        defer log.deinit();
+        try log.batch(&.{ "a1", "a2" }, true);
+        log.bytes.items[Wal.BATCH_MARKER_LEN + @sizeOf(Wal.RecordHeader) + 2] ^= 0xFF;
+        try log.writeTo(file, log.bytes.items.len);
+        try testing.expectError(error.Corruption, replayBatchTestLog(file, false));
+    }
+    // No commit marker where the batch ends, but more log after it: not a torn tail.
+    {
+        var log = BatchTestLog{};
+        defer log.deinit();
+        try log.batch(&.{"a1"}, false);
+        try log.set("later1");
+        try log.set("later2");
+        try log.writeTo(file, log.bytes.items.len);
+        try testing.expectError(error.Corruption, replayBatchTestLog(file, false));
+    }
+    // A commit marker with no batch open.
+    {
+        var log = BatchTestLog{};
+        defer log.deinit();
+        try log.set("k1");
+        try log.marker(.batch_commit, 0);
+        try log.writeTo(file, log.bytes.items.len);
+        try testing.expectError(error.Corruption, replayBatchTestLog(file, false));
+    }
+    // A record type this build does not know (the CRC covers the payload only).
+    {
+        var log = BatchTestLog{};
+        defer log.deinit();
+        try log.set("k1");
+        log.bytes.items[@offsetOf(Wal.RecordHeader, "record_type")] = 0x7F;
+        try log.writeTo(file, log.bytes.items.len);
+        try testing.expectError(error.Corruption, replayBatchTestLog(file, false));
+    }
 }

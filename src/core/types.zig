@@ -194,6 +194,10 @@ pub const WalRecordType = enum(u8) {
     delete = 0x02,
     vinsert = 0x03,
     vdelete = 0x04,
+    /// Opens a background-writer batch; payload is the batch body length in bytes.
+    batch_begin = 0x05,
+    /// Closes a background-writer batch; payload repeats the body length.
+    batch_commit = 0x06,
 };
 
 test {

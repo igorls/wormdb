@@ -76,7 +76,7 @@ fn purgePrefix(ctx: *Ctx, prefix: []const u8, stats: *PurgeCtx) !void {
     }
 
     // Phase 1: collect keys (scan holds shard locks; can't delete inside)
-    ctx.scanCallback(prefix, @ptrCast(stats), collectKeys);
+    try ctx.scanCallback(prefix, @ptrCast(stats), collectKeys);
     if (stats.oom) return error.OutOfMemory;
 
     // Phase 2: delete one-by-one. Each deleteDurable handles locking,

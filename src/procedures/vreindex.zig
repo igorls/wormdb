@@ -140,7 +140,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
     // ── Phase 1: collect valid vectors from Store with NO ns_idx lock held ──
     var cc = CollectCtx{ .allocator = ctx.allocator };
     defer cc.deinit();
-    ctx.scanCallback(namespace, @ptrCast(&cc), onVectorMatch);
+    try ctx.scanCallback(namespace, @ptrCast(&cc), onVectorMatch);
     if (cc.oom) return ctx.err("vreindex: out of memory during scan");
 
     // ── Phase 2: build fresh HNSW + slabs completely off-lock ──────────────

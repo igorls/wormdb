@@ -221,7 +221,7 @@ pub fn verifyStore(allocator: std.mem.Allocator, store: *Store, log_id: []const 
             .prefix = prefix,
             .verifier = Verifier.init(log_id),
         };
-        store.scanPrefixCallback(prefix, &ctx, struct {
+        try store.scanPrefixCallback(prefix, &ctx, struct {
             fn onEvent(raw: *anyopaque, key: []const u8, value: []const u8, timestamp: u64, is_worm: bool) Store.ScanAction {
                 const c: *VerifyCtx = @ptrCast(@alignCast(raw));
                 if (!is_worm) {

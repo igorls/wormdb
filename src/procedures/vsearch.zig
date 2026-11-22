@@ -1180,7 +1180,7 @@ fn runSearchWithIndex(
                     .saw_any = 0,
                     .cosine_score = (metric == .cosine),
                 };
-                ctx.scanCallback(bq_prefix, @ptrCast(&rq_sc), onRabitqMatch);
+                try ctx.scanCallback(bq_prefix, @ptrCast(&rq_sc), onRabitqMatch);
                 if (rq_sc.oom) return "vsearch: out of memory during BQ stage";
 
                 if (rq_sc.saw_any > 0) {
@@ -1244,7 +1244,7 @@ fn runSearchWithIndex(
                 .saw_any = 0,
                 .code_bytes = query_bq_size,
             };
-            ctx.scanCallback(bq_prefix, @ptrCast(&bq_sc), onBQMatch);
+            try ctx.scanCallback(bq_prefix, @ptrCast(&bq_sc), onBQMatch);
             if (bq_sc.oom) return "vsearch: out of memory during BQ stage";
 
             if (bq_sc.saw_any > 0) {
@@ -1310,7 +1310,7 @@ fn runSearchWithIndex(
         .allocator = ctx.allocator,
         .oom = false,
     };
-    ctx.scanCallback(namespace, @ptrCast(&exact_sc), onExactMatch);
+    try ctx.scanCallback(namespace, @ptrCast(&exact_sc), onExactMatch);
     if (exact_sc.oom) return "vsearch: out of memory during exact scan";
 
     return null;

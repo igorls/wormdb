@@ -187,7 +187,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
                 .excluded = &excluded_map,
                 .groups = &dedup_group_map,
             };
-            ctx.scanCallback(mp, @ptrCast(&mctx), MetaScanCtx.onEntry);
+            try ctx.scanCallback(mp, @ptrCast(&mctx), MetaScanCtx.onEntry);
             if (mctx.oom) return error.OutOfMemory;
         }
     }

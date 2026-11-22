@@ -270,7 +270,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
         .normalize = normalize_for_metric,
     };
     defer sc.deinit();
-    ctx.scanCallback(namespace, @ptrCast(&sc), collectAndSum);
+    try ctx.scanCallback(namespace, @ptrCast(&sc), collectAndSum);
 
     if (sc.oom) return ctx.err("vrabitq: out of memory during scan");
     const count = sc.entries.items.len;

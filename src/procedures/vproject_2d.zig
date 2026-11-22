@@ -123,7 +123,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
                 .allocator = ctx.allocator,
                 .excluded = &excluded_map,
             };
-            ctx.scanCallback(mp, @ptrCast(&sctx), ExScanCtx.onEntry);
+            try ctx.scanCallback(mp, @ptrCast(&sctx), ExScanCtx.onEntry);
             if (sctx.oom) return error.OutOfMemory;
         }
     }

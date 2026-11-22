@@ -676,9 +676,9 @@ pub const Ctx = struct {
             timestamp: u64,
             is_worm: bool,
         ) Store.ScanAction,
-    ) void {
+    ) error{OutOfMemory}!void {
         self.assertNoHeldShardLocks("scanCallback");
-        self.store.scanPrefixCallback(prefix, context, callback);
+        try self.store.scanPrefixCallback(prefix, context, callback);
     }
 
     /// Count keys matching a prefix. Lightweight — no allocation. Caller MUST

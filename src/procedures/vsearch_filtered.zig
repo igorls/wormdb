@@ -473,7 +473,7 @@ pub fn execute(ctx: *Ctx) anyerror!Ctx.Result {
                 .allocator = ctx.allocator,
                 .heap = &topk_heap,
             };
-            ctx.scanCallback(namespace, @ptrCast(&sctx), ScanCtx.onEntry);
+            try ctx.scanCallback(namespace, @ptrCast(&sctx), ScanCtx.onEntry);
             if (sctx.oom) return error.OutOfMemory;
             cand_slice = topk_heap.sortedDesc();
 
@@ -855,7 +855,7 @@ fn runBruteForceFiltered(
         .metas = &metas,
         .suffix_arena = &suffix_arena,
     };
-    ctx.scanCallback(namespace, @ptrCast(&sctx), ScanCtx.onEntry);
+    try ctx.scanCallback(namespace, @ptrCast(&sctx), ScanCtx.onEntry);
     if (sctx.oom) return error.OutOfMemory;
     if (scores.items.len == 0) return;
 
@@ -1145,7 +1145,7 @@ fn finishRemainingViaMetaPrefilter(
         .bump = bump,
         .matched = &matched_map,
     };
-    ctx.scanCallback(meta_prefix, @ptrCast(&mctx), MetaScanCtx.onMetaEntry);
+    try ctx.scanCallback(meta_prefix, @ptrCast(&mctx), MetaScanCtx.onMetaEntry);
     if (mctx.oom) return error.OutOfMemory;
     if (matched_map.count() == 0) return;
 

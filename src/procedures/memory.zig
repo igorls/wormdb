@@ -1046,7 +1046,7 @@ pub fn memQuery(ctx: *Ctx) anyerror!Ctx.Result {
                 .allocator = ctx.allocator,
                 .oom = false,
             };
-            ctx.scanCallback(vec_namespace, @ptrCast(&brute_sc), onBruteMatch);
+            try ctx.scanCallback(vec_namespace, @ptrCast(&brute_sc), onBruteMatch);
             if (brute_sc.oom) return ctx.err("mem_query: out of memory during brute-force scan");
         }
     }
@@ -1214,7 +1214,7 @@ pub fn memRange(ctx: *Ctx) anyerror!Ctx.Result {
         scan_ctx.items.deinit(scan_ctx.allocator);
     }
 
-    ctx.scanCallback(doc_prefix, @ptrCast(&scan_ctx), onRangeDoc);
+    try ctx.scanCallback(doc_prefix, @ptrCast(&scan_ctx), onRangeDoc);
     if (scan_ctx.oom) return ctx.err("mem_range: out of memory during scan");
 
     std.sort.heap(RangeItem, scan_ctx.items.items, {}, rangeItemLessThan);
@@ -1496,7 +1496,7 @@ fn collectVerifySet(ctx: *Ctx, prefix: []const u8, kind: VerifyKind, ids: *Verif
         .kind = kind,
         .ids = ids,
     };
-    ctx.scanCallback(prefix, @ptrCast(&collector), collectVerifyId);
+    try ctx.scanCallback(prefix, @ptrCast(&collector), collectVerifyId);
     if (collector.oom) return error.OutOfMemory;
 }
 
@@ -1653,7 +1653,7 @@ pub fn memDrop(ctx: *Ctx) anyerror!Ctx.Result {
             for (collector.keys.items) |k| collector.allocator.free(k);
             collector.keys.deinit(collector.allocator);
         }
-        ctx.scanCallback(prefix, @ptrCast(&collector), collectDropKey);
+        try ctx.scanCallback(prefix, @ptrCast(&collector), collectDropKey);
         if (collector.oom) return ctx.err("mem_drop: out of memory collecting keys");
 
         for (collector.keys.items) |k| {
@@ -1751,7 +1751,7 @@ pub fn memResetIndex(ctx: *Ctx) anyerror!Ctx.Result {
             for (collector.keys.items) |k| collector.allocator.free(k);
             collector.keys.deinit(collector.allocator);
         }
-        ctx.scanCallback(prefix, @ptrCast(&collector), collectDropKey);
+        try ctx.scanCallback(prefix, @ptrCast(&collector), collectDropKey);
         if (collector.oom)
             return ctx.err("mem_reset_index: out of memory collecting keys");
 

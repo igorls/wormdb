@@ -1561,6 +1561,11 @@ pub const Store = struct {
     ///   - Block on long-running work (the shard is locked, blocking writers)
     ///
     /// Returns `.stop` from the callback to halt iteration early.
+    ///
+    /// Fails with `error.OutOfMemory` when a shard is contended and the scan cannot
+    /// allocate the cursor or key chunk it needs to resume without the bucket lock.
+    /// The callback may already have seen a prefix of the matches by then; callers
+    /// must treat an error as "result incomplete", never as an empty or short scan.
     pub fn scanPrefixCallback(
         self: *Store,
         prefix: []const u8,
@@ -1610,7 +1615,7 @@ pub const Store = struct {
                                     cursor = cursor_stack[0..pk.len];
                                 } else {
                                     cursor_heap.clearRetainingCapacity();
-                                    cursor_heap.appendSlice(self.allocator, pk) catch break :fast_cb;
+                                    try cursor_heap.appendSlice(self.allocator, pk);
                                     cursor = cursor_heap.items;
                                 }
                             }
@@ -1638,7 +1643,7 @@ pub const Store = struct {
 
             while (true) {
                 chunk.clear();
-                self.ordered.collectRange(self.allocator, prefix, cursor, CHUNK, .first, &chunk) catch break;
+                self.ordered.collectRange(self.allocator, prefix, cursor, CHUNK, .first, &chunk) catch return error.OutOfMemory;
                 const key_refs = chunk.refs();
                 if (key_refs.len == 0) break;
 
@@ -1662,7 +1667,7 @@ pub const Store = struct {
                     cursor = cursor_stack[0..last_k.len];
                 } else {
                     cursor_heap.clearRetainingCapacity();
-                    cursor_heap.appendSlice(self.allocator, last_k) catch break;
+                    try cursor_heap.appendSlice(self.allocator, last_k);
                     cursor = cursor_heap.items;
                 }
             }
@@ -1968,7 +1973,7 @@ pub const Store = struct {
         ns_idx.clearLocked();
 
         var rb = VectorRebuildCtx{ .ns_idx = ns_idx };
-        self.scanPrefixCallback(namespace, @ptrCast(&rb), rebuildVectorMatch);
+        try self.scanPrefixCallback(namespace, @ptrCast(&rb), rebuildVectorMatch);
         if (rb.oom) return error.OutOfMemory;
         if (rb.inserted > 0 or rb.skipped > 0) {
             std.log.info("startup vector rebuild: {s} inserted={d} skipped={d}", .{
@@ -3498,11 +3503,11 @@ test "ordered index: scanPrefixCallback yields matches and honors stop" {
     try store.set("other", "x", false);
 
     var all = IndexCbCounter{};
-    store.scanPrefixCallback("cb:", @ptrCast(&all), indexCbCount);
+    try store.scanPrefixCallback("cb:", @ptrCast(&all), indexCbCount);
     try testing.expectEqual(@as(usize, 5), all.seen);
 
     var stopped = IndexCbCounter{ .stop_after = 2 };
-    store.scanPrefixCallback("cb:", @ptrCast(&stopped), indexCbCount);
+    try store.scanPrefixCallback("cb:", @ptrCast(&stopped), indexCbCount);
     try testing.expectEqual(@as(usize, 2), stopped.seen);
 }
 
@@ -4047,7 +4052,10 @@ test "Store OrderedIndex concurrent inserts, overwrites, deletes, and prefix sca
                 _ = self.store.countPrefix("item:");
 
                 var cb_ctx = CbCtx{};
-                self.store.scanPrefixCallback("item:", &cb_ctx, CbCtx.onRow);
+                self.store.scanPrefixCallback("item:", &cb_ctx, CbCtx.onRow) catch {
+                    _ = self.err_count.fetchAdd(1, .monotonic);
+                    continue;
+                };
                 if (cb_ctx.out_of_order) {
                     _ = self.err_count.fetchAdd(1, .monotonic);
                 }

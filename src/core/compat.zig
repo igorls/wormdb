@@ -508,12 +508,14 @@ fn getNoDelay(handle: std.posix.fd_t) !bool {
         return val != 0;
     } else {
         var val: c_int = 0;
-        try std.posix.getsockopt(
+        var len: std.posix.socklen_t = @sizeOf(c_int);
+        if (std.c.getsockopt(
             handle,
             std.posix.IPPROTO.TCP,
             std.posix.TCP.NODELAY,
-            std.mem.asBytes(&val),
-        );
+            @ptrCast(&val),
+            &len,
+        ) != 0) return error.SocketOptionFailed;
         return val != 0;
     }
 }
@@ -657,6 +659,25 @@ fn waitReadable(handle: std.posix.fd_t, deadline_ns: i128) !void {
             return error.SocketPollFailed;
         }
         if ((pfd.revents & std.posix.POLL.NVAL) != 0) return error.SocketPollFailed;
+        if (rc > 0) return;
+    }
+}
+
+/// POSIX readiness wait for socket writability bounded by an absolute deadline.
+fn waitWritable(handle: std.posix.fd_t, deadline_ns: i128) !void {
+    while (true) {
+        const remaining = deadline_ns - nowNs();
+        if (remaining <= 0) return error.Timeout;
+        const ms: c_int = @intCast(@min(@divTrunc(remaining + 999_999, 1_000_000), std.math.maxInt(c_int)));
+        var pfd = std.posix.pollfd{ .fd = handle, .events = std.posix.POLL.OUT, .revents = 0 };
+        const rc = std.c.poll(@ptrCast(&pfd), 1, ms);
+        if (rc < 0) {
+            if (std.posix.errno(rc) == .INTR) continue;
+            return error.SocketPollFailed;
+        }
+        if ((pfd.revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0) {
+            return error.BrokenPipe;
+        }
         if (rc > 0) return;
     }
 }
@@ -868,16 +889,30 @@ pub const net = if (wasm_target) struct {} else struct {
                 }
                 return;
             }
-            const deadline: ?i128 = if (self.write_timeout_ms > 0) nowNs() + @as(i128, self.write_timeout_ms) * 1_000_000 else null;
+            const send_flags: u32 = std.posix.MSG.DONTWAIT | (if (builtin.os.tag == .linux) std.posix.MSG.NOSIGNAL else 0);
+            var deadline_opt: ?i128 = null;
             var written: usize = 0;
             while (written < data.len) {
-                if (deadline) |d| if (nowNs() >= d) return error.Timeout;
-                const rc = std.c.write(handle, data[written..].ptr, data.len - written);
+                const rc = if (self.write_timeout_ms > 0)
+                    std.c.send(handle, data[written..].ptr, data.len - written, send_flags)
+                else
+                    std.c.write(handle, data[written..].ptr, data.len - written);
                 if (rc < 0) {
                     const errno = std.posix.errno(rc);
                     switch (errno) {
                         .INTR => continue,
-                        .AGAIN => return error.WouldBlock, // respect SO_SNDTIMEO
+                        .AGAIN => {
+                            if (self.write_timeout_ms > 0) {
+                                const d = deadline_opt orelse blk: {
+                                    const fresh = nowNs() + @as(i128, self.write_timeout_ms) * 1_000_000;
+                                    deadline_opt = fresh;
+                                    break :blk fresh;
+                                };
+                                try waitWritable(handle, d);
+                                continue;
+                            }
+                            return error.WouldBlock;
+                        },
                         .PIPE => return error.BrokenPipe,
                         .CONNRESET => return error.ConnectionResetByPeer,
                         .BADF => return error.NotOpenForWriting,
@@ -887,6 +922,9 @@ pub const net = if (wasm_target) struct {} else struct {
                 const n: usize = @intCast(rc);
                 if (n == 0) return error.BrokenPipe;
                 written += n;
+                if (written < data.len and self.write_timeout_ms > 0 and deadline_opt == null) {
+                    deadline_opt = nowNs() + @as(i128, self.write_timeout_ms) * 1_000_000;
+                }
             }
         }
 

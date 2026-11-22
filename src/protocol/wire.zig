@@ -570,6 +570,28 @@ pub const FixedBufWriter = struct {
     }
 };
 
+/// Total byte length of an encoded WormWire `.event` frame.
+pub inline fn eventFrameSize(channel_len: usize, message_len: usize) usize {
+    return 5 + 4 + channel_len + 4 + message_len;
+}
+
+/// Encode a complete WormWire `.event` frame into `dst` in one contiguous pass.
+/// Caller must provide `dst.len >= eventFrameSize(channel.len, message.len)`.
+pub fn encodeEventFrame(dst: []u8, channel: []const u8, message: []const u8) ![]const u8 {
+    const payload_len: usize = 4 + channel.len + 4 + message.len;
+    if (payload_len > MAX_PAYLOAD_LENGTH) return error.PayloadTooLarge;
+    const total_len: usize = 5 + payload_len;
+    std.debug.assert(dst.len >= total_len);
+    dst[0] = @backingInt(ResponseCode.event);
+    std.mem.writeInt(u32, dst[1..5], @intCast(payload_len), .big);
+    std.mem.writeInt(u32, dst[5..9], @intCast(channel.len), .big);
+    if (channel.len > 0) @memcpy(dst[9..][0..channel.len], channel);
+    const msg_off = 9 + channel.len;
+    std.mem.writeInt(u32, dst[msg_off..][0..4], @intCast(message.len), .big);
+    if (message.len > 0) @memcpy(dst[msg_off + 4 ..][0..message.len], message);
+    return dst[0..total_len];
+}
+
 pub fn writeResponse(writer: anytype, response: Response) !void {
     var w = writer;
     switch (response) {
@@ -589,14 +611,18 @@ pub fn writeResponse(writer: anytype, response: Response) !void {
             if (msg.len > 0) try w.writeAll(msg);
         },
         .event => |evt| {
-            var payload_len: usize = 0;
-            payload_len += 4 + evt.channel.len;
-            payload_len += 4 + evt.message.len;
+            const payload_len: usize = 4 + evt.channel.len + 4 + evt.message.len;
             if (payload_len > MAX_PAYLOAD_LENGTH) return error.PayloadTooLarge;
-
-            try writeHeader(w, @backingInt(ResponseCode.event), @intCast(payload_len));
-            try writeLenPrefixed(w, evt.channel);
-            try writeLenPrefixed(w, evt.message);
+            const total_len: usize = 5 + payload_len;
+            var stack_buf: [4096]u8 = undefined;
+            if (total_len <= stack_buf.len) {
+                const frame = try encodeEventFrame(&stack_buf, evt.channel, evt.message);
+                try w.writeAll(frame);
+            } else {
+                try writeHeader(w, @backingInt(ResponseCode.event), @intCast(payload_len));
+                try writeLenPrefixed(w, evt.channel);
+                try writeLenPrefixed(w, evt.message);
+            }
         },
     }
 }

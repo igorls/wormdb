@@ -1,6 +1,7 @@
 //! TCP server implementation
 
 const std = @import("std");
+const builtin = @import("builtin");
 const core = @import("../core/mod.zig");
 const storage = @import("../storage/mod.zig");
 const protocol = @import("../protocol/mod.zig");
@@ -85,14 +86,17 @@ pub const Server = struct {
     workers: []std.Thread,
     connection_limit: ConnectionLimit = .{},
     ip_limiter: IpLimiter,
+    sub_reactor: ?*SubReactor = null,
 
-    const CONN_QUEUE_CAP = 1024;
+    const CONN_QUEUE_CAP = 4096;
 
-    /// An accepted connection waiting for a worker, with the per-IP slot it
-    /// holds (null when the cap is off or the peer address was unresolvable).
-    const QueuedConn = struct {
-        conn: core.compat.net.ServerCompat.Connection,
-        ip_key: ?IpLimiter.Key = null,
+    /// An accepted connection or a resumed parked-subscriber session awaiting worker pickup.
+    const QueuedConn = union(enum) {
+        accepted: struct {
+            conn: core.compat.net.ServerCompat.Connection,
+            ip_key: ?IpLimiter.Key = null,
+        },
+        resumed: *SubSession,
     };
 
     /// Bounded queue for accepted connections awaiting worker pickup.
@@ -150,6 +154,457 @@ pub const Server = struct {
     /// connection's lifetime.
     const ARENA_RETAIN_LIMIT: usize = 256 * 1024;
 
+    /// Maximum buffered outbound event bytes per subscriber before evicting as stalled.
+    /// Absorbs high-rate pipelined publish bursts without dropping events while capping RAM.
+    const MAX_SUB_OUT_BUF: usize = 4 * 1024 * 1024;
+    const SUB_OUT_INIT_CAP: usize = 16 * 1024;
+
+    /// Heap-owned binary connection state that can be parked off the worker threadpool
+    /// onto `SubReactor` while idle on Pub/Sub subscriptions, then resumed on any worker
+    /// if the client later sends another frame (`UNSUB`, `SUB`, `PING`, etc.).
+    const SubSession = struct {
+        stream: core.compat.net.Stream,
+        ip_key: ?IpLimiter.Key,
+        conn_ctx: ConnectionContext,
+        metrics_shard: usize,
+        has_metrics: bool = false,
+        /// Reactor-owned active send buffer (swapped O(1) from `conn_ctx.out_buf`).
+        flush_buf: std.ArrayListUnmanaged(u8) = .empty,
+        flush_pos: usize = 0,
+        stalled_since_ns: ?i128 = null,
+        epoll_out_armed: bool = false,
+        reaping: bool = false,
+    };
+
+    /// Dedicated Linux epoll + eventfd reactor for parked Pub/Sub subscribers.
+    /// Eliminates fixed threadpool starvation (>worker_count idle subscribers pin 0 workers)
+    /// and coalesces pipelined publish bursts into single non-blocking `send()` syscalls.
+    const SubReactor = if (builtin.os.tag == .linux) struct {
+        const linux = std.os.linux;
+        const posix = std.posix;
+        const WAKE_TAG: u64 = std.math.maxInt(u64);
+        const MAX_EVENTS: usize = 256;
+
+        server: *Server,
+        allocator: std.mem.Allocator,
+        epoll_fd: posix.fd_t,
+        wake_fd: posix.fd_t,
+        running: std.atomic.Value(bool) = .init(true),
+        sleeping: std.atomic.Value(bool) = .init(false),
+
+        park_mutex: core.compat.Mutex = .{},
+        park_list: std.ArrayListUnmanaged(*SubSession) = .empty,
+
+        dirty_mutex: core.compat.Mutex = .{},
+        dirty_list: std.ArrayListUnmanaged(*SubSession) = .empty,
+
+        /// Owned strictly by `reactorLoop` (no mutex required).
+        parked_set: std.AutoHashMapUnmanaged(posix.fd_t, *SubSession) = .empty,
+        reap_list: std.ArrayListUnmanaged(*SubSession) = .empty,
+        thread: ?std.Thread = null,
+
+        fn create(server: *Server) !*SubReactor {
+            const ep_rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
+            if (posix.errno(ep_rc) != .SUCCESS) return error.EpollCreateFailed;
+            const epoll_fd: posix.fd_t = @intCast(ep_rc);
+            errdefer core.compat.close(epoll_fd);
+
+            const wf_rc = linux.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
+            if (posix.errno(wf_rc) != .SUCCESS) return error.EventFdCreateFailed;
+            const wake_fd: posix.fd_t = @intCast(wf_rc);
+            errdefer core.compat.close(wake_fd);
+
+            var ev = linux.epoll_event{
+                .events = linux.EPOLL.IN,
+                .data = .{ .u64 = WAKE_TAG },
+            };
+            const ctl_rc = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, wake_fd, &ev);
+            if (posix.errno(ctl_rc) != .SUCCESS) return error.EpollCtlFailed;
+
+            const self = try server.allocator.create(SubReactor);
+            errdefer server.allocator.destroy(self);
+            self.* = .{
+                .server = server,
+                .allocator = server.allocator,
+                .epoll_fd = epoll_fd,
+                .wake_fd = wake_fd,
+            };
+            self.thread = try std.Thread.spawn(.{}, reactorLoop, .{self});
+            return self;
+        }
+
+        fn stopAndDestroy(self: *SubReactor) void {
+            self.running.store(false, .seq_cst);
+            self.wakeForce();
+            if (self.thread) |t| t.join();
+            self.thread = null;
+
+            self.park_list.deinit(self.allocator);
+            self.dirty_list.deinit(self.allocator);
+            self.parked_set.deinit(self.allocator);
+            self.reap_list.deinit(self.allocator);
+            core.compat.close(self.wake_fd);
+            core.compat.close(self.epoll_fd);
+            self.allocator.destroy(self);
+        }
+
+        inline fn wakeIfSleeping(self: *SubReactor) void {
+            if (self.sleeping.load(.seq_cst)) {
+                if (self.sleeping.swap(false, .acq_rel)) {
+                    self.wakeForce();
+                }
+            }
+        }
+
+        fn wakeForce(self: *SubReactor) void {
+            var one: u64 = 1;
+            _ = std.c.write(self.wake_fd, @ptrCast(&one), @sizeOf(u64));
+        }
+
+        fn drainWakeFd(self: *SubReactor) void {
+            var val: u64 = 0;
+            while (true) {
+                const rc = std.c.read(self.wake_fd, @ptrCast(&val), @sizeOf(u64));
+                if (rc <= 0) break;
+            }
+        }
+
+        /// Hand ownership of an idle subscribed session from a worker thread to the reactor.
+        fn park(self: *SubReactor, session: *SubSession) bool {
+            if (!self.running.load(.acquire)) return false;
+            self.park_mutex.lock();
+            self.park_list.append(self.allocator, session) catch {
+                self.park_mutex.unlock();
+                return false;
+            };
+            self.park_mutex.unlock();
+            self.wakeIfSleeping();
+            return true;
+        }
+
+        /// Enqueue a session with new outbound event bytes for coalesced async flushing.
+        /// Caller must hold an active `in_flight` retain; this function takes an extra
+        /// retain released by `reactorLoop` once the dirty entry is processed.
+        fn enqueueFlush(self: *SubReactor, session: *SubSession) void {
+            ConnectionContext.retain(@ptrCast(&session.conn_ctx));
+            self.dirty_mutex.lock();
+            self.dirty_list.append(self.allocator, session) catch {
+                self.dirty_mutex.unlock();
+                session.conn_ctx.out_queued.store(false, .release);
+                ConnectionContext.release(@ptrCast(&session.conn_ctx));
+                return;
+            };
+            self.dirty_mutex.unlock();
+            self.wakeIfSleeping();
+        }
+
+        fn hasQueuedWork(self: *SubReactor) bool {
+            self.dirty_mutex.lock();
+            const has_dirty = self.dirty_list.items.len > 0;
+            self.dirty_mutex.unlock();
+            if (has_dirty) return true;
+            self.park_mutex.lock();
+            const has_park = self.park_list.items.len > 0;
+            self.park_mutex.unlock();
+            return has_park;
+        }
+
+        fn modEpollOut(self: *SubReactor, session: *SubSession, want_out: bool) void {
+            if (session.epoll_out_armed == want_out) return;
+            const fd = session.stream.getHandle();
+            var ev = linux.epoll_event{
+                .events = linux.EPOLL.IN | linux.EPOLL.RDHUP | (if (want_out) @as(u32, linux.EPOLL.OUT) else @as(u32, 0)),
+                .data = .{ .u64 = @intFromPtr(session) },
+            };
+            const rc = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, fd, &ev);
+            if (posix.errno(rc) == .SUCCESS) {
+                session.epoll_out_armed = want_out;
+            }
+        }
+
+        fn beginReap(self: *SubReactor, session: *SubSession) void {
+            if (session.reaping) return;
+            session.reaping = true;
+            const fd = session.stream.getHandle();
+            if (self.parked_set.remove(fd)) {
+                _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
+            }
+            session.conn_ctx.parked.store(false, .release);
+            session.conn_ctx.closed.store(true, .release);
+            session.conn_ctx.unsubscribeAll();
+            session.stream.shutdown();
+            self.reap_list.append(self.allocator, session) catch {
+                // Fallback: wait synchronously only on OOM
+                self.server.destroySession(session);
+            };
+        }
+
+        fn tryCompleteReaps(self: *SubReactor) void {
+            var i: usize = 0;
+            while (i < self.reap_list.items.len) {
+                const sess = self.reap_list.items[i];
+                if (sess.conn_ctx.in_flight.load(.acquire) == 0) {
+                    _ = self.reap_list.swapRemove(i);
+                    self.server.destroySession(sess);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        fn drainSessionOut(self: *SubReactor, session: *SubSession) void {
+            if (session.reaping) return;
+            if (!session.conn_ctx.parked.load(.acquire)) return;
+            if (session.conn_ctx.closed.load(.acquire)) {
+                self.beginReap(session);
+                return;
+            }
+
+            const fd = session.stream.getHandle();
+            const send_flags: u32 = linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL;
+
+            while (true) {
+                if (session.flush_pos >= session.flush_buf.items.len) {
+                    session.flush_buf.clearRetainingCapacity();
+                    session.flush_pos = 0;
+                    session.conn_ctx.out_mutex.lock();
+                    if (session.conn_ctx.out_buf.items.len > 0) {
+                        std.mem.swap(std.ArrayListUnmanaged(u8), &session.flush_buf, &session.conn_ctx.out_buf);
+                    }
+                    session.conn_ctx.out_mutex.unlock();
+                    if (session.flush_buf.items.len == 0) {
+                        session.stalled_since_ns = null;
+                        self.modEpollOut(session, false);
+                        return;
+                    }
+                }
+
+                const pending = session.flush_buf.items[session.flush_pos..];
+                const rc = std.c.send(fd, pending.ptr, pending.len, send_flags);
+                if (rc > 0) {
+                    session.flush_pos += @intCast(rc);
+                    session.stalled_since_ns = null;
+                    continue;
+                }
+                if (rc == 0) {
+                    self.beginReap(session);
+                    return;
+                }
+                const err = posix.errno(rc);
+                switch (err) {
+                    .INTR => continue,
+                    .AGAIN => {
+                        const now = core.compat.nowNs();
+                        if (session.stalled_since_ns) |since| {
+                            if (now - since >= @as(i128, EVENT_SEND_TIMEOUT_MS) * 1_000_000) {
+                                session.conn_ctx.event_bus.recordEviction();
+                                std.log.warn("evicted stalled subscriber (WouldBlock timeout)", .{});
+                                self.beginReap(session);
+                                return;
+                            }
+                        } else {
+                            session.stalled_since_ns = now;
+                        }
+                        self.modEpollOut(session, true);
+                        return;
+                    },
+                    else => {
+                        session.conn_ctx.event_bus.recordEviction();
+                        std.log.warn("evicted stalled subscriber ({s})", .{@tagName(err)});
+                        self.beginReap(session);
+                        return;
+                    },
+                }
+            }
+        }
+
+        fn unparkToWorker(self: *SubReactor, session: *SubSession) void {
+            const fd = session.stream.getHandle();
+            _ = self.parked_set.remove(fd);
+            _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
+            session.epoll_out_armed = false;
+            session.conn_ctx.parked.store(false, .release);
+
+            if (!self.server.running.load(.acquire)) {
+                self.beginReap(session);
+                return;
+            }
+            if (!self.server.conn_queue.push(.{ .resumed = session })) {
+                std.log.warn("Connection queue full on subscriber resume, closing", .{});
+                self.beginReap(session);
+                return;
+            }
+            if (self.server.metrics) |m| m.setTcpConnectionQueueDepth(self.server.conn_queue.len());
+        }
+
+        fn reactorLoop(self: *SubReactor) void {
+            var events: [MAX_EVENTS]linux.epoll_event = undefined;
+            var local_park: std.ArrayListUnmanaged(*SubSession) = .empty;
+            defer local_park.deinit(self.allocator);
+            var local_dirty: std.ArrayListUnmanaged(*SubSession) = .empty;
+            defer local_dirty.deinit(self.allocator);
+            var last_sweep_ns = core.compat.nowNs();
+
+            while (self.running.load(.acquire)) {
+                // 1. Register newly parked subscriber sessions.
+                self.park_mutex.lock();
+                if (self.park_list.items.len > 0) {
+                    std.mem.swap(std.ArrayListUnmanaged(*SubSession), &local_park, &self.park_list);
+                }
+                self.park_mutex.unlock();
+
+                for (local_park.items) |session| {
+                    if (session.conn_ctx.closed.load(.acquire)) {
+                        self.beginReap(session);
+                        continue;
+                    }
+                    const fd = session.stream.getHandle();
+                    var ev = linux.epoll_event{
+                        .events = linux.EPOLL.IN | linux.EPOLL.RDHUP,
+                        .data = .{ .u64 = @intFromPtr(session) },
+                    };
+                    const rc = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, fd, &ev);
+                    if (posix.errno(rc) != .SUCCESS) {
+                        self.beginReap(session);
+                        continue;
+                    }
+                    self.parked_set.put(self.allocator, fd, session) catch {
+                        _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
+                        self.beginReap(session);
+                        continue;
+                    };
+                    session.epoll_out_armed = false;
+                    session.conn_ctx.parked.store(true, .release);
+                    // Flush any events queued while the worker was flushing +OK.
+                    self.drainSessionOut(session);
+                }
+                local_park.clearRetainingCapacity();
+
+                // 2. Drain coalesced outbound event batches for all dirty subscribers.
+                self.dirty_mutex.lock();
+                if (self.dirty_list.items.len > 0) {
+                    std.mem.swap(std.ArrayListUnmanaged(*SubSession), &local_dirty, &self.dirty_list);
+                }
+                self.dirty_mutex.unlock();
+
+                for (local_dirty.items) |session| {
+                    session.conn_ctx.out_queued.store(false, .release);
+                    self.drainSessionOut(session);
+                    ConnectionContext.release(@ptrCast(&session.conn_ctx));
+                }
+                local_dirty.clearRetainingCapacity();
+
+                // 3. Reap any closed sessions whose in-flight publish refs have hit 0.
+                if (self.reap_list.items.len > 0) self.tryCompleteReaps();
+
+                // 4. Periodic sweep (every 100 ms) for stalled EPOLLOUT timeouts & auth expiry.
+                const now = core.compat.nowNs();
+                if (now - last_sweep_ns >= 100_000_000) {
+                    last_sweep_ns = now;
+                    var to_evict: [64]*SubSession = undefined;
+                    var evict_n: usize = 0;
+                    var it = self.parked_set.valueIterator();
+                    while (it.next()) |sp| {
+                        const sess = sp.*;
+                        if (sess.conn_ctx.closed.load(.acquire)) {
+                            if (evict_n < to_evict.len) {
+                                to_evict[evict_n] = sess;
+                                evict_n += 1;
+                            }
+                            continue;
+                        }
+                        if (sess.stalled_since_ns) |since| {
+                            if (now - since >= @as(i128, EVENT_SEND_TIMEOUT_MS) * 1_000_000) {
+                                sess.conn_ctx.event_bus.recordEviction();
+                                std.log.warn("evicted stalled subscriber (send deadline exceeded)", .{});
+                                if (evict_n < to_evict.len) {
+                                    to_evict[evict_n] = sess;
+                                    evict_n += 1;
+                                }
+                            }
+                        }
+                    }
+                    for (to_evict[0..evict_n]) |sess| self.beginReap(sess);
+                    if (self.reap_list.items.len > 0) self.tryCompleteReaps();
+                }
+
+                // 5. Dekker handshake before blocking in epoll_wait.
+                self.sleeping.store(true, .seq_cst);
+                if (self.hasQueuedWork() or !self.running.load(.seq_cst)) {
+                    self.sleeping.store(false, .release);
+                    continue;
+                }
+
+                const wait_ms: i32 = if (self.reap_list.items.len > 0) 5 else 100;
+                const rc = linux.epoll_wait(self.epoll_fd, &events, MAX_EVENTS, wait_ms);
+                self.sleeping.store(false, .release);
+                if (posix.errno(rc) != .SUCCESS) continue;
+                const nfds: usize = rc;
+
+                for (events[0..nfds]) |ev| {
+                    if (ev.data.u64 == WAKE_TAG) {
+                        self.drainWakeFd();
+                        continue;
+                    }
+                    const session: *SubSession = @ptrFromInt(ev.data.u64);
+                    const fd = session.stream.getHandle();
+                    if (!self.parked_set.contains(fd)) continue;
+
+                    if ((ev.events & linux.EPOLL.OUT) != 0) {
+                        self.drainSessionOut(session);
+                        if (!self.parked_set.contains(fd)) continue;
+                    }
+                    if (session.conn_ctx.closed.load(.acquire) or (ev.events & (linux.EPOLL.ERR | linux.EPOLL.HUP)) != 0) {
+                        self.beginReap(session);
+                        continue;
+                    }
+                    if ((ev.events & (linux.EPOLL.IN | linux.EPOLL.RDHUP)) != 0) {
+                        var peek: [1]u8 = undefined;
+                        const prc = std.c.recv(fd, &peek, 1, linux.MSG.PEEK | linux.MSG.DONTWAIT);
+                        if (prc > 0) {
+                            // Client sent a command (e.g. UNSUB, SUB, PING) — resume on worker.
+                            self.unparkToWorker(session);
+                        } else if (prc == 0) {
+                            // Clean EOF — reap directly on reactor without touching a worker.
+                            self.beginReap(session);
+                        } else if (posix.errno(prc) != .AGAIN and posix.errno(prc) != .INTR) {
+                            self.beginReap(session);
+                        }
+                    }
+                }
+            }
+
+            // Shutdown cleanup: release any queued dirty refs, parked sessions, and reaps.
+            self.dirty_mutex.lock();
+            for (self.dirty_list.items) |session| {
+                session.conn_ctx.out_queued.store(false, .release);
+                ConnectionContext.release(@ptrCast(&session.conn_ctx));
+            }
+            self.dirty_list.clearRetainingCapacity();
+            self.dirty_mutex.unlock();
+
+            self.park_mutex.lock();
+            for (self.park_list.items) |session| self.beginReap(session);
+            self.park_list.clearRetainingCapacity();
+            self.park_mutex.unlock();
+
+            var remaining_parked: std.ArrayListUnmanaged(*SubSession) = .empty;
+            defer remaining_parked.deinit(self.allocator);
+            var it = self.parked_set.valueIterator();
+            while (it.next()) |sp| remaining_parked.append(self.allocator, sp.*) catch {};
+            for (remaining_parked.items) |session| self.beginReap(session);
+
+            while (self.reap_list.items.len > 0) {
+                self.tryCompleteReaps();
+                if (self.reap_list.items.len > 0) std.Thread.yield() catch {};
+            }
+        }
+    } else struct {
+        fn stopAndDestroy(_: *@This()) void {}
+        fn enqueueFlush(_: *@This(), _: *SubSession) void {}
+        fn wakeIfSleeping(_: *@This()) void {}
+    };
+
     const ConnectionContext = struct {
         allocator: std.mem.Allocator,
         event_bus: *EventBus,
@@ -166,6 +621,14 @@ pub const Server = struct {
         rate_limiter: ?CommandRateLimiter = null,
         closed: std.atomic.Value(bool) = .init(false),
         in_flight: std.atomic.Value(u32) = .init(0),
+        /// Non-null when this connection is owned by a Linux `Server` with a `SubReactor`.
+        reactor: ?*SubReactor = null,
+        session: ?*SubSession = null,
+        parked: std.atomic.Value(bool) = .init(false),
+        /// Guards `out_buf` and `auth_state` reads on the async Pub/Sub path (never held across I/O).
+        out_mutex: core.compat.Mutex = .{},
+        out_buf: std.ArrayListUnmanaged(u8) = .empty,
+        out_queued: std.atomic.Value(bool) = .init(false),
 
         fn init(allocator: std.mem.Allocator, event_bus: *EventBus, stream: ?*core.compat.net.Stream) ConnectionContext {
             return .{
@@ -198,8 +661,7 @@ pub const Server = struct {
             };
         }
 
-        fn deinit(self: *ConnectionContext) void {
-            self.closed.store(true, .release);
+        fn unsubscribeAll(self: *ConnectionContext) void {
             var iter = self.subscriptions.iterator();
             while (iter.next()) |entry| {
                 const channel = entry.key_ptr.*;
@@ -207,11 +669,18 @@ pub const Server = struct {
                 self.event_bus.unsubscribe(channel, sub_id);
                 self.allocator.free(channel);
             }
+            self.subscriptions.clearRetainingCapacity();
+        }
+
+        fn deinit(self: *ConnectionContext) void {
+            self.closed.store(true, .release);
+            self.unsubscribeAll();
             self.subscriptions.deinit();
             self.clearAuthState();
             while (self.in_flight.load(.acquire) != 0) {
                 std.Thread.yield() catch {};
             }
+            self.out_buf.deinit(self.allocator);
         }
 
         fn retain(ctx: *anyopaque) void {
@@ -231,6 +700,8 @@ pub const Server = struct {
         fn replaceAuthState(self: *ConnectionContext, next: ?auth.TokenState) void {
             self.write_mutex.lock();
             defer self.write_mutex.unlock();
+            self.out_mutex.lock();
+            defer self.out_mutex.unlock();
             if (self.auth_state) |*state| {
                 auth.freeTokenState(self.allocator, state);
             }
@@ -284,6 +755,61 @@ pub const Server = struct {
         fn writeExactEvent(ctx: *anyopaque, channel: []const u8, message: []const u8) void {
             const self: *ConnectionContext = @ptrCast(@alignCast(ctx));
             if (self.closed.load(.acquire)) return;
+
+            // Async coalesced path (Linux Server with SubReactor): encode once,
+            // append into per-subscriber ring under brief `out_mutex`, wake reactor.
+            if (comptime builtin.os.tag == .linux) {
+                if (self.binary_mode and self.reactor != null and self.session != null) {
+                    const total_len = wire.eventFrameSize(channel.len, message.len);
+                    var stack_buf: [4096]u8 = undefined;
+                    var heap_buf: ?[]u8 = null;
+                    defer if (heap_buf) |hb| self.allocator.free(hb);
+                    const dst: []u8 = if (total_len <= stack_buf.len)
+                        &stack_buf
+                    else blk: {
+                        const hb = self.allocator.alloc(u8, total_len) catch return;
+                        heap_buf = hb;
+                        break :blk hb;
+                    };
+                    const frame = wire.encodeEventFrame(dst, channel, message) catch return;
+
+                    var evicted = false;
+                    var need_queue = false;
+                    {
+                        self.out_mutex.lock();
+                        defer self.out_mutex.unlock();
+                        if (self.closed.load(.acquire)) return;
+                        if (self.auth_enforce) {
+                            const state = if (self.auth_state) |*s| s else return;
+                            if (state.isExpired() or !state.permits(.subscribe, channel)) return;
+                        }
+                        if (self.out_buf.items.len + frame.len > MAX_SUB_OUT_BUF) {
+                            self.closed.store(true, .release);
+                            evicted = true;
+                        } else {
+                            if (self.out_buf.capacity == 0) {
+                                self.out_buf.ensureTotalCapacity(self.allocator, @max(SUB_OUT_INIT_CAP, frame.len)) catch return;
+                            }
+                            self.out_buf.appendSlice(self.allocator, frame) catch return;
+                            need_queue = !self.out_queued.swap(true, .acq_rel);
+                        }
+                    }
+
+                    const reactor = self.reactor.?;
+                    if (evicted) {
+                        if (self.stream) |stream| stream.shutdown();
+                        self.event_bus.recordEviction();
+                        std.log.warn("evicted stalled subscriber (output buffer limit exceeded)", .{});
+                        reactor.wakeIfSleeping();
+                        return;
+                    }
+                    if (need_queue) {
+                        reactor.enqueueFlush(self.session.?);
+                    }
+                    return;
+                }
+            }
+
             if (!self.write_mutex.tryLock()) {
                 self.event_bus.recordDrop();
                 return;
@@ -300,8 +826,18 @@ pub const Server = struct {
                     const saved = stream.write_timeout_ms;
                     stream.write_timeout_ms = EVENT_SEND_TIMEOUT_MS;
                     defer stream.write_timeout_ms = saved;
-                    wire.writeResponse(stream, .{ .event = .{ .channel = channel, .message = message } }) catch |err|
-                        self.evictStalled(stream, err);
+                    // Single-syscall coalesced binary event write (eliminates 5 writes/event).
+                    const total_len = wire.eventFrameSize(channel.len, message.len);
+                    var stack_buf: [4096]u8 = undefined;
+                    if (total_len <= stack_buf.len) {
+                        const frame = wire.encodeEventFrame(&stack_buf, channel, message) catch return;
+                        stream.writeAll(frame) catch |err| self.evictStalled(stream, err);
+                    } else {
+                        const heap_buf = self.allocator.alloc(u8, total_len) catch return;
+                        defer self.allocator.free(heap_buf);
+                        const frame = wire.encodeEventFrame(heap_buf, channel, message) catch return;
+                        stream.writeAll(frame) catch |err| self.evictStalled(stream, err);
+                    }
                 }
                 return;
             }
@@ -364,6 +900,17 @@ pub const Server = struct {
         var listener = try addr.listen(.{ .reuse_address = true, .kernel_backlog = 1024 });
         defer listener.deinit();
 
+        // Start dedicated subscriber reactor on Linux (0 worker threads pinned per idle SUB).
+        if (comptime builtin.os.tag == .linux) {
+            self.sub_reactor = try SubReactor.create(self);
+        }
+        defer {
+            if (self.sub_reactor) |reactor| {
+                reactor.stopAndDestroy();
+                self.sub_reactor = null;
+            }
+        }
+
         // Start worker pool
         const cpu_count = std.Thread.getCpuCount() catch 4;
         const num_workers = if (self.config.worker_count > 0)
@@ -383,6 +930,10 @@ pub const Server = struct {
                 std.log.err("Accept error: {}", .{err});
                 continue;
             };
+            if (!self.running.load(.acquire)) {
+                conn.stream.close();
+                break;
+            }
 
             if (!self.connection_limit.acquire(self.config.max_connections)) {
                 conn.stream.close();
@@ -410,7 +961,7 @@ pub const Server = struct {
             }
             // Preserve accept time through the queue and all pre-AUTH frames.
             conn.stream.read_limit_ns = core.compat.nowNs() + @as(i128, self.config.timeout_ms) * 1_000_000;
-            if (!self.conn_queue.push(.{ .conn = conn, .ip_key = ip_key })) {
+            if (!self.conn_queue.push(.{ .accepted = .{ .conn = conn, .ip_key = ip_key } })) {
                 // Queue full — reject connection
                 std.log.warn("Connection queue full, rejecting", .{});
                 if (self.metrics) |metrics| metrics.setTcpConnectionQueueDepth(self.conn_queue.len());
@@ -422,7 +973,7 @@ pub const Server = struct {
             if (self.metrics) |metrics| metrics.setTcpConnectionQueueDepth(self.conn_queue.len());
         }
 
-        // Shutdown: wake all workers so they exit
+        // Shutdown: wake all workers so they exit before tearing down SubReactor.
         for (self.workers) |*w| {
             _ = self.conn_queue.futex.fetchAdd(1, .release);
             core.compat.Futex.wake(&self.conn_queue.futex, 1);
@@ -436,7 +987,10 @@ pub const Server = struct {
         while (self.running.load(.acquire)) {
             if (self.conn_queue.pop()) |queued| {
                 if (self.metrics) |metrics| metrics.setTcpConnectionQueueDepth(self.conn_queue.len());
-                self.handleConnection(queued.conn, queued.ip_key);
+                switch (queued) {
+                    .accepted => |acc| self.handleConnection(acc.conn, acc.ip_key),
+                    .resumed => |sess| self.resumeBinarySession(sess),
+                }
             } else {
                 // Wait for new connections
                 core.compat.Futex.timedWait(&self.conn_queue.futex, self.conn_queue.futex.load(.acquire), 10_000_000);
@@ -445,51 +999,95 @@ pub const Server = struct {
         // Drain remaining connections on shutdown
         while (self.conn_queue.pop()) |queued| {
             if (self.metrics) |metrics| metrics.setTcpConnectionQueueDepth(self.conn_queue.len());
-            self.handleConnection(queued.conn, queued.ip_key);
+            switch (queued) {
+                .accepted => |acc| self.handleConnection(acc.conn, acc.ip_key),
+                .resumed => |sess| self.destroySession(sess),
+            }
         }
     }
 
     pub fn stop(self: *Server) void {
         self.running.store(false, .release);
+        if (self.sub_reactor) |reactor| reactor.wakeIfSleeping();
+    }
+
+    fn destroySession(self: *Server, session: *SubSession) void {
+        session.conn_ctx.deinit();
+        session.flush_buf.deinit(self.allocator);
+        session.stream.close();
+        if (session.has_metrics) {
+            if (self.metrics) |metrics| metrics.endTcpConnection();
+        }
+        if (session.ip_key) |key| self.ip_limiter.release(key);
+        self.connection_limit.release();
+        self.allocator.destroy(session);
+    }
+
+    fn resumeBinarySession(self: *Server, session: *SubSession) void {
+        const outcome = self.handleBinarySession(session);
+        if (outcome == .closed) {
+            self.destroySession(session);
+        }
     }
 
     fn handleConnection(self: *Server, conn: core.compat.net.ServerCompat.Connection, ip_key: ?IpLimiter.Key) void {
-        defer self.connection_limit.release();
-        defer if (ip_key) |key| self.ip_limiter.release(key);
-        var stream = conn.stream;
-        stream.beginRead(self.config.timeout_ms, false);
+        const session = self.allocator.create(SubSession) catch {
+            var s = conn.stream;
+            s.close();
+            if (ip_key) |key| self.ip_limiter.release(key);
+            self.connection_limit.release();
+            return;
+        };
+        session.* = .{
+            .stream = conn.stream,
+            .ip_key = ip_key,
+            .conn_ctx = ConnectionContext.init(self.allocator, self.event_bus, null),
+            .metrics_shard = if (self.metrics) |m| m.assignTcpShard() else 0,
+            .has_metrics = self.metrics != null,
+        };
+        session.conn_ctx.stream = &session.stream;
+        session.conn_ctx.session = session;
+        session.conn_ctx.reactor = self.sub_reactor;
+        session.conn_ctx.auth_enforce = self.config.auth_enforce;
+        session.conn_ctx.rate_limiter = CommandRateLimiter.init(self.config.max_commands_per_sec, core.compat.nowNs());
+
+        session.stream.beginRead(self.config.timeout_ms, false);
         if (self.metrics) |metrics| metrics.beginTcpConnection();
-        defer if (self.metrics) |metrics| metrics.endTcpConnection();
 
         // Disable Nagle's algorithm — critical for low-latency request/response.
-        // Without this, small response packets get buffered for up to 40ms.
-        core.compat.setNoDelay(stream.getHandle());
+        core.compat.setNoDelay(session.stream.getHandle());
         // Bound sends so a slow peer cannot pin an EventBus publisher (#84).
-        core.compat.setSendTimeoutMs(stream.getHandle(), 2_000);
-        stream.write_timeout_ms = 2_000;
-        var conn_ctx = ConnectionContext.init(self.allocator, self.event_bus, &stream);
-        conn_ctx.auth_enforce = self.config.auth_enforce;
-        conn_ctx.rate_limiter = CommandRateLimiter.init(self.config.max_commands_per_sec, core.compat.nowNs());
-        defer stream.close();
-        defer conn_ctx.deinit();
+        core.compat.setSendTimeoutMs(session.stream.getHandle(), 2_000);
+        session.stream.write_timeout_ms = 2_000;
 
         var handshake: [2]u8 = undefined;
         var handshake_read: usize = 0;
         while (handshake_read < handshake.len) {
-            const n = stream.read(handshake[handshake_read..]) catch |err| {
+            const n = session.stream.read(handshake[handshake_read..]) catch |err| {
                 std.log.debug("Handshake read error: {}", .{err});
+                self.destroySession(session);
                 return;
             };
-            if (n == 0) return;
+            if (n == 0) {
+                self.destroySession(session);
+                return;
+            }
             handshake_read += n;
         }
 
         if (std.mem.eql(u8, &handshake, &wire.WIRE_MAGIC)) {
-            if (!self.config.auth_enforce) stream.read_limit_ns = null;
-            conn_ctx.binary_mode = true;
-            self.handleBinaryConnection(&stream, &conn_ctx);
+            if (!self.config.auth_enforce) session.stream.read_limit_ns = null;
+            session.conn_ctx.binary_mode = true;
+            const outcome = self.handleBinarySession(session);
+            if (outcome == .closed) {
+                self.destroySession(session);
+            }
             return;
         }
+
+        defer self.destroySession(session);
+        const stream = &session.stream;
+        const conn_ctx = &session.conn_ctx;
 
         // Replication connections: same binary protocol but skip re-replication (anti-echo).
         // Legacy "WR" carries no peer identity, so it is only acceptable while org
@@ -498,13 +1096,13 @@ pub const Server = struct {
             if (self.config.org_trust) |trust| {
                 if (trust.enforce) {
                     std.log.warn("replication: legacy replication rejected: org trust enforced (peer must use W2 handshake)", .{});
-                    wire.writeResponse(&stream, .{ .err = "unauthorized: legacy replication rejected (org trust enforced)" }) catch {};
+                    wire.writeResponse(stream, .{ .err = "unauthorized: legacy replication rejected (org trust enforced)" }) catch {};
                     return;
                 }
             }
             conn_ctx.binary_mode = true;
             stream.read_limit_ns = null;
-            var transport = secure_channel.Transport{ .stream = &stream };
+            var transport = secure_channel.Transport{ .stream = stream };
             self.handleReplicationConnection(&transport, null);
             return;
         }
@@ -518,16 +1116,16 @@ pub const Server = struct {
             if (self.config.org_trust) |trust| {
                 if (trust.enforce and !trust.accept_w2) {
                     std.log.warn("replication: legacy W2 handshake rejected (org_trust.accept_w2 is false; peer must speak W3)", .{});
-                    wire.writeResponse(&stream, .{ .err = "unauthorized: legacy W2 replication disabled" }) catch {};
+                    wire.writeResponse(stream, .{ .err = "unauthorized: legacy W2 replication disabled" }) catch {};
                     return;
                 }
             }
-            const peer_org = self.replicationOrgHandshake(&stream) orelse return;
+            const peer_org = self.replicationOrgHandshake(stream) orelse return;
             stream.read_limit_ns = null;
             // Accepted for rolling upgrades: the peer proved its org, but this
             // link is one-way authenticated and unencrypted. Upgrade it to W3.
             std.log.warn("replication: peer uses legacy W2 handshake (unencrypted, server not authenticated) — upgrade the peer", .{});
-            var transport = secure_channel.Transport{ .stream = &stream };
+            var transport = secure_channel.Transport{ .stream = stream };
             self.handleReplicationConnection(&transport, peer_org);
             return;
         }
@@ -537,26 +1135,31 @@ pub const Server = struct {
         // frame after the handshake travels in an encrypted record.
         if (std.mem.eql(u8, &handshake, &wire.REPL_MAGIC_V3)) {
             conn_ctx.binary_mode = true;
-            var session = self.replicationMutualHandshake(&stream) orelse return;
+            var session_w3 = self.replicationMutualHandshake(stream) orelse return;
             stream.read_limit_ns = null;
-            var secure = secure_channel.SecureStream.init(self.allocator, session.keys);
+            var secure = secure_channel.SecureStream.init(self.allocator, session_w3.keys);
             defer secure.deinit();
-            session.keys.wipe();
-            var transport = secure_channel.Transport{ .stream = &stream, .secure = &secure };
-            self.handleReplicationConnection(&transport, session.org.org_pubkey);
+            session_w3.keys.wipe();
+            var transport = secure_channel.Transport{ .stream = stream, .secure = &secure };
+            self.handleReplicationConnection(&transport, session_w3.org.org_pubkey);
             return;
         }
 
         conn_ctx.writeAllLocked("-ERR binary protocol required\r\n");
     }
 
-    fn handleBinaryConnection(self: *Server, stream: *core.compat.net.Stream, conn_ctx: *ConnectionContext) void {
+    const SessionOutcome = enum { closed, parked };
+
+    fn handleBinarySession(self: *Server, session: *SubSession) SessionOutcome {
+        const stream = &session.stream;
+        const conn_ctx = &session.conn_ctx;
         // Buffered write adapter: coalesces small response frames across pipelined
         // requests into a single send syscall whenever additional frames are already
         // queued in `ReadAdapter.buf`, while still flushing immediately when the
         // read buffer drains (zero extra latency for unpipelined inflight=1).
         const WriteAdapter = struct {
             s: *core.compat.net.Stream,
+            session: *SubSession,
             conn_ctx: *ConnectionContext,
             buf: [16384]u8 = undefined,
             end: usize = 0,
@@ -579,12 +1182,19 @@ pub const Server = struct {
             }
 
             pub fn flush(wa: *@This()) !void {
+                // Flush any partial event frame left over from SubReactor before sending a command reply
+                // so wire framing stays strictly contiguous across park/unpark boundaries.
+                if (wa.session.flush_pos < wa.session.flush_buf.items.len) {
+                    try wa.s.writeAll(wa.session.flush_buf.items[wa.session.flush_pos..]);
+                    wa.session.flush_buf.clearRetainingCapacity();
+                    wa.session.flush_pos = 0;
+                }
                 if (wa.end > 0) {
                     const pending = wa.buf[0..wa.end];
                     wa.end = 0;
-                    // Only synchronize with EventBus publishers when this connection
-                    // actually holds active subscriptions (zero lock overhead on KV paths).
-                    if (wa.conn_ctx.subscriptions.count() > 0) {
+                    // On Linux with SubReactor, this worker owns the socket exclusively while unparked.
+                    // On non-Linux (or tests without SubReactor), synchronize with direct EventBus writes.
+                    if (wa.conn_ctx.reactor == null and wa.conn_ctx.subscriptions.count() > 0) {
                         wa.conn_ctx.write_mutex.lock();
                         defer wa.conn_ctx.write_mutex.unlock();
                         try wa.s.writeAll(pending);
@@ -621,15 +1231,9 @@ pub const Server = struct {
                     }
                     return n;
                 }
-                // Before blocking on the kernel socket (including mid-frame partial
-                // reads after a pipelined burst), flush every already-completed
-                // response so the client can never deadlock waiting for replies.
                 if (adapter.writer.end > 0) {
                     adapter.writer.flush() catch return error.EndOfStream;
                 }
-                // Arm the per-command whole-frame deadline lazily on the first kernel
-                // read of this command (never extended on subsequent reads of the same
-                // frame, and skipped entirely for frames served from user-space buffer).
                 if (!adapter.deadline_armed) {
                     adapter.stream.beginRead(adapter.timeout_ms, adapter.allow_idle_at_cmd_start);
                     adapter.deadline_armed = true;
@@ -649,25 +1253,20 @@ pub const Server = struct {
             }
         };
 
-        var w = WriteAdapter{ .s = stream, .conn_ctx = conn_ctx };
+        var w = WriteAdapter{ .s = stream, .session = session, .conn_ctx = conn_ctx };
         var reader = ReadAdapter{
             .stream = stream,
             .writer = &w,
             .timeout_ms = self.config.timeout_ms,
         };
 
-        // Per-command arena: avoids per-field malloc/free pairs.
-        // Reset after each command instead of O(n) individual frees.
         var cmd_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer cmd_arena.deinit();
 
-        // Pin this connection to a dedicated cache-line-isolated metrics shard so
-        // concurrent worker threads never bounce global counter cache lines.
-        const metrics_shard: usize = if (self.metrics) |m| m.assignTcpShard() else 0;
+        const metrics_shard: usize = session.metrics_shard;
         var burst_had_success = false;
 
         while (true) {
-            // Reset arena for this command cycle (key/value/args)
             _ = cmd_arena.reset(.{ .retain_with_limit = ARENA_RETAIN_LIMIT });
             const arena_alloc = cmd_arena.allocator();
 
@@ -676,7 +1275,6 @@ pub const Server = struct {
             reader.allow_idle_at_cmd_start = !reader.hasBuffered() and
                 conn_ctx.subscriptions.count() > 0 and
                 (!self.config.auth_enforce or conn_ctx.auth_state != null);
-            // Until this connection has authenticated, accept only small frames (B3).
             const max_payload: usize = if (self.config.auth_enforce and conn_ctx.auth_state == null)
                 PRE_AUTH_MAX_PAYLOAD
             else
@@ -688,34 +1286,30 @@ pub const Server = struct {
                 switch (err) {
                     error.EndOfStream, error.Timeout => {
                         w.flush() catch {};
-                        return;
+                        return .closed;
                     },
                     error.PayloadTooLarge => {
                         wire.writeResponse(&w, .{ .err = "request too large" }) catch {};
                         w.flush() catch {};
-                        return;
+                        return .closed;
                     },
                     else => {
                         wire.writeResponse(&w, .{ .err = "malformed frame" }) catch {};
                         w.flush() catch {};
-                        return;
+                        return .closed;
                     },
                 }
             };
-            // No need for deinitCommand — arena reset handles cleanup
 
-            // Per-connection command budget (C3): over the limit, the frame is
-            // answered with an error and not executed.
             if (conn_ctx.rate_limiter) |*limiter| {
                 if (!limiter.allow(core.compat.nowNs())) {
-                    wire.writeResponse(&w, .{ .err = "rate limited" }) catch return;
-                    if (!reader.hasBuffered()) w.flush() catch return;
+                    wire.writeResponse(&w, .{ .err = "rate limited" }) catch return .closed;
+                    if (!reader.hasBuffered()) w.flush() catch return .closed;
                     continue;
                 }
             }
 
             if (self.metrics) |metrics| {
-                // Flush deferred burst timestamp before STATUS so liveness reflects prior commands.
                 if (burst_had_success and cmd == .status) {
                     metrics.touchTcpSuccessMsShard(metrics_shard);
                     burst_had_success = false;
@@ -733,21 +1327,20 @@ pub const Server = struct {
                     error.Corruption => "data corruption",
                     error.InvalidPredicate => "invalid filter predicate",
                 };
-                wire.writeResponse(&w, .{ .err = err_msg }) catch return;
+                wire.writeResponse(&w, .{ .err = err_msg }) catch return .closed;
                 if (!reader.hasBuffered()) {
                     if (burst_had_success) {
                         if (self.metrics) |metrics| metrics.touchTcpSuccessMsShard(metrics_shard);
                         burst_had_success = false;
                     }
-                    w.flush() catch return;
+                    w.flush() catch return .closed;
                 }
                 if (self.metrics) |metrics| metrics.completeTcpCommandShard(metrics_shard, false, false);
                 continue;
             };
-            // No defer deinitResponse needed — arena reset handles cleanup
 
             const ok = responseSucceeded(response);
-            wire.writeResponse(&w, response) catch return;
+            wire.writeResponse(&w, response) catch return .closed;
             const more_buffered = reader.hasBuffered();
             if (self.metrics) |metrics| {
                 metrics.completeTcpCommandShard(metrics_shard, ok, ok and !more_buffered);
@@ -758,7 +1351,22 @@ pub const Server = struct {
                     burst_had_success = true;
                 }
             }
-            if (!more_buffered) w.flush() catch return;
+            if (!more_buffered) {
+                w.flush() catch return .closed;
+                // Park idle subscribed connections onto SubReactor on Linux so they pin 0 worker threads.
+                if (comptime builtin.os.tag == .linux) {
+                    if (self.sub_reactor) |reactor| {
+                        if (conn_ctx.subscriptions.count() > 0 and
+                            !conn_ctx.closed.load(.acquire) and
+                            (!self.config.auth_enforce or conn_ctx.auth_state != null))
+                        {
+                            if (reactor.park(session)) {
+                                return .parked;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2206,4 +2814,133 @@ test "binary pipelining coalesces bursts and flushes before partial-frame read" 
     try testing.expectEqual(@as(u64, 6), snap.tcp_commands_completed);
     try testing.expectEqual(@as(u64, 6), snap.tcp_commands_succeeded);
     try testing.expect(snap.tcp_last_successful_command_completed_ms > 0);
+}
+
+test "SubReactor serves more subscribers than worker threads and resumes on UNSUB" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    const net = core.compat.net;
+
+    var store = try Store.init(testing.allocator, .{ .persistence = .none });
+    defer store.deinit();
+    try store.set("after:unsub", "alive", false);
+
+    var bus = EventBus.init(testing.allocator);
+    defer bus.deinit();
+
+    // Pick an ephemeral free port, then hand it to Server.run with only 4 workers.
+    var probe = try (try net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    const port = probe.inner.socket.address.getPort();
+    probe.deinit();
+
+    var server = Server.init(testing.allocator, &store, &bus, .{
+        .bind_address = "127.0.0.1",
+        .port = port,
+        .worker_count = 4,
+        .timeout_ms = 5_000,
+    });
+    defer server.deinit();
+
+    const RunCtx = struct {
+        s: *Server,
+        fn run(ctx: @This()) void {
+            ctx.s.run() catch {};
+        }
+    };
+    const srv_th = try std.Thread.spawn(.{}, RunCtx.run, .{RunCtx{ .s = &server }});
+    defer {
+        server.stop();
+        // Wake blocked listener.accept() with one loopback connect.
+        if (net.tcpConnectToAddress(net.Address.initIp4(.{ 127, 0, 0, 1 }, port))) |*wake_c| {
+            var wc = wake_c.*;
+            wc.close();
+        } else |_| {}
+        srv_th.join();
+    }
+
+    // Wait until Server.run is listening.
+    const addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+    const n_subs: usize = 24; // 6x the 4-worker pool!
+    const n_msgs: usize = 100;
+    var subs: [n_subs]net.Stream = undefined;
+    var opened: usize = 0;
+    errdefer for (0..opened) |i| subs[i].close();
+
+    const ReadAdapter = struct {
+        stream: *net.Stream,
+        pub fn read(a: *@This(), dest: []u8) !usize {
+            return a.stream.read(dest);
+        }
+    };
+
+    for (0..n_subs) |i| {
+        var c: net.Stream = undefined;
+        var tries: usize = 0;
+        while (true) : (tries += 1) {
+            if (net.tcpConnectToAddress(addr)) |s| {
+                c = s;
+                break;
+            } else |_| {
+                if (tries > 200) return error.TestUnexpectedResult;
+                core.compat.io().sleep(.fromMilliseconds(5), .awake) catch {};
+            }
+        }
+        core.compat.setNoDelay(c.getHandle());
+        c.beginRead(5_000, false);
+        try c.writeAll(&wire.WIRE_MAGIC);
+        try wire.writeCommand(&c, .{ .subscribe = .{ .channel = "fanout:test", .filter = null } });
+        var r = ReadAdapter{ .stream = &c };
+        const resp = try wire.readResponseAlloc(&r, testing.allocator);
+        defer protocol.deinitResponse(testing.allocator, resp);
+        try testing.expect(resp == .ok);
+        subs[i] = c;
+        opened += 1;
+    }
+
+    // Open a 25th connection (publisher) while all 24 subscribers are parked — must NOT starve!
+    var pub_c = try net.tcpConnectToAddress(addr);
+    defer pub_c.close();
+    core.compat.setNoDelay(pub_c.getHandle());
+    pub_c.beginRead(5_000, false);
+    try pub_c.writeAll(&wire.WIRE_MAGIC);
+
+    for (0..n_msgs) |m| {
+        var payload_buf: [32]u8 = undefined;
+        const payload = try std.fmt.bufPrint(&payload_buf, "msg-{d}", .{m});
+        try wire.writeCommand(&pub_c, .{ .publish = .{ .channel = "fanout:test", .message = payload } });
+    }
+    var pub_r = ReadAdapter{ .stream = &pub_c };
+    for (0..n_msgs) |_| {
+        const resp = try wire.readResponseAlloc(&pub_r, testing.allocator);
+        defer protocol.deinitResponse(testing.allocator, resp);
+        try testing.expect(resp == .ok);
+    }
+
+    // Every one of the 24 subscribers must receive all 100 events in strict order!
+    for (0..n_subs) |i| {
+        var r = ReadAdapter{ .stream = &subs[i] };
+        for (0..n_msgs) |m| {
+            const ev = try wire.readResponseAlloc(&r, testing.allocator);
+            defer protocol.deinitResponse(testing.allocator, ev);
+            try testing.expect(ev == .event);
+            var exp_buf: [32]u8 = undefined;
+            const exp = try std.fmt.bufPrint(&exp_buf, "msg-{d}", .{m});
+            try testing.expectEqualStrings("fanout:test", ev.event.channel);
+            try testing.expectEqualStrings(exp, ev.event.message);
+        }
+    }
+
+    // Subscriber #0 sends UNSUB + GET to verify seamless unpark-to-worker resumption.
+    try wire.writeCommand(&subs[0], .{ .unsubscribe = "fanout:test" });
+    try wire.writeCommand(&subs[0], .{ .get = "after:unsub" });
+    var r0 = ReadAdapter{ .stream = &subs[0] };
+    const u_resp = try wire.readResponseAlloc(&r0, testing.allocator);
+    defer protocol.deinitResponse(testing.allocator, u_resp);
+    try testing.expect(u_resp == .ok);
+    const g_resp = try wire.readResponseAlloc(&r0, testing.allocator);
+    defer protocol.deinitResponse(testing.allocator, g_resp);
+    try testing.expect(g_resp == .value);
+    try testing.expectEqualStrings("alive", g_resp.value.?);
+
+    for (0..n_subs) |i| subs[i].close();
 }

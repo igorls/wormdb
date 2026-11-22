@@ -120,6 +120,7 @@ pub const Store = struct {
     segments_buf: [MAX_SEGMENTS]NamedSegment = undefined,
     segment_count: usize = 0,
     fail_put_reserve_for_test: if (@import("builtin").is_test) bool else void = if (@import("builtin").is_test) false else {},
+    fail_ordered_insert_for_test: if (@import("builtin").is_test) bool else void = if (@import("builtin").is_test) false else {},
     /// Frozen sorted-string segments (`.wsst`, see sst.zig) mounted as a
     /// TRANSPARENT overlay: GET/scan/EXEC consult live shards first, then each
     /// sst in attach order — so live writes shadow frozen keys and procedures
@@ -352,7 +353,8 @@ pub const Store = struct {
     /// new one (no dangling pointer is ever observable).
     fn shardPutLocked(self: *Store, shard: *Shard, entry: *Entry) StoreError!void {
         try self.shardReservePutLocked(shard, entry.key);
-        self.shardPutAssumeCapacityLocked(shard, entry);
+        if (!shard.data.contains(entry.key)) try self.orderedInsertLocked(shard, entry);
+        self.shardPutReservedLocked(shard, entry);
     }
 
     fn shardReservePutLocked(self: *Store, shard: *Shard, _: []const u8) StoreError!void {
@@ -360,7 +362,33 @@ pub const Store = struct {
         shard.data.ensureUnusedCapacity(self.allocator, 1) catch return error.OutOfMemory;
     }
 
-    fn shardPutAssumeCapacityLocked(self: *Store, shard: *Shard, entry: *Entry) void {
+    /// Add a NEW key's entry to the ordered index. This is the only fallible step
+    /// of publishing a new key besides the reservations, so it runs before the WAL
+    /// record is written: a failure is returned to the caller with nothing durable,
+    /// instead of leaving a key that `get` serves but scans and snapshots never see.
+    ///
+    /// Caller must hold the shard lock and keep it until the entry is either in the
+    /// shard hashmap (`shardPutReservedLocked`) or taken back out of the index
+    /// (`orderedUnindexLocked`). Readers that reach the entry through the index take
+    /// that same shard lock before touching it (`tryLock` on the fast scan paths, a
+    /// hashmap lookup under the lock on the others), so the half-published entry is
+    /// never read. `countPrefix` can include it for the duration of the write.
+    fn orderedInsertLocked(self: *Store, shard: *Shard, entry: *Entry) StoreError!void {
+        if (@import("builtin").is_test and self.fail_ordered_insert_for_test) return error.OutOfMemory;
+        const si = (@intFromPtr(shard) - @intFromPtr(&self.shards[0])) / @sizeOf(Shard);
+        self.ordered.insert(entry.key, entry, si) catch return error.OutOfMemory;
+    }
+
+    /// Undo `orderedInsertLocked` for an entry that never reached the hashmap.
+    /// Must run before the entry is destroyed: the index borrows its key bytes.
+    fn orderedUnindexLocked(self: *Store, entry: *Entry) void {
+        self.ordered.remove(entry.key);
+    }
+
+    /// Publish `entry` in the shard hashmap. Infallible: the caller has reserved
+    /// hashmap capacity and, when the key is new to the shard, already added the
+    /// entry to the ordered index with `orderedInsertLocked`.
+    fn shardPutReservedLocked(self: *Store, shard: *Shard, entry: *Entry) void {
         if (shard.data.fetchRemove(entry.key)) |removed| {
             // Existing key replaced (e.g. arena-owned snapshot entry superseded or WAL replay):
             // update `ordered` value/key pointer under exclusive bucket lock BEFORE destroying `removed.value`.
@@ -370,10 +398,6 @@ pub const Store = struct {
             return;
         }
         shard.data.putAssumeCapacity(entry.key, entry);
-        const si = (@intFromPtr(shard) - @intFromPtr(&self.shards[0])) / @sizeOf(Shard);
-        self.ordered.insert(entry.key, entry, si) catch |err| {
-            std.log.err("store: ordered index insert failed for '{s}': {s}", .{ entry.key, @errorName(err) });
-        };
         _ = self.live_keys.fetchAdd(1, .monotonic);
     }
 
@@ -675,7 +699,9 @@ pub const Store = struct {
     const PreparedUpsert = union(enum) {
         in_place_same_len: *Entry,
         in_place_new_val: struct { entry: *Entry, new_val: []u8 },
-        put_entry: *Entry,
+        /// `indexed` is set when the key is new and the entry is already in the
+        /// ordered index; an abort must take it back out before destroying it.
+        put_entry: struct { entry: *Entry, indexed: bool },
     };
 
     /// Reserve all memory and shard capacity needed for an upsert before publishing
@@ -701,14 +727,27 @@ pub const Store = struct {
         }
         try self.shardReservePutLocked(shard, key);
         const entry = try self.createMemoryEntry(key, value, is_worm, timestamp);
-        return .{ .put_entry = entry };
+        // A key that is new to the shard is indexed now, while failing is still
+        // free; an arena-owned entry being superseded is already in the index and
+        // only has its pointer swapped at commit.
+        const is_new = existing_opt == null;
+        if (is_new) {
+            self.orderedInsertLocked(shard, entry) catch |err| {
+                self.destroyEntry(entry);
+                return err;
+            };
+        }
+        return .{ .put_entry = .{ .entry = entry, .indexed = is_new } };
     }
 
     fn abortPreparedUpsert(self: *Store, prepared: PreparedUpsert) void {
         switch (prepared) {
             .in_place_same_len => {},
             .in_place_new_val => |p| self.allocator.free(p.new_val),
-            .put_entry => |e| self.destroyEntry(e),
+            .put_entry => |p| {
+                if (p.indexed) self.orderedUnindexLocked(p.entry);
+                self.destroyEntry(p.entry);
+            },
         }
     }
 
@@ -732,8 +771,8 @@ pub const Store = struct {
                 p.entry.timestamp = timestamp;
                 p.entry.flags = .{ .is_worm = is_worm, .is_deleted = false };
             },
-            .put_entry => |entry| {
-                self.shardPutAssumeCapacityLocked(shard, entry);
+            .put_entry => |p| {
+                self.shardPutReservedLocked(shard, p.entry);
             },
         }
     }
@@ -1533,7 +1572,7 @@ pub const Store = struct {
             timestamp: u64,
             is_worm: bool,
         ) ScanAction,
-    ) void {
+    ) error{OutOfMemory}!void {
         var cursor_stack: [512]u8 = undefined;
         var cursor_heap: std.ArrayListUnmanaged(u8) = .empty;
         defer cursor_heap.deinit(self.allocator);
@@ -2512,6 +2551,108 @@ test "durable SET reserves live state before publishing WAL" {
     store.fail_put_reserve_for_test = false;
     try store.set("key", "second", true);
     try testing.expectEqualStrings("second", store.get("key").?.value);
+}
+
+test "a set that cannot be indexed fails before anything is published" {
+    const testing = std.testing;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/index_before_wal.wal", .{tmp_path});
+    defer testing.allocator.free(wal_path);
+    const file = try compat.Dir.createFile(tmp_dir.dir, "index_before_wal.wal", .{});
+    compat.File.close(file);
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/index_before_wal.snapshot", .{tmp_path});
+    defer testing.allocator.free(snapshot_path);
+
+    var store = try Store.init(testing.allocator, .{
+        .wal_path = wal_path,
+        .snapshot_path = snapshot_path,
+        .sync_writes = true,
+    });
+    defer store.deinit();
+
+    try store.set("idx:a", "one", false);
+    const wal_before = try store.wal.?.size();
+
+    // New key, index insert fails: no WAL record, no hashmap entry, no index entry.
+    store.fail_ordered_insert_for_test = true;
+    try testing.expectError(error.OutOfMemory, store.set("idx:b", "two", false));
+    {
+        const pair = store.lockKeyPair("idx:c", "idx:c");
+        defer store.unlockKeyPair(pair);
+        try testing.expectError(error.OutOfMemory, store.setUnsafe("idx:c", "three", false));
+    }
+    try testing.expectEqual(wal_before, try store.wal.?.size());
+    try testing.expect(store.get("idx:b") == null);
+    try testing.expect(store.get("idx:c") == null);
+    try testing.expectEqual(@as(usize, 1), store.count());
+    try testing.expectEqual(@as(usize, 1), store.countPrefix("idx:"));
+
+    // Overwriting an existing key never touches the index, so it still succeeds.
+    try store.set("idx:a", "uno", false);
+    try testing.expectEqualStrings("uno", store.get("idx:a").?.value);
+
+    store.fail_ordered_insert_for_test = false;
+    try store.set("idx:b", "two", false);
+    try testing.expectEqual(@as(usize, 2), store.count());
+    try testing.expectEqual(@as(usize, 2), store.countPrefix("idx:"));
+    const hits = try store.scanPrefix("idx:", 10, testing.allocator);
+    defer {
+        for (hits) |h| {
+            testing.allocator.free(h.key);
+            testing.allocator.free(h.value);
+        }
+        testing.allocator.free(hits);
+    }
+    try testing.expectEqual(@as(usize, 2), hits.len);
+}
+
+test "a set whose WAL append fails is taken back out of the ordered index" {
+    const testing = std.testing;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/unindex_on_wal_fail.wal", .{tmp_path});
+    defer testing.allocator.free(wal_path);
+    const file = try compat.Dir.createFile(tmp_dir.dir, "unindex_on_wal_fail.wal", .{});
+    compat.File.close(file);
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/unindex_on_wal_fail.snapshot", .{tmp_path});
+    defer testing.allocator.free(snapshot_path);
+
+    var store = try Store.init(testing.allocator, .{
+        .wal_path = wal_path,
+        .snapshot_path = snapshot_path,
+        .sync_writes = true,
+    });
+    defer store.deinit();
+
+    try store.set("idx:a", "one", false);
+
+    // A long key is borrowed by the index, so a stale index entry would dangle
+    // once the aborted entry is destroyed.
+    const long_key = "idx:long-key-past-the-inline-key-capacity";
+    store.wal.?.fail_sync_for_test = true;
+    try testing.expectError(error.IoError, store.set(long_key, "two", false));
+    store.wal.?.fail_sync_for_test = false;
+
+    try testing.expect(store.get(long_key) == null);
+    try testing.expectEqual(@as(usize, 1), store.count());
+    try testing.expectEqual(@as(usize, 1), store.countPrefix("idx:"));
+    const hits = try store.scanPrefix("idx:", 10, testing.allocator);
+    defer {
+        for (hits) |h| {
+            testing.allocator.free(h.key);
+            testing.allocator.free(h.value);
+        }
+        testing.allocator.free(hits);
+    }
+    try testing.expectEqual(@as(usize, 1), hits.len);
+    try testing.expectEqualStrings("idx:a", hits[0].key);
 }
 
 test "WORM enforcement" {

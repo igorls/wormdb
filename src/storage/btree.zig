@@ -364,13 +364,14 @@ pub fn OrderedIndex(comptime Value: type, comptime borrow_long_leaf_keys: bool) 
             return @fieldParentPtr("hdr", hdr);
         }
 
-        const SplitResult = struct {
-            inserted: bool,
-            split: ?struct {
-                sep_p8: u64,
-                sep_key: OwnedKeyBytes,
-                right: *NodeHeader,
-            } = null,
+        /// Deepest root-to-leaf path `insertLocked` records. Splits leave nodes at
+        /// least half full, so reaching this height would take ~32^16 inserts.
+        const MAX_DEPTH: usize = 16;
+
+        const PathEntry = struct {
+            node: *InternalNode,
+            /// Index of the child the descent followed.
+            ci: usize,
         };
 
         pub const SeekPos = struct {
@@ -606,23 +607,191 @@ pub fn OrderedIndex(comptime Value: type, comptime borrow_long_leaf_keys: bool) 
                     }
                 }
 
-                const res = try self.insertNode(allocator, self.root.?, p8, key, value, key_hash, shard_idx);
-                if (res.inserted) self.len += 1;
-                if (res.split) |sp| {
-                    const new_root = try allocator.create(InternalNode);
+                // Descend to the target leaf, recording the path. Every allocation an
+                // insert can need (leaf key, split nodes, separator copy, new root) is
+                // made before the first mutation, so a failed insert leaves the tree
+                // exactly as it was: no orphaned split node, no drifted subtree count.
+                var path: [MAX_DEPTH]PathEntry = undefined;
+                var depth: usize = 0;
+                var cur = self.root.?;
+                while (cur.kind == .internal) {
+                    if (depth == MAX_DEPTH) return error.OutOfMemory;
+                    const node = asInternal(cur);
+                    const ci = node.childIndexForKey(p8, key);
+                    path[depth] = .{ .node = node, .ci = ci };
+                    depth += 1;
+                    cur = node.children[ci];
+                }
+                const leaf = asLeaf(cur);
+                const idx = leaf.findLowerBound(p8, key);
+                const cnt: usize = leaf.hdr.count;
+                if (idx < cnt and leaf.prefix8[idx] == p8 and std.mem.eql(u8, leaf.slots[idx].key.slice(), key)) {
+                    leaf.slots[idx].value = value;
+                    if (comptime borrow_long_leaf_keys) {
+                        if (key.len > INLINE_KEY_CAP) {
+                            leaf.slots[idx].key.storage.borrowed_ptr = key.ptr;
+                        }
+                    }
+                    return;
+                }
+
+                const kb = try LeafKey.init(allocator, key);
+                errdefer kb.deinit(allocator);
+
+                if (cnt < LEAF_CAP) {
+                    if (idx < cnt) {
+                        std.mem.copyBackwards(u64, leaf.prefix8[idx + 1 .. cnt + 1], leaf.prefix8[idx..cnt]);
+                        std.mem.copyBackwards(LeafSlot, leaf.slots[idx + 1 .. cnt + 1], leaf.slots[idx..cnt]);
+                    }
+                    leaf.prefix8[idx] = p8;
+                    leaf.slots[idx] = .{ .key = kb, .value = value, .key_hash = key_hash, .shard_idx = shard_idx };
+                    leaf.hdr.count += 1;
+                    leaf.hdr.subtree_count += 1;
+                    for (path[0..depth]) |pe| pe.node.hdr.subtree_count += 1;
+                    self.len += 1;
+                    return;
+                }
+
+                // The leaf is full. The split propagates up through every full internal
+                // node directly above it; if all of them are full the tree grows a root.
+                var n_split: usize = 0;
+                while (n_split < depth and path[depth - 1 - n_split].node.hdr.count == INTERNAL_CAP) n_split += 1;
+                const n_internal: usize = n_split + @intFromBool(n_split == depth);
+
+                var tmp_lp8: [LEAF_CAP + 1]u64 = undefined;
+                var tmp_slots: [LEAF_CAP + 1]LeafSlot = undefined;
+                @memcpy(tmp_lp8[0..idx], leaf.prefix8[0..idx]);
+                @memcpy(tmp_slots[0..idx], leaf.slots[0..idx]);
+                tmp_lp8[idx] = p8;
+                tmp_slots[idx] = .{ .key = kb, .value = value, .key_hash = key_hash, .shard_idx = shard_idx };
+                @memcpy(tmp_lp8[idx + 1 .. LEAF_CAP + 1], leaf.prefix8[idx..LEAF_CAP]);
+                @memcpy(tmp_slots[idx + 1 .. LEAF_CAP + 1], leaf.slots[idx..LEAF_CAP]);
+
+                const left_n: usize = if (idx == LEAF_CAP) (LEAF_CAP * 3) / 4 else (LEAF_CAP + 1) / 2;
+                const right_n: usize = (LEAF_CAP + 1) - left_n;
+
+                const right_leaf = try allocator.create(LeafNode);
+                errdefer allocator.destroy(right_leaf);
+                const leaf_sep_key = try OwnedKeyBytes.init(allocator, tmp_slots[left_n].key.slice());
+                errdefer leaf_sep_key.deinit(allocator);
+                var new_internals: [MAX_DEPTH + 1]*InternalNode = undefined;
+                var n_alloc: usize = 0;
+                errdefer for (new_internals[0..n_alloc]) |n| allocator.destroy(n);
+                while (n_alloc < n_internal) : (n_alloc += 1) {
+                    new_internals[n_alloc] = try allocator.create(InternalNode);
+                }
+
+                // ── Infallible from here on ──────────────────────────────────────
+                @memcpy(leaf.prefix8[0..left_n], tmp_lp8[0..left_n]);
+                @memcpy(leaf.slots[0..left_n], tmp_slots[0..left_n]);
+                leaf.hdr.count = @intCast(left_n);
+                leaf.hdr.subtree_count = @intCast(left_n);
+
+                right_leaf.* = .{
+                    .hdr = .{ .kind = .leaf, .count = @intCast(right_n), .subtree_count = @intCast(right_n) },
+                    .prev = leaf,
+                    .next = leaf.next,
+                };
+                @memcpy(right_leaf.prefix8[0..right_n], tmp_lp8[left_n .. LEAF_CAP + 1]);
+                @memcpy(right_leaf.slots[0..right_n], tmp_slots[left_n .. LEAF_CAP + 1]);
+
+                if (leaf.next) |old_next| {
+                    old_next.prev = right_leaf;
+                } else {
+                    self.last_leaf = right_leaf;
+                }
+                leaf.next = right_leaf;
+
+                // Pending split to hand to the parent level.
+                var sp_p8: u64 = tmp_lp8[left_n];
+                var sp_key: OwnedKeyBytes = leaf_sep_key;
+                var sp_right: *NodeHeader = right_leaf.asHeader();
+                var pending = true;
+                var used: usize = 0;
+
+                var level = depth;
+                while (level > 0) {
+                    level -= 1;
+                    const node = path[level].node;
+                    const ci = path[level].ci;
+                    node.hdr.subtree_count += 1;
+                    if (!pending) continue;
+
+                    const ncnt: usize = node.hdr.count;
+                    if (ncnt < INTERNAL_CAP) {
+                        if (ci < ncnt) {
+                            std.mem.copyBackwards(u64, node.prefix8[ci + 1 .. ncnt + 1], node.prefix8[ci..ncnt]);
+                            std.mem.copyBackwards(OwnedKeyBytes, node.keys[ci + 1 .. ncnt + 1], node.keys[ci..ncnt]);
+                            std.mem.copyBackwards(*NodeHeader, node.children[ci + 2 .. ncnt + 2], node.children[ci + 1 .. ncnt + 1]);
+                        }
+                        node.prefix8[ci] = sp_p8;
+                        node.keys[ci] = sp_key;
+                        node.children[ci + 1] = sp_right;
+                        node.hdr.count += 1;
+                        pending = false;
+                        continue;
+                    }
+
+                    const right = new_internals[used];
+                    used += 1;
+                    var tmp_p8: [INTERNAL_CAP + 1]u64 = undefined;
+                    var tmp_keys: [INTERNAL_CAP + 1]OwnedKeyBytes = undefined;
+                    var tmp_ch: [INTERNAL_CAP + 2]*NodeHeader = undefined;
+
+                    @memcpy(tmp_p8[0..ci], node.prefix8[0..ci]);
+                    @memcpy(tmp_keys[0..ci], node.keys[0..ci]);
+                    @memcpy(tmp_ch[0 .. ci + 1], node.children[0 .. ci + 1]);
+                    tmp_p8[ci] = sp_p8;
+                    tmp_keys[ci] = sp_key;
+                    tmp_ch[ci + 1] = sp_right;
+                    @memcpy(tmp_p8[ci + 1 .. INTERNAL_CAP + 1], node.prefix8[ci..INTERNAL_CAP]);
+                    @memcpy(tmp_keys[ci + 1 .. INTERNAL_CAP + 1], node.keys[ci..INTERNAL_CAP]);
+                    @memcpy(tmp_ch[ci + 2 .. INTERNAL_CAP + 2], node.children[ci + 1 .. INTERNAL_CAP + 1]);
+
+                    const mid: usize = (INTERNAL_CAP + 1) / 2;
+                    const rn: usize = INTERNAL_CAP - mid;
+
+                    @memcpy(node.prefix8[0..mid], tmp_p8[0..mid]);
+                    @memcpy(node.keys[0..mid], tmp_keys[0..mid]);
+                    @memcpy(node.children[0 .. mid + 1], tmp_ch[0 .. mid + 1]);
+                    node.hdr.count = @intCast(mid);
+                    var lsum: u32 = 0;
+                    for (node.children[0 .. mid + 1]) |ch| lsum += ch.subtree_count;
+                    node.hdr.subtree_count = lsum;
+
+                    right.* = .{
+                        .hdr = .{ .kind = .internal, .count = @intCast(rn), .subtree_count = 0 },
+                    };
+                    @memcpy(right.prefix8[0..rn], tmp_p8[mid + 1 .. INTERNAL_CAP + 1]);
+                    @memcpy(right.keys[0..rn], tmp_keys[mid + 1 .. INTERNAL_CAP + 1]);
+                    @memcpy(right.children[0 .. rn + 1], tmp_ch[mid + 1 .. INTERNAL_CAP + 2]);
+                    var rsum: u32 = 0;
+                    for (right.children[0 .. rn + 1]) |ch| rsum += ch.subtree_count;
+                    right.hdr.subtree_count = rsum;
+
+                    sp_p8 = tmp_p8[mid];
+                    sp_key = tmp_keys[mid];
+                    sp_right = right.asHeader();
+                }
+
+                if (pending) {
+                    const new_root = new_internals[used];
+                    used += 1;
                     new_root.* = .{
                         .hdr = .{
                             .kind = .internal,
                             .count = 1,
-                            .subtree_count = self.root.?.subtree_count + sp.right.subtree_count,
+                            .subtree_count = self.root.?.subtree_count + sp_right.subtree_count,
                         },
                     };
-                    new_root.prefix8[0] = sp.sep_p8;
-                    new_root.keys[0] = sp.sep_key;
+                    new_root.prefix8[0] = sp_p8;
+                    new_root.keys[0] = sp_key;
                     new_root.children[0] = self.root.?;
-                    new_root.children[1] = sp.right;
+                    new_root.children[1] = sp_right;
                     self.root = new_root.asHeader();
                 }
+                std.debug.assert(used == n_internal);
+                self.len += 1;
             }
 
             pub fn replaceValueLocked(self: *BucketTree, allocator: std.mem.Allocator, key: []const u8, value: Value) void {
@@ -644,156 +813,6 @@ pub fn OrderedIndex(comptime Value: type, comptime borrow_long_leaf_keys: bool) 
                     } else {
                         _ = allocator;
                     }
-                }
-            }
-
-            fn insertNode(
-                self: *BucketTree,
-                allocator: std.mem.Allocator,
-                hdr: *NodeHeader,
-                p8: u64,
-                key: []const u8,
-                value: Value,
-                key_hash: u64,
-                shard_idx: u8,
-            ) !SplitResult {
-                switch (hdr.kind) {
-                    .leaf => {
-                        const leaf = asLeaf(hdr);
-                        const idx = leaf.findLowerBound(p8, key);
-                        const cnt: usize = leaf.hdr.count;
-                        if (idx < cnt and leaf.prefix8[idx] == p8 and std.mem.eql(u8, leaf.slots[idx].key.slice(), key)) {
-                            leaf.slots[idx].value = value;
-                            if (comptime borrow_long_leaf_keys) {
-                                if (key.len > INLINE_KEY_CAP) {
-                                    leaf.slots[idx].key.storage.borrowed_ptr = key.ptr;
-                                }
-                            }
-                            return .{ .inserted = false };
-                        }
-
-                        const kb = try LeafKey.init(allocator, key);
-                        errdefer kb.deinit(allocator);
-
-                        if (cnt < LEAF_CAP) {
-                            if (idx < cnt) {
-                                std.mem.copyBackwards(u64, leaf.prefix8[idx + 1 .. cnt + 1], leaf.prefix8[idx..cnt]);
-                                std.mem.copyBackwards(LeafSlot, leaf.slots[idx + 1 .. cnt + 1], leaf.slots[idx..cnt]);
-                            }
-                            leaf.prefix8[idx] = p8;
-                            leaf.slots[idx] = .{ .key = kb, .value = value, .key_hash = key_hash, .shard_idx = shard_idx };
-                            leaf.hdr.count += 1;
-                            leaf.hdr.subtree_count += 1;
-                            return .{ .inserted = true };
-                        }
-
-                        const right = try allocator.create(LeafNode);
-                        errdefer allocator.destroy(right);
-
-                        var tmp_p8: [LEAF_CAP + 1]u64 = undefined;
-                        var tmp_slots: [LEAF_CAP + 1]LeafSlot = undefined;
-                        @memcpy(tmp_p8[0..idx], leaf.prefix8[0..idx]);
-                        @memcpy(tmp_slots[0..idx], leaf.slots[0..idx]);
-                        tmp_p8[idx] = p8;
-                        tmp_slots[idx] = .{ .key = kb, .value = value, .key_hash = key_hash, .shard_idx = shard_idx };
-                        @memcpy(tmp_p8[idx + 1 .. LEAF_CAP + 1], leaf.prefix8[idx..LEAF_CAP]);
-                        @memcpy(tmp_slots[idx + 1 .. LEAF_CAP + 1], leaf.slots[idx..LEAF_CAP]);
-
-                        const left_n: usize = if (idx == LEAF_CAP) (LEAF_CAP * 3) / 4 else (LEAF_CAP + 1) / 2;
-                        const right_n: usize = (LEAF_CAP + 1) - left_n;
-
-                        const sep_key = try OwnedKeyBytes.init(allocator, tmp_slots[left_n].key.slice());
-                        const sep_p8 = tmp_p8[left_n];
-
-                        @memcpy(leaf.prefix8[0..left_n], tmp_p8[0..left_n]);
-                        @memcpy(leaf.slots[0..left_n], tmp_slots[0..left_n]);
-                        leaf.hdr.count = @intCast(left_n);
-                        leaf.hdr.subtree_count = @intCast(left_n);
-
-                        right.* = .{
-                            .hdr = .{ .kind = .leaf, .count = @intCast(right_n), .subtree_count = @intCast(right_n) },
-                            .prev = leaf,
-                            .next = leaf.next,
-                        };
-                        @memcpy(right.prefix8[0..right_n], tmp_p8[left_n .. LEAF_CAP + 1]);
-                        @memcpy(right.slots[0..right_n], tmp_slots[left_n .. LEAF_CAP + 1]);
-
-                        if (leaf.next) |old_next| {
-                            old_next.prev = right;
-                        } else {
-                            self.last_leaf = right;
-                        }
-                        leaf.next = right;
-
-                        return .{
-                            .inserted = true,
-                            .split = .{ .sep_p8 = sep_p8, .sep_key = sep_key, .right = right.asHeader() },
-                        };
-                    },
-                    .internal => {
-                        const node = asInternal(hdr);
-                        const ci = node.childIndexForKey(p8, key);
-                        const res = try self.insertNode(allocator, node.children[ci], p8, key, value, key_hash, shard_idx);
-                        if (res.inserted) node.hdr.subtree_count += 1;
-                        const sp = res.split orelse return .{ .inserted = res.inserted };
-
-                        const cnt: usize = node.hdr.count;
-                        if (cnt < INTERNAL_CAP) {
-                            if (ci < cnt) {
-                                std.mem.copyBackwards(u64, node.prefix8[ci + 1 .. cnt + 1], node.prefix8[ci..cnt]);
-                                std.mem.copyBackwards(OwnedKeyBytes, node.keys[ci + 1 .. cnt + 1], node.keys[ci..cnt]);
-                                std.mem.copyBackwards(*NodeHeader, node.children[ci + 2 .. cnt + 2], node.children[ci + 1 .. cnt + 1]);
-                            }
-                            node.prefix8[ci] = sp.sep_p8;
-                            node.keys[ci] = sp.sep_key;
-                            node.children[ci + 1] = sp.right;
-                            node.hdr.count += 1;
-                            return .{ .inserted = res.inserted };
-                        }
-
-                        const right = try allocator.create(InternalNode);
-                        var tmp_p8: [INTERNAL_CAP + 1]u64 = undefined;
-                        var tmp_keys: [INTERNAL_CAP + 1]OwnedKeyBytes = undefined;
-                        var tmp_ch: [INTERNAL_CAP + 2]*NodeHeader = undefined;
-
-                        @memcpy(tmp_p8[0..ci], node.prefix8[0..ci]);
-                        @memcpy(tmp_keys[0..ci], node.keys[0..ci]);
-                        @memcpy(tmp_ch[0 .. ci + 1], node.children[0 .. ci + 1]);
-                        tmp_p8[ci] = sp.sep_p8;
-                        tmp_keys[ci] = sp.sep_key;
-                        tmp_ch[ci + 1] = sp.right;
-                        @memcpy(tmp_p8[ci + 1 .. INTERNAL_CAP + 1], node.prefix8[ci..INTERNAL_CAP]);
-                        @memcpy(tmp_keys[ci + 1 .. INTERNAL_CAP + 1], node.keys[ci..INTERNAL_CAP]);
-                        @memcpy(tmp_ch[ci + 2 .. INTERNAL_CAP + 2], node.children[ci + 1 .. INTERNAL_CAP + 1]);
-
-                        const mid: usize = (INTERNAL_CAP + 1) / 2;
-                        const promo_p8 = tmp_p8[mid];
-                        const promo_key = tmp_keys[mid];
-                        const right_n: usize = INTERNAL_CAP - mid;
-
-                        @memcpy(node.prefix8[0..mid], tmp_p8[0..mid]);
-                        @memcpy(node.keys[0..mid], tmp_keys[0..mid]);
-                        @memcpy(node.children[0 .. mid + 1], tmp_ch[0 .. mid + 1]);
-                        node.hdr.count = @intCast(mid);
-                        var lsum: u32 = 0;
-                        for (node.children[0 .. mid + 1]) |ch| lsum += ch.subtree_count;
-                        node.hdr.subtree_count = lsum;
-
-                        right.* = .{
-                            .hdr = .{ .kind = .internal, .count = @intCast(right_n), .subtree_count = 0 },
-                        };
-                        @memcpy(right.prefix8[0..right_n], tmp_p8[mid + 1 .. INTERNAL_CAP + 1]);
-                        @memcpy(right.keys[0..right_n], tmp_keys[mid + 1 .. INTERNAL_CAP + 1]);
-                        @memcpy(right.children[0 .. right_n + 1], tmp_ch[mid + 1 .. INTERNAL_CAP + 2]);
-                        var rsum: u32 = 0;
-                        for (right.children[0 .. right_n + 1]) |ch| rsum += ch.subtree_count;
-                        right.hdr.subtree_count = rsum;
-
-                        return .{
-                            .inserted = res.inserted,
-                            .split = .{ .sep_p8 = promo_p8, .sep_key = promo_key, .right = right.asHeader() },
-                        };
-                    },
                 }
             }
 
@@ -1410,4 +1429,77 @@ test "OrderedIndex bulk load builds multi-level tree and supports queries + dele
     try testing.expectEqual(@as(usize, 10_001), idx.countPrefix("key:"));
     idx.remove("key:005000");
     try testing.expectEqual(@as(usize, 10_000), idx.countPrefix("key:"));
+}
+
+test "OrderedIndex insert leaves the tree untouched when an allocation fails" {
+    const testing = std.testing;
+    const Idx = OrderedIndex(usize, true);
+
+    // Borrowed long keys need stable backing memory that outlives the index.
+    var key_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer key_arena.deinit();
+    const n_keys: usize = 4200;
+    const keys = try key_arena.allocator().alloc([]const u8, n_keys);
+    for (keys, 0..) |*k, i| {
+        k.* = try std.fmt.allocPrint(key_arena.allocator(), "k:long-key-past-inline-cap:{d:0>6}", .{i});
+    }
+
+    // Ascending evens grow the tree by tail splits until the root internal node
+    // itself splits; descending odds then force mid-leaf splits everywhere.
+    const order = try key_arena.allocator().alloc(usize, n_keys);
+    for (0..n_keys / 2) |i| order[i] = 2 * i;
+    for (0..n_keys / 2) |i| order[n_keys / 2 + i] = n_keys - 1 - 2 * i;
+
+    const Check = struct {
+        fn run(idx: *Idx, all_keys: []const []const u8, present: []const usize) !void {
+            const b = &idx.buckets['k'];
+            try testing.expectEqual(present.len, b.len);
+            try testing.expectEqual(present.len, idx.countPrefix("k"));
+
+            // The leaf chain holds exactly the present keys, in strictly ascending order.
+            var chained: usize = 0;
+            var prev: ?[]const u8 = null;
+            var leaf = b.first_leaf;
+            while (leaf) |lf| : (leaf = lf.next) {
+                for (lf.slots[0..lf.hdr.count]) |*s| {
+                    const k = s.key.slice();
+                    if (prev) |p| try testing.expect(std.mem.order(u8, p, k) == .lt);
+                    prev = k;
+                    chained += 1;
+                }
+            }
+            try testing.expectEqual(present.len, chained);
+
+            // Every present key is reachable by descending from the root.
+            for (present) |ki| {
+                const pos = b.seekFirst(all_keys[ki], null) orelse return error.TestUnexpectedResult;
+                try testing.expectEqualStrings(all_keys[ki], pos.leaf.slots[pos.idx].key.slice());
+                try testing.expectEqual(ki, pos.leaf.slots[pos.idx].value);
+            }
+        }
+    };
+
+    // Fail each allocation the workload makes, one per run, until a run needs none failed.
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        var idx = Idx.init(failing.allocator());
+        defer idx.deinit();
+
+        var failed = false;
+        for (order, 0..) |ki, done| {
+            idx.insert(keys[ki], ki, ki & 255) catch |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                try testing.expect(!failed);
+                failed = true;
+                try Check.run(&idx, keys, order[0..done]);
+                failing.fail_index = std.math.maxInt(usize);
+                try idx.insert(keys[ki], ki, ki & 255);
+            };
+        }
+        try Check.run(&idx, keys, order);
+        if (!failed) break;
+    }
+    // The workload must have exercised leaf, internal and root splits.
+    try testing.expect(fail_index > 100);
 }

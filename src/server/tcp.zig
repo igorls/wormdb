@@ -454,7 +454,9 @@ pub const Server = struct {
                 self.park_mutex.unlock();
 
                 for (local_park.items) |session| {
-                    if (session.conn_ctx.closed.load(.acquire)) {
+                    const auth_expired = session.conn_ctx.auth_enforce and
+                        (if (session.conn_ctx.auth_state) |*st| st.isExpired() else true);
+                    if (session.conn_ctx.closed.load(.acquire) or auth_expired) {
                         self.beginReap(session);
                         continue;
                     }
@@ -497,9 +499,9 @@ pub const Server = struct {
                 // 3. Reap any closed sessions whose in-flight publish refs have hit 0.
                 if (self.reap_list.items.len > 0) self.tryCompleteReaps();
 
-                // 4. Periodic sweep (every 100 ms) for stalled EPOLLOUT timeouts & auth expiry.
+                // 4. Periodic sweep (every 50 ms) for stalled EPOLLOUT timeouts & auth expiry.
                 const now = core.compat.nowNs();
-                if (now - last_sweep_ns >= 100_000_000) {
+                if (now - last_sweep_ns >= 50_000_000) {
                     last_sweep_ns = now;
                     var to_evict: [64]*SubSession = undefined;
                     var evict_n: usize = 0;
@@ -512,6 +514,16 @@ pub const Server = struct {
                                 evict_n += 1;
                             }
                             continue;
+                        }
+                        if (sess.conn_ctx.auth_enforce) {
+                            const auth_expired = if (sess.conn_ctx.auth_state) |*st| st.isExpired() else true;
+                            if (auth_expired) {
+                                if (evict_n < to_evict.len) {
+                                    to_evict[evict_n] = sess;
+                                    evict_n += 1;
+                                }
+                                continue;
+                            }
                         }
                         if (sess.stalled_since_ns) |since| {
                             if (now - since >= @as(i128, EVENT_SEND_TIMEOUT_MS) * 1_000_000) {
@@ -535,7 +547,7 @@ pub const Server = struct {
                     continue;
                 }
 
-                const wait_ms: i32 = if (self.reap_list.items.len > 0) 5 else 100;
+                const wait_ms: i32 = if (self.reap_list.items.len > 0) 5 else 50;
                 const rc = linux.epoll_wait(self.epoll_fd, &events, MAX_EVENTS, wait_ms);
                 self.sleeping.store(false, .release);
                 if (posix.errno(rc) != .SUCCESS) continue;

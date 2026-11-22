@@ -535,27 +535,66 @@ pub fn applyVbulkinsert(
                     std.log.warn("applyVbulkinsert: enqueueAsyncBatch: {s}", .{@errorName(e)});
                 };
             } else {
-                // Single write-lock cycle for the whole batch + upfront pre-reserve.
+                // Single write-lock cycle for the whole batch + upfront pre-reserve +
+                // parallel multi-threaded HNSW linking for batches >= 32 vectors.
                 idx.lock.lock();
                 defer idx.lock.unlock();
                 if (had_preexisting) idx.markIncompleteLocked();
                 if (valid_count > 0) {
                     idx.reserveAdditionalLocked(valid_count) catch {};
                 }
-                for (items, 0..) |item, item_idx| {
-                    if (staged) |s| {
-                        if (!s[item_idx].stored) continue;
+                var batch_stack: [1024]NamespaceIndex.BatchInsertItem = undefined;
+                var batch_heap: ?[]NamespaceIndex.BatchInsertItem = null;
+                defer if (batch_heap) |bh| allocator.free(bh);
+                const batch_buf: ?[]NamespaceIndex.BatchInsertItem = if (valid_count >= 32) blk: {
+                    if (valid_count <= batch_stack.len) break :blk batch_stack[0..valid_count];
+                    const b = allocator.alloc(NamespaceIndex.BatchInsertItem, valid_count) catch break :blk null;
+                    batch_heap = b;
+                    break :blk b;
+                } else null;
+
+                if (batch_buf) |buf| {
+                    var b_len: usize = 0;
+                    for (items, 0..) |item, item_idx| {
+                        if (staged) |s| {
+                            if (!s[item_idx].stored) continue;
+                        }
+                        const vec_f32 = distance.bytesToF32(item.vector) orelse continue;
+                        const pre_bq: ?[]const u8 = if (staged) |s| blk: {
+                            const meta = s[item_idx];
+                            if (meta.len > 0) break :blk bq_blob.items[meta.off..][0..meta.len];
+                            break :blk null;
+                        } else null;
+                        if (b_len < buf.len) {
+                            buf[b_len] = .{
+                                .key = item.key,
+                                .vector = vec_f32,
+                                .timestamp = item.timestamp,
+                                .pre_encoded_bq = pre_bq,
+                            };
+                            b_len += 1;
+                        }
                     }
-                    const vec_f32 = distance.bytesToF32(item.vector) orelse continue;
-                    const pre_bq: ?[]const u8 = if (staged) |s| blk: {
-                        const meta = s[item_idx];
-                        if (meta.len > 0) break :blk bq_blob.items[meta.off..][0..meta.len];
-                        break :blk null;
-                    } else null;
-                    _ = idx.insertLockedWithBq(item.key, vec_f32, item.timestamp, pre_bq) catch |e| {
+                    _ = idx.insertBatchLocked(buf[0..b_len]) catch |e| {
                         idx.markIncompleteLocked();
-                        std.log.warn("applyVbulkinsert: HNSW insert '{s}': {s}", .{ item.key, @errorName(e) });
+                        std.log.warn("applyVbulkinsert: parallel batch insert failed: {s}", .{@errorName(e)});
                     };
+                } else {
+                    for (items, 0..) |item, item_idx| {
+                        if (staged) |s| {
+                            if (!s[item_idx].stored) continue;
+                        }
+                        const vec_f32 = distance.bytesToF32(item.vector) orelse continue;
+                        const pre_bq: ?[]const u8 = if (staged) |s| blk: {
+                            const meta = s[item_idx];
+                            if (meta.len > 0) break :blk bq_blob.items[meta.off..][0..meta.len];
+                            break :blk null;
+                        } else null;
+                        _ = idx.insertLockedWithBq(item.key, vec_f32, item.timestamp, pre_bq) catch |e| {
+                            idx.markIncompleteLocked();
+                            std.log.warn("applyVbulkinsert: HNSW insert '{s}': {s}", .{ item.key, @errorName(e) });
+                        };
+                    }
                 }
             }
         }
@@ -815,6 +854,78 @@ test "applyVbulkinsert does not overwrite WORM key in HNSW or slabs when Store r
     try testing.expectApproxEqAbs(@as(f32, 0.0), idx.hnsw.getVector(id_a)[1], 1e-6);
     const id_b = idx.nodeIdFor("vec:worm:b").?;
     try testing.expectApproxEqAbs(@as(f32, 1.0), idx.hnsw.getVector(id_b)[2], 1e-6);
+}
+
+test "applyVbulkinsert parallel batch (>=32) indexes vectors, syncs BQ slab, and tombstones overwrites" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var store = try Store.init(alloc, .{ .persistence = .none });
+    defer store.deinit();
+    var reg = NamespaceRegistry.init(alloc, .{ .m = 8, .m_max0 = 16, .ef_construction = 48 });
+    defer reg.deinit();
+    store.vector_registry = &reg;
+
+    const dim: usize = 16;
+    const n_batch: usize = 96;
+    var prng = std.Random.DefaultPrng.init(0x96_B47C);
+    const rand = prng.random();
+
+    const vecs = try alloc.alloc([dim]f32, n_batch);
+    defer alloc.free(vecs);
+    const keys = try alloc.alloc([]u8, n_batch);
+    defer {
+        for (keys) |k| alloc.free(k);
+        alloc.free(keys);
+    }
+    const items = try alloc.alloc(Command.VbulkinsertParams.BulkItem, n_batch);
+    defer alloc.free(items);
+
+    for (0..n_batch) |i| {
+        for (&vecs[i]) |*x| x.* = rand.floatNorm(f32);
+        keys[i] = try std.fmt.allocPrint(alloc, "vec:par:{d:0>4}", .{i});
+        items[i] = .{
+            .key = keys[i],
+            .vector = std.mem.sliceAsBytes(&vecs[i]),
+            .timestamp = 100 + i,
+        };
+    }
+
+    // Batch 1 (48 items) + Batch 2 (48 items) both exercise parallel insert path.
+    try applyVbulkinsert(&store, null, null, &reg, alloc, "vec:par:", .cosine, false, false, items[0..48], false);
+    try applyVbulkinsert(&store, null, null, &reg, alloc, "vec:par:", .cosine, false, false, items[48..96], false);
+
+    // Batch 3: overwrite first 40 keys with fresh vectors + newer timestamps.
+    const upd_vecs = try alloc.alloc([dim]f32, 40);
+    defer alloc.free(upd_vecs);
+    const upd_items = try alloc.alloc(Command.VbulkinsertParams.BulkItem, 40);
+    defer alloc.free(upd_items);
+    for (0..40) |i| {
+        for (&upd_vecs[i]) |*x| x.* = rand.floatNorm(f32);
+        upd_items[i] = .{
+            .key = keys[i],
+            .vector = std.mem.sliceAsBytes(&upd_vecs[i]),
+            .timestamp = 500 + i,
+        };
+    }
+    try applyVbulkinsert(&store, null, null, &reg, alloc, "vec:par:", .cosine, false, false, upd_items, false);
+
+    const idx = reg.get("vec:par:").?;
+    idx.lock.lockShared();
+    defer idx.lock.unlockShared();
+
+    try testing.expectEqual(@as(usize, n_batch), idx.liveCount());
+    try testing.expectEqual(@as(usize, 40), idx.tombstone_count);
+    try testing.expectEqual(@as(usize, n_batch + 40), idx.hnsw.len());
+    try testing.expect(idx.bq_slab.synced);
+    try testing.expectEqual(idx.hnsw.len(), idx.bq_slab.len);
+
+    // Search for an overwritten vector must return its updated key as top-1.
+    var out: [5]index_mod.IndexSearchResult = undefined;
+    var scratch: [5]@import("../vector/hnsw.zig").SearchResult = undefined;
+    const found = try idx.searchLocked(&upd_vecs[7], 5, 48, &out, &scratch);
+    try testing.expect(found > 0);
+    try testing.expectEqualStrings(keys[7], out[0].key);
 }
 
 // Keep the Command union visible for callers that need to construct frames.

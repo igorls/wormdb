@@ -1661,6 +1661,626 @@ pub const Hnsw = struct {
     }
 
     // ╔═══════════════════════════════════════════════════╗
+    // ║  Parallel Bulk Insert (`insertBatchParallel`)      ║
+    // ╚═══════════════════════════════════════════════════╝
+
+    const PARALLEL_STRIPE_COUNT: usize = 256;
+    const PARALLEL_STRIPE_MASK: usize = PARALLEL_STRIPE_COUNT - 1;
+    const PARALLEL_MIN_BATCH: usize = 32;
+    const PARALLEL_MAX_M: usize = 64;
+    const PARALLEL_MAX_WORKERS: usize = 8;
+
+    const SpinLock = struct {
+        locked: std.atomic.Value(u8) align(64) = .init(0),
+
+        inline fn lock(self: *SpinLock) void {
+            while (self.locked.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+                while (self.locked.load(.monotonic) != 0) std.atomic.spinLoopHint();
+            }
+        }
+
+        inline fn unlock(self: *SpinLock) void {
+            self.locked.store(0, .release);
+        }
+    };
+
+    const ParallelBuildState = struct {
+        hnsw: *Hnsw,
+        base_id: u32,
+        total_batch: usize,
+        levels: []const u8,
+        stripes: [PARALLEL_STRIPE_COUNT]SpinLock = @splat(.{}),
+        ep_lock: SpinLock = .{},
+        next_idx: std.atomic.Value(usize),
+        had_error: std.atomic.Value(bool) = .init(false),
+    };
+
+    /// Insert `vectors` in parallel using transient stack-scoped 256-stripe node
+    /// spinlocks and the index's pre-warmed `SearchScratchPool`. Returns the first
+    /// assigned node ID (`base_id`); items receive contiguous IDs `base_id + i`.
+    ///
+    /// Thread safety: caller must hold exclusive access to `Hnsw` (no concurrent
+    /// `search()` or `insert()` calls). Falls back cleanly to sequential `insert()`
+    /// for single-threaded/wasm targets, small batches (<32), or `max(m, m_max0) > 64`.
+    pub fn insertBatchParallel(self: *Hnsw, vectors: []const []align(1) const f32) !u32 {
+        if (vectors.len == 0) return @intCast(self.node_count);
+
+        const target_dim = if (self.dim == 0 and self.node_count == 0) vectors[0].len else self.dim;
+        for (vectors) |v| {
+            if (v.len != target_dim) return error.DimensionMismatch;
+        }
+
+        const max_m = @max(self.params.m, self.params.m_max0);
+        if (comptime no_sync) {
+            return self.insertBatchSequential(vectors);
+        } else {
+            if (vectors.len < PARALLEL_MIN_BATCH or self.params.m_max0 == 0 or max_m > PARALLEL_MAX_M) {
+                return self.insertBatchSequential(vectors);
+            }
+
+            const cpu_count = std.Thread.getCpuCount() catch 4;
+            const n_workers = @min(@min(cpu_count, PARALLEL_MAX_WORKERS), vectors.len / 16);
+            if (n_workers <= 1) {
+                return self.insertBatchSequential(vectors);
+            }
+
+            const base_id: u32 = @intCast(self.node_count);
+
+            // Bootstrap empty/tiny graphs sequentially up to 32 nodes so workers
+            // start with a well-connected multi-layer seed core.
+            var start_rel: usize = 0;
+            if (self.node_count < 32) {
+                const seed_n = @min(vectors.len, 32 - self.node_count);
+                for (vectors[0..seed_n]) |v| {
+                    _ = try self.insert(v);
+                }
+                start_rel = seed_n;
+                if (vectors.len - start_rel < PARALLEL_MIN_BATCH) {
+                    for (vectors[start_rel..]) |v| {
+                        _ = try self.insert(v);
+                    }
+                    return base_id;
+                }
+            }
+
+            // Phase A (single-threaded): pre-allocate all slabs, sample levels,
+            // pre-size upper layers, and normalize/copy all remaining vectors upfront
+            // so zero reallocations happen while worker threads run.
+            const rem_vecs = vectors[start_rel..];
+            const rem_n = rem_vecs.len;
+            const rem_base: u32 = @intCast(self.node_count);
+
+            if (self.dim == 0 and self.node_count == 0) {
+                self.dim = target_dim;
+                self.vec_stride = if (target_dim > 0) std.mem.alignForward(usize, target_dim, 16) else 0;
+            }
+
+            const final_count = try std.math.add(usize, self.node_count, rem_n);
+            try self.ensureNodeCapacity(final_count, false);
+
+            const levels = try self.allocator.alloc(u8, rem_n);
+            defer self.allocator.free(levels);
+
+            var extra_upper_slots: usize = 0;
+            for (0..rem_n) |i| {
+                const lvl = self.sampleLevel();
+                levels[i] = lvl;
+                extra_upper_slots += lvl;
+            }
+
+            const old_upper_slots = self.upper_counts.items.len;
+            if (extra_upper_slots > 0) {
+                const new_upper_slots = try std.math.add(usize, old_upper_slots, extra_upper_slots);
+                try self.upper_counts.resize(self.allocator, new_upper_slots);
+                errdefer self.upper_counts.items.len = old_upper_slots;
+                @memset(self.upper_counts.items[old_upper_slots..new_upper_slots], 0);
+                if (self.upper_stride > 0) {
+                    const new_link_elems = try std.math.mul(usize, new_upper_slots, self.upper_stride);
+                    try self.upper_links.resize(self.allocator, new_link_elems);
+                }
+            }
+
+            // Acquire & pre-warm one SearchScratch per worker BEFORE committing `node_count`
+            // so OOM cannot leave half-linked nodes in the graph.
+            var checkouts: [PARALLEL_MAX_WORKERS]SearchScratchPool.Checkout = undefined;
+            var acquired: usize = 0;
+            defer {
+                for (0..acquired) |wi| {
+                    self.scratch_pool.release(self.allocator, checkouts[wi]);
+                }
+            }
+            const min_cand_cap = @max(@as(usize, self.params.ef_construction) * 4, 256);
+            for (0..n_workers) |wi| {
+                checkouts[wi] = try self.scratch_pool.acquire(self.allocator);
+                acquired += 1;
+                const sc = checkouts[wi].scratch;
+                try sc.visited.prepare(self.allocator, final_count);
+                sc.visited.reset();
+                try sc.candidates.items.ensureTotalCapacity(self.allocator, min_cand_cap);
+                if (sc.results_buf.items.len < self.params.ef_construction) {
+                    try sc.results_buf.resize(self.allocator, self.params.ef_construction);
+                }
+            }
+
+            // Populate vector slab and headers (all immutable fields during Phase B).
+            var next_upper: usize = old_upper_slots;
+            for (rem_vecs, 0..) |v, i| {
+                const nid: u32 = rem_base + @as(u32, @intCast(i));
+                const lvl = levels[i];
+                var uoff: u32 = NO_UPPER;
+                if (lvl > 0) {
+                    uoff = @intCast(next_upper);
+                    next_upper += lvl;
+                }
+                self.writeVectorToSlab(nid, v);
+                self.headers[nid] = .{
+                    .l0_count = 0,
+                    .level = lvl,
+                    .flags = 0,
+                    .upper_offset = uoff,
+                };
+                self.l0_max_dist[nid] = std.math.inf(f32);
+            }
+            self.node_count = final_count;
+
+            // Phase B: parallel linking across `n_workers` threads (caller is worker 0).
+            var state = ParallelBuildState{
+                .hnsw = self,
+                .base_id = rem_base,
+                .total_batch = rem_n,
+                .levels = levels,
+                .next_idx = .init(0),
+            };
+
+            const WorkerArg = struct {
+                state: *ParallelBuildState,
+                scratch: *SearchScratch,
+            };
+            var args: [PARALLEL_MAX_WORKERS]WorkerArg = undefined;
+            for (0..n_workers) |wi| {
+                args[wi] = .{ .state = &state, .scratch = checkouts[wi].scratch };
+            }
+
+            var threads: [PARALLEL_MAX_WORKERS - 1]std.Thread = undefined;
+            var spawned: usize = 0;
+            for (1..n_workers) |wi| {
+                threads[spawned] = std.Thread.spawn(.{}, parallelInsertWorker, .{&args[wi]}) catch break;
+                spawned += 1;
+            }
+
+            parallelInsertWorker(&args[0]);
+
+            for (threads[0..spawned]) |th| th.join();
+
+            if (state.had_error.load(.acquire)) {
+                return error.OutOfMemory;
+            }
+            return base_id;
+        }
+    }
+
+    fn insertBatchSequential(self: *Hnsw, vectors: []const []align(1) const f32) !u32 {
+        const base_id: u32 = @intCast(self.node_count);
+        try self.reserve(vectors.len);
+        for (vectors) |v| {
+            _ = try self.insert(v);
+        }
+        return base_id;
+    }
+
+    fn parallelInsertWorker(arg: anytype) void {
+        const state: *ParallelBuildState = arg.state;
+        const self = state.hnsw;
+        const scratch: *SearchScratch = arg.scratch;
+
+        var eps: std.ArrayListUnmanaged(PQItem) = .empty;
+        defer eps.deinit(self.allocator);
+        eps.ensureTotalCapacity(self.allocator, @max(@as(usize, self.params.ef_construction), 64)) catch {
+            state.had_error.store(true, .release);
+            return;
+        };
+
+        const CHUNK: usize = 4;
+        while (true) {
+            const start = state.next_idx.fetchAdd(CHUNK, .monotonic);
+            if (start >= state.total_batch) break;
+            const end = @min(start + CHUNK, state.total_batch);
+
+            for (start..end) |rel| {
+                const new_id: u32 = state.base_id + @as(u32, @intCast(rel));
+                const new_level = state.levels[rel];
+                self.linkNodeParallel(state, new_id, new_level, scratch, &eps) catch {
+                    state.had_error.store(true, .release);
+                    return;
+                };
+            }
+        }
+    }
+
+    inline fn copyNeighborsLocked(
+        self: *const Hnsw,
+        state: *ParallelBuildState,
+        id: u32,
+        lc: usize,
+        out: *[PARALLEL_MAX_M]u32,
+    ) usize {
+        const stripe = &state.stripes[id & PARALLEL_STRIPE_MASK];
+        stripe.lock();
+        const nbrs = self.nodeNeighbors(id, lc);
+        const n = @min(nbrs.len, PARALLEL_MAX_M);
+        if (n > 0) @memcpy(out[0..n], nbrs[0..n]);
+        stripe.unlock();
+        return n;
+    }
+
+    fn greedyDescendParallel(
+        self: *const Hnsw,
+        state: *ParallelBuildState,
+        q_ptr: [*]align(32) const f32,
+        start_id: u32,
+        start_dist: f32,
+        from_level: u8,
+        to_level_exclusive: u8,
+    ) PQItem {
+        return switch (self.metric_kind) {
+            .cosine_unit => self.greedyDescendParallelKind(.cosine_unit, state, q_ptr, start_id, start_dist, from_level, to_level_exclusive),
+            .dot => self.greedyDescendParallelKind(.dot, state, q_ptr, start_id, start_dist, from_level, to_level_exclusive),
+            .l2 => self.greedyDescendParallelKind(.l2, state, q_ptr, start_id, start_dist, from_level, to_level_exclusive),
+            .custom => self.greedyDescendParallelKind(.custom, state, q_ptr, start_id, start_dist, from_level, to_level_exclusive),
+        };
+    }
+
+    fn greedyDescendParallelKind(
+        self: *const Hnsw,
+        comptime kind: MetricKind,
+        state: *ParallelBuildState,
+        q_ptr: [*]align(32) const f32,
+        start_id: u32,
+        start_dist: f32,
+        from_level: u8,
+        to_level_exclusive: u8,
+    ) PQItem {
+        var curr_id = start_id;
+        var curr_dist = start_dist;
+        var lc: i32 = from_level;
+        var local_nbrs: [PARALLEL_MAX_M]u32 = undefined;
+        while (lc > to_level_exclusive) : (lc -= 1) {
+            const level: usize = @intCast(lc);
+            while (true) {
+                const n_nbrs = self.copyNeighborsLocked(state, curr_id, level, &local_nbrs);
+                if (n_nbrs == 0) break;
+                const nbrs = local_nbrs[0..n_nbrs];
+
+                var improved = false;
+                var j: usize = 0;
+                const init_pf = @min(@as(usize, 4), n_nbrs);
+                for (0..init_pf) |pf| {
+                    if (nbrs[pf] < self.node_count) self.prefetchVector(nbrs[pf]);
+                }
+
+                while (j + 4 <= n_nbrs) : (j += 4) {
+                    const pf_end = @min(j + 8, n_nbrs);
+                    var pf = j + 4;
+                    while (pf < pf_end) : (pf += 1) {
+                        if (nbrs[pf] < self.node_count) self.prefetchVector(nbrs[pf]);
+                    }
+                    const batch_ids: [4]u32 = .{ nbrs[j], nbrs[j + 1], nbrs[j + 2], nbrs[j + 3] };
+                    const ds = self.distPreparedBatch4Kind(kind, q_ptr, batch_ids);
+                    inline for (0..4) |lane| {
+                        if (ds[lane] < curr_dist) {
+                            curr_dist = ds[lane];
+                            curr_id = batch_ids[lane];
+                            improved = true;
+                        }
+                    }
+                }
+                while (j < n_nbrs) : (j += 1) {
+                    const nb_id = nbrs[j];
+                    const d = self.distPreparedSingleKind(kind, q_ptr, nb_id);
+                    if (d < curr_dist) {
+                        curr_dist = d;
+                        curr_id = nb_id;
+                        improved = true;
+                    }
+                }
+                if (!improved) break;
+            }
+        }
+        return .{ .id = curr_id, .dist = curr_dist };
+    }
+
+    fn searchLayerParallel(
+        self: *const Hnsw,
+        state: *ParallelBuildState,
+        q_ptr: [*]align(32) const f32,
+        entry_points: []const PQItem,
+        ef: usize,
+        lc: u8,
+        exclude_id: u32,
+        scratch: *SearchScratch,
+    ) !BoundedResultHeap {
+        return switch (self.metric_kind) {
+            .cosine_unit => self.searchLayerParallelKind(.cosine_unit, state, q_ptr, entry_points, ef, lc, exclude_id, scratch),
+            .dot => self.searchLayerParallelKind(.dot, state, q_ptr, entry_points, ef, lc, exclude_id, scratch),
+            .l2 => self.searchLayerParallelKind(.l2, state, q_ptr, entry_points, ef, lc, exclude_id, scratch),
+            .custom => self.searchLayerParallelKind(.custom, state, q_ptr, entry_points, ef, lc, exclude_id, scratch),
+        };
+    }
+
+    fn searchLayerParallelKind(
+        self: *const Hnsw,
+        comptime kind: MetricKind,
+        state: *ParallelBuildState,
+        q_ptr: [*]align(32) const f32,
+        entry_points: []const PQItem,
+        ef: usize,
+        lc: u8,
+        exclude_id: u32,
+        scratch: *SearchScratch,
+    ) !BoundedResultHeap {
+        try scratch.visited.prepare(self.allocator, self.node_count);
+        defer scratch.visited.reset();
+
+        scratch.candidates.clearRetainingCapacity();
+        var w = BoundedResultHeap.init(scratch.results_buf.items[0..ef]);
+
+        for (entry_points) |ep| {
+            if (ep.id >= self.node_count) continue;
+            if (scratch.visited.testAndSet(ep.id)) continue;
+            try scratch.candidates.push(self.allocator, ep);
+            if (ep.id != exclude_id) {
+                w.pushOrReplace(ep);
+            }
+        }
+
+        var worst_dist: f32 = w.worstDist();
+        const use_tags = scratch.visited.use_tags;
+        const node_count = self.node_count;
+        var local_nbrs: [PARALLEL_MAX_M]u32 = undefined;
+
+        while (scratch.candidates.pop()) |c| {
+            if (c.dist > worst_dist) break;
+
+            const n_nbrs = self.copyNeighborsLocked(state, c.id, lc, &local_nbrs);
+            if (n_nbrs == 0) continue;
+            const nbrs = local_nbrs[0..n_nbrs];
+
+            var unvisited: [PARALLEL_MAX_M]u32 = undefined;
+            var u_count: usize = 0;
+            if (use_tags) {
+                const tags = scratch.visited.tags.items;
+                const gen = scratch.visited.gen;
+                for (nbrs) |nb_id| {
+                    if (nb_id >= node_count) continue;
+                    if (tags[nb_id] != gen) {
+                        tags[nb_id] = gen;
+                        unvisited[u_count] = nb_id;
+                        if (u_count < 4) self.prefetchVector(nb_id);
+                        u_count += 1;
+                    }
+                }
+            } else {
+                for (nbrs) |nb_id| {
+                    if (nb_id >= node_count) continue;
+                    if (!scratch.visited.testAndSetBitset(nb_id)) {
+                        unvisited[u_count] = nb_id;
+                        if (u_count < 4) self.prefetchVector(nb_id);
+                        u_count += 1;
+                    }
+                }
+            }
+
+            var j: usize = 0;
+            while (j + 4 <= u_count) : (j += 4) {
+                const pf_end = @min(j + 8, u_count);
+                var pf = j + 4;
+                while (pf < pf_end) : (pf += 1) {
+                    self.prefetchVector(unvisited[pf]);
+                }
+                const batch_ids: [4]u32 = .{ unvisited[j], unvisited[j + 1], unvisited[j + 2], unvisited[j + 3] };
+                const ds = self.distPreparedBatch4Kind(kind, q_ptr, batch_ids);
+                inline for (0..4) |lane| {
+                    const d = ds[lane];
+                    if (d < worst_dist) {
+                        const nb_id = batch_ids[lane];
+                        try scratch.candidates.push(self.allocator, .{ .id = nb_id, .dist = d });
+                        if (nb_id != exclude_id) {
+                            w.pushOrReplace(.{ .id = nb_id, .dist = d });
+                            worst_dist = w.worstDist();
+                        }
+                    }
+                }
+            }
+            while (j < u_count) : (j += 1) {
+                const nb_id = unvisited[j];
+                const d = self.distPreparedSingleKind(kind, q_ptr, nb_id);
+                if (d < worst_dist) {
+                    try scratch.candidates.push(self.allocator, .{ .id = nb_id, .dist = d });
+                    if (nb_id != exclude_id) {
+                        w.pushOrReplace(.{ .id = nb_id, .dist = d });
+                        worst_dist = w.worstDist();
+                    }
+                }
+            }
+        }
+
+        return w;
+    }
+
+    /// Add edge `nb_id -> target_id` while caller holds `state.stripes[nb_id & mask]`.
+    /// Stack-only (zero heap alloc, zero `insert_scratch` use) and deduplicated.
+    fn addBackEdgeUnderStripeLock(
+        self: *Hnsw,
+        nb_id: u32,
+        target_id: u32,
+        d_new: f32,
+        lc: u8,
+    ) void {
+        if (nb_id == target_id) return;
+        const cap = self.maxNeighborsAtLevel(lc);
+        if (cap == 0) return;
+
+        const nb_nbrs_slice = self.nodeNeighborsMut(nb_id, lc);
+        const cur_count = self.nodeNeighborCount(nb_id, lc);
+
+        for (nb_nbrs_slice[0..cur_count]) |existing| {
+            if (existing == target_id) return;
+        }
+
+        if (cur_count < cap) {
+            nb_nbrs_slice[cur_count] = target_id;
+            self.setNodeNeighborCount(nb_id, lc, @intCast(cur_count + 1));
+            return;
+        }
+
+        if (lc == 0 and self.metric_kind != .custom and
+            (self.headers[nb_id].flags & FLAG_L0_PRUNED) != 0 and
+            d_new > self.l0_max_dist[nb_id])
+        {
+            return;
+        }
+
+        var stack_cands: [PARALLEL_MAX_M + 1]PQItem = undefined;
+        var stack_sel: [PARALLEL_MAX_M]PQItem = undefined;
+        const total = cur_count + 1;
+        const cands = stack_cands[0..total];
+
+        const nb_ptr: [*]align(32) const f32 = self.vecPtr(nb_id);
+        var j: usize = 0;
+        const init_pf = @min(@as(usize, 4), cur_count);
+        for (0..init_pf) |pf| self.prefetchVector(nb_nbrs_slice[pf]);
+
+        while (j + 4 <= cur_count) : (j += 4) {
+            const pf_end = @min(j + 8, cur_count);
+            var pf = j + 4;
+            while (pf < pf_end) : (pf += 1) self.prefetchVector(nb_nbrs_slice[pf]);
+
+            const batch_ids: [4]u32 = .{
+                nb_nbrs_slice[j],
+                nb_nbrs_slice[j + 1],
+                nb_nbrs_slice[j + 2],
+                nb_nbrs_slice[j + 3],
+            };
+            const ds = self.distPreparedBatch4(nb_ptr, batch_ids);
+            inline for (0..4) |lane| {
+                cands[j + lane] = .{ .id = batch_ids[lane], .dist = ds[lane] };
+            }
+        }
+        while (j < cur_count) : (j += 1) {
+            const id = nb_nbrs_slice[j];
+            cands[j] = .{ .id = id, .dist = self.distPreparedSingle(nb_ptr, id) };
+        }
+        cands[cur_count] = .{ .id = target_id, .dist = d_new };
+
+        sortPQItemsAsc(cands);
+
+        const n_selected = self.selectNeighborsHeuristicSorted(cands, cap, stack_sel[0..cap]);
+        for (0..n_selected) |i| {
+            nb_nbrs_slice[i] = stack_sel[i].id;
+        }
+        self.setNodeNeighborCount(nb_id, lc, @intCast(n_selected));
+
+        if (lc == 0) {
+            if (n_selected == cap) {
+                self.headers[nb_id].flags |= FLAG_L0_PRUNED;
+                self.l0_max_dist[nb_id] = stack_sel[n_selected - 1].dist;
+            } else {
+                self.headers[nb_id].flags &= ~FLAG_L0_PRUNED;
+            }
+        }
+    }
+
+    fn linkNodeParallel(
+        self: *Hnsw,
+        state: *ParallelBuildState,
+        new_id: u32,
+        new_level: u8,
+        scratch: *SearchScratch,
+        eps: *std.ArrayListUnmanaged(PQItem),
+    ) !void {
+        const q_ptr: [*]align(32) const f32 = self.vecPtr(new_id);
+
+        state.ep_lock.lock();
+        const ep0 = self.entry_point.?;
+        const snap_top = self.top_level;
+        state.ep_lock.unlock();
+
+        var curr_ep = PQItem{ .id = ep0, .dist = self.distPreparedSingle(q_ptr, ep0) };
+        if (snap_top > new_level) {
+            curr_ep = self.greedyDescendParallel(state, q_ptr, curr_ep.id, curr_ep.dist, snap_top, new_level);
+        }
+
+        eps.clearRetainingCapacity();
+        try eps.append(self.allocator, curr_ep);
+
+        var stack_sel: [PARALLEL_MAX_M]PQItem = undefined;
+        var lc: i32 = @min(@as(i32, snap_top), @as(i32, new_level));
+        while (lc >= 0) : (lc -= 1) {
+            const level: u8 = @intCast(lc);
+            var w = try self.searchLayerParallel(
+                state,
+                q_ptr,
+                eps.items,
+                self.params.ef_construction,
+                level,
+                new_id,
+                scratch,
+            );
+
+            if (lc > 0) {
+                const w_items = w.items();
+                eps.clearRetainingCapacity();
+                try eps.ensureTotalCapacity(self.allocator, w_items.len);
+                eps.appendSliceAssumeCapacity(w_items);
+            }
+
+            const sorted = w.sortedAsc();
+            const m_target = self.maxNeighborsAtLevel(level);
+            const n_selected = self.selectNeighborsHeuristicSorted(sorted, m_target, stack_sel[0..m_target]);
+
+            if (n_selected > 0) {
+                // Install forward links on `new_id` under its own stripe lock.
+                const self_stripe = &state.stripes[new_id & PARALLEL_STRIPE_MASK];
+                self_stripe.lock();
+                const cur_cnt = self.nodeNeighborCount(new_id, level);
+                if (cur_cnt == 0) {
+                    const self_nbrs = self.nodeNeighborsMut(new_id, level);
+                    for (0..n_selected) |i| {
+                        self_nbrs[i] = stack_sel[i].id;
+                    }
+                    self.setNodeNeighborCount(new_id, level, @intCast(n_selected));
+                    if (level == 0 and n_selected == m_target) {
+                        self.headers[new_id].flags |= FLAG_L0_PRUNED;
+                        self.l0_max_dist[new_id] = stack_sel[n_selected - 1].dist;
+                    }
+                } else {
+                    for (stack_sel[0..n_selected]) |sel| {
+                        self.addBackEdgeUnderStripeLock(new_id, sel.id, sel.dist, level);
+                    }
+                }
+                self_stripe.unlock();
+
+                // Install reverse back-edges one neighbor stripe lock at a time.
+                for (stack_sel[0..n_selected]) |sel| {
+                    const nb_stripe = &state.stripes[sel.id & PARALLEL_STRIPE_MASK];
+                    nb_stripe.lock();
+                    self.addBackEdgeUnderStripeLock(sel.id, new_id, sel.dist, level);
+                    nb_stripe.unlock();
+                }
+            }
+        }
+
+        if (new_level > snap_top) {
+            state.ep_lock.lock();
+            if (new_level > self.top_level) {
+                self.top_level = new_level;
+                self.entry_point = new_id;
+            }
+            state.ep_lock.unlock();
+        }
+    }
+
+    // ╔═══════════════════════════════════════════════════╗
     // ║  Algorithm 5 — search_knn                          ║
     // ╚═══════════════════════════════════════════════════╝
 
@@ -2700,4 +3320,105 @@ test "hnsw: corrupt and truncated readFrom are leak-free" {
         var reader = SerdeHarness.Reader{ .h = &bad };
         try testing.expectError(error.CorruptGraph, Hnsw.readFrom(alloc, &reader, VecStore.resolve, @ptrCast(&vs)));
     }
+}
+
+test "hnsw: insertBatchParallel builds valid graph with high Recall@10 and handles dim mismatch" {
+    const alloc = testing.allocator;
+    const dim: usize = 32;
+    const n_total: usize = 1000;
+    const batch1_n: usize = 500;
+    const n_queries: usize = 25;
+    const k: usize = 10;
+
+    var prng = std.Random.DefaultPrng.init(0x5EED_B47C);
+    const rand = prng.random();
+
+    // Generate 1,000 clustered 32d vectors + 25 queries.
+    const centers = try alloc.alloc(f32, 16 * dim);
+    defer alloc.free(centers);
+    for (centers) |*c| c.* = rand.floatNorm(f32);
+
+    const data = try alloc.alloc(f32, n_total * dim);
+    defer alloc.free(data);
+    const slices = try alloc.alloc([]align(1) const f32, n_total);
+    defer alloc.free(slices);
+
+    for (0..n_total) |i| {
+        const cid = i % 16;
+        const dst = data[i * dim ..][0..dim];
+        const ctr = centers[cid * dim ..][0..dim];
+        for (0..dim) |d| {
+            dst[d] = ctr[d] + 0.25 * rand.floatNorm(f32);
+        }
+        slices[i] = dst;
+    }
+
+    var h = Hnsw.init(alloc, .{ .m = 16, .m_max0 = 32, .ef_construction = 100, .seed = 0x12345 });
+    defer h.deinit();
+
+    // Two consecutive parallel batches: from-empty (0..500) + incremental (500..1000).
+    const base1 = try h.insertBatchParallel(slices[0..batch1_n]);
+    try testing.expectEqual(@as(u32, 0), base1);
+    try testing.expectEqual(batch1_n, h.len());
+
+    const base2 = try h.insertBatchParallel(slices[batch1_n..n_total]);
+    try testing.expectEqual(@as(u32, batch1_n), base2);
+    try testing.expectEqual(n_total, h.len());
+
+    // Dimension mismatch rejects cleanly without mutating node_count or leaking.
+    const bad_vec = [_]f32{ 1, 2, 3, 4 };
+    const bad_batch = [_][]align(1) const f32{ slices[0], &bad_vec };
+    try testing.expectError(error.DimensionMismatch, h.insertBatchParallel(&bad_batch));
+    try testing.expectEqual(n_total, h.len());
+
+    // Structural graph invariants across every node and every level.
+    for (0..n_total) |i| {
+        const nid: u32 = @intCast(i);
+        const lvl = h.nodeLevel(nid);
+        try testing.expect(h.nodeNeighbors(nid, 0).len > 0);
+        for (0..@as(usize, lvl) + 1) |lc| {
+            const nbrs = h.nodeNeighbors(nid, lc);
+            try testing.expect(nbrs.len <= h.maxNeighborsAtLevel(@intCast(lc)));
+            for (nbrs, 0..) |nb, a| {
+                try testing.expect(nb < n_total);
+                try testing.expect(nb != nid); // no self-loops
+                for (nbrs[a + 1 ..]) |nb2| {
+                    try testing.expect(nb != nb2); // no duplicate edges
+                }
+            }
+        }
+    }
+
+    // Verify Recall@10 >= 0.98 against exact brute-force ground truth.
+    var hits: usize = 0;
+    const total_possible = n_queries * k;
+    var q: [dim]f32 = undefined;
+    var exact: [n_total]SearchResult = undefined;
+    var out: [k]SearchResult = undefined;
+    for (0..n_queries) |qi| {
+        const ctr = centers[(qi % 16) * dim ..][0..dim];
+        for (0..dim) |d| q[d] = ctr[d] + 0.25 * rand.floatNorm(f32);
+
+        for (0..n_total) |i| {
+            exact[i] = .{ .id = @intCast(i), .dist = metric_mod.cosine_dist(&q, slices[i]) };
+        }
+        std.mem.sort(SearchResult, &exact, {}, struct {
+            fn lt(_: void, a: SearchResult, b: SearchResult) bool {
+                return a.dist < b.dist;
+            }
+        }.lt);
+
+        const got = try h.search(&q, k, 64, &out, null);
+        try testing.expectEqual(k, got);
+        for (out[0..got]) |r| {
+            for (exact[0..k]) |gt| {
+                if (r.id == gt.id) {
+                    hits += 1;
+                    break;
+                }
+            }
+        }
+    }
+    const recall = @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(total_possible));
+    try testing.expect(recall >= 0.98);
 }

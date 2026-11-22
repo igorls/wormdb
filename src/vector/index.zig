@@ -1095,15 +1095,41 @@ pub const NamespaceIndex = struct {
                 // One write-lock acquisition for the entire drain batch.
                 self.lock.lock();
                 self.reserveAdditionalLocked(drained) catch {};
-                for (q.scratch.items) |item| {
-                    const vec_f32 = distance.bytesToF32(item.vector) orelse {
-                        std.log.warn("async hnsw: invalid vector bytes for key '{s}'", .{item.key});
-                        continue;
-                    };
-                    _ = self.insertLocked(item.key, vec_f32, item.timestamp) catch |e| {
+                var batch_stack: [512]BatchInsertItem = undefined;
+                var batch_heap: ?[]BatchInsertItem = null;
+                defer if (batch_heap) |bh| self.allocator.free(bh);
+                const batch_buf: ?[]BatchInsertItem = if (drained >= 32) blk: {
+                    if (drained <= batch_stack.len) break :blk batch_stack[0..drained];
+                    const b = self.allocator.alloc(BatchInsertItem, drained) catch break :blk null;
+                    batch_heap = b;
+                    break :blk b;
+                } else null;
+
+                if (batch_buf) |buf| {
+                    var valid: usize = 0;
+                    for (q.scratch.items) |item| {
+                        const vec_f32 = distance.bytesToF32(item.vector) orelse {
+                            std.log.warn("async hnsw: invalid vector bytes for key '{s}'", .{item.key});
+                            continue;
+                        };
+                        buf[valid] = .{ .key = item.key, .vector = vec_f32, .timestamp = item.timestamp };
+                        valid += 1;
+                    }
+                    _ = self.insertBatchLocked(buf[0..valid]) catch |e| {
                         self.complete_with_store = false;
-                        std.log.warn("async hnsw: insert '{s}' failed: {s}", .{ item.key, @errorName(e) });
+                        std.log.warn("async hnsw: batch insert failed: {s}", .{@errorName(e)});
                     };
+                } else {
+                    for (q.scratch.items) |item| {
+                        const vec_f32 = distance.bytesToF32(item.vector) orelse {
+                            std.log.warn("async hnsw: invalid vector bytes for key '{s}'", .{item.key});
+                            continue;
+                        };
+                        _ = self.insertLocked(item.key, vec_f32, item.timestamp) catch |e| {
+                            self.complete_with_store = false;
+                            std.log.warn("async hnsw: insert '{s}' failed: {s}", .{ item.key, @errorName(e) });
+                        };
+                    }
                 }
                 self.lock.unlock();
 
@@ -1288,6 +1314,236 @@ pub const NamespaceIndex = struct {
         }
 
         return node_id;
+    }
+
+    pub const BatchInsertItem = struct {
+        key: []const u8,
+        vector: []align(1) const f32,
+        timestamp: u64,
+        pre_encoded_bq: ?[]const u8 = null,
+    };
+
+    /// Insert a batch of vectors under the caller's write-lock using multi-threaded
+    /// `Hnsw.insertBatchParallel` when `items.len >= 32` and all items share a single
+    /// dimension with distinct keys. Falls back to sequential `insertLockedWithBq` for
+    /// small batches, mixed dimensions, intra-batch duplicate keys, or single-threaded
+    /// (`wasm32-wasi`) builds, preserving identical per-item semantics.
+    pub fn insertBatchLocked(self: *NamespaceIndex, items: []const BatchInsertItem) !usize {
+        if (items.len == 0) return 0;
+
+        if (comptime build_options.single_threaded) {
+            return self.insertBatchSequentialLocked(items);
+        } else {
+            if (items.len < 32) {
+                return self.insertBatchSequentialLocked(items);
+            }
+
+            const target_dim = self.dim orelse items[0].vector.len;
+            if (target_dim == 0) {
+                return self.insertBatchSequentialLocked(items);
+            }
+
+            // Validate uniform dimension and absence of intra-batch duplicate keys.
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            defer seen.deinit(self.allocator);
+            try seen.ensureTotalCapacity(self.allocator, @intCast(items.len));
+            for (items) |item| {
+                if (item.vector.len != target_dim) {
+                    return self.insertBatchSequentialLocked(items);
+                }
+                const gop = seen.getOrPutAssumeCapacity(item.key);
+                if (gop.found_existing) {
+                    return self.insertBatchSequentialLocked(items);
+                }
+            }
+
+            const StagedEntry = struct {
+                item_idx: usize,
+                key_copy: []u8,
+                incoming_hash: u64,
+                old_live_id: ?u32,
+                rq_l2_norm: f32 = 0,
+                rq_corr: f32 = 0,
+            };
+
+            var staged: std.ArrayListUnmanaged(StagedEntry) = .empty;
+            defer {
+                for (staged.items) |st| self.allocator.free(st.key_copy);
+                staged.deinit(self.allocator);
+            }
+            try staged.ensureTotalCapacity(self.allocator, items.len);
+
+            var batch_vecs: std.ArrayListUnmanaged([]align(1) const f32) = .empty;
+            defer batch_vecs.deinit(self.allocator);
+            try batch_vecs.ensureTotalCapacity(self.allocator, items.len);
+
+            // Pass 1: filter identical/stale overwrites and stage key copies + vectors.
+            for (items, 0..) |item, idx| {
+                const incoming_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(item.vector));
+                var old_live_id: ?u32 = null;
+                if (self.key_to_node.get(item.key)) |old_id| {
+                    if (!self.tombstones.isSet(old_id)) {
+                        if (item.timestamp < self.timestamps.items[old_id]) {
+                            continue;
+                        }
+                        const same_vec = if (self.hnsw.storesUnitVectors())
+                            self.vec_hashes.items[old_id] == incoming_hash and self.hnsw.dim == item.vector.len
+                        else blk: {
+                            const old_vec = self.hnsw.getVector(old_id);
+                            break :blk old_vec.len == item.vector.len and
+                                std.mem.eql(u8, std.mem.sliceAsBytes(old_vec), std.mem.sliceAsBytes(item.vector));
+                        };
+                        if (same_vec) {
+                            self.timestamps.items[old_id] = item.timestamp;
+                            continue;
+                        }
+                        old_live_id = old_id;
+                    }
+                }
+
+                const key_copy = try self.allocator.dupe(u8, item.key);
+                staged.appendAssumeCapacity(.{
+                    .item_idx = idx,
+                    .key_copy = key_copy,
+                    .incoming_hash = incoming_hash,
+                    .old_live_id = old_live_id,
+                });
+                batch_vecs.appendAssumeCapacity(item.vector);
+            }
+
+            const n_new = staged.items.len;
+            if (n_new == 0) return 0;
+
+            const base_len = self.hnsw.len();
+            const final_len = try std.math.add(usize, base_len, n_new);
+
+            // Reserve all side-tables + slabs upfront BEFORE mutating HNSW.
+            try self.keys.ensureTotalCapacity(self.allocator, final_len);
+            try self.timestamps.ensureTotalCapacity(self.allocator, final_len);
+            try self.vec_hashes.ensureTotalCapacity(self.allocator, final_len);
+            try self.key_to_node.ensureTotalCapacity(self.allocator, @intCast(final_len));
+            try self.tombstones.resize(self.allocator, final_len, false);
+
+            const want_rq = blk: {
+                if (self.rabitq_params) |p| {
+                    if (self.rq_slab.synced and p.dim == target_dim and self.rq_slab.len == base_len) {
+                        if (self.rq_slab.dim == 0) self.rq_slab.configure(self.allocator, target_dim);
+                        try self.rq_slab.ensureCapacity(self.allocator, final_len, false);
+                        break :blk true;
+                    }
+                }
+                break :blk false;
+            };
+            const want_bq = blk: {
+                if (self.rabitq_params == null and self.bq_slab.synced and self.bq_slab.len == base_len) {
+                    if (self.bq_slab.dim == 0) self.bq_slab.configure(self.allocator, target_dim);
+                    try self.bq_slab.ensureCapacity(self.allocator, final_len, false);
+                    break :blk true;
+                }
+                break :blk false;
+            };
+
+            // Pre-encode RaBitQ codes into a contiguous staging buffer before mutating HNSW.
+            const rq_cb = if (want_rq) rabitq_mod.codeBytes(target_dim) else 0;
+            var rq_codes_buf: []u8 = &.{};
+            defer if (rq_codes_buf.len > 0) self.allocator.free(rq_codes_buf);
+            if (want_rq) {
+                rq_codes_buf = try self.allocator.alloc(u8, n_new * rq_cb);
+                const p = self.rabitq_params.?;
+                for (staged.items, 0..) |*st, i| {
+                    const item = items[st.item_idx];
+                    const dst = rq_codes_buf[i * rq_cb ..][0..rq_cb];
+                    var parsed: ?rabitq_mod.Encoded = null;
+                    if (item.pre_encoded_bq) |pb| {
+                        if (rabitq_mod.parse(pb, target_dim)) |enc| {
+                            @memcpy(dst, enc.code);
+                            parsed = enc;
+                        }
+                    }
+                    if (parsed == null) {
+                        parsed = try self.encodeRabitqCoreLocked(self.allocator, p, item.vector, dst);
+                    }
+                    st.rq_l2_norm = parsed.?.l2_norm;
+                    st.rq_corr = parsed.?.corr;
+                }
+            }
+
+            // Pass 2: Parallel multi-threaded HNSW graph construction!
+            const base_id = try self.hnsw.insertBatchParallel(batch_vecs.items);
+
+            // Pass 3: Infallible commit of side-tables and quantized slabs.
+            if (self.dim == null) self.dim = target_dim;
+
+            for (staged.items, 0..) |st, i| {
+                const node_id: u32 = base_id + @as(u32, @intCast(i));
+                const item = items[st.item_idx];
+                if (st.old_live_id) |old_id| {
+                    self.tombstones.set(old_id);
+                    self.tombstone_count += 1;
+                }
+                self.keys.appendAssumeCapacity(st.key_copy);
+                self.timestamps.appendAssumeCapacity(item.timestamp);
+                self.vec_hashes.appendAssumeCapacity(st.incoming_hash);
+                self.key_to_node.putAssumeCapacity(st.key_copy, node_id);
+
+                if (want_rq) {
+                    const code = rq_codes_buf[i * rq_cb ..][0..rq_cb];
+                    self.rq_slab.setSlot(node_id, code, st.rq_l2_norm, st.rq_corr);
+                } else if (want_bq) {
+                    const cb = self.bq_slab.code_bytes;
+                    if (item.pre_encoded_bq) |pb| {
+                        if (pb.len == cb) {
+                            self.bq_slab.setSlot(node_id, pb);
+                        } else {
+                            const dst = self.bq_slab.codes[node_id * self.bq_slab.code_stride ..][0..self.bq_slab.code_stride];
+                            distance.binaryQuantize(item.vector, dst[0..cb]);
+                            if (self.bq_slab.code_stride > cb) @memset(dst[cb..self.bq_slab.code_stride], 0);
+                        }
+                    } else {
+                        const dst = self.bq_slab.codes[node_id * self.bq_slab.code_stride ..][0..self.bq_slab.code_stride];
+                        distance.binaryQuantize(item.vector, dst[0..cb]);
+                        if (self.bq_slab.code_stride > cb) @memset(dst[cb..self.bq_slab.code_stride], 0);
+                    }
+                }
+            }
+
+            // Ownership of all `key_copy` slices transferred into `self.keys`.
+            staged.clearRetainingCapacity();
+
+            if (want_rq) {
+                const old_blocks = self.rq_slab.packed_blocks;
+                self.rq_slab.len = final_len;
+                const new_blocks = final_len / 32;
+                var b = old_blocks;
+                while (b < new_blocks) : (b += 1) {
+                    self.rq_slab.packBlock(b);
+                }
+                self.rq_slab.packed_blocks = new_blocks;
+            } else if (self.rabitq_params != null) {
+                self.rq_slab.synced = false;
+            }
+
+            if (want_bq) {
+                self.bq_slab.len = final_len;
+            } else if (self.rabitq_params == null) {
+                self.bq_slab.synced = false;
+            }
+
+            return n_new;
+        }
+    }
+
+    fn insertBatchSequentialLocked(self: *NamespaceIndex, items: []const BatchInsertItem) !usize {
+        var inserted: usize = 0;
+        for (items) |item| {
+            _ = self.insertLockedWithBq(item.key, item.vector, item.timestamp, item.pre_encoded_bq) catch |e| {
+                self.markIncompleteLocked();
+                std.log.warn("insertBatchLocked: HNSW insert '{s}': {s}", .{ item.key, @errorName(e) });
+                continue;
+            };
+            inserted += 1;
+        }
+        return inserted;
     }
 
     fn encodeRabitqCoreLocked(

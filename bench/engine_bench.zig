@@ -221,7 +221,7 @@ fn benchKvStore(alloc: std.mem.Allocator) !void {
         };
         const t0 = nowNs();
         for (0..iters) |_| {
-            store_rnd.scanPrefixCallback("scan:1k:", @ptrCast(&sink), Cb.onMatch);
+            try store_rnd.scanPrefixCallback("scan:1k:", @ptrCast(&sink), Cb.onMatch);
         }
         const t1 = nowNs();
         std.mem.doNotOptimizeAway(sink);

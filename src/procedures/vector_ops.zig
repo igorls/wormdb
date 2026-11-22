@@ -27,6 +27,22 @@ const Metric = @import("../vector/metric.zig").Metric;
 const core = @import("../core/mod.zig");
 const VEC_NS_META_PREFIX: []const u8 = "__meta:vecns:";
 
+/// Test-only fault injection for `applyVbulkinsert`'s optional Phase-1 bookkeeping:
+/// `.staging` fails the `StagedBq` allocation, `.all` also withholds the fallback
+/// stored-item bitmap. Only read under `builtin.is_test`.
+const BulkTrackingFault = enum { none, staging, all };
+var bulk_tracking_fault_for_test: BulkTrackingFault = .none;
+
+const STORED_WORD_BITS: usize = @bitSizeOf(usize);
+
+inline fn storedBitSet(words: []usize, i: usize) void {
+    words[i / STORED_WORD_BITS] |= @as(usize, 1) << @intCast(i % STORED_WORD_BITS);
+}
+
+inline fn storedBitGet(words: []const usize, i: usize) bool {
+    return ((words[i / STORED_WORD_BITS] >> @intCast(i % STORED_WORD_BITS)) & 1) != 0;
+}
+
 /// Format `"<prefix><suffix>"` into `stack_buf` when it fits, otherwise allocate.
 fn concatInto(
     allocator: std.mem.Allocator,
@@ -426,12 +442,32 @@ pub fn applyVbulkinsert(
     defer if (staged) |s| allocator.free(s);
     var bq_blob: std.ArrayListUnmanaged(u8) = .empty;
     defer bq_blob.deinit(allocator);
-    if (stage_sync) {
+    const tracking_fault: BulkTrackingFault = if (@import("builtin").is_test) bulk_tracking_fault_for_test else .none;
+    if (stage_sync and tracking_fault == .none) {
         if (allocator.alloc(StagedBq, items.len)) |s| {
             @memset(s, .{});
             staged = s;
         } else |_| {}
     }
+
+    // Without `staged` (its allocation failed, or async was requested and may not get
+    // enabled) the sync Phase 2 still has to know which items Phase 1 stored: the
+    // parallel batch buffer is sized to `valid_count`, so an unstored item (WORM
+    // rejection, dimension mismatch) must not take a stored item's slot, nor be
+    // indexed. One bit per item, stack-backed for typical batch sizes.
+    var stored_stack: [64]usize = undefined;
+    var stored_heap: ?[]usize = null;
+    defer if (stored_heap) |h| allocator.free(h);
+    const stored_bits: ?[]usize = if (registry != null and staged == null and tracking_fault != .all) blk: {
+        const words = (items.len + STORED_WORD_BITS - 1) / STORED_WORD_BITS;
+        const w: []usize = if (words <= stored_stack.len) stored_stack[0..words] else heap: {
+            const h = allocator.alloc(usize, words) catch break :blk null;
+            stored_heap = h;
+            break :heap h;
+        };
+        @memset(w, 0);
+        break :blk w;
+    } else null;
 
     var bq_key_stack: [512]u8 = undefined;
     var bq_val_stack: [256]u8 = undefined;
@@ -462,6 +498,7 @@ pub fn applyVbulkinsert(
         };
         valid_count += 1;
         if (staged) |s| s[item_idx].stored = true;
+        if (stored_bits) |w| storedBitSet(w, item_idx);
         store.appendVectorInsertWal(item.key, namespace, metric.name(), worm, is_async, item.timestamp) catch |e| {
             std.log.warn("applyVbulkinsert: vector WAL metadata '{s}': {s}", .{ item.key, @errorName(e) });
         };
@@ -546,7 +583,12 @@ pub fn applyVbulkinsert(
                 var batch_stack: [1024]NamespaceIndex.BatchInsertItem = undefined;
                 var batch_heap: ?[]NamespaceIndex.BatchInsertItem = null;
                 defer if (batch_heap) |bh| allocator.free(bh);
-                const batch_buf: ?[]NamespaceIndex.BatchInsertItem = if (valid_count >= 32) blk: {
+                // The batch buffer holds exactly the stored items, so it is only usable
+                // when Phase 1 recorded which ones those are. With neither `staged` nor
+                // `stored_bits` every byte-valid item is a candidate and could outnumber
+                // `valid_count`; that case takes the unbounded per-item loop below.
+                const stored_tracked = staged != null or stored_bits != null;
+                const batch_buf: ?[]NamespaceIndex.BatchInsertItem = if (stored_tracked and valid_count >= 32) blk: {
                     if (valid_count <= batch_stack.len) break :blk batch_stack[0..valid_count];
                     const b = allocator.alloc(NamespaceIndex.BatchInsertItem, valid_count) catch break :blk null;
                     batch_heap = b;
@@ -555,9 +597,12 @@ pub fn applyVbulkinsert(
 
                 if (batch_buf) |buf| {
                     var b_len: usize = 0;
+                    var overflowed = false;
                     for (items, 0..) |item, item_idx| {
                         if (staged) |s| {
                             if (!s[item_idx].stored) continue;
+                        } else if (stored_bits) |w| {
+                            if (!storedBitGet(w, item_idx)) continue;
                         }
                         const vec_f32 = distance.bytesToF32(item.vector) orelse continue;
                         const pre_bq: ?[]const u8 = if (staged) |s| blk: {
@@ -565,15 +610,23 @@ pub fn applyVbulkinsert(
                             if (meta.len > 0) break :blk bq_blob.items[meta.off..][0..meta.len];
                             break :blk null;
                         } else null;
-                        if (b_len < buf.len) {
-                            buf[b_len] = .{
-                                .key = item.key,
-                                .vector = vec_f32,
-                                .timestamp = item.timestamp,
-                                .pre_encoded_bq = pre_bq,
-                            };
-                            b_len += 1;
+                        if (b_len == buf.len) {
+                            // Unreachable while the stored set matches `valid_count`; if that
+                            // ever drifts, flag the index instead of silently losing vectors.
+                            overflowed = true;
+                            break;
                         }
+                        buf[b_len] = .{
+                            .key = item.key,
+                            .vector = vec_f32,
+                            .timestamp = item.timestamp,
+                            .pre_encoded_bq = pre_bq,
+                        };
+                        b_len += 1;
+                    }
+                    if (overflowed) {
+                        idx.markIncompleteLocked();
+                        std.log.warn("applyVbulkinsert: batch buffer overflow in '{s}' (index marked incomplete)", .{namespace});
                     }
                     _ = idx.insertBatchLocked(buf[0..b_len]) catch |e| {
                         idx.markIncompleteLocked();
@@ -583,6 +636,8 @@ pub fn applyVbulkinsert(
                     for (items, 0..) |item, item_idx| {
                         if (staged) |s| {
                             if (!s[item_idx].stored) continue;
+                        } else if (stored_bits) |w| {
+                            if (!storedBitGet(w, item_idx)) continue;
                         }
                         const vec_f32 = distance.bytesToF32(item.vector) orelse continue;
                         const pre_bq: ?[]const u8 = if (staged) |s| blk: {
@@ -926,6 +981,78 @@ test "applyVbulkinsert parallel batch (>=32) indexes vectors, syncs BQ slab, and
     const found = try idx.searchLocked(&upd_vecs[7], 5, 48, &out, &scratch);
     try testing.expect(found > 0);
     try testing.expectEqualStrings(keys[7], out[0].key);
+}
+
+/// Shared body for the unstaged-bulk regression tests: one pre-existing WORM key that
+/// the batch tries (and fails) to overwrite as its FIRST item, followed by 39 new keys.
+/// `valid_count` is 39, so the parallel batch buffer has 39 slots while 40 items carry
+/// parseable vector bytes.
+fn runUnstagedBulkWithRejectedItem(fault: BulkTrackingFault, expect_worm_untouched: bool) !void {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var store = try Store.init(alloc, .{ .persistence = .none });
+    defer store.deinit();
+    var reg = NamespaceRegistry.init(alloc, .{ .m = 8, .m_max0 = 16, .ef_construction = 48 });
+    defer reg.deinit();
+    store.vector_registry = &reg;
+
+    const n: usize = 40;
+    const v_orig = [_]f32{ -5.0, -5.0, -5.0, -5.0 };
+
+    var vecs: [n][4]f32 = undefined;
+    var key_bufs: [n][16]u8 = undefined;
+    var items: [n]Command.VbulkinsertParams.BulkItem = undefined;
+    for (0..n) |i| {
+        const f: f32 = @floatFromInt(i);
+        vecs[i] = .{ f + 1.0, f * 0.5, 1.0, 0.0 };
+        const key = try std.fmt.bufPrint(&key_bufs[i], "vec:ub:{d:0>4}", .{i});
+        items[i] = .{ .key = key, .vector = std.mem.sliceAsBytes(&vecs[i]), .timestamp = 100 + i };
+    }
+
+    try applyVinsert(&store, null, null, &reg, alloc, .{
+        .key = items[0].key,
+        .vector = std.mem.sliceAsBytes(&v_orig),
+        .worm = true,
+        .namespace = "vec:ub:",
+        .metric = .l2,
+        .timestamp = 10,
+        .replicate = false,
+    });
+
+    bulk_tracking_fault_for_test = fault;
+    defer bulk_tracking_fault_for_test = .none;
+    try applyVbulkinsert(&store, null, null, &reg, alloc, "vec:ub:", .l2, false, false, &items, false);
+
+    const idx = reg.get("vec:ub:").?;
+    idx.lock.lockShared();
+    defer idx.lock.unlockShared();
+
+    // Every vector the Store accepted must be in the index, the last one included.
+    for (items[1..], 1..) |item, i| {
+        try testing.expect(store.get(item.key) != null);
+        const id = idx.nodeIdFor(item.key) orelse {
+            std.debug.print("stored vector '{s}' missing from index\n", .{item.key});
+            return error.TestUnexpectedResult;
+        };
+        try testing.expectApproxEqAbs(vecs[i][0], idx.hnsw.getVector(id)[0], 1e-6);
+    }
+
+    if (expect_worm_untouched) {
+        // The rejected overwrite must not reach the index either.
+        try testing.expectEqual(n, idx.liveCount());
+        try testing.expectEqual(@as(usize, 0), idx.tombstone_count);
+        const id0 = idx.nodeIdFor(items[0].key).?;
+        try testing.expectApproxEqAbs(@as(f32, -5.0), idx.hnsw.getVector(id0)[0], 1e-6);
+    }
+}
+
+test "applyVbulkinsert without BQ staging indexes every stored vector and skips rejected ones" {
+    try runUnstagedBulkWithRejectedItem(.staging, true);
+}
+
+test "applyVbulkinsert with no stored-item tracking still indexes every stored vector" {
+    try runUnstagedBulkWithRejectedItem(.all, false);
 }
 
 // Keep the Command union visible for callers that need to construct frames.

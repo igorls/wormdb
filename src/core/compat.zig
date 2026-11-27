@@ -383,6 +383,25 @@ pub const Dir = struct {
         return dir.createDirPath(io(), path);
     }
 
+    pub fn deleteFile(dir: std.Io.Dir, path: []const u8) !void {
+        return dir.deleteFile(io(), path);
+    }
+
+    /// Flush directory metadata for the parent directory of `path` so a preceding
+    /// atomic rename is durable across crash/power loss.
+    ///
+    /// On Windows, NTFS journals rename metadata and rejects `NtFlushBuffersFile`
+    /// on read-only directory handles, so this is a no-op there. On POSIX/WASI,
+    /// opening with `.iterate = true` guarantees a readable directory fd (never
+    /// `O_PATH` on Linux, which `fsync` rejects with `EBADF`).
+    pub fn syncParent(dir: std.Io.Dir, path: []const u8) !void {
+        if (comptime builtin.os.tag == .windows) return;
+        const parent_path = std.fs.path.dirname(path) orelse ".";
+        var parent_dir = try dir.openDir(io(), parent_path, .{ .iterate = true });
+        defer parent_dir.close(io());
+        try File.sync(.{ .handle = parent_dir.handle, .flags = .{ .nonblocking = false } });
+    }
+
     /// Replacement for removed 0.15 `Dir.realpathAlloc(allocator, sub_path)`.
     /// Returns a caller-owned absolute path.
     pub fn realPathAlloc(dir: std.Io.Dir, allocator: std.mem.Allocator, sub_path: []const u8) ![]u8 {

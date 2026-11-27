@@ -121,6 +121,8 @@ pub const Store = struct {
     segment_count: usize = 0,
     fail_put_reserve_for_test: if (@import("builtin").is_test) bool else void = if (@import("builtin").is_test) false else {},
     fail_ordered_insert_for_test: if (@import("builtin").is_test) bool else void = if (@import("builtin").is_test) false else {},
+    fail_snapshot_sync_for_test: if (@import("builtin").is_test) bool else void = if (@import("builtin").is_test) false else {},
+    fail_snapshot_dir_sync_for_test: if (@import("builtin").is_test) bool else void = if (@import("builtin").is_test) false else {},
     /// Frozen sorted-string segments (`.wsst`, see sst.zig) mounted as a
     /// TRANSPARENT overlay: GET/scan/EXEC consult live shards first, then each
     /// sst in attach order — so live writes shadow frozen keys and procedures
@@ -1709,12 +1711,54 @@ pub const Store = struct {
             if (!w.writer_started) {
                 self.wal_enqueue_mutex.lock();
                 defer self.wal_enqueue_mutex.unlock();
+                if (w.sync_failed) return error.WalNeedsRecovery;
+                errdefer if (w.sync_writes) {
+                    w.sync_failed = true;
+                };
                 try self.writeSnapshot();
                 try w.truncate();
                 return;
             }
         }
         try self.writeSnapshot();
+    }
+
+    /// Synchronously checkpoint live state to disk (`wormdb.snapshot.tmp` -> fsync ->
+    /// atomic rename -> parent directory fsync) and truncate + fsync `wormdb.wal`.
+    ///
+    /// Designed for direct synchronous handles (`wormdb_open_sync`, where
+    /// `persistence == .full` and `!wal.writer_started`), and also supported for
+    /// snapshot-only stores (`persistence == .snapshot`).
+    ///
+    /// Fails closed without touching snapshot or WAL if:
+    /// - `persistence == .none` (`error.PersistenceDisabled`)
+    /// - a background WAL writer thread is active (`error.BackgroundWriterActive`)
+    /// - `wal.sync_failed` is already latched (`error.WalNeedsRecovery`)
+    ///
+    /// On any I/O error during snapshot persistence or WAL truncation, latches
+    /// `wal.sync_failed = true` before returning. Never truncates `wormdb.wal`
+    /// unless the new snapshot is durably synced, renamed, and directory-synced.
+    pub fn checkpointSync(self: *Store) !void {
+        switch (self.config.persistence) {
+            .none => return error.PersistenceDisabled,
+            .snapshot => {
+                try self.writeSnapshot();
+                return;
+            },
+            .full => {
+                const w = &(self.wal orelse return error.WalUnavailable);
+                self.wal_enqueue_mutex.lock();
+                defer self.wal_enqueue_mutex.unlock();
+
+                if (w.writer_started) return error.BackgroundWriterActive;
+                if (w.sync_failed) return error.WalNeedsRecovery;
+
+                errdefer w.sync_failed = true;
+
+                try self.writeSnapshot();
+                try w.truncateSync();
+            },
+        }
     }
 
     const MAX_INCREMENTAL_WAL_KEYS: usize = 4096;
@@ -2217,6 +2261,11 @@ pub const Store = struct {
         const temp_snapshot_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{self.config.snapshot_path});
         defer self.allocator.free(temp_snapshot_path);
 
+        // Registered before opening the temp file so LIFO cleanup closes the handle
+        // before attempting unlink (required on Windows) if any pre-rename step fails.
+        var renamed = false;
+        errdefer if (!renamed) compat.Dir.deleteFile(core.compat.cwd(), temp_snapshot_path) catch {};
+
         const snapshot_file = try compat.Dir.createFile(core.compat.cwd(), temp_snapshot_path, .{ .read = true, .truncate = true });
         var file_open = true;
         defer if (file_open) compat.File.close(snapshot_file);
@@ -2254,11 +2303,20 @@ pub const Store = struct {
         }
 
         try writer.flush();
+        if (@import("builtin").is_test and self.fail_snapshot_sync_for_test) {
+            return error.InjectedSnapshotSyncFailure;
+        }
         try compat.File.sync(snapshot_file);
         compat.File.close(snapshot_file);
         file_open = false;
 
         try compat.Dir.rename(core.compat.cwd(), temp_snapshot_path, self.config.snapshot_path);
+        renamed = true;
+
+        if (@import("builtin").is_test and self.fail_snapshot_dir_sync_for_test) {
+            return error.InjectedDirSyncFailure;
+        }
+        try compat.Dir.syncParent(core.compat.cwd(), self.config.snapshot_path);
     }
 
     /// Buffered counterpart to BufferedFileReader for the snapshot write path.

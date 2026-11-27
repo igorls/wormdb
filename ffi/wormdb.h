@@ -111,6 +111,18 @@ wormdb_Db *wormdb_open_sync(const char *dir);
 /* Flush, close, and free a handle. */
 void wormdb_close(wormdb_Db *db);
 
+/* Synchronously checkpoint live state to disk (`wormdb.snapshot.tmp` -> fsync ->
+ * atomic rename -> parent directory fsync) and truncate + fsync `wormdb.wal`.
+ *
+ * Intended for handles opened with `wormdb_open_sync` (also supported for
+ * `WORMDB_PERSIST_SNAPSHOT`, which has no WAL). Returns WORMDB_OK on success or
+ * WORMDB_ERR if `db` is NULL, persistence is `WORMDB_PERSIST_NONE`, a background
+ * WAL writer thread is active (`wormdb_open(..., WORMDB_PERSIST_FULL)`),
+ * `sync_failed` is already latched, or any I/O error occurs. On any I/O error,
+ * latches `sync_failed` until close/reopen recovery and never truncates the WAL
+ * unless the new snapshot is durably on disk. */
+int wormdb_checkpoint_sync(wormdb_Db *db);
+
 /* Set key -> value (mutable). Returns WORMDB_OK / WORMDB_ERR. */
 int wormdb_set(wormdb_Db *db, const unsigned char *key, size_t key_len,
                const unsigned char *val, size_t val_len);

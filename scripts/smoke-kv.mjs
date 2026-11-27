@@ -45,7 +45,7 @@ const mem = () => new Uint8Array(ex.memory.buffer);
 const dv = () => new DataView(ex.memory.buffer);
 
 // The export surface the host depends on. A missing entry point is a hard failure, not a warning.
-for (const name of ["wormdb_version", "wormdb_open", "wormdb_set", "wormdb_get", "wormdb_delete", "wormdb_alloc", "wormdb_free", "wormdb_close"]) {
+for (const name of ["wormdb_version", "wormdb_open", "wormdb_open_sync", "wormdb_checkpoint_sync", "wormdb_set", "wormdb_get", "wormdb_delete", "wormdb_alloc", "wormdb_free", "wormdb_close"]) {
   check(typeof ex[name] === "function", `exports ${name}`);
 }
 
@@ -111,6 +111,9 @@ const p4 = scratch(), l4 = scratch();
 // A deleted key must report NOT FOUND specifically. `!== 0` would also pass on an internal error,
 // which is the difference between "the delete worked" and "the store is broken" — so require the code.
 check(ex.wormdb_get(db, k.ptr, k.len, p4, l4) === 1, "a deleted key is not found (NOT_FOUND)", `rc=${ex.wormdb_get(db, k.ptr, k.len, p4, l4)}`);
+
+check(ex.wormdb_checkpoint_sync(0) === -1, "wormdb_checkpoint_sync(NULL) fails closed with WORMDB_ERR");
+check(ex.wormdb_checkpoint_sync(db) === -1, "wormdb_checkpoint_sync on persistence=none fails closed with WORMDB_ERR");
 
 check((ex.wormdb_close(db), true), "wormdb_close does not throw");
 finish();

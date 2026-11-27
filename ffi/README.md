@@ -22,6 +22,8 @@ iOS, since apps cannot `dlopen` user dylibs).
 
 ```c
 wormdb_Db *wormdb_open(const char *dir, int persistence);  // WORMDB_PERSIST_{FULL,SNAPSHOT,NONE}
+wormdb_Db *wormdb_open_sync(const char *dir);              // synchronous per-write WAL fsync (no bg thread)
+int        wormdb_checkpoint_sync(wormdb_Db *db);          // durable snapshot + dir fsync + WAL truncate
 void       wormdb_close(wormdb_Db *db);
 int        wormdb_set(wormdb_Db*, const u8 *key, size_t, const u8 *val, size_t);
 int        wormdb_set_worm(...);            // write-once entry

@@ -270,6 +270,20 @@ export fn wormdb_close(db: *Db) void {
     gpa.destroy(db);
 }
 
+/// Synchronously checkpoint live state to disk (`wormdb.snapshot.tmp` -> fsync ->
+/// atomic rename -> parent directory fsync) and truncate + fsync `wormdb.wal`.
+///
+/// Intended for synchronous direct-WAL handles (`wormdb_open_sync`) and snapshot-only
+/// handles (`WORMDB_PERSIST_SNAPSHOT`). Fails closed with `WORMDB_ERR` if `db` is NULL,
+/// persistence is `WORMDB_PERSIST_NONE`, a background WAL writer thread is active,
+/// `sync_failed` is already latched, or any I/O step fails (latching `sync_failed` until
+/// close/reopen recovery). Never truncates the WAL unless the new snapshot is durably on disk.
+export fn wormdb_checkpoint_sync(db: ?*Db) c_int {
+    const handle = db orelse return ERR;
+    handle.store.checkpointSync() catch return ERR;
+    return OK;
+}
+
 /// Set key → value (mutable; not WORM). Returns WORMDB_OK or WORMDB_ERR.
 export fn wormdb_set(db: *Db, key: [*]const u8, key_len: usize, val: [*]const u8, val_len: usize) c_int {
     db.store.set(key[0..key_len], val[0..val_len], false) catch return ERR;
@@ -804,4 +818,413 @@ test "ffi sync failure has uncertain outcome and blocks writes until recovery" {
     try testing.expectEqualStrings("first", value.?[0..len]);
     try testing.expectEqual(ERR, wormdb_set_worm(recovered, "key", 3, "second", 6));
     try testing.expectEqual(OK, wormdb_set(recovered, "other", 5, "value", 5));
+}
+
+test "ffi checkpoint_sync shrinks WAL and preserves binary/NUL, empty, timestamps, and WORM across reopen" {
+    const testing = std.testing;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try wormdb.core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+    const zpath = try testing.allocator.dupeSentinel(u8, tmp_path, 0);
+    defer testing.allocator.free(zpath);
+
+    const worm_key = "worm:anchor";
+    const worm_val = "immutable-payload";
+    const empty_key = "empty:val";
+    const bin_key = "bin\x00key\xff";
+    const bin_val = "\x00\x01\x02\x00\xfe\xff";
+    const hot_key = "hot:mutable";
+    const log_id = "audit:checkpoint";
+
+    var saved_worm_meta: EntryMeta = undefined;
+    var saved_log_report: AppendLogReport = undefined;
+
+    {
+        const db = wormdb_open_sync(zpath.ptr) orelse return error.OpenFailed;
+        defer wormdb_close(db);
+
+        try testing.expectEqual(OK, wormdb_set_worm(db, worm_key.ptr, worm_key.len, worm_val.ptr, worm_val.len));
+        try testing.expectEqual(OK, wormdb_get_meta(db, worm_key.ptr, worm_key.len, &saved_worm_meta));
+        try testing.expectEqual(@as(c_int, 1), saved_worm_meta.is_worm);
+
+        var r1: AppendReceipt = undefined;
+        var r2: AppendReceipt = undefined;
+        try testing.expectEqual(OK, wormdb_append_log(db, log_id.ptr, log_id.len, "ev1", 3, null, 0, 1_800_000_010_000, &r1));
+        try testing.expectEqual(OK, wormdb_append_log(db, log_id.ptr, log_id.len, "ev2", 3, null, 0, 1_800_000_020_000, &r2));
+        try testing.expectEqual(OK, wormdb_append_log_verify(db, log_id.ptr, log_id.len, &saved_log_report));
+        try testing.expectEqual(@as(usize, 2), saved_log_report.count);
+        try testing.expectEqual(@as(u64, 2), saved_log_report.last_seq);
+
+        try testing.expectEqual(OK, wormdb_set(db, empty_key.ptr, empty_key.len, "".ptr, 0));
+        try testing.expectEqual(OK, wormdb_set(db, bin_key.ptr, bin_key.len, bin_val.ptr, bin_val.len));
+
+        // Heavy overwrites + deletes grow wormdb.wal substantially.
+        var payload_buf: [512]u8 = undefined;
+        for (0..120) |i| {
+            @memset(&payload_buf, @intCast(i & 0xff));
+            try testing.expectEqual(OK, wormdb_set(db, hot_key.ptr, hot_key.len, &payload_buf, payload_buf.len));
+        }
+        var eph_key_buf: [32]u8 = undefined;
+        for (0..40) |i| {
+            const k = try std.fmt.bufPrint(&eph_key_buf, "ephemeral:{d:0>3}", .{i});
+            try testing.expectEqual(OK, wormdb_set(db, k.ptr, k.len, &payload_buf, 128));
+            try testing.expectEqual(OK, wormdb_delete(db, k.ptr, k.len));
+        }
+
+        const wal_before_stat = try wormdb.core.compat.File.stat(db.store.wal.?.file);
+        try testing.expect(wal_before_stat.size > 60_000);
+        try testing.expect((try db.store.wal.?.size()) > 60_000);
+
+        // Synchronous checkpoint: durable snapshot + parent dir fsync + WAL truncate + WAL fsync.
+        try testing.expectEqual(OK, wormdb_checkpoint_sync(db));
+
+        try testing.expectEqual(@as(usize, 0), try db.store.wal.?.size());
+        const wal_after_stat = try wormdb.core.compat.File.stat(db.store.wal.?.file);
+        try testing.expectEqual(@as(u64, 0), wal_after_stat.size);
+
+        const snap_file = try tmp_dir.dir.openFile(io(), "wormdb.snapshot", .{ .mode = .read_only });
+        defer wormdb.core.compat.File.close(snap_file);
+        const snap_stat = try wormdb.core.compat.File.stat(snap_file);
+        try testing.expect(snap_stat.size > 0);
+        try testing.expectError(error.FileNotFound, tmp_dir.dir.openFile(io(), "wormdb.snapshot.tmp", .{ .mode = .read_only }));
+
+        // Writes after checkpoint append cleanly to the truncated WAL.
+        const post_k = "post:checkpoint";
+        const post_v = "replayed-over-snapshot";
+        try testing.expectEqual(OK, wormdb_set(db, post_k.ptr, post_k.len, post_v.ptr, post_v.len));
+        const wal_post_stat = try wormdb.core.compat.File.stat(db.store.wal.?.file);
+        try testing.expect(wal_post_stat.size > 0);
+    }
+
+    // Reopen and verify every live entry, WORM immutability, timestamps, deleted absences, and post-checkpoint WAL replay.
+    {
+        const reopened = wormdb_open_sync(zpath.ptr) orelse return error.OpenFailed;
+        defer wormdb_close(reopened);
+
+        var out_val: ?[*]u8 = null;
+        var out_len: usize = 0;
+
+        // WORM key value, metadata, timestamp, and immutability preserved.
+        try testing.expectEqual(OK, wormdb_get(reopened, worm_key.ptr, worm_key.len, &out_val, &out_len));
+        defer wormdb_free(out_val, out_len);
+        try testing.expectEqualStrings(worm_val, out_val.?[0..out_len]);
+
+        var meta_after: EntryMeta = undefined;
+        try testing.expectEqual(OK, wormdb_get_meta(reopened, worm_key.ptr, worm_key.len, &meta_after));
+        try testing.expectEqual(@as(c_int, 1), meta_after.is_worm);
+        try testing.expectEqual(saved_worm_meta.timestamp_ms, meta_after.timestamp_ms);
+        try testing.expectEqual(saved_worm_meta.value_len, meta_after.value_len);
+        try testing.expectEqualSlices(u8, &saved_worm_meta.value_sha256, &meta_after.value_sha256);
+        try testing.expectEqual(ERR, wormdb_set(reopened, worm_key.ptr, worm_key.len, "mut", 3));
+        try testing.expectEqual(ERR, wormdb_set_worm(reopened, worm_key.ptr, worm_key.len, "mut", 3));
+        try testing.expectEqual(ERR, wormdb_delete(reopened, worm_key.ptr, worm_key.len));
+
+        // Append-log hash chain and receipt head survive checkpoint + WAL truncate + reopen.
+        var log_report_after: AppendLogReport = undefined;
+        try testing.expectEqual(OK, wormdb_append_log_verify(reopened, log_id.ptr, log_id.len, &log_report_after));
+        try testing.expectEqual(saved_log_report.count, log_report_after.count);
+        try testing.expectEqual(saved_log_report.last_seq, log_report_after.last_seq);
+        try testing.expectEqualSlices(u8, &saved_log_report.head_hash, &log_report_after.head_hash);
+
+        // Empty value remains distinct from NOT_FOUND.
+        var empty_val: ?[*]u8 = null;
+        var empty_len: usize = 99;
+        try testing.expectEqual(OK, wormdb_get(reopened, empty_key.ptr, empty_key.len, &empty_val, &empty_len));
+        defer wormdb_free(empty_val, empty_len);
+        try testing.expectEqual(@as(usize, 0), empty_len);
+
+        // Binary key & value with embedded NUL bytes preserved byte-for-byte.
+        var bin_out: ?[*]u8 = null;
+        var bin_out_len: usize = 0;
+        try testing.expectEqual(OK, wormdb_get(reopened, bin_key.ptr, bin_key.len, &bin_out, &bin_out_len));
+        defer wormdb_free(bin_out, bin_out_len);
+        try testing.expectEqualSlices(u8, bin_val, bin_out.?[0..bin_out_len]);
+
+        // Hot key reflects final 120th overwrite (byte 119).
+        var hot_out: ?[*]u8 = null;
+        var hot_out_len: usize = 0;
+        try testing.expectEqual(OK, wormdb_get(reopened, hot_key.ptr, hot_key.len, &hot_out, &hot_out_len));
+        defer wormdb_free(hot_out, hot_out_len);
+        try testing.expectEqual(@as(usize, 512), hot_out_len);
+        var expected_hot: [512]u8 = undefined;
+        @memset(&expected_hot, 119);
+        try testing.expectEqualSlices(u8, &expected_hot, hot_out.?[0..hot_out_len]);
+
+        // Deleted ephemeral keys did not resurrect.
+        var gone_val: ?[*]u8 = null;
+        var gone_len: usize = 0;
+        try testing.expectEqual(NOT_FOUND, wormdb_get(reopened, "ephemeral:000", 13, &gone_val, &gone_len));
+        try testing.expectEqual(NOT_FOUND, wormdb_get(reopened, "ephemeral:039", 13, &gone_val, &gone_len));
+
+        // Post-checkpoint write survived via WAL replay on top of the new snapshot.
+        var post_out: ?[*]u8 = null;
+        var post_out_len: usize = 0;
+        try testing.expectEqual(OK, wormdb_get(reopened, "post:checkpoint", 15, &post_out, &post_out_len));
+        defer wormdb_free(post_out, post_out_len);
+        try testing.expectEqualStrings("replayed-over-snapshot", post_out.?[0..post_out_len]);
+
+        // Second checkpoint compacts the post-checkpoint WAL cleanly back to 0.
+        try testing.expectEqual(OK, wormdb_checkpoint_sync(reopened));
+        const wal_second = try wormdb.core.compat.File.stat(reopened.store.wal.?.file);
+        try testing.expectEqual(@as(u64, 0), wal_second.size);
+    }
+
+    // Reopen after second checkpoint to confirm empty WAL + refreshed snapshot.
+    const reopened2 = wormdb_open_sync(zpath.ptr) orelse return error.OpenFailed;
+    defer wormdb_close(reopened2);
+    var post_out2: ?[*]u8 = null;
+    var post_out2_len: usize = 0;
+    try testing.expectEqual(OK, wormdb_get(reopened2, "post:checkpoint", 15, &post_out2, &post_out2_len));
+    defer wormdb_free(post_out2, post_out2_len);
+    try testing.expectEqualStrings("replayed-over-snapshot", post_out2.?[0..post_out2_len]);
+}
+
+test "ffi checkpoint_sync rejects null handle, persistence=none, and active background writer" {
+    const testing = std.testing;
+
+    try testing.expectEqual(ERR, wormdb_checkpoint_sync(null));
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try wormdb.core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+    const zpath = try testing.allocator.dupeSentinel(u8, tmp_path, 0);
+    defer testing.allocator.free(zpath);
+
+    // PERSIST_NONE must fail closed.
+    const mem_db = wormdb_open(zpath.ptr, PERSIST_NONE) orelse return error.OpenFailed;
+    defer wormdb_close(mem_db);
+    try testing.expectEqual(ERR, wormdb_checkpoint_sync(mem_db));
+
+    // Background-writer PERSIST_FULL must fail closed (never truncate under an active writer thread).
+    const bg_dir = try std.fmt.allocPrint(testing.allocator, "{s}/bg", .{tmp_path});
+    defer testing.allocator.free(bg_dir);
+    const bg_zpath = try testing.allocator.dupeSentinel(u8, bg_dir, 0);
+    defer testing.allocator.free(bg_zpath);
+    const bg_db = wormdb_open(bg_zpath.ptr, PERSIST_FULL) orelse return error.OpenFailed;
+    defer wormdb_close(bg_db);
+    if (!@import("builtin").single_threaded) {
+        try testing.expect(bg_db.store.wal.?.writer_started);
+        try testing.expectEqual(OK, wormdb_set(bg_db, "bg_key", 6, "bg_val", 6));
+        try testing.expectEqual(ERR, wormdb_checkpoint_sync(bg_db));
+        try testing.expectError(error.FileNotFound, tmp_dir.dir.openFile(io(), "bg/wormdb.snapshot", .{ .mode = .read_only }));
+    }
+
+    // PERSIST_SNAPSHOT (no WAL) durably writes snapshot.
+    const snap_dir = try std.fmt.allocPrint(testing.allocator, "{s}/snap_only", .{tmp_path});
+    defer testing.allocator.free(snap_dir);
+    const snap_zpath = try testing.allocator.dupeSentinel(u8, snap_dir, 0);
+    defer testing.allocator.free(snap_zpath);
+    {
+        const snap_db = wormdb_open(snap_zpath.ptr, PERSIST_SNAPSHOT) orelse return error.OpenFailed;
+        defer wormdb_close(snap_db);
+        try testing.expectEqual(OK, wormdb_set(snap_db, "s", 1, "ok", 2));
+        try testing.expectEqual(OK, wormdb_checkpoint_sync(snap_db));
+    }
+    const snap_reopened = wormdb_open(snap_zpath.ptr, PERSIST_SNAPSHOT) orelse return error.OpenFailed;
+    defer wormdb_close(snap_reopened);
+    var out_val: ?[*]u8 = null;
+    var out_len: usize = 0;
+    try testing.expectEqual(OK, wormdb_get(snap_reopened, "s", 1, &out_val, &out_len));
+    defer wormdb_free(out_val, out_len);
+    try testing.expectEqualStrings("ok", out_val.?[0..out_len]);
+}
+
+test "ffi checkpoint_sync fails closed when sync_failed is latched without truncating WAL" {
+    const testing = std.testing;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try wormdb.core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+    const zpath = try testing.allocator.dupeSentinel(u8, tmp_path, 0);
+    defer testing.allocator.free(zpath);
+
+    {
+        const db = wormdb_open_sync(zpath.ptr) orelse return error.OpenFailed;
+        defer wormdb_close(db);
+
+        try testing.expectEqual(OK, wormdb_set(db, "before", 6, "v1", 2));
+        db.store.wal.?.fail_sync_for_test = true;
+        try testing.expectEqual(ERR, wormdb_set(db, "uncertain", 9, "v2", 2));
+        try testing.expect(db.store.wal.?.sync_failed);
+        db.store.wal.?.fail_sync_for_test = false;
+
+        const wal_stat_before = try wormdb.core.compat.File.stat(db.store.wal.?.file);
+        try testing.expect(wal_stat_before.size > 0);
+
+        // Must fail closed without writing a snapshot or truncating the WAL.
+        try testing.expectEqual(ERR, wormdb_checkpoint_sync(db));
+
+        const wal_stat_after = try wormdb.core.compat.File.stat(db.store.wal.?.file);
+        try testing.expectEqual(wal_stat_before.size, wal_stat_after.size);
+        try testing.expectError(error.FileNotFound, tmp_dir.dir.openFile(io(), "wormdb.snapshot", .{ .mode = .read_only }));
+    }
+
+    // Reopen recovers both the acknowledged write and the uncertain WAL record cleanly.
+    const recovered = wormdb_open_sync(zpath.ptr) orelse return error.OpenFailed;
+    defer wormdb_close(recovered);
+
+    var out_val: ?[*]u8 = null;
+    var out_len: usize = 0;
+    try testing.expectEqual(OK, wormdb_get(recovered, "before", 6, &out_val, &out_len));
+    defer wormdb_free(out_val, out_len);
+    try testing.expectEqualStrings("v1", out_val.?[0..out_len]);
+
+    var out_val2: ?[*]u8 = null;
+    var out_len2: usize = 0;
+    try testing.expectEqual(OK, wormdb_get(recovered, "uncertain", 9, &out_val2, &out_len2));
+    defer wormdb_free(out_val2, out_len2);
+    try testing.expectEqualStrings("v2", out_val2.?[0..out_len2]);
+}
+
+test "ffi checkpoint_sync snapshot or dir-sync failure latches sync_failed and preserves WAL" {
+    const testing = std.testing;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try wormdb.core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+    const zpath = try testing.allocator.dupeSentinel(u8, tmp_path, 0);
+    defer testing.allocator.free(zpath);
+
+    // Case A: failure during snapshot file fsync (before rename & before WAL truncate).
+    {
+        const db = wormdb_open_sync(zpath.ptr) orelse return error.OpenFailed;
+        defer wormdb_close(db);
+
+        try testing.expectEqual(OK, wormdb_set(db, "k1", 2, "v1", 2));
+        const wal_before = (try wormdb.core.compat.File.stat(db.store.wal.?.file)).size;
+        try testing.expect(wal_before > 0);
+
+        db.store.fail_snapshot_sync_for_test = true;
+        try testing.expectEqual(ERR, wormdb_checkpoint_sync(db));
+        try testing.expect(db.store.wal.?.sync_failed);
+        db.store.fail_snapshot_sync_for_test = false;
+
+        // WAL untouched, temp snapshot removed, live snapshot absent, further writes fenced.
+        const wal_after = (try wormdb.core.compat.File.stat(db.store.wal.?.file)).size;
+        try testing.expectEqual(wal_before, wal_after);
+        try testing.expectError(error.FileNotFound, tmp_dir.dir.openFile(io(), "wormdb.snapshot.tmp", .{ .mode = .read_only }));
+        try testing.expectError(error.FileNotFound, tmp_dir.dir.openFile(io(), "wormdb.snapshot", .{ .mode = .read_only }));
+        try testing.expectEqual(ERR, wormdb_set(db, "blocked", 7, "no", 2));
+        try testing.expectEqual(ERR, wormdb_checkpoint_sync(db));
+    }
+
+    // Reopen recovers k1 from intact WAL; then test Case B: failure during parent dir fsync.
+    {
+        const db = wormdb_open_sync(zpath.ptr) orelse return error.OpenFailed;
+        defer wormdb_close(db);
+
+        try testing.expectEqual(OK, wormdb_set(db, "k2", 2, "v2", 2));
+        const wal_before = (try wormdb.core.compat.File.stat(db.store.wal.?.file)).size;
+        try testing.expect(wal_before > 0);
+
+        db.store.fail_snapshot_dir_sync_for_test = true;
+        try testing.expectEqual(ERR, wormdb_checkpoint_sync(db));
+        try testing.expect(db.store.wal.?.sync_failed);
+        db.store.fail_snapshot_dir_sync_for_test = false;
+
+        // WAL must NOT be truncated if parent dir fsync failed.
+        const wal_after = (try wormdb.core.compat.File.stat(db.store.wal.?.file)).size;
+        try testing.expectEqual(wal_before, wal_after);
+        try testing.expectEqual(ERR, wormdb_set(db, "blocked2", 8, "no", 2));
+    }
+
+    // Final reopen recovers both k1 and k2 cleanly and allows normal writes + checkpointing.
+    {
+        const recovered = wormdb_open_sync(zpath.ptr) orelse return error.OpenFailed;
+        defer wormdb_close(recovered);
+        var v1: ?[*]u8 = null;
+        var v1_len: usize = 0;
+        try testing.expectEqual(OK, wormdb_get(recovered, "k1", 2, &v1, &v1_len));
+        defer wormdb_free(v1, v1_len);
+        try testing.expectEqualStrings("v1", v1.?[0..v1_len]);
+
+        var v2: ?[*]u8 = null;
+        var v2_len: usize = 0;
+        try testing.expectEqual(OK, wormdb_get(recovered, "k2", 2, &v2, &v2_len));
+        defer wormdb_free(v2, v2_len);
+        try testing.expectEqualStrings("v2", v2.?[0..v2_len]);
+
+        try testing.expectEqual(OK, wormdb_checkpoint_sync(recovered));
+        try testing.expectEqual(@as(u64, 0), (try wormdb.core.compat.File.stat(recovered.store.wal.?.file)).size);
+
+        // Case C: when a prior snapshot already exists, a failed subsequent snapshot sync
+        // preserves both the prior snapshot and the new post-checkpoint WAL.
+        try testing.expectEqual(OK, wormdb_set(recovered, "k3", 2, "v3", 2));
+        const wal_c_before = (try wormdb.core.compat.File.stat(recovered.store.wal.?.file)).size;
+        try testing.expect(wal_c_before > 0);
+
+        recovered.store.fail_snapshot_sync_for_test = true;
+        try testing.expectEqual(ERR, wormdb_checkpoint_sync(recovered));
+        try testing.expect(recovered.store.wal.?.sync_failed);
+        recovered.store.fail_snapshot_sync_for_test = false;
+
+        try testing.expectEqual(wal_c_before, (try wormdb.core.compat.File.stat(recovered.store.wal.?.file)).size);
+        try testing.expectError(error.FileNotFound, tmp_dir.dir.openFile(io(), "wormdb.snapshot.tmp", .{ .mode = .read_only }));
+    }
+
+    // Reopen recovers k1+k2 from the intact prior snapshot AND k3 from the intact WAL.
+    const recovered2 = wormdb_open_sync(zpath.ptr) orelse return error.OpenFailed;
+    defer wormdb_close(recovered2);
+    var v1b: ?[*]u8 = null;
+    var v1b_len: usize = 0;
+    try testing.expectEqual(OK, wormdb_get(recovered2, "k1", 2, &v1b, &v1b_len));
+    defer wormdb_free(v1b, v1b_len);
+    try testing.expectEqualStrings("v1", v1b.?[0..v1b_len]);
+
+    var v3: ?[*]u8 = null;
+    var v3_len: usize = 0;
+    try testing.expectEqual(OK, wormdb_get(recovered2, "k3", 2, &v3, &v3_len));
+    defer wormdb_free(v3, v3_len);
+    try testing.expectEqualStrings("v3", v3.?[0..v3_len]);
+}
+
+test "ffi checkpoint_sync WAL truncate sync failure latches sync_failed while snapshot remains recoverable" {
+    const testing = std.testing;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try wormdb.core.compat.Dir.realPathAlloc(tmp_dir.dir, testing.allocator, ".");
+    defer testing.allocator.free(tmp_path);
+    const zpath = try testing.allocator.dupeSentinel(u8, tmp_path, 0);
+    defer testing.allocator.free(zpath);
+
+    {
+        const db = wormdb_open_sync(zpath.ptr) orelse return error.OpenFailed;
+        defer wormdb_close(db);
+
+        try testing.expectEqual(OK, wormdb_set(db, "k_trunc", 7, "durable", 7));
+        try testing.expectEqual(OK, wormdb_set_worm(db, "w_trunc", 7, "immutable", 9));
+
+        // Snapshot succeeds + dir-syncs; WAL truncate fails at fsync.
+        db.store.wal.?.fail_sync_for_test = true;
+        try testing.expectEqual(ERR, wormdb_checkpoint_sync(db));
+        try testing.expect(db.store.wal.?.sync_failed);
+        db.store.wal.?.fail_sync_for_test = false;
+
+        // Subsequent writes remain fenced until reopen.
+        try testing.expectEqual(ERR, wormdb_set(db, "after_fail", 10, "no", 2));
+    }
+
+    const recovered = wormdb_open_sync(zpath.ptr) orelse return error.OpenFailed;
+    defer wormdb_close(recovered);
+
+    var out_k: ?[*]u8 = null;
+    var out_k_len: usize = 0;
+    try testing.expectEqual(OK, wormdb_get(recovered, "k_trunc", 7, &out_k, &out_k_len));
+    defer wormdb_free(out_k, out_k_len);
+    try testing.expectEqualStrings("durable", out_k.?[0..out_k_len]);
+
+    var out_w: ?[*]u8 = null;
+    var out_w_len: usize = 0;
+    try testing.expectEqual(OK, wormdb_get(recovered, "w_trunc", 7, &out_w, &out_w_len));
+    defer wormdb_free(out_w, out_w_len);
+    try testing.expectEqualStrings("immutable", out_w.?[0..out_w_len]);
+    try testing.expectEqual(ERR, wormdb_delete(recovered, "w_trunc", 7));
+    try testing.expectEqual(OK, wormdb_set(recovered, "after_recover", 13, "yes", 3));
 }

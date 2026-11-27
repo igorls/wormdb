@@ -820,14 +820,31 @@ pub const Wal = struct {
 
     /// Truncate the WAL to zero bytes and reset write cursor to the beginning.
     pub fn truncate(self: *Wal) !void {
+        try self.truncateInternal(self.sync_writes);
+    }
+
+    /// Truncate the WAL to zero bytes, reset write cursor to the beginning, and
+    /// unconditionally fsync the WAL file (latching `sync_failed` on any error).
+    pub fn truncateSync(self: *Wal) !void {
+        try self.truncateInternal(true);
+    }
+
+    fn truncateInternal(self: *Wal, do_sync: bool) !void {
+        if (self.sync_failed) return error.WalNeedsRecovery;
+        errdefer if (do_sync) {
+            self.sync_failed = true;
+        };
         try compat.File.setLength(self.file, 0);
         try compat.File.seekTo(self.file, 0);
+        if (do_sync) {
+            if (@import("builtin").is_test) {
+                if (self.fail_sync_for_test) return error.InjectedSyncFailure;
+            }
+            try compat.File.sync(self.file);
+        }
         self.wal_bytes.store(0, .monotonic);
         for (&self.lanes) |*lane| {
             lane.bytes_enqueued.store(0, .monotonic);
-        }
-        if (self.sync_writes) {
-            try compat.File.sync(self.file);
         }
     }
 };
